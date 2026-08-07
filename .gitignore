@@ -1,0 +1,47 @@
+# Environment and secrets
+.env
+*.secret
+*.pem
+*.key
+
+# Python environments and bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Logs
+logs/
+*.log
+
+# Local data and temporary files
+data/
+local-data/
+tmp/
+temp/
+.tmp/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

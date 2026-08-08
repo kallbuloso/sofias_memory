@@ -153,7 +153,7 @@ def test_dataset_has_no_forbidden_ownership_or_soft_delete_columns() -> None:
 
 
 def test_base_metadata_contains_only_dataset_product_table_at_this_stage() -> None:
-    assert set(Base.metadata.tables) == {"datasets", "documents", "sources"}
+    assert set(Base.metadata.tables) == {"chunks", "datasets", "documents", "sources"}
 
 
 def test_dataset_can_be_constructed_without_mutating_settings_or_connecting() -> None:

@@ -5,7 +5,7 @@ from sofias_memory.infrastructure.postgres.engine import (
     create_async_engine_from_settings,
     dispose_async_engine,
 )
-from sofias_memory.infrastructure.postgres.models import Dataset, Document, Source
+from sofias_memory.infrastructure.postgres.models import Chunk, Dataset, Document, Source
 from sofias_memory.infrastructure.postgres.session import (
     create_session_factory,
     session_scope,
@@ -16,6 +16,7 @@ from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 __all__ = [
     "AsyncSessionFactory",
     "Base",
+    "Chunk",
     "Dataset",
     "Document",
     "NAMING_CONVENTION",

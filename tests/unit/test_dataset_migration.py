@@ -96,6 +96,7 @@ def test_dataset_revision_is_current_head() -> None:
         "0001_enable_required_extensions.py",
         "0002_create_datasets.py",
         "0003_create_sources_and_documents.py",
+        "0004_create_chunks.py",
     ]
 
 

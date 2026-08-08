@@ -87,10 +87,13 @@ def test_versions_directory_exists() -> None:
     assert VERSIONS_DIR.is_dir()
 
 
-def test_versions_directory_contains_only_first_revision() -> None:
+def test_versions_directory_contains_expected_foundation_revisions() -> None:
     revision_files = sorted(path.name for path in VERSIONS_DIR.glob("*.py"))
 
-    assert revision_files == ["0001_enable_required_extensions.py"]
+    assert revision_files == [
+        "0001_enable_required_extensions.py",
+        "0002_create_datasets.py",
+    ]
 
 
 def test_revision_template_contains_upgrade_and_downgrade() -> None:

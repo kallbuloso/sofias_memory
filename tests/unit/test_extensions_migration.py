@@ -40,10 +40,10 @@ def upgrade_statements() -> list[str]:
     return op_spy.statements
 
 
-def test_exactly_one_real_revision_exists() -> None:
+def test_extension_migration_remains_initial_revision() -> None:
     revision_files = sorted(path.name for path in MIGRATIONS_VERSIONS.glob("*.py"))
 
-    assert revision_files == ["0001_enable_required_extensions.py"]
+    assert revision_files[0] == "0001_enable_required_extensions.py"
 
 
 def test_initial_revision_metadata() -> None:

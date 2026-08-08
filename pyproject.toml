@@ -82,6 +82,9 @@ addopts = [
     "--strict-config",
     "--strict-markers",
 ]
+markers = [
+    "integration: tests that require explicitly provided external infrastructure",
+]
 
 [tool.coverage.run]
 source = ["sofias_memory"]

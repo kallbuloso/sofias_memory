@@ -57,9 +57,9 @@ Estas decisões vencem qualquer trecho antigo conflitante:
 - package Python em `sofias_memory/` na raiz;
 - NÃO usar `src/sofias_memory`;
 - `compose.yaml` é canônico e portável;
-- `compose.easypanel.yaml` é deployment EasyPanel;
-- `compose.portainer.yaml` é deployment Portainer;
-- EasyPanel/Portainer não fazem parte da arquitetura da aplicação.
+- EasyPanel/Portainer não fazem parte da arquitetura da aplicação;
+- arquivos específicos de EasyPanel/Portainer só devem existir quando houver diferença
+  real e documentada em relação ao `compose.yaml` canônico.
 
 Não reabra essas decisões sem solicitação explícita.
 
@@ -183,8 +183,6 @@ sofias-memory/
 ├── alembic.ini
 ├── Dockerfile
 ├── compose.yaml
-├── compose.easypanel.yaml
-├── compose.portainer.yaml
 ├── .env.example
 ├── LICENSE
 ├── NOTICE.md
@@ -873,13 +871,17 @@ neo4j
 
 Sem profiles opcionais no MVP.
 
-### `compose.easypanel.yaml`
+### EasyPanel
 
-Somente diferenças necessárias ao EasyPanel.
+Use `compose.yaml` diretamente quando não houver diferença real e documentada para
+EasyPanel. Crie um arquivo específico somente para adaptações necessárias e não
+especulativas.
 
-### `compose.portainer.yaml`
+### Portainer
 
-Somente diferenças necessárias ao Portainer.
+Use `compose.yaml` diretamente quando não houver diferença real e documentada para
+Portainer. Crie um arquivo específico somente para adaptações necessárias e não
+especulativas.
 
 Não pode haver diferença funcional entre os deployments.
 
@@ -892,7 +894,9 @@ Regras:
 - app non-root;
 - secrets fora do Git;
 - tags de produção imutáveis;
-- os três arquivos devem passar em `docker compose config`.
+- `compose.yaml` deve passar em `docker compose config`;
+- arquivos específicos de plataforma, quando existirem, também devem passar em
+  `docker compose config`.
 
 ## 23. Licença/Cognee upstream
 

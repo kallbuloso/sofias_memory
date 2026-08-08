@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from sofias_memory.domain import DatasetStatus, SourceKind, SourceStatus
+from enum import StrEnum
+
+from sofias_memory.domain import (
+    DatasetStatus,
+    MemoryEntryType,
+    SourceKind,
+    SourceStatus,
+    SummaryTargetType,
+)
 
 
 def test_dataset_status_values_are_exact() -> None:
@@ -47,3 +55,33 @@ def test_source_enums_serialize_as_string_values() -> None:
 def test_source_enums_have_no_aliases() -> None:
     assert len(SourceKind) == len({kind.value for kind in SourceKind})
     assert len(SourceStatus) == len({status.value for status in SourceStatus})
+
+
+def test_summary_target_type_values_are_exact() -> None:
+    assert [target_type.value for target_type in SummaryTargetType] == [
+        "document",
+        "entity",
+        "dataset",
+        "cluster",
+    ]
+
+
+def test_memory_entry_type_values_are_exact() -> None:
+    assert [entry_type.value for entry_type in MemoryEntryType] == [
+        "text",
+        "qa",
+        "feedback",
+        "note",
+    ]
+
+
+def test_sm210_enums_are_str_enums_and_serialize_lowercase_values() -> None:
+    assert issubclass(SummaryTargetType, StrEnum)
+    assert issubclass(MemoryEntryType, StrEnum)
+    assert str(SummaryTargetType.DOCUMENT) == "document"
+    assert f"{MemoryEntryType.QA}" == "qa"
+
+
+def test_sm210_enums_have_no_aliases() -> None:
+    assert len(SummaryTargetType) == len({target_type.value for target_type in SummaryTargetType})
+    assert len(MemoryEntryType) == len({entry_type.value for entry_type in MemoryEntryType})

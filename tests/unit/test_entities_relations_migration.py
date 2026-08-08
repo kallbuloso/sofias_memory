@@ -102,6 +102,7 @@ def test_entities_relations_revision_is_current_head() -> None:
         "0003_create_sources_and_documents.py",
         "0004_create_chunks.py",
         "0005_create_entities_relations.py",
+        "0006_create_summaries_memory_queries_feedback.py",
     ]
 
 

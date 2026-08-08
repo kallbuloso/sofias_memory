@@ -159,9 +159,13 @@ def test_base_metadata_contains_only_dataset_product_table_at_this_stage() -> No
         "documents",
         "entities",
         "entity_mentions",
+        "feedback",
+        "memory_entries",
+        "queries",
         "relation_evidence",
         "relations",
         "sources",
+        "summaries",
     }
 
 

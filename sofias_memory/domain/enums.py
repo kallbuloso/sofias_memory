@@ -30,3 +30,21 @@ class SourceStatus(StrEnum):
     FAILED = "failed"
     DELETING = "deleting"
     DELETED = "deleted"
+
+
+class SummaryTargetType(StrEnum):
+    """Supported summary target categories."""
+
+    DOCUMENT = "document"
+    ENTITY = "entity"
+    DATASET = "dataset"
+    CLUSTER = "cluster"
+
+
+class MemoryEntryType(StrEnum):
+    """Persisted lightweight memory entry categories."""
+
+    TEXT = "text"
+    QA = "qa"
+    FEEDBACK = "feedback"
+    NOTE = "note"

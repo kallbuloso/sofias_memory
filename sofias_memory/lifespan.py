@@ -27,6 +27,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        postgres_readiness_checker = getattr(app.state, "postgres_readiness_checker", None)
+        if postgres_readiness_checker is not None:
+            await postgres_readiness_checker.dispose()
         logger.info("application_shutdown", **safe_metadata)
 
 

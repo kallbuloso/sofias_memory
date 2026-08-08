@@ -13,9 +13,10 @@ from sofias_memory.api.errors import ConfigurationError
 from sofias_memory.api.middleware import API_KEY_HEADER, REQUEST_ID_HEADER
 from sofias_memory.api.routes.health import (
     READINESS_CHECK_TIMEOUT_SECONDS,
+    ReadinessCheckRegistry,
     ReadinessCheckResult,
 )
-from sofias_memory.app import create_app
+from sofias_memory.app import create_app as create_production_app
 from sofias_memory.config import Settings
 from sofias_memory.observability.logging import clear_log_context, configure_logging
 
@@ -52,6 +53,17 @@ def log_stream() -> StringIO:
 def make_client(app: FastAPI) -> httpx.AsyncClient:
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
+
+
+def create_app(
+    settings: Settings,
+    readiness_checks: ReadinessCheckRegistry = (),
+) -> FastAPI:
+    return create_production_app(
+        settings,
+        readiness_checks=readiness_checks,
+        enable_postgres_readiness=False,
+    )
 
 
 def response_json(response: httpx.Response) -> dict[str, object]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping
 from typing import cast
 
 from fastapi import FastAPI
@@ -21,16 +22,27 @@ from sofias_memory.api.middleware import (
     RequestIdMiddleware,
     max_body_bytes_from_mebibytes,
 )
-from sofias_memory.api.routes.health import ReadinessCheckRegistry, validate_readiness_checks
+from sofias_memory.api.routes.health import (
+    ReadinessCheckRegistry,
+    ReadinessCheckResult,
+    validate_readiness_checks,
+)
 from sofias_memory.api.routes.health import router as health_router
 from sofias_memory.api.routes.info import router as info_router
 from sofias_memory.config import Settings, load_settings
+from sofias_memory.infrastructure.postgres.readiness import (
+    POSTGRES_NOT_READY_DETAIL,
+    PostgresReadinessChecker,
+)
 from sofias_memory.lifespan import lifespan
 
 
 def create_app(
     settings: Settings | None = None,
     readiness_checks: ReadinessCheckRegistry = (),
+    *,
+    enable_postgres_readiness: bool = True,
+    postgres_readiness_checker: PostgresReadinessChecker | None = None,
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else load_settings()
     application = FastAPI(
@@ -39,7 +51,17 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.settings = resolved_settings
-    application.state.readiness_checks = validate_readiness_checks(readiness_checks)
+    resolved_readiness_checks = tuple(
+        readiness_checks.items() if isinstance(readiness_checks, Mapping) else readiness_checks
+    )
+    if enable_postgres_readiness:
+        checker = postgres_readiness_checker or PostgresReadinessChecker(resolved_settings)
+        application.state.postgres_readiness_checker = checker
+        resolved_readiness_checks = (
+            ("postgres", _postgres_readiness_check(checker)),
+            *resolved_readiness_checks,
+        )
+    application.state.readiness_checks = validate_readiness_checks(resolved_readiness_checks)
 
     application.add_exception_handler(
         SofiasMemoryError,
@@ -70,3 +92,16 @@ def create_app(
     application.add_middleware(RequestIdMiddleware)
 
     return application
+
+
+def _postgres_readiness_check(
+    checker: PostgresReadinessChecker,
+) -> Callable[[], Awaitable[ReadinessCheckResult]]:
+    async def check() -> ReadinessCheckResult:
+        result = await checker.check()
+        return ReadinessCheckResult(
+            ready=result.ready,
+            detail=None if result.ready else POSTGRES_NOT_READY_DETAIL,
+        )
+
+    return check

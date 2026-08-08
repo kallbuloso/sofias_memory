@@ -48,3 +48,50 @@ class MemoryEntryType(StrEnum):
     QA = "qa"
     FEEDBACK = "feedback"
     NOTE = "note"
+
+
+class PipelineType(StrEnum):
+    """Write pipeline kinds that create durable runs."""
+
+    REMEMBER = "remember"
+    COGNIFY = "cognify"
+    IMPROVE = "improve"
+    FORGET = "forget"
+
+
+class PipelineRunStatus(StrEnum):
+    """Lifecycle status for persisted pipeline runs."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+
+
+class PipelineStepStatus(StrEnum):
+    """Lifecycle status for persisted pipeline steps."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+
+
+class GraphOutboxOperation(StrEnum):
+    """Graph projection operation type."""
+
+    UPSERT = "upsert"
+    DELETE = "delete"
+
+
+class GraphOutboxStatus(StrEnum):
+    """Graph outbox processing status."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"

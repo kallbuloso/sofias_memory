@@ -2,7 +2,12 @@
 
 from sofias_memory.domain.enums import (
     DatasetStatus,
+    GraphOutboxOperation,
+    GraphOutboxStatus,
     MemoryEntryType,
+    PipelineRunStatus,
+    PipelineStepStatus,
+    PipelineType,
     SourceKind,
     SourceStatus,
     SummaryTargetType,
@@ -10,7 +15,12 @@ from sofias_memory.domain.enums import (
 
 __all__ = [
     "DatasetStatus",
+    "GraphOutboxOperation",
+    "GraphOutboxStatus",
     "MemoryEntryType",
+    "PipelineRunStatus",
+    "PipelineStepStatus",
+    "PipelineType",
     "SourceKind",
     "SourceStatus",
     "SummaryTargetType",

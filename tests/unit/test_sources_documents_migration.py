@@ -116,6 +116,7 @@ def test_sources_documents_revision_is_current_head() -> None:
         "0004_create_chunks.py",
         "0005_create_entities_relations.py",
         "0006_create_summaries_memory_queries_feedback.py",
+        "0007_create_pipeline_and_graph_outbox.py",
     ]
 
 

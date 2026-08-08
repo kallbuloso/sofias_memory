@@ -4,7 +4,12 @@ from enum import StrEnum
 
 from sofias_memory.domain import (
     DatasetStatus,
+    GraphOutboxOperation,
+    GraphOutboxStatus,
     MemoryEntryType,
+    PipelineRunStatus,
+    PipelineStepStatus,
+    PipelineType,
     SourceKind,
     SourceStatus,
     SummaryTargetType,
@@ -85,3 +90,65 @@ def test_sm210_enums_are_str_enums_and_serialize_lowercase_values() -> None:
 def test_sm210_enums_have_no_aliases() -> None:
     assert len(SummaryTargetType) == len({target_type.value for target_type in SummaryTargetType})
     assert len(MemoryEntryType) == len({entry_type.value for entry_type in MemoryEntryType})
+
+
+def test_pipeline_type_values_are_exact_from_adr_0007() -> None:
+    assert [pipeline_type.value for pipeline_type in PipelineType] == [
+        "remember",
+        "cognify",
+        "improve",
+        "forget",
+    ]
+
+
+def test_pipeline_run_status_values_are_exact_from_adr_0007_without_stale() -> None:
+    assert [status.value for status in PipelineRunStatus] == [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelling",
+        "cancelled",
+    ]
+    assert "stale" not in {status.value for status in PipelineRunStatus}
+
+
+def test_pipeline_step_status_values_are_exact_from_adr_0007_without_stale() -> None:
+    assert [status.value for status in PipelineStepStatus] == [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelling",
+        "cancelled",
+    ]
+    assert "stale" not in {status.value for status in PipelineStepStatus}
+
+
+def test_graph_outbox_operation_and_status_values_are_exact() -> None:
+    assert [operation.value for operation in GraphOutboxOperation] == ["upsert", "delete"]
+    assert [status.value for status in GraphOutboxStatus] == [
+        "pending",
+        "processing",
+        "done",
+        "failed",
+    ]
+
+
+def test_sm211_enums_are_str_enums_and_serialize_lowercase_values() -> None:
+    assert issubclass(PipelineType, StrEnum)
+    assert issubclass(PipelineRunStatus, StrEnum)
+    assert issubclass(PipelineStepStatus, StrEnum)
+    assert issubclass(GraphOutboxOperation, StrEnum)
+    assert issubclass(GraphOutboxStatus, StrEnum)
+    assert str(PipelineType.REMEMBER) == "remember"
+    assert f"{PipelineRunStatus.CANCELLING}" == "cancelling"
+    assert str(GraphOutboxOperation.UPSERT) == "upsert"
+
+
+def test_sm211_enums_have_no_aliases() -> None:
+    assert len(PipelineType) == len({pipeline_type.value for pipeline_type in PipelineType})
+    assert len(PipelineRunStatus) == len({status.value for status in PipelineRunStatus})
+    assert len(PipelineStepStatus) == len({status.value for status in PipelineStepStatus})
+    assert len(GraphOutboxOperation) == len({operation.value for operation in GraphOutboxOperation})
+    assert len(GraphOutboxStatus) == len({status.value for status in GraphOutboxStatus})

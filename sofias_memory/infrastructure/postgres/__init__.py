@@ -5,7 +5,16 @@ from sofias_memory.infrastructure.postgres.engine import (
     create_async_engine_from_settings,
     dispose_async_engine,
 )
-from sofias_memory.infrastructure.postgres.models import Chunk, Dataset, Document, Source
+from sofias_memory.infrastructure.postgres.models import (
+    Chunk,
+    Dataset,
+    Document,
+    Entity,
+    EntityMention,
+    Relation,
+    RelationEvidence,
+    Source,
+)
 from sofias_memory.infrastructure.postgres.session import (
     create_session_factory,
     session_scope,
@@ -19,7 +28,11 @@ __all__ = [
     "Chunk",
     "Dataset",
     "Document",
+    "Entity",
+    "EntityMention",
     "NAMING_CONVENTION",
+    "Relation",
+    "RelationEvidence",
     "Source",
     "create_async_engine_from_settings",
     "create_session_factory",

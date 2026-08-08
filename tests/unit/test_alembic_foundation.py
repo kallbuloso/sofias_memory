@@ -95,6 +95,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
         "0002_create_datasets.py",
         "0003_create_sources_and_documents.py",
         "0004_create_chunks.py",
+        "0005_create_entities_relations.py",
     ]
 
 

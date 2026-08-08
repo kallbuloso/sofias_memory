@@ -93,6 +93,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
     assert revision_files == [
         "0001_enable_required_extensions.py",
         "0002_create_datasets.py",
+        "0003_create_sources_and_documents.py",
     ]
 
 

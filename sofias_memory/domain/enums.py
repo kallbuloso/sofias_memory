@@ -11,3 +11,22 @@ class DatasetStatus(StrEnum):
     ACTIVE = "active"
     DELETING = "deleting"
     DELETED = "deleted"
+
+
+class SourceKind(StrEnum):
+    """Accepted source input kinds."""
+
+    TEXT = "text"
+    FILE = "file"
+    URL = "url"
+
+
+class SourceStatus(StrEnum):
+    """Lifecycle status for sources."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    ACTIVE = "active"
+    FAILED = "failed"
+    DELETING = "deleting"
+    DELETED = "deleted"

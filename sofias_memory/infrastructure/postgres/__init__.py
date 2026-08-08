@@ -28,6 +28,7 @@ from sofias_memory.infrastructure.postgres.session import (
     transaction_scope,
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
+from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 
 __all__ = [
     "AsyncSessionFactory",
@@ -43,6 +44,7 @@ __all__ = [
     "NAMING_CONVENTION",
     "PipelineRun",
     "PipelineStep",
+    "PostgresUnitOfWork",
     "Query",
     "Relation",
     "RelationEvidence",

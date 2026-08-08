@@ -85,17 +85,12 @@ def test_importing_runtime_postgres_infrastructure_does_not_connect() -> None:
 
 def test_versions_directory_exists() -> None:
     assert VERSIONS_DIR.is_dir()
-    assert (VERSIONS_DIR / ".gitkeep").is_file()
 
 
-def test_no_real_revision_exists_yet() -> None:
-    revision_files = [
-        path
-        for path in VERSIONS_DIR.iterdir()
-        if path.is_file() and path.name != ".gitkeep" and path.suffix == ".py"
-    ]
+def test_versions_directory_contains_only_first_revision() -> None:
+    revision_files = sorted(path.name for path in VERSIONS_DIR.glob("*.py"))
 
-    assert revision_files == []
+    assert revision_files == ["0001_enable_required_extensions.py"]
 
 
 def test_revision_template_contains_upgrade_and_downgrade() -> None:

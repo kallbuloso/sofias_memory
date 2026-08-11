@@ -30,7 +30,12 @@ from sofias_memory.api.routes.health import (
 from sofias_memory.api.routes.health import router as health_router
 from sofias_memory.api.routes.info import router as info_router
 from sofias_memory.config import Settings, load_settings
-from sofias_memory.infrastructure.neo4j import Neo4jResource, create_neo4j_resource_from_settings
+from sofias_memory.infrastructure.neo4j import (
+    NEO4J_NOT_READY_DETAIL,
+    Neo4jReadinessChecker,
+    Neo4jResource,
+    create_neo4j_resource_from_settings,
+)
 from sofias_memory.infrastructure.postgres.readiness import (
     POSTGRES_NOT_READY_DETAIL,
     PostgresReadinessChecker,
@@ -46,6 +51,7 @@ def create_app(
     postgres_readiness_checker: PostgresReadinessChecker | None = None,
     enable_neo4j: bool = True,
     neo4j_resource: Neo4jResource | None = None,
+    neo4j_readiness_checker: Neo4jReadinessChecker | None = None,
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else load_settings()
     application = FastAPI(
@@ -58,15 +64,20 @@ def create_app(
         readiness_checks.items() if isinstance(readiness_checks, Mapping) else readiness_checks
     )
     if enable_postgres_readiness:
-        checker = postgres_readiness_checker or PostgresReadinessChecker(resolved_settings)
-        application.state.postgres_readiness_checker = checker
+        postgres_checker = postgres_readiness_checker or PostgresReadinessChecker(resolved_settings)
+        application.state.postgres_readiness_checker = postgres_checker
         resolved_readiness_checks = (
-            ("postgres", _postgres_readiness_check(checker)),
+            ("postgres", _postgres_readiness_check(postgres_checker)),
             *resolved_readiness_checks,
         )
     if enable_neo4j:
-        application.state.neo4j_resource = neo4j_resource or create_neo4j_resource_from_settings(
-            resolved_settings
+        resource = neo4j_resource or create_neo4j_resource_from_settings(resolved_settings)
+        neo4j_checker = neo4j_readiness_checker or Neo4jReadinessChecker(resource)
+        application.state.neo4j_resource = resource
+        application.state.neo4j_readiness_checker = neo4j_checker
+        resolved_readiness_checks = (
+            ("neo4j", _neo4j_readiness_check(neo4j_checker)),
+            *resolved_readiness_checks,
         )
     application.state.readiness_checks = validate_readiness_checks(resolved_readiness_checks)
 
@@ -109,6 +120,19 @@ def _postgres_readiness_check(
         return ReadinessCheckResult(
             ready=result.ready,
             detail=None if result.ready else POSTGRES_NOT_READY_DETAIL,
+        )
+
+    return check
+
+
+def _neo4j_readiness_check(
+    checker: Neo4jReadinessChecker,
+) -> Callable[[], Awaitable[ReadinessCheckResult]]:
+    async def check() -> ReadinessCheckResult:
+        result = await checker.check()
+        return ReadinessCheckResult(
+            ready=result.ready,
+            detail=None if result.ready else NEO4J_NOT_READY_DETAIL,
         )
 
     return check

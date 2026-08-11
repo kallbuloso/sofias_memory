@@ -366,7 +366,11 @@ async def test_private_request_without_api_key_does_not_read_huge_body(
 
 @pytest.mark.asyncio
 async def test_get_without_body_and_health_continue_working(log_stream: StringIO) -> None:
-    app = create_app(make_settings(max_request_body_mb=1), enable_postgres_readiness=False)
+    app = create_app(
+        make_settings(max_request_body_mb=1),
+        enable_postgres_readiness=False,
+        enable_neo4j=False,
+    )
 
     async with make_client(app) as client:
         info_response = await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})

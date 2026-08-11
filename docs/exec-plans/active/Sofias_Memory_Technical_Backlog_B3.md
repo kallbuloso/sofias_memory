@@ -462,7 +462,7 @@ O teste local não deve destruir dados existentes.
 
 ## SM-304 — Integrar Neo4j ao readiness
 
-**Status:** TODO  
+**Status:** DONE
 **Prioridade:** P0  
 **Dependências:** SM-302, SM-303  
 **PRD:** FR-120; startup/readiness; NFR-001  

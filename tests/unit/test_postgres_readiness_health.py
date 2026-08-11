@@ -74,7 +74,11 @@ async def not_initialized_check() -> ReadinessCheckResult:
 @pytest.mark.asyncio
 async def test_ready_route_reports_postgres_ready_when_checker_is_healthy() -> None:
     fake_checker = FakePostgresReadinessChecker(PostgresReadinessResult(ready=True))
-    app = create_app(make_settings(), postgres_readiness_checker=as_checker(fake_checker))
+    app = create_app(
+        make_settings(),
+        postgres_readiness_checker=as_checker(fake_checker),
+        enable_neo4j=False,
+    )
 
     async with make_client(app) as client:
         response = await client.get("/health/ready")
@@ -92,7 +96,11 @@ async def test_ready_route_reports_postgres_not_ready_when_checker_fails() -> No
     fake_checker = FakePostgresReadinessChecker(
         PostgresReadinessResult(ready=False, failures=("connection",))
     )
-    app = create_app(make_settings(), postgres_readiness_checker=as_checker(fake_checker))
+    app = create_app(
+        make_settings(),
+        postgres_readiness_checker=as_checker(fake_checker),
+        enable_neo4j=False,
+    )
 
     async with make_client(app) as client:
         response = await client.get("/health/ready")
@@ -115,6 +123,7 @@ async def test_ready_route_keeps_overall_not_ready_when_other_components_are_not
             ("worker", not_initialized_check),
         ),
         postgres_readiness_checker=as_checker(fake_checker),
+        enable_neo4j=False,
     )
 
     async with make_client(app) as client:
@@ -131,7 +140,11 @@ async def test_ready_route_keeps_overall_not_ready_when_other_components_are_not
 @pytest.mark.asyncio
 async def test_ready_route_does_not_leak_postgres_exception_details() -> None:
     fake_checker = ExplodingPostgresReadinessChecker()
-    app = create_app(make_settings(), postgres_readiness_checker=as_checker(fake_checker))
+    app = create_app(
+        make_settings(),
+        postgres_readiness_checker=as_checker(fake_checker),
+        enable_neo4j=False,
+    )
 
     async with make_client(app) as client:
         response = await client.get("/health/ready")
@@ -145,7 +158,11 @@ async def test_ready_route_does_not_leak_postgres_exception_details() -> None:
 @pytest.mark.asyncio
 async def test_live_route_does_not_call_postgres_readiness_checker() -> None:
     fake_checker = ExplodingPostgresReadinessChecker()
-    app = create_app(make_settings(), postgres_readiness_checker=as_checker(fake_checker))
+    app = create_app(
+        make_settings(),
+        postgres_readiness_checker=as_checker(fake_checker),
+        enable_neo4j=False,
+    )
 
     async with make_client(app) as client:
         response = await client.get("/health/live")

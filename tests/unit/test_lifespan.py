@@ -51,15 +51,19 @@ def read_log_records(stream: StringIO) -> list[dict[str, object]]:
     return [json.loads(line) for line in stream.getvalue().splitlines() if line]
 
 
+def create_lifespan_test_app(settings: Settings) -> FastAPI:
+    return create_app(settings, enable_neo4j=False)
+
+
 def test_lifespan_executes_startup(log_stream: StringIO) -> None:
-    with TestClient(create_app(make_settings())):
+    with TestClient(create_lifespan_test_app(make_settings())):
         records = read_log_records(log_stream)
 
     assert records[0]["event"] == "application_starting"
 
 
 def test_lifespan_executes_shutdown(log_stream: StringIO) -> None:
-    with TestClient(create_app(make_settings())):
+    with TestClient(create_lifespan_test_app(make_settings())):
         pass
 
     records = read_log_records(log_stream)
@@ -75,7 +79,7 @@ def test_lifespan_configures_logging_on_startup(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("sofias_memory.lifespan.configure_logging", configure_logging_spy)
 
-    with TestClient(create_app(make_settings(log_level="WARNING"))):
+    with TestClient(create_lifespan_test_app(make_settings(log_level="WARNING"))):
         pass
 
     assert calls == ["WARNING"]
@@ -84,7 +88,7 @@ def test_lifespan_configures_logging_on_startup(monkeypatch: pytest.MonkeyPatch)
 def test_startup_log_contains_safe_metadata(log_stream: StringIO) -> None:
     settings = make_settings()
 
-    with TestClient(create_app(settings)):
+    with TestClient(create_lifespan_test_app(settings)):
         records = read_log_records(log_stream)
 
     startup = records[0]
@@ -104,7 +108,7 @@ def test_startup_and_shutdown_logs_do_not_contain_secrets(log_stream: StringIO) 
         llm_api_key=KNOWN_SECRET,
     )
 
-    with TestClient(create_app(settings)):
+    with TestClient(create_lifespan_test_app(settings)):
         pass
 
     output = log_stream.getvalue()
@@ -113,7 +117,7 @@ def test_startup_and_shutdown_logs_do_not_contain_secrets(log_stream: StringIO) 
 
 
 def test_shutdown_log_is_emitted(log_stream: StringIO) -> None:
-    with TestClient(create_app(make_settings())):
+    with TestClient(create_lifespan_test_app(make_settings())):
         pass
 
     assert any(record["event"] == "application_shutdown" for record in read_log_records(log_stream))

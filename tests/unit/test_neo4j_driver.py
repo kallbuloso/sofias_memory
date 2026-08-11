@@ -14,6 +14,9 @@ from fastapi.testclient import TestClient
 
 from sofias_memory.config import API_KEY_PREFIX, Settings
 from sofias_memory.infrastructure.neo4j import Neo4jResource
+from sofias_memory.infrastructure.neo4j.readiness import SHOW_CONSTRAINTS_QUERY, SHOW_INDEXES_QUERY
+from sofias_memory.infrastructure.neo4j.schema import NEO4J_SCHEMA_STATEMENTS
+from sofias_memory.lifespan import NEO4J_STARTUP_PROBE_QUERY
 from sofias_memory.observability.logging import clear_log_context, configure_logging
 
 VALID_API_KEY = f"{API_KEY_PREFIX}{'a' * 32}"
@@ -57,8 +60,100 @@ class FakeAsyncNeo4jDriver:
         raise AssertionError("unexpected schema bootstrap")
 
 
+class FakeRecord:
+    def __init__(self, data: Mapping[str, object]) -> None:
+        self._data = data
+
+    def data(self) -> Mapping[str, object]:
+        return self._data
+
+
+class FakeResult:
+    def __init__(self, records: list[Mapping[str, object]] | None = None) -> None:
+        self.records = [FakeRecord(record) for record in records or []]
+
+
+class FakeLifecycleNeo4jDriver:
+    def __init__(self) -> None:
+        self.execute_query_calls: list[dict[str, object]] = []
+        self.verify_connectivity_calls = 0
+        self.close_calls = 0
+
+    async def verify_connectivity(self, **config: object) -> None:
+        self.verify_connectivity_calls += 1
+        raise AssertionError("Neo4j connectivity should not be checked")
+
+    async def execute_query(
+        self,
+        query_: str,
+        parameters_: Mapping[str, object] | None = None,
+        *,
+        database_: str | None = None,
+    ) -> FakeResult:
+        if parameters_ is not None:
+            raise AssertionError("unexpected query parameters")
+        self.execute_query_calls.append({"query": query_, "database_": database_})
+        if query_ == NEO4J_STARTUP_PROBE_QUERY:
+            return FakeResult()
+        if query_ in {statement.cypher for statement in NEO4J_SCHEMA_STATEMENTS}:
+            return FakeResult()
+        if query_ == SHOW_CONSTRAINTS_QUERY:
+            return FakeResult(
+                [
+                    {
+                        "name": "entity_id_unique",
+                        "type": "UNIQUENESS",
+                        "entityType": "NODE",
+                        "labelsOrTypes": ["Entity"],
+                        "properties": ["id"],
+                    },
+                    {
+                        "name": "chunk_id_unique",
+                        "type": "UNIQUENESS",
+                        "entityType": "NODE",
+                        "labelsOrTypes": ["Chunk"],
+                        "properties": ["id"],
+                    },
+                ]
+            )
+        if query_ == SHOW_INDEXES_QUERY:
+            return FakeResult(
+                [
+                    {
+                        "name": "entity_dataset_id_index",
+                        "state": "ONLINE",
+                        "type": "RANGE",
+                        "entityType": "NODE",
+                        "labelsOrTypes": ["Entity"],
+                        "properties": ["dataset_id"],
+                    },
+                    {
+                        "name": "chunk_dataset_id_index",
+                        "state": "ONLINE",
+                        "type": "RANGE",
+                        "entityType": "NODE",
+                        "labelsOrTypes": ["Chunk"],
+                        "properties": ["dataset_id"],
+                    },
+                    {
+                        "name": "entity_name_index",
+                        "state": "ONLINE",
+                        "type": "RANGE",
+                        "entityType": "NODE",
+                        "labelsOrTypes": ["Entity"],
+                        "properties": ["name"],
+                    },
+                ]
+            )
+        raise AssertionError(f"unexpected query: {query_}")
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
 class FakeNeo4jResource:
     def __init__(self) -> None:
+        self.driver = FakeLifecycleNeo4jDriver()
         self.database = VALID_NEO4J_DATABASE
         self.verify_connectivity_calls = 0
         self.close_calls = 0
@@ -69,6 +164,7 @@ class FakeNeo4jResource:
 
     async def close(self) -> None:
         self.close_calls += 1
+        await self.driver.close()
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -276,7 +372,7 @@ async def test_live_route_does_not_check_neo4j_connectivity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_readiness_behavior_is_not_changed_by_neo4j_lifecycle() -> None:
+async def test_readiness_reports_injected_neo4j_resource() -> None:
     from sofias_memory.app import create_app
 
     fake_resource = FakeNeo4jResource()
@@ -290,5 +386,5 @@ async def test_readiness_behavior_is_not_changed_by_neo4j_lifecycle() -> None:
         response = await client.get("/health/ready")
 
     assert response.status_code == 200
-    assert response_json(response) == {"status": "ready", "checks": {}}
+    assert response_json(response) == {"status": "ready", "checks": {"neo4j": {"ready": True}}}
     assert fake_resource.verify_connectivity_calls == 0

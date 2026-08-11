@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import cast
 
 from fastapi import FastAPI
 
 from sofias_memory.config import Settings
+from sofias_memory.infrastructure.neo4j import Neo4jResource, ensure_neo4j_schema
 from sofias_memory.observability.logging import configure_logging, get_logger
+
+NEO4J_STARTUP_PROBE_QUERY = "RETURN 1 AS ok"
 
 
 def app_settings(app: FastAPI) -> Settings:
@@ -25,6 +29,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("application_starting", **safe_metadata)
     try:
+        neo4j_resource = getattr(app.state, "neo4j_resource", None)
+        if neo4j_resource is not None:
+            try:
+                await _bootstrap_neo4j(cast(Neo4jResource, neo4j_resource))
+            except Exception as exc:
+                logger.error("neo4j_startup_failed", exception_type=type(exc).__name__)
+                raise
         yield
     finally:
         neo4j_resource = getattr(app.state, "neo4j_resource", None)
@@ -43,3 +54,8 @@ def _safe_application_metadata(settings: Settings) -> dict[str, str]:
         "app_env": settings.app_env,
         "config_fingerprint": settings.config_fingerprint(),
     }
+
+
+async def _bootstrap_neo4j(resource: Neo4jResource) -> None:
+    await resource.driver.execute_query(NEO4J_STARTUP_PROBE_QUERY, database_=resource.database)
+    await ensure_neo4j_schema(resource)

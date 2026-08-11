@@ -63,6 +63,7 @@ def create_app(
         settings,
         readiness_checks=readiness_checks,
         enable_postgres_readiness=False,
+        enable_neo4j=False,
     )
 
 

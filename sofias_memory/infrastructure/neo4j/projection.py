@@ -98,6 +98,11 @@ CHUNK_NEXT_DELETE_CYPHER = " ".join(
     )
 )
 
+DATASET_ENTITY_CLEANUP_CYPHER = "MATCH (n:Entity {dataset_id: $dataset_id}) DETACH DELETE n"
+DATASET_CHUNK_CLEANUP_CYPHER = "MATCH (n:Chunk {dataset_id: $dataset_id}) DETACH DELETE n"
+GLOBAL_ENTITY_CLEANUP_CYPHER = "MATCH (n:Entity) DETACH DELETE n"
+GLOBAL_CHUNK_CLEANUP_CYPHER = "MATCH (n:Chunk) DETACH DELETE n"
+
 
 class ProjectionEndpointMissingError(RuntimeError):
     """Relationship projection endpoints are not currently present in Neo4j."""
@@ -133,6 +138,29 @@ class Neo4jProjection:
             params,
             database_=self._resource.database,
         )
+
+
+async def delete_dataset_projection(resource: Neo4jResource, dataset_id: str) -> None:
+    """Delete only Sofias projection nodes for one dataset."""
+
+    params = {"dataset_id": dataset_id}
+    await resource.driver.execute_query(
+        DATASET_ENTITY_CLEANUP_CYPHER,
+        params,
+        database_=resource.database,
+    )
+    await resource.driver.execute_query(
+        DATASET_CHUNK_CLEANUP_CYPHER,
+        params,
+        database_=resource.database,
+    )
+
+
+async def delete_all_projection(resource: Neo4jResource) -> None:
+    """Delete only Sofias projection labels, preserving arbitrary other Neo4j data."""
+
+    await resource.driver.execute_query(GLOBAL_ENTITY_CLEANUP_CYPHER, database_=resource.database)
+    await resource.driver.execute_query(GLOBAL_CHUNK_CLEANUP_CYPHER, database_=resource.database)
 
 
 def _upsert_query(

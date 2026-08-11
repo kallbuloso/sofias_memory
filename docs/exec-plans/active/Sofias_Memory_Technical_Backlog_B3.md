@@ -763,7 +763,7 @@ Se houver script destrutivo, exigir confirmação explícita.
 
 ## SM-308 — Criar gate real Neo4j/projection/recovery
 
-**Status:** TODO  
+**Status:** DONE
 **Prioridade:** P0  
 **Dependências:** SM-302..SM-307  
 **Tipo:** INTEGRATION GATE  
@@ -849,9 +849,20 @@ Não executar esses cenários contra Neo4j local persistente por fallback.
 - criar worker B5;
 - criar graph-RAG.
 
+### Gate
+
+SM-308 foi marcada `DONE` após o gate real Testcontainers passar no PowerShell.
+O gate validou PostgreSQL descartável com Alembic `upgrade head`, Neo4j descartável,
+projeção dos cinco aggregate types, replay/update/delete, outbox success/retry/replay,
+rebuild por dataset, isolamento entre datasets, reset/rebuild global, rebuild independente
+do histórico de `graph_outbox`, preservação de dados externos à projeção e
+degradação/restauração de readiness.
+
 ---
 
 # GATE-B3 — Neo4j Foundation concluída
+
+**Status:** PASSED
 
 Antes de iniciar B4:
 

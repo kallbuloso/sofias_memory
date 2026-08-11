@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Protocol, cast
 
 from neo4j import AsyncDriver, AsyncGraphDatabase
@@ -17,6 +17,15 @@ class AsyncNeo4jDriver(Protocol):
 
     async def verify_connectivity(self, **config: object) -> None:
         """Verify network connectivity when explicitly requested."""
+
+    async def execute_query(
+        self,
+        query_: str,
+        parameters_: Mapping[str, object] | None = None,
+        *,
+        database_: str | None = None,
+    ) -> object:
+        """Execute an explicit Neo4j query against the configured database."""
 
     async def close(self) -> None:
         """Close driver resources."""

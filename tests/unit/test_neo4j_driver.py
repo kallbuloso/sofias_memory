@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from collections.abc import Mapping
 from io import StringIO
 from typing import cast
 
@@ -39,9 +40,17 @@ class FakeAsyncNeo4jDriver:
     async def close(self) -> None:
         self.close_calls += 1
 
-    async def execute_query(self, query: str) -> None:
+    async def execute_query(
+        self,
+        query_: str,
+        parameters_: Mapping[str, object] | None = None,
+        *,
+        database_: str | None = None,
+    ) -> object:
         self.query_calls += 1
-        raise AssertionError(f"unexpected query: {query}")
+        raise AssertionError(
+            f"unexpected query: {query_}; parameters={parameters_!r}; database={database_!r}"
+        )
 
     async def install_schema(self) -> None:
         self.schema_calls += 1

@@ -405,7 +405,7 @@ git diff --check
 
 ## SM-303 — Implementar constraints e índices Neo4j
 
-**Status:** TODO  
+**Status:** DONE
 **Prioridade:** P0  
 **Dependências:** SM-302  
 **PRD:** seção 13 Modelo de grafo Neo4j  

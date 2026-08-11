@@ -7,6 +7,20 @@ from sofias_memory.infrastructure.neo4j.driver import (
     create_async_neo4j_driver,
     create_neo4j_resource_from_settings,
 )
+from sofias_memory.infrastructure.neo4j.projection import (
+    CHUNK_DELETE_CYPHER,
+    CHUNK_NEXT_DELETE_CYPHER,
+    CHUNK_NEXT_UPSERT_CYPHER,
+    CHUNK_UPSERT_CYPHER,
+    ENTITY_DELETE_CYPHER,
+    ENTITY_MENTION_DELETE_CYPHER,
+    ENTITY_MENTION_UPSERT_CYPHER,
+    ENTITY_UPSERT_CYPHER,
+    RELATION_DELETE_CYPHER,
+    RELATION_UPSERT_CYPHER,
+    Neo4jProjection,
+    ProjectionEndpointMissingError,
+)
 from sofias_memory.infrastructure.neo4j.readiness import (
     NEO4J_NOT_READY_DETAIL,
     SHOW_CONSTRAINTS_QUERY,
@@ -26,6 +40,14 @@ from sofias_memory.infrastructure.neo4j.schema import (
 
 __all__ = [
     "AsyncNeo4jDriver",
+    "CHUNK_DELETE_CYPHER",
+    "CHUNK_NEXT_DELETE_CYPHER",
+    "CHUNK_NEXT_UPSERT_CYPHER",
+    "CHUNK_UPSERT_CYPHER",
+    "ENTITY_DELETE_CYPHER",
+    "ENTITY_MENTION_DELETE_CYPHER",
+    "ENTITY_MENTION_UPSERT_CYPHER",
+    "ENTITY_UPSERT_CYPHER",
     "NEO4J_NOT_READY_DETAIL",
     "NEO4J_SCHEMA_NAMES",
     "NEO4J_SCHEMA_STATEMENTS",
@@ -34,8 +56,12 @@ __all__ = [
     "Neo4jReadinessChecker",
     "Neo4jReadinessResult",
     "Neo4jReadinessSnapshot",
+    "Neo4jProjection",
     "Neo4jResource",
     "Neo4jSchemaStatement",
+    "ProjectionEndpointMissingError",
+    "RELATION_DELETE_CYPHER",
+    "RELATION_UPSERT_CYPHER",
     "SHOW_CONSTRAINTS_QUERY",
     "SHOW_INDEXES_QUERY",
     "create_async_neo4j_driver",

@@ -530,7 +530,7 @@ Teste opt-in com Neo4j real, sem operações destrutivas globais.
 
 ## SM-305 — Implementar Projection Port e projeção Neo4j idempotente
 
-**Status:** TODO  
+**Status:** DONE
 **Prioridade:** P0  
 **Dependências:** SM-301, SM-302, SM-303  
 **PRD:** seção 13; ADR-0002  

@@ -30,6 +30,7 @@ from sofias_memory.api.routes.health import (
 from sofias_memory.api.routes.health import router as health_router
 from sofias_memory.api.routes.info import router as info_router
 from sofias_memory.config import Settings, load_settings
+from sofias_memory.infrastructure.neo4j import Neo4jResource, create_neo4j_resource_from_settings
 from sofias_memory.infrastructure.postgres.readiness import (
     POSTGRES_NOT_READY_DETAIL,
     PostgresReadinessChecker,
@@ -43,6 +44,8 @@ def create_app(
     *,
     enable_postgres_readiness: bool = True,
     postgres_readiness_checker: PostgresReadinessChecker | None = None,
+    enable_neo4j: bool = True,
+    neo4j_resource: Neo4jResource | None = None,
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else load_settings()
     application = FastAPI(
@@ -60,6 +63,10 @@ def create_app(
         resolved_readiness_checks = (
             ("postgres", _postgres_readiness_check(checker)),
             *resolved_readiness_checks,
+        )
+    if enable_neo4j:
+        application.state.neo4j_resource = neo4j_resource or create_neo4j_resource_from_settings(
+            resolved_settings
         )
     application.state.readiness_checks = validate_readiness_checks(resolved_readiness_checks)
 

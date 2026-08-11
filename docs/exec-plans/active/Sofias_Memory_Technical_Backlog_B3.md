@@ -270,7 +270,7 @@ contratos usados por todas as seguintes.
 
 ## SM-301 — Architecture Gate: congelar contrato da projeção Neo4j
 
-**Status:** DONE  
+**Status:** DONE
 **Prioridade:** P0  
 **Dependências:** GATE-B2  
 **Tipo:** ARCHITECTURE GATE  
@@ -316,7 +316,7 @@ SM-301 foi marcada `DONE` após a revisão do ADR-0008.
 
 ## SM-302 — Implementar driver Neo4j assíncrono e lifecycle
 
-**Status:** TODO  
+**Status:** DONE
 **Prioridade:** P0  
 **Dependências:** SM-301  
 **PRD:** configuração Neo4j; startup/shutdown; FR-120  

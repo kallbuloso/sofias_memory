@@ -27,6 +27,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        neo4j_resource = getattr(app.state, "neo4j_resource", None)
+        if neo4j_resource is not None:
+            await neo4j_resource.close()
         postgres_readiness_checker = getattr(app.state, "postgres_readiness_checker", None)
         if postgres_readiness_checker is not None:
             await postgres_readiness_checker.dispose()

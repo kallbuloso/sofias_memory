@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import cast
+from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sofias_memory.domain import GraphOutboxStatus
+from sofias_memory.domain import GraphOutboxOperation, GraphOutboxStatus
 from sofias_memory.infrastructure.postgres.models import GraphOutbox
+from sofias_memory.ports import ProjectionCommand
 
 
 class GraphOutboxRepository:
@@ -22,6 +24,21 @@ class GraphOutboxRepository:
         self._session.add(event)
         await self._session.flush()
         return event
+
+    async def add_projection_command(self, command: ProjectionCommand) -> GraphOutbox:
+        """Persist one ADR-0008 projection snapshot in this active transaction."""
+
+        event = GraphOutbox(
+            dataset_id=UUID(command.dataset_id),
+            aggregate_type=command.aggregate_type,
+            aggregate_id=UUID(command.aggregate_id),
+            operation=GraphOutboxOperation(command.operation),
+            payload=command.to_payload(),
+            status=GraphOutboxStatus.PENDING,
+            attempt=0,
+            processed_at=None,
+        )
+        return await self.add(event)
 
     async def get_by_id(self, event_id: int) -> GraphOutbox | None:
         statement = select(GraphOutbox).where(GraphOutbox.id == event_id)
@@ -52,3 +69,25 @@ class GraphOutboxRepository:
         event.processed_at = None
         await self._session.flush()
         return event
+
+    async def list_processable_ids_for_dataset(self, dataset_id: UUID) -> list[int]:
+        """Return a detached, dependency-ordered snapshot of pending retryable events."""
+
+        aggregate_order = case(
+            (GraphOutbox.aggregate_type == "entity", 0),
+            (GraphOutbox.aggregate_type == "chunk", 1),
+            (GraphOutbox.aggregate_type == "entity_mention", 2),
+            (GraphOutbox.aggregate_type == "relation", 3),
+            (GraphOutbox.aggregate_type == "chunk_next", 4),
+            else_=5,
+        )
+        statement = (
+            select(GraphOutbox.id)
+            .where(
+                GraphOutbox.dataset_id == dataset_id,
+                GraphOutbox.status.in_((GraphOutboxStatus.PENDING, GraphOutboxStatus.FAILED)),
+            )
+            .order_by(aggregate_order, GraphOutbox.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)

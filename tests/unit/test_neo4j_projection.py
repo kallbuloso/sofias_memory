@@ -183,6 +183,12 @@ def test_projection_command_validates_payload_contract() -> None:
     assert command.properties["id"] == ENTITY_A_ID
 
 
+def test_projection_command_round_trips_through_outbox_payload() -> None:
+    command = projection_command_from_payload(relation_payload())
+
+    assert ProjectionCommand.from_payload(command.to_payload()) == command
+
+
 def test_projection_command_rejects_identity_mismatch() -> None:
     payload = entity_payload()
     payload["aggregate_id"] = ENTITY_B_ID

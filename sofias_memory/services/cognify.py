@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -38,6 +39,14 @@ from sofias_memory.pipelines.chunking import (
     TextTokenizer,
     chunk_document_text,
     document_token_count,
+)
+from sofias_memory.ports import (
+    ProjectionCommand,
+    chunk_next_upsert_command,
+    chunk_upsert_command,
+    entity_mention_upsert_command,
+    entity_upsert_command,
+    relation_upsert_command,
 )
 from sofias_memory.schemas.cognify import CognifyRequest, CognifyResult
 from sofias_memory.schemas.common import ErrorCode, JSONValue, utc_now
@@ -151,6 +160,14 @@ class SummaryRepositoryForCognify(Protocol):
     ) -> Summary | None: ...
 
 
+class GraphOutboxRepositoryForCognify(Protocol):
+    async def add_projection_command(self, command: ProjectionCommand) -> object: ...
+
+
+class GraphProjectionDrain(Protocol):
+    async def process_dataset(self, dataset_id: UUID) -> object: ...
+
+
 class CognifyUnitOfWork(Protocol):
     datasets: DatasetRepositoryForCognify
     sources: SourceRepositoryForCognify
@@ -161,6 +178,7 @@ class CognifyUnitOfWork(Protocol):
     relations: RelationRepositoryForCognify
     relation_evidence: RelationEvidenceRepositoryForCognify
     summaries: SummaryRepositoryForCognify
+    graph_outbox: GraphOutboxRepositoryForCognify
     pipeline_runs: PipelineRunRepositoryForCognify
 
     async def __aenter__(self) -> CognifyUnitOfWork: ...
@@ -230,6 +248,7 @@ class CognifyService:
         embedding_client: EmbeddingClient,
         knowledge_extraction_client: KnowledgeExtractionClient,
         document_summary_client: DocumentSummaryClient,
+        graph_projection_drain: GraphProjectionDrain,
         session_factory: AsyncSessionFactory | None = None,
         unit_of_work_factory: UnitOfWorkFactory | None = None,
     ) -> None:
@@ -239,6 +258,7 @@ class CognifyService:
         self._embedding_client = embedding_client
         self._knowledge_extraction_client = knowledge_extraction_client
         self._document_summary_client = document_summary_client
+        self._graph_projection_drain = graph_projection_drain
         self._unit_of_work_factory = unit_of_work_factory or _postgres_unit_of_work_factory(
             cast(AsyncSessionFactory, session_factory)
         )
@@ -325,6 +345,8 @@ class CognifyService:
                 relations=totals.relations + persisted.relations,
             )
             sources_processed += 1
+
+        await self._graph_projection_drain.process_dataset(dataset.id)
 
         result = CognifyResult(
             run_id=run_id,
@@ -626,6 +648,9 @@ class CognifyService:
 
             entities_created = 0
             relations_created = 0
+            entity_commands: dict[UUID, ProjectionCommand] = {}
+            entity_mention_commands: dict[UUID, ProjectionCommand] = {}
+            relation_commands: dict[UUID, ProjectionCommand] = {}
             for chunk_id, extraction in prepared.extractions:
                 chunk = await uow.chunks.get_by_id(chunk_id)
                 if chunk is None:
@@ -640,12 +665,28 @@ class CognifyService:
                     )
                     entities_created += int(created)
                     chunk_entities[extracted_entity.local_id] = entity
+                    entity_commands[entity.id] = entity_upsert_command(
+                        entity_id=entity.id,
+                        dataset_id=entity.dataset_id,
+                        name=entity.name,
+                        entity_type=entity.entity_type,
+                        description=entity.description,
+                        importance_weight=float(entity.importance_weight),
+                        generation=entity.generation,
+                    )
                     if not await uow.entity_mentions.exists_for_entity_chunk(
                         entity_id=entity.id,
                         chunk_id=chunk.id,
                     ):
-                        await uow.entity_mentions.add(
+                        mention = await uow.entity_mentions.add(
                             entity_mention_from_extraction(extracted_entity, entity.id, chunk)
+                        )
+                        entity_mention_commands[mention.id] = entity_mention_upsert_command(
+                            mention_id=mention.id,
+                            dataset_id=prepared.work_item.dataset_id,
+                            entity_id=mention.entity_id,
+                            chunk_id=mention.chunk_id,
+                            confidence=float(mention.confidence),
                         )
 
                 for extracted_relation in extraction.relations:
@@ -681,6 +722,17 @@ class CognifyService:
                         )
                         if not relation.description:
                             relation.description = extracted_relation.description
+                    relation_commands[relation.id] = relation_upsert_command(
+                        relation_id=relation.id,
+                        dataset_id=relation.dataset_id,
+                        source_entity_id=relation.source_entity_id,
+                        target_entity_id=relation.target_entity_id,
+                        predicate=relation.predicate,
+                        description=relation.description,
+                        confidence=float(relation.confidence),
+                        importance_weight=float(relation.importance_weight),
+                        generation=relation.generation,
+                    )
                     if not await uow.relation_evidence.exists_for_relation_chunk(
                         relation_id=relation.id,
                         chunk_id=chunk.id,
@@ -725,6 +777,31 @@ class CognifyService:
                 embedding_model=self._settings.embedding_model,
                 config_fingerprint=self._settings.config_fingerprint(),
             )
+
+            active_chunks = await uow.chunks.list_for_source_generation(
+                source_id=prepared.work_item.source_id,
+                generation=prepared.work_item.generation,
+            )
+            chunk_commands = {
+                chunk.id: chunk_upsert_command(
+                    chunk_id=chunk.id,
+                    dataset_id=chunk.dataset_id,
+                    source_id=chunk.source_id,
+                    document_id=chunk.document_id,
+                    ordinal=chunk.ordinal,
+                    generation=chunk.generation,
+                )
+                for chunk in active_chunks
+            }
+            next_commands = _chunk_next_projection_commands(active_chunks)
+            for command in _ordered_projection_commands(
+                entity_commands=tuple(entity_commands.values()),
+                chunk_commands=tuple(chunk_commands.values()),
+                entity_mention_commands=tuple(entity_mention_commands.values()),
+                relation_commands=tuple(relation_commands.values()),
+                next_commands=next_commands,
+            ):
+                await uow.graph_outbox.add_projection_command(command)
 
             source.status = SourceStatus.ACTIVE
             await uow.commit()
@@ -1004,6 +1081,57 @@ def entity_mention_from_extraction(
         end_char=end_char,
         confidence=extracted.confidence,
     )
+
+
+def _chunk_next_projection_commands(chunks: Sequence[Chunk]) -> tuple[ProjectionCommand, ...]:
+    groups: dict[tuple[UUID, UUID, int], list[Chunk]] = defaultdict(list)
+    for chunk in chunks:
+        if chunk.is_active:
+            groups[(chunk.dataset_id, chunk.document_id, chunk.generation)].append(chunk)
+
+    commands: list[ProjectionCommand] = []
+    for group_chunks in groups.values():
+        ordered_chunks = sorted(group_chunks, key=lambda chunk: (chunk.ordinal, chunk.id))
+        for from_chunk, to_chunk in zip(ordered_chunks, ordered_chunks[1:], strict=False):
+            if to_chunk.ordinal == from_chunk.ordinal + 1:
+                commands.append(
+                    chunk_next_upsert_command(
+                        dataset_id=from_chunk.dataset_id,
+                        from_chunk_id=from_chunk.id,
+                        to_chunk_id=to_chunk.id,
+                    )
+                )
+    return tuple(commands)
+
+
+def _ordered_projection_commands(
+    *,
+    entity_commands: Sequence[ProjectionCommand],
+    chunk_commands: Sequence[ProjectionCommand],
+    entity_mention_commands: Sequence[ProjectionCommand],
+    relation_commands: Sequence[ProjectionCommand],
+    next_commands: Sequence[ProjectionCommand],
+) -> tuple[ProjectionCommand, ...]:
+    commands_by_identity: dict[tuple[str, str, str | None], ProjectionCommand] = {}
+    for command in (
+        *entity_commands,
+        *chunk_commands,
+        *entity_mention_commands,
+        *relation_commands,
+        *next_commands,
+    ):
+        commands_by_identity[_projection_command_identity(command)] = command
+    return tuple(commands_by_identity.values())
+
+
+def _projection_command_identity(command: ProjectionCommand) -> tuple[str, str, str | None]:
+    if command.aggregate_type == "chunk_next":
+        return (
+            command.aggregate_type,
+            command.identity["from_chunk_id"],
+            command.identity["to_chunk_id"],
+        )
+    return command.aggregate_type, command.aggregate_id, None
 
 
 def _snapshot_persistence_error() -> SofiasMemoryError:

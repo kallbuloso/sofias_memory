@@ -65,6 +65,21 @@ class ProjectionCommand:
 
         return projection_command_from_payload(payload)
 
+    def to_payload(self) -> dict[str, object]:
+        """Serialize the validated ADR-0008 command snapshot for JSONB storage."""
+
+        command = validate_projection_command(self)
+        return {
+            "schema_version": command.schema_version,
+            "aggregate_type": command.aggregate_type,
+            "operation": command.operation,
+            "dataset_id": command.dataset_id,
+            "aggregate_id": command.aggregate_id,
+            "identity": dict(command.identity),
+            "endpoints": dict(command.endpoints),
+            "properties": dict(command.properties),
+        }
+
 
 class GraphProjectionPort(Protocol):
     """Port for applying one graph projection command."""
@@ -127,6 +142,154 @@ def validate_projection_command(command: ProjectionCommand) -> ProjectionCommand
         _require_endpoint_matches_identity(command, "from_chunk_id")
         _require_endpoint_matches_identity(command, "to_chunk_id")
     return command
+
+
+def entity_upsert_command(
+    *,
+    entity_id: UUID | str,
+    dataset_id: UUID | str,
+    name: str,
+    entity_type: str,
+    description: str,
+    importance_weight: float,
+    generation: int,
+) -> ProjectionCommand:
+    """Build the frozen upsert command for one authoritative entity."""
+
+    entity_id_text = str(entity_id)
+    dataset_id_text = str(dataset_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="entity",
+        operation="upsert",
+        dataset_id=dataset_id_text,
+        aggregate_id=entity_id_text,
+        identity={"id": entity_id_text},
+        endpoints={},
+        properties={
+            "id": entity_id_text,
+            "dataset_id": dataset_id_text,
+            "name": name,
+            "entity_type": entity_type,
+            "description": description,
+            "importance_weight": importance_weight,
+            "generation": generation,
+        },
+    )
+
+
+def chunk_upsert_command(
+    *,
+    chunk_id: UUID | str,
+    dataset_id: UUID | str,
+    source_id: UUID | str,
+    document_id: UUID | str,
+    ordinal: int,
+    generation: int,
+) -> ProjectionCommand:
+    """Build the frozen upsert command for one authoritative chunk."""
+
+    chunk_id_text = str(chunk_id)
+    dataset_id_text = str(dataset_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="chunk",
+        operation="upsert",
+        dataset_id=dataset_id_text,
+        aggregate_id=chunk_id_text,
+        identity={"id": chunk_id_text},
+        endpoints={},
+        properties={
+            "id": chunk_id_text,
+            "dataset_id": dataset_id_text,
+            "source_id": str(source_id),
+            "document_id": str(document_id),
+            "ordinal": ordinal,
+            "generation": generation,
+        },
+    )
+
+
+def relation_upsert_command(
+    *,
+    relation_id: UUID | str,
+    dataset_id: UUID | str,
+    source_entity_id: UUID | str,
+    target_entity_id: UUID | str,
+    predicate: str,
+    description: str,
+    confidence: float,
+    importance_weight: float,
+    generation: int,
+) -> ProjectionCommand:
+    """Build the frozen upsert command for one authoritative relation."""
+
+    relation_id_text = str(relation_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="relation",
+        operation="upsert",
+        dataset_id=str(dataset_id),
+        aggregate_id=relation_id_text,
+        identity={"relation_id": relation_id_text},
+        endpoints={
+            "source_entity_id": str(source_entity_id),
+            "target_entity_id": str(target_entity_id),
+        },
+        properties={
+            "relation_id": relation_id_text,
+            "predicate": predicate,
+            "description": description,
+            "confidence": confidence,
+            "importance_weight": importance_weight,
+            "generation": generation,
+        },
+    )
+
+
+def entity_mention_upsert_command(
+    *,
+    mention_id: UUID | str,
+    dataset_id: UUID | str,
+    entity_id: UUID | str,
+    chunk_id: UUID | str,
+    confidence: float,
+) -> ProjectionCommand:
+    """Build the frozen upsert command for one persisted mention occurrence."""
+
+    mention_id_text = str(mention_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="entity_mention",
+        operation="upsert",
+        dataset_id=str(dataset_id),
+        aggregate_id=mention_id_text,
+        identity={"mention_id": mention_id_text},
+        endpoints={"entity_id": str(entity_id), "chunk_id": str(chunk_id)},
+        properties={"mention_id": mention_id_text, "confidence": confidence},
+    )
+
+
+def chunk_next_upsert_command(
+    *,
+    dataset_id: UUID | str,
+    from_chunk_id: UUID | str,
+    to_chunk_id: UUID | str,
+) -> ProjectionCommand:
+    """Build the frozen upsert command for one derived consecutive chunk edge."""
+
+    from_chunk_id_text = str(from_chunk_id)
+    to_chunk_id_text = str(to_chunk_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="chunk_next",
+        operation="upsert",
+        dataset_id=str(dataset_id),
+        aggregate_id=from_chunk_id_text,
+        identity={"from_chunk_id": from_chunk_id_text, "to_chunk_id": to_chunk_id_text},
+        endpoints={"from_chunk_id": from_chunk_id_text, "to_chunk_id": to_chunk_id_text},
+        properties={},
+    )
 
 
 def _schema_version(value: object) -> int:

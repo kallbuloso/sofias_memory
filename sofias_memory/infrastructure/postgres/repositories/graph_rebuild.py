@@ -17,7 +17,14 @@ from sofias_memory.infrastructure.postgres.models import (
     EntityMention,
     Relation,
 )
-from sofias_memory.ports import GRAPH_PROJECTION_SCHEMA_VERSION, ProjectionCommand
+from sofias_memory.ports import (
+    ProjectionCommand,
+    chunk_next_upsert_command,
+    chunk_upsert_command,
+    entity_mention_upsert_command,
+    entity_upsert_command,
+    relation_upsert_command,
+)
 
 
 @dataclass(frozen=True)
@@ -259,43 +266,25 @@ def _next_commands(chunks: tuple[ChunkRebuildRow, ...]) -> tuple[ProjectionComma
 
 
 def _entity_command(entity: EntityRebuildRow) -> ProjectionCommand:
-    return ProjectionCommand(
-        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
-        aggregate_type="entity",
-        operation="upsert",
+    return entity_upsert_command(
+        entity_id=entity.id,
         dataset_id=entity.dataset_id,
-        aggregate_id=entity.id,
-        identity={"id": entity.id},
-        endpoints={},
-        properties={
-            "id": entity.id,
-            "dataset_id": entity.dataset_id,
-            "name": entity.name,
-            "entity_type": entity.entity_type,
-            "description": entity.description,
-            "importance_weight": entity.importance_weight,
-            "generation": entity.generation,
-        },
+        name=entity.name,
+        entity_type=entity.entity_type,
+        description=entity.description,
+        importance_weight=entity.importance_weight,
+        generation=entity.generation,
     )
 
 
 def _chunk_command(chunk: ChunkRebuildRow) -> ProjectionCommand:
-    return ProjectionCommand(
-        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
-        aggregate_type="chunk",
-        operation="upsert",
+    return chunk_upsert_command(
+        chunk_id=chunk.id,
         dataset_id=chunk.dataset_id,
-        aggregate_id=chunk.id,
-        identity={"id": chunk.id},
-        endpoints={},
-        properties={
-            "id": chunk.id,
-            "dataset_id": chunk.dataset_id,
-            "source_id": chunk.source_id,
-            "document_id": chunk.document_id,
-            "ordinal": chunk.ordinal,
-            "generation": chunk.generation,
-        },
+        source_id=chunk.source_id,
+        document_id=chunk.document_id,
+        ordinal=chunk.ordinal,
+        generation=chunk.generation,
     )
 
 
@@ -303,38 +292,26 @@ def _entity_mention_command(
     mention: EntityMentionRebuildRow,
     dataset_id: str,
 ) -> ProjectionCommand:
-    return ProjectionCommand(
-        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
-        aggregate_type="entity_mention",
-        operation="upsert",
+    return entity_mention_upsert_command(
+        mention_id=mention.id,
         dataset_id=dataset_id,
-        aggregate_id=mention.id,
-        identity={"mention_id": mention.id},
-        endpoints={"entity_id": mention.entity_id, "chunk_id": mention.chunk_id},
-        properties={"mention_id": mention.id, "confidence": mention.confidence},
+        entity_id=mention.entity_id,
+        chunk_id=mention.chunk_id,
+        confidence=mention.confidence,
     )
 
 
 def _relation_command(relation: RelationRebuildRow) -> ProjectionCommand:
-    return ProjectionCommand(
-        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
-        aggregate_type="relation",
-        operation="upsert",
+    return relation_upsert_command(
+        relation_id=relation.id,
         dataset_id=relation.dataset_id,
-        aggregate_id=relation.id,
-        identity={"relation_id": relation.id},
-        endpoints={
-            "source_entity_id": relation.source_entity_id,
-            "target_entity_id": relation.target_entity_id,
-        },
-        properties={
-            "relation_id": relation.id,
-            "predicate": relation.predicate,
-            "description": relation.description,
-            "confidence": relation.confidence,
-            "importance_weight": relation.importance_weight,
-            "generation": relation.generation,
-        },
+        source_entity_id=relation.source_entity_id,
+        target_entity_id=relation.target_entity_id,
+        predicate=relation.predicate,
+        description=relation.description,
+        confidence=relation.confidence,
+        importance_weight=relation.importance_weight,
+        generation=relation.generation,
     )
 
 
@@ -342,15 +319,10 @@ def _chunk_next_command(
     from_chunk: ChunkRebuildRow,
     to_chunk: ChunkRebuildRow,
 ) -> ProjectionCommand:
-    return ProjectionCommand(
-        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
-        aggregate_type="chunk_next",
-        operation="upsert",
+    return chunk_next_upsert_command(
         dataset_id=from_chunk.dataset_id,
-        aggregate_id=from_chunk.id,
-        identity={"from_chunk_id": from_chunk.id, "to_chunk_id": to_chunk.id},
-        endpoints={"from_chunk_id": from_chunk.id, "to_chunk_id": to_chunk.id},
-        properties={},
+        from_chunk_id=from_chunk.id,
+        to_chunk_id=to_chunk.id,
     )
 
 

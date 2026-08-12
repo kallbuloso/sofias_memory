@@ -29,6 +29,13 @@ def app_postgres_session_factory(app: FastAPI) -> AsyncSessionFactory:
     return cast(AsyncSessionFactory, session_factory)
 
 
+def app_neo4j_resource(app: FastAPI) -> Neo4jResource:
+    resource = getattr(app.state, "neo4j_resource", None)
+    if not isinstance(resource, Neo4jResource):
+        raise RuntimeError("Neo4j resource is not configured")
+    return resource
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app_settings(app)

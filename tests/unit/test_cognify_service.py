@@ -29,6 +29,7 @@ from sofias_memory.infrastructure.postgres.models import (
     Source,
     Summary,
 )
+from sofias_memory.ports import ProjectionCommand
 from sofias_memory.schemas.cognify import CognifyRequest
 from sofias_memory.schemas.knowledge import (
     ChunkKnowledgeExtraction,
@@ -40,6 +41,7 @@ from sofias_memory.services.cognify import (
     KNOWLEDGE_EXTRACTION_VERSION,
     CognifyService,
     CognifyUnitOfWork,
+    GraphProjectionDrain,
     UnitOfWorkFactory,
     document_summary_id,
     document_summary_metadata,
@@ -133,6 +135,7 @@ class FakeStore:
         self.relations: list[Relation] = []
         self.relation_evidence: list[RelationEvidence] = []
         self.summaries: list[Summary] = []
+        self.graph_outbox_commands: list[ProjectionCommand] = []
         self.pipeline_runs: list[PipelineRun] = []
         self.loaded_datasets: list[Dataset] = []
         self.commits = 0
@@ -353,6 +356,27 @@ class FakeSummaryRepository:
         )
 
 
+class FakeGraphOutboxRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def add_projection_command(self, command: ProjectionCommand) -> object:
+        self._store.graph_outbox_commands.append(command)
+        return object()
+
+
+class FakeGraphProjectionDrain:
+    def __init__(self, *, failure: Exception | None = None) -> None:
+        self.dataset_ids: list[UUID] = []
+        self.failure = failure
+
+    async def process_dataset(self, dataset_id: UUID) -> object:
+        self.dataset_ids.append(dataset_id)
+        if self.failure is not None:
+            raise self.failure
+        return object()
+
+
 class FakeUnitOfWork:
     def __init__(self, store: FakeStore) -> None:
         self.datasets = FakeDatasetRepository(store)
@@ -364,6 +388,7 @@ class FakeUnitOfWork:
         self.relations = FakeRelationRepository(store)
         self.relation_evidence = FakeRelationEvidenceRepository(store)
         self.summaries = FakeSummaryRepository(store)
+        self.graph_outbox = FakeGraphOutboxRepository(store)
         self.pipeline_runs = FakePipelineRunRepository(store)
         self._store = store
 
@@ -392,6 +417,7 @@ def service_for(
     document_summary_client: (
         FakeDocumentSummaryClient | FailingDocumentSummaryClient | None
     ) = None,
+    graph_projection_drain: FakeGraphProjectionDrain | None = None,
 ) -> CognifyService:
     def create_uow() -> CognifyUnitOfWork:
         return cast(CognifyUnitOfWork, FakeUnitOfWork(store))
@@ -401,6 +427,10 @@ def service_for(
         embedding_client=embedding_client,
         knowledge_extraction_client=knowledge_client or FakeKnowledgeExtractionClient(),
         document_summary_client=document_summary_client or FakeDocumentSummaryClient(),
+        graph_projection_drain=cast(
+            GraphProjectionDrain,
+            graph_projection_drain or FakeGraphProjectionDrain(),
+        ),
         unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
     )
 
@@ -740,6 +770,21 @@ async def test_cognify_enriches_existing_chunks_canonically_and_idempotently(
     assert source.status == SourceStatus.ACTIVE
     assert embedding_client.calls == [[document_summary_client.summary]]
     assert len(store.summaries) == 1
+    assert [command.aggregate_type for command in store.graph_outbox_commands] == [
+        "entity",
+        "entity",
+        "chunk",
+        "chunk",
+        "entity_mention",
+        "entity_mention",
+        "entity_mention",
+        "entity_mention",
+        "relation",
+        "chunk_next",
+    ]
+    assert all(
+        "text" not in command.to_payload()["properties"] for command in store.graph_outbox_commands
+    )
 
     second = await service.cognify(CognifyRequest())
 
@@ -752,6 +797,50 @@ async def test_cognify_enriches_existing_chunks_canonically_and_idempotently(
     assert len(store.relation_evidence) == 2
     assert len(store.summaries) == 1
     assert len(document_summary_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cognify_keeps_authoritative_source_active_when_projection_drain_fails(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    _, source, _ = seed_pending_source(store, "Authoritative state survives projection failure.")
+    drain = FakeGraphProjectionDrain(failure=RuntimeError("neo4j unavailable"))
+    embedding_client = FakeEmbeddingClient()
+    knowledge_client = FakeKnowledgeExtractionClient()
+    summary_client = FakeDocumentSummaryClient()
+    service = service_for(
+        tmp_path,
+        store,
+        embedding_client,
+        knowledge_client,
+        summary_client,
+        graph_projection_drain=drain,
+    )
+
+    with pytest.raises(RuntimeError, match="neo4j unavailable"):
+        await service.cognify(CognifyRequest())
+
+    assert source.status == SourceStatus.ACTIVE
+    assert store.graph_outbox_commands
+    assert store.pipeline_runs[0].status == PipelineRunStatus.FAILED
+    assert drain.dataset_ids == [source.dataset_id]
+
+    embedding_calls = list(embedding_client.calls)
+    extraction_calls = list(knowledge_client.calls)
+    summary_calls = list(summary_client.calls)
+    outbox_count = len(store.graph_outbox_commands)
+    drain.failure = None
+
+    result = await service.cognify(CognifyRequest(source_ids=[source.id]))
+
+    assert result.sources_processed == 0
+    assert embedding_client.calls == embedding_calls
+    assert knowledge_client.calls == extraction_calls
+    assert summary_client.calls == summary_calls
+    assert len(store.graph_outbox_commands) == outbox_count
+    assert drain.dataset_ids == [source.dataset_id, source.dataset_id]
+    assert store.pipeline_runs[-1].status == PipelineRunStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio

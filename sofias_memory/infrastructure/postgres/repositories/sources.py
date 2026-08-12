@@ -41,3 +41,21 @@ class SourceRepository:
         )
         result = await self._session.scalar(statement)
         return cast(Source | None, result)
+
+    async def get_latest_by_content_hash(
+        self,
+        *,
+        dataset_id: UUID,
+        content_sha256: str,
+    ) -> Source | None:
+        statement = (
+            select(Source)
+            .where(
+                Source.dataset_id == dataset_id,
+                Source.content_sha256 == content_sha256,
+            )
+            .order_by(Source.version.desc(), Source.created_at.desc(), Source.id)
+            .limit(1)
+        )
+        result = await self._session.scalar(statement)
+        return cast(Source | None, result)

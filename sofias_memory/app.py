@@ -29,12 +29,18 @@ from sofias_memory.api.routes.health import (
 )
 from sofias_memory.api.routes.health import router as health_router
 from sofias_memory.api.routes.info import router as info_router
+from sofias_memory.api.routes.remember import router as remember_router
 from sofias_memory.config import Settings, load_settings
 from sofias_memory.infrastructure.neo4j import (
     NEO4J_NOT_READY_DETAIL,
     Neo4jReadinessChecker,
     Neo4jResource,
     create_neo4j_resource_from_settings,
+)
+from sofias_memory.infrastructure.postgres import (
+    AsyncSessionFactory,
+    create_async_engine_from_settings,
+    create_session_factory,
 )
 from sofias_memory.infrastructure.postgres.readiness import (
     POSTGRES_NOT_READY_DETAIL,
@@ -52,6 +58,7 @@ def create_app(
     enable_neo4j: bool = True,
     neo4j_resource: Neo4jResource | None = None,
     neo4j_readiness_checker: Neo4jReadinessChecker | None = None,
+    postgres_session_factory: AsyncSessionFactory | None = None,
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else load_settings()
     application = FastAPI(
@@ -60,6 +67,12 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.settings = resolved_settings
+    if postgres_session_factory is None:
+        postgres_engine = create_async_engine_from_settings(resolved_settings)
+        application.state.postgres_engine = postgres_engine
+        application.state.postgres_session_factory = create_session_factory(postgres_engine)
+    else:
+        application.state.postgres_session_factory = postgres_session_factory
     resolved_readiness_checks = tuple(
         readiness_checks.items() if isinstance(readiness_checks, Mapping) else readiness_checks
     )
@@ -93,6 +106,7 @@ def create_app(
 
     application.include_router(health_router)
     application.include_router(info_router, prefix="/api/v1")
+    application.include_router(remember_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

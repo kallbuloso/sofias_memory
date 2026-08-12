@@ -5,9 +5,11 @@ from contextlib import asynccontextmanager
 from typing import cast
 
 from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sofias_memory.config import Settings
 from sofias_memory.infrastructure.neo4j import Neo4jResource, ensure_neo4j_schema
+from sofias_memory.infrastructure.postgres import AsyncSessionFactory, dispose_async_engine
 from sofias_memory.observability.logging import configure_logging, get_logger
 
 NEO4J_STARTUP_PROBE_QUERY = "RETURN 1 AS ok"
@@ -18,6 +20,13 @@ def app_settings(app: FastAPI) -> Settings:
     if not isinstance(settings, Settings):
         raise RuntimeError("application settings are not configured")
     return settings
+
+
+def app_postgres_session_factory(app: FastAPI) -> AsyncSessionFactory:
+    session_factory = getattr(app.state, "postgres_session_factory", None)
+    if session_factory is None:
+        raise RuntimeError("PostgreSQL session factory is not configured")
+    return cast(AsyncSessionFactory, session_factory)
 
 
 @asynccontextmanager
@@ -44,6 +53,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         postgres_readiness_checker = getattr(app.state, "postgres_readiness_checker", None)
         if postgres_readiness_checker is not None:
             await postgres_readiness_checker.dispose()
+        postgres_engine = getattr(app.state, "postgres_engine", None)
+        if postgres_engine is not None:
+            await dispose_async_engine(cast(AsyncEngine, postgres_engine))
         logger.info("application_shutdown", **safe_metadata)
 
 

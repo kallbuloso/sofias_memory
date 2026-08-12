@@ -35,3 +35,22 @@ class DocumentRepository:
         )
         result = await self._session.scalars(statement)
         return list(result)
+
+    async def get_for_source_generation(
+        self,
+        *,
+        source_id: UUID,
+        generation: int,
+    ) -> Document | None:
+        statement = (
+            select(Document)
+            .where(
+                Document.source_id == source_id,
+                Document.generation == generation,
+                Document.is_active.is_(True),
+            )
+            .order_by(Document.created_at.desc(), Document.id)
+            .limit(1)
+        )
+        result = await self._session.scalar(statement)
+        return cast(Document | None, result)

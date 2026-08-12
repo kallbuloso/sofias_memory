@@ -8,6 +8,7 @@ from typing import Self
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sofias_memory.infrastructure.postgres.repositories import (
+    ChunkRepository,
     DatasetRepository,
     DocumentRepository,
     GraphOutboxRepository,
@@ -29,6 +30,7 @@ class PostgresUnitOfWork:
         self._datasets: DatasetRepository | None = None
         self._sources: SourceRepository | None = None
         self._documents: DocumentRepository | None = None
+        self._chunks: ChunkRepository | None = None
         self._pipeline_runs: PipelineRunRepository | None = None
         self._pipeline_steps: PipelineStepRepository | None = None
         self._graph_outbox: GraphOutboxRepository | None = None
@@ -44,6 +46,7 @@ class PostgresUnitOfWork:
         self._datasets = DatasetRepository(session)
         self._sources = SourceRepository(session)
         self._documents = DocumentRepository(session)
+        self._chunks = ChunkRepository(session)
         self._pipeline_runs = PipelineRunRepository(session)
         self._pipeline_steps = PipelineStepRepository(session)
         self._graph_outbox = GraphOutboxRepository(session)
@@ -80,6 +83,12 @@ class PostgresUnitOfWork:
         if self._documents is None:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._documents
+
+    @property
+    def chunks(self) -> ChunkRepository:
+        if self._chunks is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._chunks
 
     @property
     def pipeline_runs(self) -> PipelineRunRepository:
@@ -123,6 +132,7 @@ class PostgresUnitOfWork:
         self._datasets = None
         self._sources = None
         self._documents = None
+        self._chunks = None
         self._pipeline_runs = None
         self._pipeline_steps = None
         self._graph_outbox = None

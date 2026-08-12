@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sofias_memory.infrastructure.postgres.models import (
+    Chunk,
     Dataset,
     Document,
     GraphOutbox,
@@ -15,6 +16,7 @@ from sofias_memory.infrastructure.postgres.models import (
     Source,
 )
 from sofias_memory.infrastructure.postgres.repositories import (
+    ChunkRepository,
     DatasetRepository,
     DocumentRepository,
     GraphOutboxRepository,
@@ -74,6 +76,7 @@ def repository_sessions(uow: PostgresUnitOfWork) -> list[object]:
         uow.datasets._session,
         uow.sources._session,
         uow.documents._session,
+        uow.chunks._session,
         uow.pipeline_runs._session,
         uow.pipeline_steps._session,
         uow.graph_outbox._session,
@@ -86,7 +89,7 @@ async def test_unit_of_work_wires_repositories_to_one_shared_session() -> None:
     uow = PostgresUnitOfWork(make_session_factory(fake_session))
 
     async with uow:
-        assert repository_sessions(uow) == [fake_session] * 6
+        assert repository_sessions(uow) == [fake_session] * 7
 
 
 @pytest.mark.asyncio
@@ -164,6 +167,7 @@ async def test_repository_add_flushes_but_never_commits_or_rolls_back() -> None:
         (DatasetRepository(session), cast(Dataset, object())),
         (SourceRepository(session), cast(Source, object())),
         (DocumentRepository(session), cast(Document, object())),
+        (ChunkRepository(session), chunk_model()),
         (PipelineRunRepository(session), cast(PipelineRun, object())),
         (PipelineStepRepository(session), cast(PipelineStep, object())),
         (GraphOutboxRepository(session), cast(GraphOutbox, object())),
@@ -176,6 +180,27 @@ async def test_repository_add_flushes_but_never_commits_or_rolls_back() -> None:
     assert fake_session.flush_calls == len(repositories_and_models)
     assert fake_session.commit_calls == 0
     assert fake_session.rollback_calls == 0
+
+
+def chunk_model() -> Chunk:
+    return Chunk(
+        id=uuid4(),
+        dataset_id=uuid4(),
+        document_id=uuid4(),
+        source_id=uuid4(),
+        generation=0,
+        ordinal=0,
+        text="chunk text",
+        content_sha256="a" * 64,
+        token_count=2,
+        start_char=0,
+        end_char=10,
+        section_path=[],
+        metadata_={},
+        embedding=[0.1] * 3072,
+        lexical="",
+        is_active=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -197,11 +222,15 @@ async def test_repository_lookup_methods_return_scalar_results() -> None:
         is expected
     )
     assert await DocumentRepository(session).get_by_id(uuid4()) is expected
+    assert await ChunkRepository(session).exists_for_source_generation(
+        source_id=uuid4(),
+        generation=0,
+    )
     assert await PipelineRunRepository(session).get_by_id(uuid4()) is expected
     assert await PipelineRunRepository(session).get_by_idempotency_key("key") is expected
     assert await PipelineStepRepository(session).get_by_id(uuid4()) is expected
     assert await GraphOutboxRepository(session).get_by_id(1) is expected
-    assert fake_session.scalar_calls == 9
+    assert fake_session.scalar_calls == 10
 
 
 @pytest.mark.asyncio
@@ -213,5 +242,9 @@ async def test_repository_list_methods_return_deterministic_scalar_lists() -> No
     fake_session.scalars_result = (first, second)
 
     assert await DocumentRepository(session).list_for_source(uuid4()) == [first, second]
+    assert await ChunkRepository(session).list_for_source_generation(
+        source_id=uuid4(),
+        generation=0,
+    ) == [first, second]
     assert await PipelineStepRepository(session).list_for_run(uuid4()) == [first, second]
-    assert fake_session.scalars_calls == 2
+    assert fake_session.scalars_calls == 3

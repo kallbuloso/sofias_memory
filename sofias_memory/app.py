@@ -22,6 +22,7 @@ from sofias_memory.api.middleware import (
     RequestIdMiddleware,
     max_body_bytes_from_mebibytes,
 )
+from sofias_memory.api.routes.cognify import router as cognify_router
 from sofias_memory.api.routes.health import (
     ReadinessCheckRegistry,
     ReadinessCheckResult,
@@ -107,6 +108,7 @@ def create_app(
     application.include_router(health_router)
     application.include_router(info_router, prefix="/api/v1")
     application.include_router(remember_router, prefix="/api/v1")
+    application.include_router(cognify_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

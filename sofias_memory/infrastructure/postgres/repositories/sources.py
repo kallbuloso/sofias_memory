@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sofias_memory.domain import SourceStatus
 from sofias_memory.infrastructure.postgres.models import Source
 
 
@@ -59,3 +60,15 @@ class SourceRepository:
         )
         result = await self._session.scalar(statement)
         return cast(Source | None, result)
+
+    async def list_pending_for_dataset(self, dataset_id: UUID) -> list[Source]:
+        statement = (
+            select(Source)
+            .where(
+                Source.dataset_id == dataset_id,
+                Source.status == SourceStatus.PENDING,
+            )
+            .order_by(Source.created_at, Source.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)

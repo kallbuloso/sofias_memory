@@ -10,18 +10,26 @@ from sofias_memory.infrastructure.postgres.models import (
     Chunk,
     Dataset,
     Document,
+    Entity,
+    EntityMention,
     GraphOutbox,
     PipelineRun,
     PipelineStep,
+    Relation,
+    RelationEvidence,
     Source,
 )
 from sofias_memory.infrastructure.postgres.repositories import (
     ChunkRepository,
     DatasetRepository,
     DocumentRepository,
+    EntityMentionRepository,
+    EntityRepository,
     GraphOutboxRepository,
     PipelineRunRepository,
     PipelineStepRepository,
+    RelationEvidenceRepository,
+    RelationRepository,
     SourceRepository,
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
@@ -77,6 +85,10 @@ def repository_sessions(uow: PostgresUnitOfWork) -> list[object]:
         uow.sources._session,
         uow.documents._session,
         uow.chunks._session,
+        uow.entities._session,
+        uow.entity_mentions._session,
+        uow.relations._session,
+        uow.relation_evidence._session,
         uow.pipeline_runs._session,
         uow.pipeline_steps._session,
         uow.graph_outbox._session,
@@ -89,7 +101,7 @@ async def test_unit_of_work_wires_repositories_to_one_shared_session() -> None:
     uow = PostgresUnitOfWork(make_session_factory(fake_session))
 
     async with uow:
-        assert repository_sessions(uow) == [fake_session] * 7
+        assert repository_sessions(uow) == [fake_session] * 11
 
 
 @pytest.mark.asyncio
@@ -168,6 +180,10 @@ async def test_repository_add_flushes_but_never_commits_or_rolls_back() -> None:
         (SourceRepository(session), cast(Source, object())),
         (DocumentRepository(session), cast(Document, object())),
         (ChunkRepository(session), chunk_model()),
+        (EntityRepository(session), cast(Entity, object())),
+        (EntityMentionRepository(session), cast(EntityMention, object())),
+        (RelationRepository(session), cast(Relation, object())),
+        (RelationEvidenceRepository(session), cast(RelationEvidence, object())),
         (PipelineRunRepository(session), cast(PipelineRun, object())),
         (PipelineStepRepository(session), cast(PipelineStep, object())),
         (GraphOutboxRepository(session), cast(GraphOutbox, object())),
@@ -226,11 +242,33 @@ async def test_repository_lookup_methods_return_scalar_results() -> None:
         source_id=uuid4(),
         generation=0,
     )
+    assert await ChunkRepository(session).get_by_id(uuid4()) is expected
+    assert (
+        await EntityRepository(session).get_active_by_canonical_key(
+            dataset_id=uuid4(), canonical_key="technology:postgresql"
+        )
+        is expected
+    )
+    assert await EntityMentionRepository(session).exists_for_entity_chunk(
+        entity_id=uuid4(), chunk_id=uuid4()
+    )
+    assert (
+        await RelationRepository(session).get_active_by_identity(
+            source_entity_id=uuid4(),
+            target_entity_id=uuid4(),
+            predicate="uses",
+            generation=0,
+        )
+        is expected
+    )
+    assert await RelationEvidenceRepository(session).exists_for_relation_chunk(
+        relation_id=uuid4(), chunk_id=uuid4()
+    )
     assert await PipelineRunRepository(session).get_by_id(uuid4()) is expected
     assert await PipelineRunRepository(session).get_by_idempotency_key("key") is expected
     assert await PipelineStepRepository(session).get_by_id(uuid4()) is expected
     assert await GraphOutboxRepository(session).get_by_id(1) is expected
-    assert fake_session.scalar_calls == 10
+    assert fake_session.scalar_calls == 15
 
 
 @pytest.mark.asyncio

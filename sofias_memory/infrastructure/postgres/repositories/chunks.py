@@ -31,6 +31,10 @@ class ChunkRepository:
         await self._session.flush()
         return list(chunks)
 
+    async def get_by_id(self, chunk_id: UUID) -> Chunk | None:
+        result = await self._session.scalar(select(Chunk).where(Chunk.id == chunk_id))
+        return cast(Chunk | None, result)
+
     async def list_for_source_generation(
         self,
         *,

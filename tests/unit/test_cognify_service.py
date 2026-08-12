@@ -20,11 +20,26 @@ from sofias_memory.infrastructure.postgres.models import (
     Chunk,
     Dataset,
     Document,
+    Entity,
+    EntityMention,
     PipelineRun,
+    Relation,
+    RelationEvidence,
     Source,
 )
 from sofias_memory.schemas.cognify import CognifyRequest
-from sofias_memory.services.cognify import CognifyService, CognifyUnitOfWork, UnitOfWorkFactory
+from sofias_memory.schemas.knowledge import (
+    ChunkKnowledgeExtraction,
+    ExtractedEntity,
+    ExtractedRelation,
+)
+from sofias_memory.services.cognify import (
+    GRAPH_EXTRACTION_PROMPT_VERSION,
+    KNOWLEDGE_EXTRACTION_VERSION,
+    CognifyService,
+    CognifyUnitOfWork,
+    UnitOfWorkFactory,
+)
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
@@ -60,12 +75,39 @@ class FakeEmbeddingClient:
         return [[0.125] * self.dimensions for _ in texts]
 
 
+class FakeKnowledgeExtractionClient:
+    def __init__(self, extraction: ChunkKnowledgeExtraction | None = None) -> None:
+        self.extraction = extraction or ChunkKnowledgeExtraction(
+            summary="A retrieval summary.",
+            entities=[],
+            relations=[],
+        )
+        self.calls: list[str] = []
+
+    async def extract(self, chunk_text: str) -> ChunkKnowledgeExtraction:
+        self.calls.append(chunk_text)
+        return self.extraction
+
+
+class FailingKnowledgeExtractionClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def extract(self, chunk_text: str) -> ChunkKnowledgeExtraction:
+        self.calls.append(chunk_text)
+        raise ValueError("invalid after repair")
+
+
 class FakeStore:
     def __init__(self) -> None:
         self.datasets: list[Dataset] = []
         self.sources: list[Source] = []
         self.documents: list[Document] = []
         self.chunks: list[Chunk] = []
+        self.entities: list[Entity] = []
+        self.entity_mentions: list[EntityMention] = []
+        self.relations: list[Relation] = []
+        self.relation_evidence: list[RelationEvidence] = []
         self.pipeline_runs: list[PipelineRun] = []
         self.loaded_datasets: list[Dataset] = []
         self.commits = 0
@@ -89,11 +131,12 @@ class FakeSourceRepository:
     async def get_by_id(self, source_id: UUID) -> Source | None:
         return next((source for source in self._store.sources if source.id == source_id), None)
 
-    async def list_pending_for_dataset(self, dataset_id: UUID) -> list[Source]:
+    async def list_for_cognify(self, dataset_id: UUID) -> list[Source]:
         return [
             source
             for source in self._store.sources
-            if source.dataset_id == dataset_id and source.status == SourceStatus.PENDING
+            if source.dataset_id == dataset_id
+            and source.status in {SourceStatus.PENDING, SourceStatus.ACTIVE}
         ]
 
 
@@ -127,18 +170,105 @@ class FakeChunkRepository:
         self._store.chunks.extend(chunks)
         return list(chunks)
 
-    async def exists_for_source_generation(
+    async def get_by_id(self, chunk_id: UUID) -> Chunk | None:
+        return next((chunk for chunk in self._store.chunks if chunk.id == chunk_id), None)
+
+    async def list_for_source_generation(
         self,
         *,
         source_id: UUID,
         generation: int,
         active_only: bool = True,
-    ) -> bool:
-        return any(
-            chunk.source_id == source_id
+    ) -> list[Chunk]:
+        return [
+            chunk
+            for chunk in self._store.chunks
+            if chunk.source_id == source_id
             and chunk.generation == generation
             and (chunk.is_active or not active_only)
-            for chunk in self._store.chunks
+        ]
+
+
+class FakeEntityRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def add(self, entity: Entity) -> Entity:
+        self._store.entities.append(entity)
+        return entity
+
+    async def get_active_by_canonical_key(
+        self, *, dataset_id: UUID, canonical_key: str
+    ) -> Entity | None:
+        return next(
+            (
+                entity
+                for entity in self._store.entities
+                if entity.dataset_id == dataset_id
+                and entity.canonical_key == canonical_key
+                and entity.is_active
+            ),
+            None,
+        )
+
+
+class FakeEntityMentionRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def add(self, mention: EntityMention) -> EntityMention:
+        self._store.entity_mentions.append(mention)
+        return mention
+
+    async def exists_for_entity_chunk(self, *, entity_id: UUID, chunk_id: UUID) -> bool:
+        return any(
+            mention.entity_id == entity_id and mention.chunk_id == chunk_id
+            for mention in self._store.entity_mentions
+        )
+
+
+class FakeRelationRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def add(self, relation: Relation) -> Relation:
+        self._store.relations.append(relation)
+        return relation
+
+    async def get_active_by_identity(
+        self,
+        *,
+        source_entity_id: UUID,
+        target_entity_id: UUID,
+        predicate: str,
+        generation: int,
+    ) -> Relation | None:
+        return next(
+            (
+                relation
+                for relation in self._store.relations
+                if relation.source_entity_id == source_entity_id
+                and relation.target_entity_id == target_entity_id
+                and relation.predicate == predicate
+                and relation.generation == generation
+                and relation.is_active
+            ),
+            None,
+        )
+
+
+class FakeRelationEvidenceRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def add(self, evidence: RelationEvidence) -> RelationEvidence:
+        self._store.relation_evidence.append(evidence)
+        return evidence
+
+    async def exists_for_relation_chunk(self, *, relation_id: UUID, chunk_id: UUID) -> bool:
+        return any(
+            evidence.relation_id == relation_id and evidence.chunk_id == chunk_id
+            for evidence in self._store.relation_evidence
         )
 
 
@@ -160,6 +290,10 @@ class FakeUnitOfWork:
         self.sources = FakeSourceRepository(store)
         self.documents = FakeDocumentRepository(store)
         self.chunks = FakeChunkRepository(store)
+        self.entities = FakeEntityRepository(store)
+        self.entity_mentions = FakeEntityMentionRepository(store)
+        self.relations = FakeRelationRepository(store)
+        self.relation_evidence = FakeRelationEvidenceRepository(store)
         self.pipeline_runs = FakePipelineRunRepository(store)
         self._store = store
 
@@ -182,6 +316,9 @@ def service_for(
     tmp_path: Path,
     store: FakeStore,
     embedding_client: FakeEmbeddingClient,
+    knowledge_client: (
+        FakeKnowledgeExtractionClient | FailingKnowledgeExtractionClient | None
+    ) = None,
 ) -> CognifyService:
     def create_uow() -> CognifyUnitOfWork:
         return cast(CognifyUnitOfWork, FakeUnitOfWork(store))
@@ -189,6 +326,7 @@ def service_for(
     return CognifyService(
         make_settings(tmp_path),
         embedding_client=embedding_client,
+        knowledge_extraction_client=knowledge_client or FakeKnowledgeExtractionClient(),
         unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
     )
 
@@ -374,7 +512,12 @@ async def test_cognify_reexecution_does_not_duplicate_existing_chunks(tmp_path: 
         start_char=0,
         end_char=len(document.normalized_text),
         section_path=[],
-        metadata_={},
+        metadata_={
+            "knowledge_extraction": {
+                "version": KNOWLEDGE_EXTRACTION_VERSION,
+                "prompt_version": GRAPH_EXTRACTION_PROMPT_VERSION,
+            }
+        },
         embedding=[0.1] * 3072,
         lexical="",
         is_active=True,
@@ -382,13 +525,152 @@ async def test_cognify_reexecution_does_not_duplicate_existing_chunks(tmp_path: 
     store.chunks.append(existing_chunk)
     source.status = SourceStatus.ACTIVE
     embedding_client = FakeEmbeddingClient()
+    knowledge_client = FakeKnowledgeExtractionClient()
 
-    result = await service_for(tmp_path, store, embedding_client).cognify(CognifyRequest())
+    result = await service_for(
+        tmp_path,
+        store,
+        embedding_client,
+        knowledge_client,
+    ).cognify(CognifyRequest())
 
     assert result.sources_processed == 0
     assert result.chunks == 0
     assert store.chunks == [existing_chunk]
     assert embedding_client.calls == []
+    assert knowledge_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_cognify_enriches_existing_chunks_canonically_and_idempotently(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    _, source, document = seed_pending_source(store, "PostgreSQL supports Sofias Memory.")
+    source.status = SourceStatus.ACTIVE
+    for ordinal in range(2):
+        store.chunks.append(
+            Chunk(
+                id=uuid4(),
+                dataset_id=source.dataset_id,
+                document_id=document.id,
+                source_id=source.id,
+                generation=document.generation,
+                ordinal=ordinal,
+                text=document.normalized_text,
+                content_sha256=f"{ordinal + 1:064x}",
+                token_count=5,
+                start_char=0,
+                end_char=len(document.normalized_text),
+                section_path=[],
+                metadata_={"existing": "preserved"},
+                embedding=[0.1] * 3072,
+                lexical="",
+                is_active=True,
+            )
+        )
+    extraction = ChunkKnowledgeExtraction(
+        summary="PostgreSQL replication is described.",
+        entities=[
+            ExtractedEntity(
+                local_id="e1",
+                name="PostgreSQL",
+                type="Technology",
+                description="A database technology.",
+                aliases=[],
+                confidence=0.9,
+            ),
+            ExtractedEntity(
+                local_id="e2",
+                name="Sofias Memory",
+                type="System",
+                description="A persistent memory system.",
+                aliases=[],
+                confidence=0.9,
+            ),
+        ],
+        relations=[
+            ExtractedRelation(
+                source_local_id="e1",
+                target_local_id="e2",
+                predicate="supports",
+                description="PostgreSQL supports Sofias Memory.",
+                confidence=0.8,
+                evidence="PostgreSQL supports Sofias Memory.",
+            )
+        ],
+    )
+    embedding_client = FakeEmbeddingClient()
+    knowledge_client = FakeKnowledgeExtractionClient(extraction)
+    service = service_for(tmp_path, store, embedding_client, knowledge_client)
+
+    result = await service.cognify(CognifyRequest())
+
+    assert result.chunks == 0
+    assert result.entities == 2
+    assert result.relations == 1
+    assert len(store.entities) == 2
+    assert len(store.entity_mentions) == 4
+    assert len(store.relations) == 1
+    assert len(store.relation_evidence) == 2
+    assert all(chunk.metadata_["existing"] == "preserved" for chunk in store.chunks)
+    assert all("knowledge_extraction" in chunk.metadata_ for chunk in store.chunks)
+    assert source.status == SourceStatus.ACTIVE
+    assert embedding_client.calls == []
+
+    second = await service.cognify(CognifyRequest())
+
+    assert second.sources_processed == 0
+    assert second.chunks == second.entities == second.relations == 0
+    assert len(knowledge_client.calls) == 2
+    assert len(store.entities) == 2
+    assert len(store.entity_mentions) == 4
+    assert len(store.relations) == 1
+    assert len(store.relation_evidence) == 2
+
+
+@pytest.mark.asyncio
+async def test_cognify_invalid_enrichment_preserves_chunks_and_marks_failure(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    _, source, document = seed_pending_source(store, "Already embedded content.")
+    source.status = SourceStatus.ACTIVE
+    existing_chunk = Chunk(
+        id=uuid4(),
+        dataset_id=source.dataset_id,
+        document_id=document.id,
+        source_id=source.id,
+        generation=document.generation,
+        ordinal=0,
+        text=document.normalized_text,
+        content_sha256="c" * 64,
+        token_count=3,
+        start_char=0,
+        end_char=len(document.normalized_text),
+        section_path=[],
+        metadata_={},
+        embedding=[0.1] * 3072,
+        lexical="",
+        is_active=True,
+    )
+    store.chunks.append(existing_chunk)
+
+    with pytest.raises(DependencyUnavailableError, match="Knowledge extraction"):
+        await service_for(
+            tmp_path,
+            store,
+            FakeEmbeddingClient(),
+            FailingKnowledgeExtractionClient(),
+        ).cognify(CognifyRequest())
+
+    assert store.chunks == [existing_chunk]
+    assert store.entities == []
+    assert store.entity_mentions == []
+    assert store.relations == []
+    assert store.relation_evidence == []
+    assert source.status == SourceStatus.FAILED
+    assert store.pipeline_runs[0].status == PipelineRunStatus.FAILED
 
 
 @pytest.mark.asyncio

@@ -72,3 +72,15 @@ class SourceRepository:
         )
         result = await self._session.scalars(statement)
         return list(result)
+
+    async def list_for_cognify(self, dataset_id: UUID) -> list[Source]:
+        statement = (
+            select(Source)
+            .where(
+                Source.dataset_id == dataset_id,
+                Source.status.in_((SourceStatus.PENDING, SourceStatus.ACTIVE)),
+            )
+            .order_by(Source.created_at, Source.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)

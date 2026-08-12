@@ -11,9 +11,13 @@ from sofias_memory.infrastructure.postgres.repositories import (
     ChunkRepository,
     DatasetRepository,
     DocumentRepository,
+    EntityMentionRepository,
+    EntityRepository,
     GraphOutboxRepository,
     PipelineRunRepository,
     PipelineStepRepository,
+    RelationEvidenceRepository,
+    RelationRepository,
     SourceRepository,
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
@@ -31,6 +35,10 @@ class PostgresUnitOfWork:
         self._sources: SourceRepository | None = None
         self._documents: DocumentRepository | None = None
         self._chunks: ChunkRepository | None = None
+        self._entities: EntityRepository | None = None
+        self._entity_mentions: EntityMentionRepository | None = None
+        self._relations: RelationRepository | None = None
+        self._relation_evidence: RelationEvidenceRepository | None = None
         self._pipeline_runs: PipelineRunRepository | None = None
         self._pipeline_steps: PipelineStepRepository | None = None
         self._graph_outbox: GraphOutboxRepository | None = None
@@ -47,6 +55,10 @@ class PostgresUnitOfWork:
         self._sources = SourceRepository(session)
         self._documents = DocumentRepository(session)
         self._chunks = ChunkRepository(session)
+        self._entities = EntityRepository(session)
+        self._entity_mentions = EntityMentionRepository(session)
+        self._relations = RelationRepository(session)
+        self._relation_evidence = RelationEvidenceRepository(session)
         self._pipeline_runs = PipelineRunRepository(session)
         self._pipeline_steps = PipelineStepRepository(session)
         self._graph_outbox = GraphOutboxRepository(session)
@@ -91,6 +103,30 @@ class PostgresUnitOfWork:
         return self._chunks
 
     @property
+    def entities(self) -> EntityRepository:
+        if self._entities is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._entities
+
+    @property
+    def entity_mentions(self) -> EntityMentionRepository:
+        if self._entity_mentions is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._entity_mentions
+
+    @property
+    def relations(self) -> RelationRepository:
+        if self._relations is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._relations
+
+    @property
+    def relation_evidence(self) -> RelationEvidenceRepository:
+        if self._relation_evidence is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._relation_evidence
+
+    @property
     def pipeline_runs(self) -> PipelineRunRepository:
         if self._pipeline_runs is None:
             raise RuntimeError("PostgresUnitOfWork is not active")
@@ -133,6 +169,10 @@ class PostgresUnitOfWork:
         self._sources = None
         self._documents = None
         self._chunks = None
+        self._entities = None
+        self._entity_mentions = None
+        self._relations = None
+        self._relation_evidence = None
         self._pipeline_runs = None
         self._pipeline_steps = None
         self._graph_outbox = None

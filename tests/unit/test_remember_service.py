@@ -5,11 +5,19 @@ from typing import cast
 from uuid import UUID
 
 import pytest
+from fastapi import UploadFile
 
 from sofias_memory.api.errors import SofiasMemoryError
+from sofias_memory.api.routes.remember import parse_metadata_json, read_upload_file_bytes
 from sofias_memory.config import Settings
-from sofias_memory.domain import DatasetStatus, PipelineRunStatus, SourceStatus
+from sofias_memory.domain import DatasetStatus, PipelineRunStatus, SourceKind, SourceStatus
 from sofias_memory.infrastructure.postgres.models import Dataset, Document, PipelineRun, Source
+from sofias_memory.loaders.text import (
+    MARKDOWN_FILE_MIME_TYPE,
+    TEXT_FILE_MIME_TYPE,
+    TextFileLoadError,
+    prepare_text_file_content,
+)
 from sofias_memory.schemas.remember import RememberTextRequest
 from sofias_memory.services.remember import RememberService, RememberUnitOfWork, UnitOfWorkFactory
 
@@ -220,3 +228,126 @@ async def test_idempotency_key_rejects_same_key_with_different_payload(tmp_path:
     assert exc_info.value.status_code == 409
     assert len(store.sources) == 1
     assert len(store.documents) == 1
+
+
+@pytest.mark.asyncio
+async def test_remember_txt_file_creates_source_document_and_storage(tmp_path: Path) -> None:
+    store = FakeStore()
+    original_bytes = b"Sofias Memory\r\nfile ingest."
+    prepared_file = prepare_text_file_content("note.txt", original_bytes)
+
+    result = await service_for(tmp_path, store).remember_file(
+        dataset="main",
+        prepared_file=prepared_file,
+        metadata={"origin": "upload"},
+        session_id="file-session",
+        mode="ingest",
+        wait=True,
+        force=False,
+    )
+
+    source = store.sources[0]
+    document = store.documents[0]
+    assert source.kind == SourceKind.FILE
+    assert source.mime_type == TEXT_FILE_MIME_TYPE
+    assert source.name == "note.txt"
+    assert source.content_sha256 == result.content_hash
+    assert source.normalized_sha256 == document.text_sha256
+    assert source.content_sha256 != source.normalized_sha256
+    assert document.normalized_text == "Sofias Memory\nfile ingest."
+    assert document.metadata_["session_id"] == "file-session"
+
+    stored_file = tmp_path / str(result.dataset_id) / str(result.source_id) / "original.txt"
+    assert stored_file.read_bytes() == original_bytes
+
+
+@pytest.mark.asyncio
+async def test_remember_markdown_preserves_headings_and_removes_nul(tmp_path: Path) -> None:
+    store = FakeStore()
+    original_bytes = b"\xef\xbb\xbf# Title\r\n\nBody\x00 text"
+    prepared_file = prepare_text_file_content("../note.markdown", original_bytes)
+
+    await service_for(tmp_path, store).remember_file(
+        dataset="main",
+        prepared_file=prepared_file,
+        metadata={},
+        session_id=None,
+        mode="ingest",
+        wait=True,
+        force=False,
+    )
+
+    assert store.sources[0].kind == SourceKind.FILE
+    assert store.sources[0].mime_type == MARKDOWN_FILE_MIME_TYPE
+    assert store.sources[0].name == "note.markdown"
+    assert store.documents[0].title == "note.markdown"
+    assert store.documents[0].normalized_text == "# Title\n\nBody text"
+
+
+@pytest.mark.asyncio
+async def test_remember_file_deduplicates_and_force_creates_next_version(tmp_path: Path) -> None:
+    store = FakeStore()
+    service = service_for(tmp_path, store)
+    prepared_file = prepare_text_file_content("note.md", b"# Same\n")
+
+    first = await service.remember_file(
+        dataset="main",
+        prepared_file=prepared_file,
+        metadata={},
+        session_id=None,
+        mode="ingest",
+        wait=True,
+        force=False,
+    )
+    duplicate = await service.remember_file(
+        dataset="main",
+        prepared_file=prepared_file,
+        metadata={},
+        session_id=None,
+        mode="ingest",
+        wait=True,
+        force=False,
+    )
+    forced = await service.remember_file(
+        dataset="main",
+        prepared_file=prepared_file,
+        metadata={},
+        session_id=None,
+        mode="ingest",
+        wait=True,
+        force=True,
+    )
+
+    assert duplicate.deduplicated is True
+    assert duplicate.source_id == first.source_id
+    assert forced.deduplicated is False
+    assert forced.source_id != first.source_id
+    assert [source.version for source in store.sources] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_remember_file_rejects_unsupported_metadata_and_oversize() -> None:
+    with pytest.raises(TextFileLoadError, match="Unsupported"):
+        prepare_text_file_content("data.json", b"{}")
+
+    with pytest.raises(SofiasMemoryError) as metadata_error:
+        parse_metadata_json("[1, 2, 3]")
+    assert metadata_error.value.status_code == 400
+
+    upload = UploadFile(filename="large.txt", file=cast(object, _BytesFile(b"abcdef")))
+    with pytest.raises(SofiasMemoryError) as size_error:
+        await read_upload_file_bytes(upload, max_bytes=3)
+    assert size_error.value.status_code == 413
+
+
+class _BytesFile:
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+        self._offset = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._content) - self._offset
+        start = self._offset
+        self._offset = min(len(self._content), self._offset + size)
+        return self._content[start : self._offset]

@@ -7,11 +7,17 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Protocol, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import DEFAULT_PROMPT_VERSIONS, Settings
-from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType, SourceStatus
+from sofias_memory.domain import (
+    DatasetStatus,
+    PipelineRunStatus,
+    PipelineType,
+    SourceStatus,
+    SummaryTargetType,
+)
 from sofias_memory.infrastructure.postgres.models import (
     Chunk,
     Dataset,
@@ -22,6 +28,7 @@ from sofias_memory.infrastructure.postgres.models import (
     Relation,
     RelationEvidence,
     Source,
+    Summary,
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -46,6 +53,8 @@ COGNIFY_CHUNK_STEP = "chunk_embeddings"
 COGNIFY_RESULT_METRIC_KEY = "cognify_result"
 KNOWLEDGE_EXTRACTION_VERSION = "v1"
 GRAPH_EXTRACTION_PROMPT_VERSION = DEFAULT_PROMPT_VERSIONS["graph_extraction"]
+DOCUMENT_SUMMARY_VERSION = "v1"
+DOCUMENT_SUMMARY_PROMPT_VERSION = DEFAULT_PROMPT_VERSIONS["document_summary"]
 
 
 class EmbeddingClient(Protocol):
@@ -54,6 +63,10 @@ class EmbeddingClient(Protocol):
 
 class KnowledgeExtractionClient(Protocol):
     async def extract(self, chunk_text: str) -> ChunkKnowledgeExtraction: ...
+
+
+class DocumentSummaryClient(Protocol):
+    async def summarize(self, chunk_summaries: Sequence[str]) -> str: ...
 
 
 class DatasetRepositoryForCognify(Protocol):
@@ -66,6 +79,7 @@ class SourceRepositoryForCognify(Protocol):
 
 
 class DocumentRepositoryForCognify(Protocol):
+    async def get_by_id(self, document_id: UUID) -> Document | None: ...
     async def get_for_source_generation(
         self,
         *,
@@ -123,6 +137,20 @@ class PipelineRunRepositoryForCognify(Protocol):
     async def get_by_id(self, run_id: UUID) -> PipelineRun | None: ...
 
 
+class SummaryRepositoryForCognify(Protocol):
+    async def add(self, summary: Summary) -> Summary: ...
+    async def get_by_id(self, summary_id: UUID) -> Summary | None: ...
+    async def get_active_for_target(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+        target_type: SummaryTargetType,
+        target_id: UUID,
+        level: int,
+    ) -> Summary | None: ...
+
+
 class CognifyUnitOfWork(Protocol):
     datasets: DatasetRepositoryForCognify
     sources: SourceRepositoryForCognify
@@ -132,6 +160,7 @@ class CognifyUnitOfWork(Protocol):
     entity_mentions: EntityMentionRepositoryForCognify
     relations: RelationRepositoryForCognify
     relation_evidence: RelationEvidenceRepositoryForCognify
+    summaries: SummaryRepositoryForCognify
     pipeline_runs: PipelineRunRepositoryForCognify
 
     async def __aenter__(self) -> CognifyUnitOfWork: ...
@@ -168,7 +197,8 @@ class CognifySourceWorkItem:
     document_id: UUID
     generation: int
     normalized_text: str | None
-    chunks: tuple[CognifyChunkSnapshot, ...]
+    existing_chunks: tuple[CognifyChunkSnapshot, ...]
+    chunks_to_extract: tuple[CognifyChunkSnapshot, ...]
 
 
 @dataclass(frozen=True)
@@ -178,6 +208,9 @@ class CognifyPreparedSource:
     new_chunks: tuple[TextChunk, ...]
     embeddings: tuple[list[float], ...]
     extractions: tuple[tuple[UUID, ChunkKnowledgeExtraction], ...]
+    document_summary_id: UUID
+    document_summary_text: str
+    document_summary_embedding: list[float]
 
 
 @dataclass(frozen=True)
@@ -196,6 +229,7 @@ class CognifyService:
         *,
         embedding_client: EmbeddingClient,
         knowledge_extraction_client: KnowledgeExtractionClient,
+        document_summary_client: DocumentSummaryClient,
         session_factory: AsyncSessionFactory | None = None,
         unit_of_work_factory: UnitOfWorkFactory | None = None,
     ) -> None:
@@ -204,6 +238,7 @@ class CognifyService:
         self._settings = settings
         self._embedding_client = embedding_client
         self._knowledge_extraction_client = knowledge_extraction_client
+        self._document_summary_client = document_summary_client
         self._unit_of_work_factory = unit_of_work_factory or _postgres_unit_of_work_factory(
             cast(AsyncSessionFactory, session_factory)
         )
@@ -333,17 +368,11 @@ class CognifyService:
             )
             selected: list[UUID] = []
             for source in sources:
-                chunks = await uow.chunks.list_for_source_generation(
-                    source_id=source.id,
-                    generation=dataset.active_generation,
-                )
-                if chunks and all(is_chunk_knowledge_extracted(chunk) for chunk in chunks):
-                    continue
-                if (
-                    chunks
-                    and source.status
-                    in {SourceStatus.ACTIVE, SourceStatus.PENDING, SourceStatus.FAILED}
-                ) or (not chunks and source.status == SourceStatus.PENDING):
+                if source.status in {
+                    SourceStatus.ACTIVE,
+                    SourceStatus.PENDING,
+                    SourceStatus.FAILED,
+                }:
                     selected.append(source.id)
             return selected
 
@@ -367,13 +396,32 @@ class CognifyService:
                 source_id=source.id,
                 generation=dataset.active_generation,
             )
+            document = await uow.documents.get_for_source_generation(
+                source_id=source.id,
+                generation=dataset.active_generation,
+            )
+            if document is None:
+                raise SofiasMemoryError(
+                    code=ErrorCode.INVALID_REQUEST,
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    message="Source has no active normalized document for the dataset generation.",
+                    details={"source_id": str(source.id)},
+                )
+            active_summary = await uow.summaries.get_by_id(
+                document_summary_id(document.id, generation=document.generation)
+            )
+            if (
+                chunks
+                and all(is_chunk_knowledge_extracted(chunk) for chunk in chunks)
+                and (is_document_summary_complete(document, active_summary))
+            ):
+                if source.status != SourceStatus.ACTIVE:
+                    source.status = SourceStatus.ACTIVE
+                    await uow.commit()
+                return None
             chunks_to_extract = tuple(
                 chunk_snapshot(chunk) for chunk in chunks if not is_chunk_knowledge_extracted(chunk)
             )
-            if chunks and not chunks_to_extract:
-                source.status = SourceStatus.ACTIVE
-                await uow.commit()
-                return None
             if source.status == SourceStatus.FAILED and not allow_failed:
                 return None
             if source.status not in {
@@ -382,35 +430,17 @@ class CognifyService:
                 SourceStatus.FAILED,
             }:
                 return None
-            if chunks:
-                document_id = chunks[0].document_id
-                normalized_text: str | None = None
-            else:
-                if source.status != SourceStatus.PENDING:
-                    return None
-                document = await uow.documents.get_for_source_generation(
-                    source_id=source.id,
-                    generation=dataset.active_generation,
-                )
-                if document is None:
-                    raise SofiasMemoryError(
-                        code=ErrorCode.INVALID_REQUEST,
-                        status_code=HTTPStatus.BAD_REQUEST,
-                        message=(
-                            "Source has no active normalized document for the dataset generation."
-                        ),
-                        details={"source_id": str(source.id)},
-                    )
-                document_id = document.id
-                normalized_text = document.normalized_text
+            if not chunks and source.status == SourceStatus.ACTIVE:
+                return None
             source.status = SourceStatus.PROCESSING
             work_item = CognifySourceWorkItem(
                 dataset_id=dataset.id,
                 source_id=source.id,
-                document_id=document_id,
+                document_id=document.id,
                 generation=dataset.active_generation,
-                normalized_text=normalized_text,
-                chunks=chunks_to_extract,
+                normalized_text=document.normalized_text if not chunks else None,
+                existing_chunks=tuple(chunk_snapshot(chunk) for chunk in chunks),
+                chunks_to_extract=chunks_to_extract,
             )
             await uow.commit()
             return work_item
@@ -447,8 +477,9 @@ class CognifyService:
         return sources
 
     async def _prepare_source(self, work_item: CognifySourceWorkItem) -> CognifyPreparedSource:
-        if work_item.chunks:
-            chunk_snapshots = work_item.chunks
+        if work_item.existing_chunks:
+            all_chunk_snapshots = work_item.existing_chunks
+            chunks_to_extract = work_item.chunks_to_extract
             document_tokens = None
             text_chunks: tuple[TextChunk, ...] = ()
             embeddings: tuple[list[float], ...] = ()
@@ -469,11 +500,24 @@ class CognifyService:
                 )
             )
             embeddings = tuple(await self._embed_chunks(text_chunks))
-            chunk_snapshots = tuple(
+            all_chunk_snapshots = tuple(
                 chunk_snapshot_from_text_chunk(chunk, work_item) for chunk in text_chunks
             )
+            chunks_to_extract = all_chunk_snapshots
 
-        extractions = await self._extract_chunk_knowledge(chunk_snapshots)
+        extractions = await self._extract_chunk_knowledge(chunks_to_extract)
+        extractions_by_chunk_id = {
+            chunk.id: extraction
+            for chunk, extraction in zip(chunks_to_extract, extractions, strict=True)
+        }
+        ordered_chunk_summaries = [
+            extraction.summary
+            if (extraction := extractions_by_chunk_id.get(chunk.id)) is not None
+            else chunk_knowledge_summary(chunk)
+            for chunk in sorted(all_chunk_snapshots, key=lambda item: (item.ordinal, item.id))
+        ]
+        document_summary_text = await self._summarize_document(ordered_chunk_summaries)
+        document_summary_embedding = await self._embed_document_summary(document_summary_text)
         return CognifyPreparedSource(
             work_item=work_item,
             document_tokens=document_tokens,
@@ -481,8 +525,14 @@ class CognifyService:
             embeddings=embeddings,
             extractions=tuple(
                 (chunk.id, extraction)
-                for chunk, extraction in zip(chunk_snapshots, extractions, strict=True)
+                for chunk, extraction in zip(chunks_to_extract, extractions, strict=True)
             ),
+            document_summary_id=document_summary_id(
+                work_item.document_id,
+                generation=work_item.generation,
+            ),
+            document_summary_text=document_summary_text,
+            document_summary_embedding=document_summary_embedding,
         )
 
     async def _embed_chunks(self, chunks: Sequence[TextChunk]) -> list[list[float]]:
@@ -510,6 +560,24 @@ class CognifyService:
         except Exception as exc:
             raise DependencyUnavailableError("Knowledge extraction failed.") from exc
 
+    async def _summarize_document(self, chunk_summaries: Sequence[str]) -> str:
+        try:
+            return await self._document_summary_client.summarize(chunk_summaries)
+        except SofiasMemoryError:
+            raise
+        except Exception as exc:
+            raise DependencyUnavailableError("Document summary generation failed.") from exc
+
+    async def _embed_document_summary(self, summary_text: str) -> list[float]:
+        try:
+            embeddings = await self._embedding_client.embed_texts([summary_text])
+        except SofiasMemoryError:
+            raise
+        except Exception as exc:
+            raise DependencyUnavailableError("Embedding provider is unavailable.") from exc
+        self._validate_embeddings(embeddings, expected_count=1)
+        return embeddings[0]
+
     def _validate_embeddings(self, embeddings: list[list[float]], *, expected_count: int) -> None:
         if len(embeddings) != expected_count:
             raise DependencyUnavailableError(
@@ -526,15 +594,12 @@ class CognifyService:
     ) -> CognifyPersistedCounts:
         async with self._unit_of_work_factory() as uow:
             source = await uow.sources.get_by_id(prepared.work_item.source_id)
-            if source is None:
+            document = await uow.documents.get_by_id(prepared.work_item.document_id)
+            if source is None or document is None:
                 raise _snapshot_persistence_error()
 
             if prepared.new_chunks:
-                document = await uow.documents.get_for_source_generation(
-                    source_id=prepared.work_item.source_id,
-                    generation=prepared.work_item.generation,
-                )
-                if document is None or prepared.document_tokens is None:
+                if prepared.document_tokens is None:
                     raise _snapshot_persistence_error()
                 chunks = [
                     chunk_model_from_text_chunk(
@@ -634,6 +699,32 @@ class CognifyService:
                     llm_model=self._settings.llm_model,
                     config_fingerprint=self._settings.config_fingerprint(),
                 )
+
+            summary = await uow.summaries.get_by_id(prepared.document_summary_id)
+            if summary is None:
+                summary = Summary(
+                    id=prepared.document_summary_id,
+                    dataset_id=prepared.work_item.dataset_id,
+                    generation=prepared.work_item.generation,
+                    target_type=SummaryTargetType.DOCUMENT,
+                    target_id=prepared.work_item.document_id,
+                    level=0,
+                    text=prepared.document_summary_text,
+                    embedding=prepared.document_summary_embedding,
+                    is_active=True,
+                )
+                await uow.summaries.add(summary)
+            else:
+                summary.text = prepared.document_summary_text
+                summary.embedding = prepared.document_summary_embedding
+                summary.is_active = True
+            document.metadata_ = document_summary_metadata(
+                document.metadata_,
+                summary_id=summary.id,
+                llm_model=self._settings.llm_model,
+                embedding_model=self._settings.embedding_model,
+                config_fingerprint=self._settings.config_fingerprint(),
+            )
 
             source.status = SourceStatus.ACTIVE
             await uow.commit()
@@ -802,6 +893,42 @@ def chunk_snapshot_from_text_chunk(
     )
 
 
+def document_summary_id(document_id: UUID, *, generation: int) -> UUID:
+    return uuid5(
+        document_id,
+        f"document-summary:{generation}:{DOCUMENT_SUMMARY_PROMPT_VERSION}",
+    )
+
+
+def is_document_summary_complete(document: Document, summary: Summary | None) -> bool:
+    marker = document.metadata_.get("document_summary")
+    expected_id = document_summary_id(document.id, generation=document.generation)
+    return (
+        isinstance(marker, dict)
+        and marker.get("version") == DOCUMENT_SUMMARY_VERSION
+        and marker.get("prompt_version") == DOCUMENT_SUMMARY_PROMPT_VERSION
+        and marker.get("summary_id") == str(expected_id)
+        and summary is not None
+        and summary.id == expected_id
+        and summary.dataset_id == document.dataset_id
+        and summary.generation == document.generation
+        and summary.target_type == SummaryTargetType.DOCUMENT
+        and summary.target_id == document.id
+        and summary.level == 0
+        and summary.is_active
+    )
+
+
+def chunk_knowledge_summary(chunk: CognifyChunkSnapshot) -> str:
+    marker = chunk.metadata.get("knowledge_extraction")
+    if not isinstance(marker, dict):
+        raise _snapshot_persistence_error()
+    summary = marker.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise _snapshot_persistence_error()
+    return summary.strip()
+
+
 def is_chunk_knowledge_extracted(chunk: Chunk | CognifyChunkSnapshot) -> bool:
     marker = (
         chunk.metadata.get("knowledge_extraction")
@@ -829,6 +956,26 @@ def knowledge_extraction_metadata(
         "llm_model": llm_model,
         "config_fingerprint": config_fingerprint,
         "summary": summary,
+    }
+    return metadata
+
+
+def document_summary_metadata(
+    existing: dict[str, object],
+    *,
+    summary_id: UUID,
+    llm_model: str,
+    embedding_model: str,
+    config_fingerprint: str,
+) -> dict[str, object]:
+    metadata = dict(existing)
+    metadata["document_summary"] = {
+        "version": DOCUMENT_SUMMARY_VERSION,
+        "prompt_version": DOCUMENT_SUMMARY_PROMPT_VERSION,
+        "summary_id": str(summary_id),
+        "llm_model": llm_model,
+        "embedding_model": embedding_model,
+        "config_fingerprint": config_fingerprint,
     }
     return metadata
 

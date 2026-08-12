@@ -15,6 +15,7 @@ from sofias_memory.domain import (
     PipelineType,
     SourceKind,
     SourceStatus,
+    SummaryTargetType,
 )
 from sofias_memory.infrastructure.postgres.models import (
     Chunk,
@@ -26,6 +27,7 @@ from sofias_memory.infrastructure.postgres.models import (
     Relation,
     RelationEvidence,
     Source,
+    Summary,
 )
 from sofias_memory.schemas.cognify import CognifyRequest
 from sofias_memory.schemas.knowledge import (
@@ -39,6 +41,9 @@ from sofias_memory.services.cognify import (
     CognifyService,
     CognifyUnitOfWork,
     UnitOfWorkFactory,
+    document_summary_id,
+    document_summary_metadata,
+    is_chunk_knowledge_extracted,
 )
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -98,6 +103,25 @@ class FailingKnowledgeExtractionClient:
         raise ValueError("invalid after repair")
 
 
+class FakeDocumentSummaryClient:
+    def __init__(self, summary: str = "A retrieval-ready document summary.") -> None:
+        self.summary = summary
+        self.calls: list[list[str]] = []
+
+    async def summarize(self, chunk_summaries: Sequence[str]) -> str:
+        self.calls.append(list(chunk_summaries))
+        return self.summary
+
+
+class FailingDocumentSummaryClient:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def summarize(self, chunk_summaries: Sequence[str]) -> str:
+        self.calls.append(list(chunk_summaries))
+        raise ValueError("invalid after repair")
+
+
 class FakeStore:
     def __init__(self) -> None:
         self.datasets: list[Dataset] = []
@@ -108,6 +132,7 @@ class FakeStore:
         self.entity_mentions: list[EntityMention] = []
         self.relations: list[Relation] = []
         self.relation_evidence: list[RelationEvidence] = []
+        self.summaries: list[Summary] = []
         self.pipeline_runs: list[PipelineRun] = []
         self.loaded_datasets: list[Dataset] = []
         self.commits = 0
@@ -143,6 +168,12 @@ class FakeSourceRepository:
 class FakeDocumentRepository:
     def __init__(self, store: FakeStore) -> None:
         self._store = store
+
+    async def get_by_id(self, document_id: UUID) -> Document | None:
+        return next(
+            (document for document in self._store.documents if document.id == document_id),
+            None,
+        )
 
     async def get_for_source_generation(
         self,
@@ -284,6 +315,44 @@ class FakePipelineRunRepository:
         return next((run for run in self._store.pipeline_runs if run.id == run_id), None)
 
 
+class FakeSummaryRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def add(self, summary: Summary) -> Summary:
+        self._store.summaries.append(summary)
+        return summary
+
+    async def get_by_id(self, summary_id: UUID) -> Summary | None:
+        return next(
+            (summary for summary in self._store.summaries if summary.id == summary_id),
+            None,
+        )
+
+    async def get_active_for_target(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+        target_type: SummaryTargetType,
+        target_id: UUID,
+        level: int,
+    ) -> Summary | None:
+        return next(
+            (
+                summary
+                for summary in self._store.summaries
+                if summary.dataset_id == dataset_id
+                and summary.generation == generation
+                and summary.target_type == target_type
+                and summary.target_id == target_id
+                and summary.level == level
+                and summary.is_active
+            ),
+            None,
+        )
+
+
 class FakeUnitOfWork:
     def __init__(self, store: FakeStore) -> None:
         self.datasets = FakeDatasetRepository(store)
@@ -294,6 +363,7 @@ class FakeUnitOfWork:
         self.entity_mentions = FakeEntityMentionRepository(store)
         self.relations = FakeRelationRepository(store)
         self.relation_evidence = FakeRelationEvidenceRepository(store)
+        self.summaries = FakeSummaryRepository(store)
         self.pipeline_runs = FakePipelineRunRepository(store)
         self._store = store
 
@@ -319,6 +389,9 @@ def service_for(
     knowledge_client: (
         FakeKnowledgeExtractionClient | FailingKnowledgeExtractionClient | None
     ) = None,
+    document_summary_client: (
+        FakeDocumentSummaryClient | FailingDocumentSummaryClient | None
+    ) = None,
 ) -> CognifyService:
     def create_uow() -> CognifyUnitOfWork:
         return cast(CognifyUnitOfWork, FakeUnitOfWork(store))
@@ -327,6 +400,7 @@ def service_for(
         make_settings(tmp_path),
         embedding_client=embedding_client,
         knowledge_extraction_client=knowledge_client or FakeKnowledgeExtractionClient(),
+        document_summary_client=document_summary_client or FakeDocumentSummaryClient(),
         unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
     )
 
@@ -372,6 +446,41 @@ def seed_pending_source(store: FakeStore, text: str) -> tuple[Dataset, Source, D
     store.sources.append(source)
     store.documents.append(document)
     return dataset, source, document
+
+
+def mark_chunk_knowledge_complete(chunk: Chunk, summary: str = "Existing chunk summary.") -> None:
+    chunk.metadata_ = {
+        **chunk.metadata_,
+        "knowledge_extraction": {
+            "version": KNOWLEDGE_EXTRACTION_VERSION,
+            "prompt_version": GRAPH_EXTRACTION_PROMPT_VERSION,
+            "summary": summary,
+        },
+    }
+
+
+def seed_document_summary(store: FakeStore, document: Document) -> Summary:
+    summary_id = document_summary_id(document.id, generation=document.generation)
+    summary = Summary(
+        id=summary_id,
+        dataset_id=document.dataset_id,
+        generation=document.generation,
+        target_type=SummaryTargetType.DOCUMENT,
+        target_id=document.id,
+        level=0,
+        text="Existing document summary.",
+        embedding=[0.2] * 3072,
+        is_active=True,
+    )
+    store.summaries.append(summary)
+    document.metadata_ = document_summary_metadata(
+        document.metadata_,
+        summary_id=summary_id,
+        llm_model="gpt-5-mini",
+        embedding_model="text-embedding-3-large",
+        config_fingerprint="existing-fingerprint",
+    )
+    return summary
 
 
 class ExpiringDataset:
@@ -431,6 +540,12 @@ async def test_cognify_processes_pending_source_and_persists_chunks(tmp_path: Pa
     assert all(chunk.source_id == source.id for chunk in store.chunks)
     assert all(len(chunk.embedding) == 3072 for chunk in store.chunks)
     assert all(chunk.lexical == "" for chunk in store.chunks)
+    assert len(store.summaries) == 1
+    assert store.summaries[0].target_type == SummaryTargetType.DOCUMENT
+    assert store.summaries[0].target_id == document.id
+    assert store.summaries[0].level == 0
+    assert len(store.summaries[0].embedding) == 3072
+    assert "document_summary" in document.metadata_
     assert store.pipeline_runs[0].pipeline_type == PipelineType.COGNIFY
     assert store.pipeline_runs[0].status == PipelineRunStatus.SUCCEEDED
     assert "normalized_text" not in store.pipeline_runs[0].input
@@ -512,26 +627,25 @@ async def test_cognify_reexecution_does_not_duplicate_existing_chunks(tmp_path: 
         start_char=0,
         end_char=len(document.normalized_text),
         section_path=[],
-        metadata_={
-            "knowledge_extraction": {
-                "version": KNOWLEDGE_EXTRACTION_VERSION,
-                "prompt_version": GRAPH_EXTRACTION_PROMPT_VERSION,
-            }
-        },
+        metadata_={},
         embedding=[0.1] * 3072,
         lexical="",
         is_active=True,
     )
+    mark_chunk_knowledge_complete(existing_chunk)
     store.chunks.append(existing_chunk)
+    seed_document_summary(store, document)
     source.status = SourceStatus.ACTIVE
     embedding_client = FakeEmbeddingClient()
     knowledge_client = FakeKnowledgeExtractionClient()
+    document_summary_client = FakeDocumentSummaryClient()
 
     result = await service_for(
         tmp_path,
         store,
         embedding_client,
         knowledge_client,
+        document_summary_client,
     ).cognify(CognifyRequest())
 
     assert result.sources_processed == 0
@@ -539,6 +653,7 @@ async def test_cognify_reexecution_does_not_duplicate_existing_chunks(tmp_path: 
     assert store.chunks == [existing_chunk]
     assert embedding_client.calls == []
     assert knowledge_client.calls == []
+    assert document_summary_client.calls == []
 
 
 @pytest.mark.asyncio
@@ -602,7 +717,14 @@ async def test_cognify_enriches_existing_chunks_canonically_and_idempotently(
     )
     embedding_client = FakeEmbeddingClient()
     knowledge_client = FakeKnowledgeExtractionClient(extraction)
-    service = service_for(tmp_path, store, embedding_client, knowledge_client)
+    document_summary_client = FakeDocumentSummaryClient()
+    service = service_for(
+        tmp_path,
+        store,
+        embedding_client,
+        knowledge_client,
+        document_summary_client,
+    )
 
     result = await service.cognify(CognifyRequest())
 
@@ -616,7 +738,8 @@ async def test_cognify_enriches_existing_chunks_canonically_and_idempotently(
     assert all(chunk.metadata_["existing"] == "preserved" for chunk in store.chunks)
     assert all("knowledge_extraction" in chunk.metadata_ for chunk in store.chunks)
     assert source.status == SourceStatus.ACTIVE
-    assert embedding_client.calls == []
+    assert embedding_client.calls == [[document_summary_client.summary]]
+    assert len(store.summaries) == 1
 
     second = await service.cognify(CognifyRequest())
 
@@ -627,6 +750,8 @@ async def test_cognify_enriches_existing_chunks_canonically_and_idempotently(
     assert len(store.entity_mentions) == 4
     assert len(store.relations) == 1
     assert len(store.relation_evidence) == 2
+    assert len(store.summaries) == 1
+    assert len(document_summary_client.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -671,6 +796,128 @@ async def test_cognify_invalid_enrichment_preserves_chunks_and_marks_failure(
     assert store.relation_evidence == []
     assert source.status == SourceStatus.FAILED
     assert store.pipeline_runs[0].status == PipelineRunStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_cognify_adds_only_document_summary_to_sm404_source(tmp_path: Path) -> None:
+    store = FakeStore()
+    _, source, document = seed_pending_source(store, "Knowledge already extracted.")
+    source.status = SourceStatus.ACTIVE
+    chunk = Chunk(
+        id=uuid4(),
+        dataset_id=source.dataset_id,
+        document_id=document.id,
+        source_id=source.id,
+        generation=document.generation,
+        ordinal=0,
+        text=document.normalized_text,
+        content_sha256="d" * 64,
+        token_count=3,
+        start_char=0,
+        end_char=len(document.normalized_text),
+        section_path=[],
+        metadata_={},
+        embedding=[0.1] * 3072,
+        lexical="",
+        is_active=True,
+    )
+    mark_chunk_knowledge_complete(chunk, "Knowledge is already extracted.")
+    store.chunks.append(chunk)
+    embedding_client = FakeEmbeddingClient()
+    knowledge_client = FakeKnowledgeExtractionClient()
+    document_summary_client = FakeDocumentSummaryClient()
+
+    result = await service_for(
+        tmp_path,
+        store,
+        embedding_client,
+        knowledge_client,
+        document_summary_client,
+    ).cognify(CognifyRequest())
+
+    assert result.sources_processed == 1
+    assert result.chunks == result.entities == result.relations == 0
+    assert knowledge_client.calls == []
+    assert document_summary_client.calls == [["Knowledge is already extracted."]]
+    assert embedding_client.calls == [[document_summary_client.summary]]
+    assert len(store.summaries) == 1
+    assert store.summaries[0].id == document_summary_id(
+        document.id,
+        generation=document.generation,
+    )
+    assert source.status == SourceStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_document_summary_failure_does_not_persist_partial_knowledge(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    _, source, document = seed_pending_source(store, "Existing embedded chunk.")
+    source.status = SourceStatus.ACTIVE
+    chunk = Chunk(
+        id=uuid4(),
+        dataset_id=source.dataset_id,
+        document_id=document.id,
+        source_id=source.id,
+        generation=document.generation,
+        ordinal=0,
+        text=document.normalized_text,
+        content_sha256="e" * 64,
+        token_count=3,
+        start_char=0,
+        end_char=len(document.normalized_text),
+        section_path=[],
+        metadata_={},
+        embedding=[0.1] * 3072,
+        lexical="",
+        is_active=True,
+    )
+    store.chunks.append(chunk)
+
+    with pytest.raises(DependencyUnavailableError, match="Document summary"):
+        await service_for(
+            tmp_path,
+            store,
+            FakeEmbeddingClient(),
+            FakeKnowledgeExtractionClient(),
+            FailingDocumentSummaryClient(),
+        ).cognify(CognifyRequest())
+
+    assert chunk.metadata_ == {}
+    assert store.summaries == []
+    assert "document_summary" not in document.metadata_
+    assert source.status == SourceStatus.FAILED
+
+
+def test_knowledge_marker_does_not_depend_on_global_config_fingerprint() -> None:
+    chunk = Chunk(
+        id=uuid4(),
+        dataset_id=uuid4(),
+        document_id=uuid4(),
+        source_id=uuid4(),
+        generation=0,
+        ordinal=0,
+        text="Existing knowledge.",
+        content_sha256="f" * 64,
+        token_count=2,
+        start_char=0,
+        end_char=19,
+        section_path=[],
+        metadata_={
+            "knowledge_extraction": {
+                "version": KNOWLEDGE_EXTRACTION_VERSION,
+                "prompt_version": GRAPH_EXTRACTION_PROMPT_VERSION,
+                "config_fingerprint": "fingerprint-before-document-summary-prompt",
+                "summary": "Existing summary.",
+            }
+        },
+        embedding=[0.1] * 3072,
+        lexical="",
+        is_active=True,
+    )
+
+    assert is_chunk_knowledge_extracted(chunk) is True
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ from sofias_memory.infrastructure.postgres.repositories.relation_evidence import
 )
 from sofias_memory.infrastructure.postgres.repositories.relations import RelationRepository
 from sofias_memory.infrastructure.postgres.repositories.sources import SourceRepository
+from sofias_memory.infrastructure.postgres.repositories.summaries import SummaryRepository
 
 __all__ = [
     "ChunkRepository",
@@ -30,4 +31,5 @@ __all__ = [
     "RelationEvidenceRepository",
     "RelationRepository",
     "SourceRepository",
+    "SummaryRepository",
 ]

@@ -507,12 +507,15 @@ def test_build_config_fingerprint_matches_settings_method() -> None:
     assert build_config_fingerprint(settings) == settings.config_fingerprint()
 
 
-def test_fingerprint_payload_has_schema_version_and_graph_prompt_version() -> None:
+def test_fingerprint_payload_has_schema_version_and_prompt_versions() -> None:
     payload = build_config_fingerprint_payload(make_settings())
 
     assert payload["schema_version"] == FINGERPRINT_SCHEMA_VERSION
     assert "application" not in payload
-    assert payload["prompt_versions"] == {"graph_extraction": "v1"}
+    assert payload["prompt_versions"] == {
+        "document_summary": "v1",
+        "graph_extraction": "v1",
+    }
 
 
 def test_prompt_versions_are_deterministic_when_provided() -> None:

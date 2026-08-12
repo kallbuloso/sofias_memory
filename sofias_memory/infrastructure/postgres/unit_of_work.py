@@ -19,6 +19,7 @@ from sofias_memory.infrastructure.postgres.repositories import (
     RelationEvidenceRepository,
     RelationRepository,
     SourceRepository,
+    SummaryRepository,
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 
@@ -33,6 +34,7 @@ class PostgresUnitOfWork:
         self._rolled_back = False
         self._datasets: DatasetRepository | None = None
         self._sources: SourceRepository | None = None
+        self._summaries: SummaryRepository | None = None
         self._documents: DocumentRepository | None = None
         self._chunks: ChunkRepository | None = None
         self._entities: EntityRepository | None = None
@@ -53,6 +55,7 @@ class PostgresUnitOfWork:
         self._rolled_back = False
         self._datasets = DatasetRepository(session)
         self._sources = SourceRepository(session)
+        self._summaries = SummaryRepository(session)
         self._documents = DocumentRepository(session)
         self._chunks = ChunkRepository(session)
         self._entities = EntityRepository(session)
@@ -89,6 +92,12 @@ class PostgresUnitOfWork:
         if self._sources is None:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._sources
+
+    @property
+    def summaries(self) -> SummaryRepository:
+        if self._summaries is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._summaries
 
     @property
     def documents(self) -> DocumentRepository:
@@ -167,6 +176,7 @@ class PostgresUnitOfWork:
         self._rolled_back = False
         self._datasets = None
         self._sources = None
+        self._summaries = None
         self._documents = None
         self._chunks = None
         self._entities = None

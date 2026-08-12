@@ -26,6 +26,7 @@ GRAPH_EXTRACTION_PROMPT_PATH = (
 DOCUMENT_SUMMARY_PROMPT_PATH = (
     Path(__file__).resolve().parents[1] / "prompts" / "document_summary.v1.md"
 )
+RECALL_RAG_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "recall_rag.v1.md"
 STRUCTURED_OUTPUT_REPAIR_ATTEMPTS = 1
 
 
@@ -181,3 +182,38 @@ class OpenAIDocumentSummaryClient:
         if not isinstance(content, str):
             raise TypeError("structured response content is missing")
         return content
+
+
+class OpenAIRagAnswerClient:
+    """Generate one grounded plain-text answer from retrieved chunk context."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._model = settings.llm_model
+        self._prompt = RECALL_RAG_PROMPT_PATH.read_text(encoding="utf-8")
+        self._semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
+        self._client = AsyncOpenAI(
+            api_key=settings.llm_api_key.get_secret_value(),
+            base_url=settings.llm_base_url.rstrip("/"),
+            timeout=settings.llm_timeout_seconds,
+            max_retries=settings.llm_max_retries,
+        )
+
+    async def answer(self, query: str, context: str) -> str:
+        messages: list[ChatCompletionSystemMessageParam | ChatCompletionUserMessageParam] = [
+            {"role": "system", "content": self._prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"<untrusted_context>\n{context}\n</untrusted_context>\n\nQuestion:\n{query}"
+                ),
+            },
+        ]
+        async with self._semaphore:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+            )
+        content = response.choices[0].message.content if response.choices else None
+        if not isinstance(content, str) or not content.strip():
+            raise TypeError("RAG response content is missing")
+        return content.strip()

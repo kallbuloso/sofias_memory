@@ -30,6 +30,7 @@ from sofias_memory.api.routes.health import (
 )
 from sofias_memory.api.routes.health import router as health_router
 from sofias_memory.api.routes.info import router as info_router
+from sofias_memory.api.routes.recall import router as recall_router
 from sofias_memory.api.routes.remember import router as remember_router
 from sofias_memory.config import Settings, load_settings
 from sofias_memory.infrastructure.neo4j import (
@@ -109,6 +110,7 @@ def create_app(
     application.include_router(info_router, prefix="/api/v1")
     application.include_router(remember_router, prefix="/api/v1")
     application.include_router(cognify_router, prefix="/api/v1")
+    application.include_router(recall_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

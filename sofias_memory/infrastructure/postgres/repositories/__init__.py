@@ -11,6 +11,7 @@ from sofias_memory.infrastructure.postgres.repositories.graph_outbox import Grap
 from sofias_memory.infrastructure.postgres.repositories.graph_rebuild import GraphRebuildRepository
 from sofias_memory.infrastructure.postgres.repositories.pipeline_runs import PipelineRunRepository
 from sofias_memory.infrastructure.postgres.repositories.pipeline_steps import PipelineStepRepository
+from sofias_memory.infrastructure.postgres.repositories.queries import QueryRepository
 from sofias_memory.infrastructure.postgres.repositories.relation_evidence import (
     RelationEvidenceRepository,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "GraphRebuildRepository",
     "PipelineRunRepository",
     "PipelineStepRepository",
+    "QueryRepository",
     "RelationEvidenceRepository",
     "RelationRepository",
     "SourceRepository",

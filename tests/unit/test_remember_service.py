@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from docx import Document as WordDocument
 from fastapi import UploadFile
+from pypdf import PdfWriter
 
 from sofias_memory.api.errors import SofiasMemoryError
 from sofias_memory.api.middleware import API_KEY_HEADER
@@ -17,9 +20,11 @@ from sofias_memory.domain import DatasetStatus, PipelineRunStatus, SourceKind, S
 from sofias_memory.infrastructure.postgres.models import Dataset, Document, PipelineRun, Source
 from sofias_memory.loaders.text import (
     CSV_FILE_MIME_TYPE,
+    DOCX_FILE_MIME_TYPE,
     HTML_FILE_MIME_TYPE,
     JSON_FILE_MIME_TYPE,
     MARKDOWN_FILE_MIME_TYPE,
+    PDF_FILE_MIME_TYPE,
     TEXT_FILE_MIME_TYPE,
     TextFileLoadError,
     prepare_text_file_content,
@@ -162,6 +167,94 @@ def remember_request(
         wait=True,
         force=force,
     )
+
+
+def make_text_pdf(*page_texts: str) -> bytes:
+    objects: list[bytes] = []
+    page_object_numbers: list[int] = []
+    content_object_numbers: list[int] = []
+    font_object_number = 3 + (len(page_texts) * 2)
+
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objects.append(b"")
+    for page_text in page_texts:
+        page_object_number = len(objects) + 1
+        content_object_number = page_object_number + 1
+        page_object_numbers.append(page_object_number)
+        content_object_numbers.append(content_object_number)
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 {font_object_number} 0 R >> >> "
+                f"/Contents {content_object_number} 0 R >>"
+            ).encode("ascii")
+        )
+        stream = f"BT /F1 12 Tf 72 720 Td ({pdf_literal(page_text)}) Tj ET".encode("ascii")
+        objects.append(
+            b"<< /Length "
+            + str(len(stream)).encode("ascii")
+            + b" >>\nstream\n"
+            + stream
+            + b"\nendstream"
+        )
+
+    kids = " ".join(f"{page_number} 0 R" for page_number in page_object_numbers)
+    objects[1] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_object_numbers)} >>".encode(
+        "ascii"
+    )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    return render_pdf_objects(objects)
+
+
+def pdf_literal(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def render_pdf_objects(objects: list[bytes]) -> bytes:
+    chunks = [b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"]
+    offsets = [0]
+    offset = len(chunks[0])
+    for index, body in enumerate(objects, start=1):
+        obj = f"{index} 0 obj\n".encode("ascii") + body + b"\nendobj\n"
+        offsets.append(offset)
+        chunks.append(obj)
+        offset += len(obj)
+    xref_offset = offset
+    xref = [f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii")]
+    xref.extend(f"{object_offset:010d} 00000 n \n".encode("ascii") for object_offset in offsets[1:])
+    trailer = (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    ).encode("ascii")
+    return b"".join([*chunks, *xref, trailer])
+
+
+def make_blank_pdf() -> bytes:
+    output = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(output)
+    return output.getvalue()
+
+
+def make_docx_with_content() -> bytes:
+    document = WordDocument()
+    document.add_heading("Heading", level=1)
+    document.add_paragraph("Intro paragraph.")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Name"
+    table.cell(0, 1).text = "Value"
+    table.cell(1, 0).text = "Sofias"
+    table.cell(1, 1).text = "Memory"
+    document.add_paragraph("After table.")
+    output = BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
+def make_empty_docx() -> bytes:
+    output = BytesIO()
+    WordDocument().save(output)
+    return output.getvalue()
 
 
 @pytest.mark.asyncio
@@ -340,6 +433,44 @@ def test_html_file_extracts_visible_text_and_ignores_non_visible_content() -> No
         prepare_text_file_content("empty.html", b"<script>onlyHidden()</script><style>x{}</style>")
 
 
+def test_pdf_file_extracts_textual_pages_and_preserves_original_bytes() -> None:
+    original_bytes = make_text_pdf("First page", "Second page")
+    prepared_file = prepare_text_file_content("document.pdf", original_bytes)
+
+    assert prepared_file.mime_type == PDF_FILE_MIME_TYPE
+    assert prepared_file.storage_extension == ".pdf"
+    assert prepared_file.text.original_bytes == original_bytes
+    assert prepared_file.text.normalized_text == "First page\n\nSecond page"
+
+
+def test_pdf_file_rejects_invalid_or_non_textual_pdf() -> None:
+    with pytest.raises(TextFileLoadError, match="readable textual PDF"):
+        prepare_text_file_content("broken.pdf", b"not a pdf")
+
+    with pytest.raises(TextFileLoadError, match="extractable text"):
+        prepare_text_file_content("blank.pdf", make_blank_pdf())
+
+
+def test_docx_file_extracts_body_text_tables_and_preserves_order() -> None:
+    original_bytes = make_docx_with_content()
+    prepared_file = prepare_text_file_content("document.docx", original_bytes)
+
+    assert prepared_file.mime_type == DOCX_FILE_MIME_TYPE
+    assert prepared_file.storage_extension == ".docx"
+    assert prepared_file.text.original_bytes == original_bytes
+    assert prepared_file.text.normalized_text == (
+        "Heading\nIntro paragraph.\nName\tValue\nSofias\tMemory\nAfter table."
+    )
+
+
+def test_docx_file_rejects_invalid_or_empty_docx() -> None:
+    with pytest.raises(TextFileLoadError, match="readable DOCX"):
+        prepare_text_file_content("broken.docx", b"not a docx")
+
+    with pytest.raises(TextFileLoadError, match="must contain text"):
+        prepare_text_file_content("empty.docx", make_empty_docx())
+
+
 @pytest.mark.asyncio
 async def test_remember_file_deduplicates_and_force_creates_next_version(tmp_path: Path) -> None:
     store = FakeStore()
@@ -384,7 +515,7 @@ async def test_remember_file_deduplicates_and_force_creates_next_version(tmp_pat
 @pytest.mark.asyncio
 async def test_remember_file_rejects_unsupported_metadata_and_oversize() -> None:
     with pytest.raises(TextFileLoadError, match="Unsupported"):
-        prepare_text_file_content("data.pdf", b"%PDF")
+        prepare_text_file_content("data.docm", b"not supported")
 
     with pytest.raises(SofiasMemoryError) as metadata_error:
         parse_metadata_json("[1, 2, 3]")
@@ -432,6 +563,8 @@ async def test_remember_file_route_accepts_new_formats(
             ("payload.json", b'{"ok": true}'),
             ("table.csv", b"a,b\n1,2\n"),
             ("page.html", b"<p>Hello</p>"),
+            ("document.pdf", make_text_pdf("PDF text")),
+            ("document.docx", make_docx_with_content()),
         ):
             response = await client.post(
                 "/api/v1/remember/file",
@@ -441,7 +574,13 @@ async def test_remember_file_route_accepts_new_formats(
             )
             assert response.status_code == 200
 
-    assert seen_mime_types == [JSON_FILE_MIME_TYPE, CSV_FILE_MIME_TYPE, HTML_FILE_MIME_TYPE]
+    assert seen_mime_types == [
+        JSON_FILE_MIME_TYPE,
+        CSV_FILE_MIME_TYPE,
+        HTML_FILE_MIME_TYPE,
+        PDF_FILE_MIME_TYPE,
+        DOCX_FILE_MIME_TYPE,
+    ]
 
 
 class _BytesFile:

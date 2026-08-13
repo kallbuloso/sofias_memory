@@ -7,16 +7,21 @@ import json
 from dataclasses import dataclass
 from hashlib import sha256
 from html.parser import HTMLParser
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import PurePosixPath
 
+from docx import Document as DocxDocument
+from pypdf import PdfReader
+
 CSV_FILE_MIME_TYPE = "text/csv"
+DOCX_FILE_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 HTML_FILE_MIME_TYPE = "text/html"
 JSON_FILE_MIME_TYPE = "application/json"
+PDF_FILE_MIME_TYPE = "application/pdf"
 TEXT_FILE_MIME_TYPE = "text/plain"
 MARKDOWN_FILE_MIME_TYPE = "text/markdown"
 SUPPORTED_TEXT_FILE_EXTENSIONS = frozenset(
-    {".txt", ".md", ".markdown", ".json", ".csv", ".html", ".htm"}
+    {".txt", ".md", ".markdown", ".json", ".csv", ".html", ".htm", ".pdf", ".docx"}
 )
 STORAGE_EXTENSION_BY_SOURCE_EXTENSION = {
     ".txt": ".txt",
@@ -26,6 +31,8 @@ STORAGE_EXTENSION_BY_SOURCE_EXTENSION = {
     ".csv": ".csv",
     ".html": ".html",
     ".htm": ".html",
+    ".pdf": ".pdf",
+    ".docx": ".docx",
 }
 MIME_TYPE_BY_SOURCE_EXTENSION = {
     ".txt": TEXT_FILE_MIME_TYPE,
@@ -35,6 +42,8 @@ MIME_TYPE_BY_SOURCE_EXTENSION = {
     ".csv": CSV_FILE_MIME_TYPE,
     ".html": HTML_FILE_MIME_TYPE,
     ".htm": HTML_FILE_MIME_TYPE,
+    ".pdf": PDF_FILE_MIME_TYPE,
+    ".docx": DOCX_FILE_MIME_TYPE,
 }
 ALLOWED_CONTROL_CHARACTERS = frozenset({"\t", "\n", "\r", "\f"})
 HTML_BLOCK_TAGS = frozenset(
@@ -120,8 +129,13 @@ def prepare_text_file_content(filename: str | None, original_bytes: bytes) -> Pr
     if source_extension not in SUPPORTED_TEXT_FILE_EXTENSIONS:
         raise TextFileLoadError("Unsupported file extension.")
 
-    decoded_text = decode_utf8_text(original_bytes)
-    normalized_text = normalized_text_for_extension(source_extension, decoded_text)
+    if source_extension == ".pdf":
+        normalized_text = extract_pdf_text(original_bytes)
+    elif source_extension == ".docx":
+        normalized_text = extract_docx_text(original_bytes)
+    else:
+        decoded_text = decode_utf8_text(original_bytes)
+        normalized_text = normalized_text_for_extension(source_extension, decoded_text)
 
     if not normalized_text:
         raise TextFileLoadError("File content must not be empty.")
@@ -193,6 +207,84 @@ def normalize_html_text(decoded_text: str) -> str:
     if not text:
         raise TextFileLoadError("HTML file content must contain visible text.")
     return text
+
+
+def extract_pdf_text(original_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(BytesIO(original_bytes), strict=False)
+        if reader.is_encrypted:
+            decrypt_result = reader.decrypt("")
+            if decrypt_result == 0:
+                raise TextFileLoadError(
+                    "PDF file is encrypted and cannot be read without a password."
+                )
+
+        page_texts = [
+            normalize_line_endings(page.extract_text() or "").strip() for page in reader.pages
+        ]
+    except TextFileLoadError:
+        raise
+    except Exception as exc:
+        raise TextFileLoadError("File content must be a readable textual PDF.") from exc
+
+    extracted_text = "\n\n".join(page_text for page_text in page_texts if page_text)
+    if not extracted_text:
+        raise TextFileLoadError("PDF file must contain extractable text.")
+    return extracted_text
+
+
+def extract_docx_text(original_bytes: bytes) -> str:
+    try:
+        document = DocxDocument(BytesIO(original_bytes))
+        blocks = list(iter_docx_text_blocks(document))
+    except Exception as exc:
+        raise TextFileLoadError("File content must be a readable DOCX document.") from exc
+
+    extracted_text = "\n".join(block for block in blocks if block.strip()).strip()
+    if not extracted_text:
+        raise TextFileLoadError("DOCX file must contain text.")
+    return normalize_line_endings(extracted_text)
+
+
+def iter_docx_text_blocks(document: object) -> list[str]:
+    if hasattr(document, "iter_inner_content"):
+        return [
+            text for element in document.iter_inner_content() for text in docx_element_text(element)
+        ]
+
+    paragraphs = getattr(document, "paragraphs", ())
+    tables = getattr(document, "tables", ())
+    return [
+        *(paragraph.text for paragraph in paragraphs if paragraph.text.strip()),
+        *(docx_table_text(table) for table in tables if docx_table_text(table).strip()),
+    ]
+
+
+def docx_element_text(element: object) -> list[str]:
+    rows = getattr(element, "rows", None)
+    if rows is not None:
+        table_text = docx_table_text(element)
+        return [table_text] if table_text.strip() else []
+
+    text = getattr(element, "text", "")
+    if isinstance(text, str) and text.strip():
+        return [text.strip()]
+    return []
+
+
+def docx_table_text(table: object) -> str:
+    rows = getattr(table, "rows", ())
+    row_texts: list[str] = []
+    for row in rows:
+        cells = getattr(row, "cells", ())
+        cell_texts = [normalize_docx_cell_text(cell.text) for cell in cells if cell.text.strip()]
+        if cell_texts:
+            row_texts.append("\t".join(cell_texts))
+    return "\n".join(row_texts)
+
+
+def normalize_docx_cell_text(text: str) -> str:
+    return " ".join(normalize_line_endings(text).split())
 
 
 def prepare_text_bytes(original_bytes: bytes, *, decoded_text: str) -> PreparedText:

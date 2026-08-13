@@ -25,7 +25,11 @@ from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.loaders.text import PreparedText, PreparedTextFile, prepare_text_content
 from sofias_memory.schemas.common import ErrorCode, JSONValue, utc_now
-from sofias_memory.schemas.remember import RememberTextRequest, RememberTextResult
+from sofias_memory.schemas.remember import (
+    RememberTextRequest,
+    RememberTextResult,
+    RememberUrlRequest,
+)
 
 DEFAULT_DATASET_SLUG = "main"
 INGEST_MODE = "ingest"
@@ -91,6 +95,7 @@ class RememberPreparedInput:
     storage_extension: str
     prepared_text: PreparedText
     run_input: dict[str, JSONValue]
+    original_uri: str | None = None
 
 
 class RememberService:
@@ -171,6 +176,34 @@ class RememberService:
                 force=force,
                 mime_type=prepared_file.mime_type,
             ),
+        )
+        return await self._remember_prepared(prepared_input, idempotency_key=idempotency_key)
+
+    async def remember_url(
+        self,
+        request: RememberUrlRequest,
+        *,
+        prepared_file: PreparedTextFile,
+        original_uri: str,
+        idempotency_key: str | None = None,
+    ) -> RememberTextResult:
+        prepared_input = RememberPreparedInput(
+            dataset=request.dataset,
+            name=prepared_file.original_filename,
+            metadata=dict(request.metadata),
+            session_id=request.session_id,
+            mode=request.mode,
+            wait=request.wait,
+            force=request.force,
+            source_kind=SourceKind.URL,
+            mime_type=prepared_file.mime_type,
+            storage_extension=prepared_file.storage_extension,
+            prepared_text=prepared_file.text,
+            run_input=remember_url_run_input(
+                request,
+                original_uri=original_uri,
+            ),
+            original_uri=original_uri,
         )
         return await self._remember_prepared(prepared_input, idempotency_key=idempotency_key)
 
@@ -377,7 +410,7 @@ class RememberService:
             kind=prepared_input.source_kind,
             name=source_name(prepared_input),
             mime_type=prepared_input.mime_type,
-            original_uri=None,
+            original_uri=prepared_input.original_uri,
             storage_uri=storage_uri,
             content_sha256=prepared_input.prepared_text.content_sha256,
             normalized_sha256=prepared_input.prepared_text.normalized_sha256,
@@ -472,6 +505,23 @@ def remember_file_run_input(
         "force": force,
         "source_kind": SourceKind.FILE.value,
         "mime_type": mime_type,
+    }
+
+
+def remember_url_run_input(
+    request: RememberUrlRequest,
+    *,
+    original_uri: str,
+) -> dict[str, JSONValue]:
+    return {
+        "dataset": request.dataset,
+        "url": original_uri,
+        "metadata": request.metadata,
+        "session_id": request.session_id,
+        "mode": request.mode,
+        "wait": request.wait,
+        "force": request.force,
+        "source_kind": SourceKind.URL.value,
     }
 
 

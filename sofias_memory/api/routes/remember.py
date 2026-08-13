@@ -12,8 +12,13 @@ from pydantic import TypeAdapter, ValidationError
 from sofias_memory.api.errors import SofiasMemoryError, current_request_id
 from sofias_memory.lifespan import app_postgres_session_factory, app_settings
 from sofias_memory.loaders.text import TextFileLoadError, prepare_text_file_content
+from sofias_memory.loaders.url import fetch_https_url
 from sofias_memory.schemas.common import ErrorCode, JSONValue, ResponseMeta, SuccessEnvelope
-from sofias_memory.schemas.remember import RememberTextRequest, RememberTextResult
+from sofias_memory.schemas.remember import (
+    RememberTextRequest,
+    RememberTextResult,
+    RememberUrlRequest,
+)
 from sofias_memory.services.remember import RememberService
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
@@ -34,6 +39,42 @@ async def remember_text(
         session_factory=app_postgres_session_factory(request.app),
     )
     result = await service.remember_text(payload, idempotency_key=idempotency_key)
+    return SuccessEnvelope[RememberTextResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.post("/remember/url", response_model=SuccessEnvelope[RememberTextResult])
+async def remember_url(
+    payload: RememberUrlRequest,
+    request: Request,
+    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
+) -> SuccessEnvelope[RememberTextResult]:
+    settings = app_settings(request.app)
+    fetched = await fetch_https_url(
+        payload.url,
+        max_bytes=settings.max_source_size_mb * 1024 * 1024,
+    )
+    try:
+        prepared_file = prepare_text_file_content(fetched.filename, fetched.body)
+    except TextFileLoadError as exc:
+        raise SofiasMemoryError(
+            code=ErrorCode.INVALID_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
+            message=str(exc),
+        ) from exc
+
+    service = RememberService(
+        settings,
+        session_factory=app_postgres_session_factory(request.app),
+    )
+    result = await service.remember_url(
+        payload,
+        prepared_file=prepared_file,
+        original_uri=fetched.requested_url,
+        idempotency_key=idempotency_key,
+    )
     return SuccessEnvelope[RememberTextResult](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),

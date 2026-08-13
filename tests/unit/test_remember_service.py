@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from io import BytesIO
 from pathlib import Path
 from typing import cast
@@ -29,7 +30,12 @@ from sofias_memory.loaders.text import (
     TextFileLoadError,
     prepare_text_file_content,
 )
-from sofias_memory.schemas.remember import RememberTextRequest, RememberTextResult
+from sofias_memory.loaders.url import FetchedUrlContent, fetch_https_url
+from sofias_memory.schemas.remember import (
+    RememberTextRequest,
+    RememberTextResult,
+    RememberUrlRequest,
+)
 from sofias_memory.services.remember import RememberService, RememberUnitOfWork, UnitOfWorkFactory
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -581,6 +587,287 @@ async def test_remember_file_route_accepts_new_formats(
         PDF_FILE_MIME_TYPE,
         DOCX_FILE_MIME_TYPE,
     ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_https_url_accepts_supported_content_and_redirects() -> None:
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "/page"})
+        if request.url.path == "/document":
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/pdf"},
+                content=b"%PDF-placeholder",
+            )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            content=b"<h1>Hello</h1>",
+        )
+
+    fetched = await fetch_https_url(
+        "https://example.com/start#fragment",
+        max_bytes=1024,
+        transport=httpx.MockTransport(handler),
+        resolver=public_resolver,
+    )
+    pdf_fetched = await fetch_https_url(
+        "https://example.com/document",
+        max_bytes=1024,
+        transport=httpx.MockTransport(handler),
+        resolver=public_resolver,
+    )
+
+    assert requests[:2] == ["https://example.com/start", "https://example.com/page"]
+    assert fetched.requested_url == "https://example.com/start"
+    assert fetched.filename == "page.html"
+    assert fetched.media_type == HTML_FILE_MIME_TYPE
+    assert fetched.body == b"<h1>Hello</h1>"
+    assert pdf_fetched.filename == "document.pdf"
+    assert pdf_fetched.media_type == PDF_FILE_MIME_TYPE
+
+
+@pytest.mark.asyncio
+async def test_fetch_https_url_blocks_ssrf_and_unsafe_redirects() -> None:
+    async def redirect_to_private(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(302, headers={"Location": "https://private.example/page"})
+
+    async def redirect_to_http(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(302, headers={"Location": "http://example.com/page"})
+
+    async def redirect_loop(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(302, headers={"Location": "/loop"})
+
+    with pytest.raises(SofiasMemoryError, match="HTTPS"):
+        await fetch_https_url(
+            "http://example.com/page",
+            max_bytes=1024,
+            transport=httpx.MockTransport(redirect_to_http),
+            resolver=public_resolver,
+        )
+    with pytest.raises(SofiasMemoryError, match="credentials"):
+        await fetch_https_url(
+            "https://user:pass@example.com/page",
+            max_bytes=1024,
+            transport=httpx.MockTransport(redirect_to_http),
+            resolver=public_resolver,
+        )
+    with pytest.raises(SofiasMemoryError, match="blocked network"):
+        await fetch_https_url(
+            "https://10.0.0.1/page",
+            max_bytes=1024,
+            transport=httpx.MockTransport(redirect_to_http),
+            resolver=private_resolver,
+        )
+    with pytest.raises(SofiasMemoryError, match="blocked network"):
+        await fetch_https_url(
+            "https://example.com/page",
+            max_bytes=1024,
+            transport=httpx.MockTransport(redirect_to_private),
+            resolver=resolver_blocking_private_hostname,
+        )
+    with pytest.raises(SofiasMemoryError, match="HTTPS"):
+        await fetch_https_url(
+            "https://example.com/page",
+            max_bytes=1024,
+            transport=httpx.MockTransport(redirect_to_http),
+            resolver=public_resolver,
+        )
+    with pytest.raises(SofiasMemoryError, match="redirect loop"):
+        await fetch_https_url(
+            "https://example.com/loop",
+            max_bytes=1024,
+            transport=httpx.MockTransport(redirect_loop),
+            resolver=public_resolver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_https_url_enforces_size_and_supported_content_type() -> None:
+    async def content_length_too_large(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/html", "Content-Length": "5"},
+            content=b"short",
+        )
+
+    async def streamed_too_large(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, headers={"Content-Type": "text/html"}, content=b"abcdef")
+
+    async def unsupported_content_type(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, headers={"Content-Type": "application/octet-stream"})
+
+    with pytest.raises(SofiasMemoryError) as content_length_error:
+        await fetch_https_url(
+            "https://example.com/page",
+            max_bytes=4,
+            transport=httpx.MockTransport(content_length_too_large),
+            resolver=public_resolver,
+        )
+    assert content_length_error.value.status_code == 413
+
+    with pytest.raises(SofiasMemoryError) as streaming_error:
+        await fetch_https_url(
+            "https://example.com/page",
+            max_bytes=4,
+            transport=httpx.MockTransport(streamed_too_large),
+            resolver=public_resolver,
+        )
+    assert streaming_error.value.status_code == 413
+
+    with pytest.raises(SofiasMemoryError, match="content type"):
+        await fetch_https_url(
+            "https://example.com/page",
+            max_bytes=1024,
+            transport=httpx.MockTransport(unsupported_content_type),
+            resolver=public_resolver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_remember_url_creates_url_source_and_idempotent_run(tmp_path: Path) -> None:
+    store = FakeStore()
+    service = service_for(tmp_path, store)
+    request = RememberUrlRequest(
+        dataset="main",
+        url="https://example.com/page",
+        metadata={"origin": "unit"},
+        session_id="url-session",
+    )
+    prepared_file = prepare_text_file_content("page.html", b"<h1>Hello URL</h1>")
+
+    first = await service.remember_url(
+        request,
+        prepared_file=prepared_file,
+        original_uri="https://example.com/page",
+        idempotency_key="url-key",
+    )
+    replay = await service.remember_url(
+        request,
+        prepared_file=prepared_file,
+        original_uri="https://example.com/page",
+        idempotency_key="url-key",
+    )
+
+    assert replay == first
+    assert len(store.sources) == 1
+    assert store.sources[0].kind == SourceKind.URL
+    assert store.sources[0].original_uri == "https://example.com/page"
+    assert store.sources[0].mime_type == HTML_FILE_MIME_TYPE
+    assert store.documents[0].normalized_text == "Hello URL"
+
+
+@pytest.mark.asyncio
+async def test_remember_url_idempotency_key_rejects_different_url(tmp_path: Path) -> None:
+    store = FakeStore()
+    service = service_for(tmp_path, store)
+    prepared_file = prepare_text_file_content("page.html", b"<p>Same body</p>")
+    first_request = RememberUrlRequest(dataset="main", url="https://example.com/one")
+    second_request = RememberUrlRequest(dataset="main", url="https://example.com/two")
+
+    await service.remember_url(
+        first_request,
+        prepared_file=prepared_file,
+        original_uri="https://example.com/one",
+        idempotency_key="url-key",
+    )
+
+    with pytest.raises(SofiasMemoryError) as exc_info:
+        await service.remember_url(
+            second_request,
+            prepared_file=prepared_file,
+            original_uri="https://example.com/two",
+            idempotency_key="url-key",
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_remember_url_route_uses_fetcher_loader_and_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_original_uri: list[str] = []
+    seen_mime_types: list[str] = []
+
+    async def fake_fetch(url: str, *, max_bytes: int) -> FetchedUrlContent:
+        assert url == "https://example.com/page#ignored"
+        assert max_bytes > 0
+        return FetchedUrlContent(
+            requested_url="https://example.com/page",
+            final_url="https://example.com/page",
+            filename="page.html",
+            media_type=HTML_FILE_MIME_TYPE,
+            body=b"<h1>Remote</h1>",
+        )
+
+    class FakeRememberService:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def remember_url(self, *args: object, **kwargs: object) -> RememberTextResult:
+            prepared_file = kwargs["prepared_file"]
+            seen_mime_types.append(prepared_file.mime_type)
+            seen_original_uri.append(cast(str, kwargs["original_uri"]))
+            return RememberTextResult(
+                run_id=uuid4(),
+                status=PipelineRunStatus.SUCCEEDED.value,
+                dataset_id=uuid4(),
+                source_id=uuid4(),
+                document_id=uuid4(),
+                content_hash=prepared_file.text.content_sha256,
+                chunks=0,
+                entities=0,
+                relations=0,
+                deduplicated=False,
+            )
+
+    monkeypatch.setattr("sofias_memory.api.routes.remember.fetch_https_url", fake_fetch)
+    monkeypatch.setattr("sofias_memory.api.routes.remember.RememberService", FakeRememberService)
+    app = create_app(make_settings(tmp_path), enable_postgres_readiness=False, enable_neo4j=False)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/v1/remember/url",
+            headers={API_KEY_HEADER: EXPECTED_API_KEY, "Idempotency-Key": "url-route-key"},
+            json={"url": "https://example.com/page#ignored", "metadata": {"origin": "unit"}},
+        )
+
+    assert response.status_code == 200
+    assert seen_original_uri == ["https://example.com/page"]
+    assert seen_mime_types == [HTML_FILE_MIME_TYPE]
+
+
+def public_resolver(host: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    del host, port
+    return [ipaddress.ip_address("93.184.216.34")]
+
+
+def private_resolver(host: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    del host, port
+    return [ipaddress.ip_address("10.0.0.1")]
+
+
+def resolver_blocking_private_hostname(
+    host: str,
+    port: int,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    del port
+    if host == "private.example":
+        return [ipaddress.ip_address("10.0.0.1")]
+    return [ipaddress.ip_address("93.184.216.34")]
 
 
 class _BytesFile:

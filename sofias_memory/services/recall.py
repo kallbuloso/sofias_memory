@@ -20,7 +20,10 @@ from sofias_memory.infrastructure.postgres.repositories.relation_evidence import
     RecalledRelationEvidence,
 )
 from sofias_memory.infrastructure.postgres.repositories.relations import RecalledRelation
-from sofias_memory.infrastructure.postgres.repositories.summaries import RecalledDocumentSummary
+from sofias_memory.infrastructure.postgres.repositories.summaries import (
+    RecalledDocumentSummary,
+    RetrievedDocumentSummary,
+)
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.schemas.common import ErrorCode
@@ -32,6 +35,7 @@ from sofias_memory.schemas.recall import (
     RecallRelation,
     RecallRequest,
     RecallResult,
+    RecallSummaryContextItem,
 )
 
 NO_EVIDENCE_ANSWER = "No sufficient evidence was found in memory to answer this query."
@@ -134,6 +138,15 @@ class SummaryRepositoryForRecall(Protocol):
         document_ids: list[UUID],
     ) -> list[RecalledDocumentSummary]: ...
 
+    async def vector_search_document_summaries(
+        self,
+        *,
+        dataset_ids: list[UUID],
+        query_embedding: list[float],
+        limit: int,
+        filters: RecallFilters,
+    ) -> list[RetrievedDocumentSummary]: ...
+
 
 class RecallUnitOfWork(Protocol):
     datasets: DatasetRepositoryForRecall
@@ -215,6 +228,15 @@ class RecallService:
         query_embedding = await self._embed_query(request.query)
         embedding_ms = elapsed_ms(embedding_started_at)
 
+        if request.mode == "summaries":
+            return await self._recall_summaries(
+                request,
+                datasets=datasets,
+                query_embedding=query_embedding,
+                embedding_ms=embedding_ms,
+                started_at=started_at,
+            )
+
         retrieval_started_at = time.perf_counter()
         vector_results, lexical_results = await asyncio.gather(
             self._vector_search(datasets, query_embedding, request),
@@ -231,7 +253,9 @@ class RecallService:
         graph_hydration = await self._graph_hydration(request, datasets, hits)
         graph_ms = elapsed_ms(graph_started_at)
 
-        context = [context_item_from_hit(hit) for hit in hits]
+        context: list[RecallContextItem | RecallSummaryContextItem] = [
+            context_item_from_hit(hit) for hit in hits
+        ]
         all_references = recall_references(
             hits, graph_hydration.evidence, graph_hydration.relations
         )
@@ -265,13 +289,6 @@ class RecallService:
         )
 
     def _validate_supported_mode(self, request: RecallRequest) -> None:
-        if request.mode == "summaries":
-            raise SofiasMemoryError(
-                code=ErrorCode.INVALID_REQUEST,
-                status_code=HTTPStatus.BAD_REQUEST,
-                message=f"Recall mode '{request.mode}' is not available in this checkpoint.",
-                details={"mode": request.mode},
-            )
         if request.top_k is not None and request.top_k > self._settings.recall_max_top_k:
             raise SofiasMemoryError(
                 code=ErrorCode.INVALID_REQUEST,
@@ -307,6 +324,49 @@ class RecallService:
                 "Embedding provider returned an unexpected vector dimension."
             )
         return embeddings[0]
+
+    async def _recall_summaries(
+        self,
+        request: RecallRequest,
+        *,
+        datasets: list[RecallDatasetSnapshot],
+        query_embedding: list[float],
+        embedding_ms: int,
+        started_at: float,
+    ) -> RecallResult:
+        retrieval_started_at = time.perf_counter()
+        async with self._unit_of_work_factory() as uow:
+            summaries = await uow.summaries.vector_search_document_summaries(
+                dataset_ids=[dataset.id for dataset in datasets],
+                query_embedding=query_embedding,
+                limit=self._effective_top_k(request),
+                filters=request.filters,
+            )
+        retrieval_ms = elapsed_ms(retrieval_started_at)
+        timings_ms = {
+            "embedding": embedding_ms,
+            "retrieval": retrieval_ms,
+            "graph": 0,
+            "generation": 0,
+            "total": elapsed_ms(started_at),
+        }
+        query_id = await self._persist_query_audit(
+            request,
+            datasets=datasets,
+            answer=None,
+            references=[],
+            timings_ms=timings_ms,
+        )
+        return RecallResult(
+            query_id=query_id,
+            mode=request.mode,
+            answer=None,
+            context=[summary_context_item(summary) for summary in summaries],
+            references=[],
+            entities=[],
+            relations=[],
+            timings_ms=timings_ms,
+        )
 
     async def _vector_search(
         self,
@@ -538,6 +598,19 @@ def context_item_from_hit(hit: RecallChunkHit) -> RecallContextItem:
         start_char=hit.start_char,
         end_char=hit.end_char,
         score=hit.score,
+    )
+
+
+def summary_context_item(summary: RetrievedDocumentSummary) -> RecallSummaryContextItem:
+    return RecallSummaryContextItem(
+        summary_id=summary.summary_id,
+        dataset_id=summary.dataset_id,
+        source_id=summary.source_id,
+        source_name=summary.source_name,
+        document_id=summary.document_id,
+        text=summary.text,
+        score=summary.score,
+        url=summary.source_url,
     )
 
 

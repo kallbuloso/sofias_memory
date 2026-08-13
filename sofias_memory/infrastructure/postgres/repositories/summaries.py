@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import Executable, Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sofias_memory.domain import DatasetStatus, SummaryTargetType
-from sofias_memory.infrastructure.postgres.models import Dataset, Summary
+from sofias_memory.domain import DatasetStatus, SourceStatus, SummaryTargetType
+from sofias_memory.infrastructure.postgres.models import Dataset, Document, Source, Summary
+from sofias_memory.schemas.recall import RecallFilters
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,20 @@ class RecalledDocumentSummary:
 
     document_id: UUID
     text: str
+
+
+@dataclass(frozen=True)
+class RetrievedDocumentSummary:
+    """Immutable document summary retrieval snapshot detached from the session."""
+
+    summary_id: UUID
+    dataset_id: UUID
+    source_id: UUID
+    source_name: str
+    source_url: str | None
+    document_id: UUID
+    text: str
+    score: float
 
 
 class SummaryRepository:
@@ -92,4 +107,82 @@ class SummaryRepository:
         return [
             RecalledDocumentSummary(document_id=document_id, text=text)
             for document_id, text in summaries.items()
+        ]
+
+    async def vector_search_document_summaries(
+        self,
+        *,
+        dataset_ids: list[UUID],
+        query_embedding: list[float],
+        limit: int,
+        filters: RecallFilters,
+    ) -> list[RetrievedDocumentSummary]:
+        distance = Summary.embedding.cosine_distance(query_embedding).label("distance")
+        statement = self._base_document_summary_recall_statement(dataset_ids, filters).add_columns(
+            distance
+        )
+        statement = statement.order_by(distance.asc(), Summary.id).limit(limit)
+        return await self._retrieved_document_summaries(cast(Executable, statement))
+
+    def _base_document_summary_recall_statement(
+        self,
+        dataset_ids: list[UUID],
+        filters: RecallFilters,
+    ) -> Select[tuple[UUID, UUID, UUID, str, str | None, UUID, str]]:
+        statement = (
+            select(
+                Summary.id,
+                Summary.dataset_id,
+                Source.id.label("source_id"),
+                Source.name.label("source_name"),
+                Source.original_uri.label("source_url"),
+                Document.id.label("document_id"),
+                Summary.text,
+            )
+            .join(Document, Summary.target_id == Document.id)
+            .join(Source, Document.source_id == Source.id)
+            .join(Dataset, Summary.dataset_id == Dataset.id)
+            .where(
+                Summary.dataset_id.in_(dataset_ids),
+                Summary.target_type == SummaryTargetType.DOCUMENT,
+                Summary.level == 0,
+                Summary.is_active.is_(True),
+                Document.is_active.is_(True),
+                Source.status == SourceStatus.ACTIVE,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Summary.target_id == Document.id,
+                Summary.dataset_id == Dataset.id,
+                Document.dataset_id == Dataset.id,
+                Source.dataset_id == Dataset.id,
+                Summary.generation == Dataset.active_generation,
+                Document.generation == Dataset.active_generation,
+            )
+        )
+        if filters.source_ids:
+            statement = statement.where(Source.id.in_(filters.source_ids))
+        if filters.created_after is not None:
+            statement = statement.where(Source.created_at >= filters.created_after)
+        if filters.created_before is not None:
+            statement = statement.where(Source.created_at <= filters.created_before)
+        if filters.metadata:
+            statement = statement.where(Source.metadata_.contains(filters.metadata))
+        return statement
+
+    async def _retrieved_document_summaries(
+        self,
+        statement: Executable,
+    ) -> list[RetrievedDocumentSummary]:
+        result = await self._session.execute(statement)
+        return [
+            RetrievedDocumentSummary(
+                summary_id=row.id,
+                dataset_id=row.dataset_id,
+                source_id=row.source_id,
+                source_name=row.source_name,
+                source_url=row.source_url,
+                document_id=row.document_id,
+                text=row.text,
+                score=1.0 - float(row.distance),
+            )
+            for row in result
         ]

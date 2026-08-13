@@ -16,7 +16,7 @@ from sofias_memory.api.middleware import API_KEY_HEADER
 from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus
-from sofias_memory.infrastructure.postgres.models import Dataset, Query
+from sofias_memory.infrastructure.postgres.models import Dataset, Query, Summary
 from sofias_memory.infrastructure.postgres.repositories.chunks import (
     ChunkRepository,
     RetrievedChunk,
@@ -26,7 +26,11 @@ from sofias_memory.infrastructure.postgres.repositories.relation_evidence import
     RecalledRelationEvidence,
 )
 from sofias_memory.infrastructure.postgres.repositories.relations import RecalledRelation
-from sofias_memory.infrastructure.postgres.repositories.summaries import RecalledDocumentSummary
+from sofias_memory.infrastructure.postgres.repositories.summaries import (
+    RecalledDocumentSummary,
+    RetrievedDocumentSummary,
+    SummaryRepository,
+)
 from sofias_memory.schemas.recall import RecallFilters, RecallRequest, RecallResult
 from sofias_memory.services.recall import (
     NO_EVIDENCE_ANSWER,
@@ -85,8 +89,12 @@ class FakeStore:
         self.datasets: list[Dataset] = []
         self.vector_results: list[RetrievedChunk] = []
         self.lexical_results: list[RetrievedChunk] = []
+        self.summary_vector_results: list[RetrievedDocumentSummary] = []
         self.queries: list[Query] = []
         self.filters: list[object] = []
+        self.vector_search_calls = 0
+        self.lexical_search_calls = 0
+        self.summary_vector_search_calls: list[dict[str, object]] = []
         self.entities: list[RecalledEntity] = []
         self.relations: list[RecalledRelation] = []
         self.evidence: list[RecalledRelationEvidence] = []
@@ -107,10 +115,12 @@ class FakeRecallChunkRepository:
         self._store = store
 
     async def vector_search(self, **kwargs: object) -> list[RetrievedChunk]:
+        self._store.vector_search_calls += 1
         self._store.filters.append(kwargs["filters"])
         return self._store.vector_results
 
     async def lexical_search(self, **kwargs: object) -> list[RetrievedChunk]:
+        self._store.lexical_search_calls += 1
         self._store.filters.append(kwargs["filters"])
         return self._store.lexical_results
 
@@ -168,6 +178,13 @@ class FakeSummaryRepository:
     ) -> list[RecalledDocumentSummary]:
         ids = set(cast(list[UUID], kwargs["document_ids"]))
         return [summary for summary in self._store.summaries if summary.document_id in ids]
+
+    async def vector_search_document_summaries(
+        self,
+        **kwargs: object,
+    ) -> list[RetrievedDocumentSummary]:
+        self._store.summary_vector_search_calls.append(dict(kwargs))
+        return self._store.summary_vector_results[: cast(int, kwargs["limit"])]
 
 
 class FakeUnitOfWork:
@@ -244,6 +261,24 @@ def retrieved_chunk(dataset_id: UUID, *, chunk_id: UUID | None = None) -> Retrie
         text="Sofias Memory keeps grounded memory.",
         start_char=0,
         end_char=36,
+    )
+
+
+def retrieved_summary(
+    dataset_id: UUID,
+    *,
+    summary_id: UUID | None = None,
+    score: float = 0.91,
+) -> RetrievedDocumentSummary:
+    return RetrievedDocumentSummary(
+        summary_id=summary_id or uuid4(),
+        dataset_id=dataset_id,
+        source_id=uuid4(),
+        source_name="source.txt",
+        source_url="https://example.com/source",
+        document_id=uuid4(),
+        text="Document summary about Sofias Memory.",
+        score=score,
     )
 
 
@@ -324,6 +359,118 @@ def test_postgres_recall_scope_filters_to_active_generation_and_supported_filter
     assert "sources.metadata @>" in rendered
 
 
+def test_summary_recall_scope_filters_document_target_active_generation_and_order() -> None:
+    repository = SummaryRepository(cast(object, AsyncMock()))
+    statement = repository._base_document_summary_recall_statement(
+        [uuid4()],
+        RecallFilters(
+            source_ids=[uuid4()],
+            created_after=datetime(2026, 1, 1, tzinfo=UTC),
+            created_before=datetime(2026, 1, 2, tzinfo=UTC),
+            metadata={"origin": "smoke"},
+        ),
+    )
+    distance = Summary.embedding.cosine_distance([0.1] * 3072).label("distance")
+    rendered = str(statement.add_columns(distance).order_by(distance.asc(), Summary.id).limit(3))
+
+    assert "summaries.target_type" in rendered
+    assert "summaries.level" in rendered
+    assert "summaries.is_active IS true" in rendered
+    assert "documents.is_active IS true" in rendered
+    assert "sources.status" in rendered
+    assert "datasets.status" in rendered
+    assert "summaries.generation = datasets.active_generation" in rendered
+    assert "documents.generation = datasets.active_generation" in rendered
+    assert "sources.metadata @>" in rendered
+    assert "ORDER BY distance ASC, summaries.id" in rendered
+
+
+@pytest.mark.asyncio
+async def test_summaries_recall_uses_summary_vector_search_without_chunks_graph_or_llm(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    first = retrieved_summary(dataset.id, summary_id=UUID("10000000-0000-0000-0000-000000000001"))
+    second = retrieved_summary(
+        dataset.id,
+        summary_id=UUID("10000000-0000-0000-0000-000000000002"),
+        score=0.84,
+    )
+    store.summary_vector_results = [first, second]
+    graph = FakeGraphRecallClient()
+    service, embedding, rag = service_for(tmp_path, store, graph_client=graph)
+    filters = RecallFilters(
+        source_ids=[first.source_id],
+        created_after=datetime(2026, 1, 1, tzinfo=UTC),
+        created_before=datetime(2026, 1, 2, tzinfo=UTC),
+        metadata={"origin": "unit"},
+    )
+
+    result = await service.recall(
+        RecallRequest(
+            query="summary memory",
+            mode="summaries",
+            top_k=1,
+            include_references=True,
+            filters=filters,
+        )
+    )
+
+    assert embedding.calls == [["summary memory"]]
+    assert store.vector_search_calls == 0
+    assert store.lexical_search_calls == 0
+    assert store.summary_vector_search_calls == [
+        {
+            "dataset_ids": [dataset.id],
+            "query_embedding": [0.1] * 3072,
+            "limit": 1,
+            "filters": filters,
+        }
+    ]
+    assert graph.calls == []
+    assert rag.calls == []
+    assert len(result.context) == 1
+    summary_context = result.context[0]
+    assert summary_context.summary_id == first.summary_id
+    assert summary_context.source_id == first.source_id
+    assert summary_context.source_name == first.source_name
+    assert summary_context.document_id == first.document_id
+    assert summary_context.url == first.source_url
+    assert summary_context.text == first.text
+    assert summary_context.score == first.score
+    assert result.answer is None
+    assert result.references == []
+    assert result.entities == []
+    assert result.relations == []
+    assert result.timings_ms["graph"] == 0
+    assert result.timings_ms["generation"] == 0
+    assert store.queries[-1].mode == "summaries"
+    assert store.queries[-1].answer is None
+    assert store.queries[-1].references == {"items": []}
+    assert store.queries[-1].model is None
+
+
+@pytest.mark.asyncio
+async def test_summaries_recall_zero_results_is_stable(tmp_path: Path) -> None:
+    store = FakeStore()
+    seed_dataset(store)
+    service, embedding, rag = service_for(tmp_path, store)
+
+    result = await service.recall(RecallRequest(query="missing", mode="summaries"))
+
+    assert embedding.calls == [["missing"]]
+    assert result.answer is None
+    assert result.context == []
+    assert result.references == []
+    assert result.entities == []
+    assert result.relations == []
+    assert rag.calls == []
+    assert store.vector_search_calls == 0
+    assert store.lexical_search_calls == 0
+    assert len(store.summary_vector_search_calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_chunks_recall_fuses_context_references_filters_and_audits(tmp_path: Path) -> None:
     store = FakeStore()
@@ -383,13 +530,11 @@ async def test_rag_only_context_zero_evidence_and_query_privacy(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_recall_rejects_unavailable_modes_and_top_k(tmp_path: Path) -> None:
+async def test_recall_rejects_top_k_above_configured_maximum(tmp_path: Path) -> None:
     store = FakeStore()
     seed_dataset(store)
     service, _, _ = service_for(tmp_path, store)
 
-    with pytest.raises(SofiasMemoryError, match="not available"):
-        await service.recall(RecallRequest(query="memory", mode="summaries"))
     with pytest.raises(SofiasMemoryError, match="configured maximum"):
         await service.recall(RecallRequest(query="memory", top_k=4))
 

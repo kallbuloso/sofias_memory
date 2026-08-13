@@ -88,6 +88,21 @@ class RecallContextItem(BaseModel):
     score: float
 
 
+class RecallSummaryContextItem(BaseModel):
+    """One retrieved document summary returned as recall context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary_id: UUID
+    dataset_id: UUID
+    source_id: UUID
+    source_name: str
+    document_id: UUID
+    text: str
+    score: float
+    url: str | None
+
+
 class RecallReference(BaseModel):
     """Deterministic provenance reference for a retrieved chunk."""
 
@@ -141,7 +156,7 @@ class RecallResult(BaseModel):
     query_id: UUID
     mode: str
     answer: str | None
-    context: list[RecallContextItem]
+    context: list[RecallContextItem | RecallSummaryContextItem]
     references: list[RecallReference]
     entities: list[RecallEntity] = Field(default_factory=list)
     relations: list[RecallRelation] = Field(default_factory=list)

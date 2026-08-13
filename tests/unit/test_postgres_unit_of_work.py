@@ -12,6 +12,7 @@ from sofias_memory.infrastructure.postgres.models import (
     Document,
     Entity,
     EntityMention,
+    Feedback,
     GraphOutbox,
     PipelineRun,
     PipelineStep,
@@ -25,6 +26,7 @@ from sofias_memory.infrastructure.postgres.repositories import (
     DocumentRepository,
     EntityMentionRepository,
     EntityRepository,
+    FeedbackRepository,
     GraphOutboxRepository,
     PipelineRunRepository,
     PipelineStepRepository,
@@ -91,6 +93,8 @@ def repository_sessions(uow: PostgresUnitOfWork) -> list[object]:
         uow.relation_evidence._session,
         uow.pipeline_runs._session,
         uow.pipeline_steps._session,
+        uow.queries._session,
+        uow.feedback._session,
         uow.graph_outbox._session,
     ]
 
@@ -101,7 +105,7 @@ async def test_unit_of_work_wires_repositories_to_one_shared_session() -> None:
     uow = PostgresUnitOfWork(make_session_factory(fake_session))
 
     async with uow:
-        assert repository_sessions(uow) == [fake_session] * 11
+        assert repository_sessions(uow) == [fake_session] * 13
 
 
 @pytest.mark.asyncio
@@ -186,6 +190,7 @@ async def test_repository_add_flushes_but_never_commits_or_rolls_back() -> None:
         (RelationEvidenceRepository(session), cast(RelationEvidence, object())),
         (PipelineRunRepository(session), cast(PipelineRun, object())),
         (PipelineStepRepository(session), cast(PipelineStep, object())),
+        (FeedbackRepository(session), cast(Feedback, object())),
         (GraphOutboxRepository(session), cast(GraphOutbox, object())),
     ]
 
@@ -267,8 +272,9 @@ async def test_repository_lookup_methods_return_scalar_results() -> None:
     assert await PipelineRunRepository(session).get_by_id(uuid4()) is expected
     assert await PipelineRunRepository(session).get_by_idempotency_key("key") is expected
     assert await PipelineStepRepository(session).get_by_id(uuid4()) is expected
+    assert await FeedbackRepository(session).get_by_id(uuid4()) is expected
     assert await GraphOutboxRepository(session).get_by_id(1) is expected
-    assert fake_session.scalar_calls == 15
+    assert fake_session.scalar_calls == 16
 
 
 @pytest.mark.asyncio

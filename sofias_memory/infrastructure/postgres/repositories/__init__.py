@@ -7,6 +7,7 @@ from sofias_memory.infrastructure.postgres.repositories.entities import EntityRe
 from sofias_memory.infrastructure.postgres.repositories.entity_mentions import (
     EntityMentionRepository,
 )
+from sofias_memory.infrastructure.postgres.repositories.feedback import FeedbackRepository
 from sofias_memory.infrastructure.postgres.repositories.graph_outbox import GraphOutboxRepository
 from sofias_memory.infrastructure.postgres.repositories.graph_rebuild import GraphRebuildRepository
 from sofias_memory.infrastructure.postgres.repositories.pipeline_runs import PipelineRunRepository
@@ -25,6 +26,7 @@ __all__ = [
     "DocumentRepository",
     "EntityMentionRepository",
     "EntityRepository",
+    "FeedbackRepository",
     "GraphOutboxRepository",
     "GraphRebuildRepository",
     "PipelineRunRepository",

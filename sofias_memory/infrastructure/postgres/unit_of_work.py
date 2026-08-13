@@ -13,6 +13,7 @@ from sofias_memory.infrastructure.postgres.repositories import (
     DocumentRepository,
     EntityMentionRepository,
     EntityRepository,
+    FeedbackRepository,
     GraphOutboxRepository,
     PipelineRunRepository,
     PipelineStepRepository,
@@ -45,6 +46,7 @@ class PostgresUnitOfWork:
         self._pipeline_runs: PipelineRunRepository | None = None
         self._pipeline_steps: PipelineStepRepository | None = None
         self._queries: QueryRepository | None = None
+        self._feedback: FeedbackRepository | None = None
         self._graph_outbox: GraphOutboxRepository | None = None
 
     async def __aenter__(self) -> Self:
@@ -67,6 +69,7 @@ class PostgresUnitOfWork:
         self._pipeline_runs = PipelineRunRepository(session)
         self._pipeline_steps = PipelineStepRepository(session)
         self._queries = QueryRepository(session)
+        self._feedback = FeedbackRepository(session)
         self._graph_outbox = GraphOutboxRepository(session)
         return self
 
@@ -157,6 +160,12 @@ class PostgresUnitOfWork:
         return self._queries
 
     @property
+    def feedback(self) -> FeedbackRepository:
+        if self._feedback is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._feedback
+
+    @property
     def graph_outbox(self) -> GraphOutboxRepository:
         if self._graph_outbox is None:
             raise RuntimeError("PostgresUnitOfWork is not active")
@@ -195,4 +204,5 @@ class PostgresUnitOfWork:
         self._pipeline_runs = None
         self._pipeline_steps = None
         self._queries = None
+        self._feedback = None
         self._graph_outbox = None

@@ -27,6 +27,17 @@ class RecalledRelation:
     importance_weight: float
 
 
+@dataclass(frozen=True)
+class RelationEmbeddingCandidate:
+    """Detached relation snapshot for Improve relation embedding."""
+
+    relation_id: UUID
+    source_name: str
+    target_name: str
+    predicate: str
+    description: str
+
+
 class RelationRepository:
     """Persistence operations for canonical directed relations."""
 
@@ -56,6 +67,91 @@ class RelationRepository:
             )
         )
         return cast(Relation | None, result)
+
+    async def list_missing_embedding_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[RelationEmbeddingCandidate]:
+        source_entity = aliased(Entity)
+        target_entity = aliased(Entity)
+        statement = (
+            select(
+                Relation.id,
+                source_entity.name.label("source_name"),
+                target_entity.name.label("target_name"),
+                Relation.predicate,
+                Relation.description,
+            )
+            .join(Dataset, Relation.dataset_id == Dataset.id)
+            .join(source_entity, Relation.source_entity_id == source_entity.id)
+            .join(target_entity, Relation.target_entity_id == target_entity.id)
+            .where(
+                Relation.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                Relation.embedding.is_(None),
+                source_entity.dataset_id == Dataset.id,
+                source_entity.generation == Dataset.active_generation,
+                source_entity.is_active.is_(True),
+                target_entity.dataset_id == Dataset.id,
+                target_entity.generation == Dataset.active_generation,
+                target_entity.is_active.is_(True),
+            )
+            .order_by(Relation.id)
+        )
+        result = await self._session.execute(statement)
+        return [
+            RelationEmbeddingCandidate(
+                relation_id=row.id,
+                source_name=row.source_name,
+                target_name=row.target_name,
+                predicate=row.predicate,
+                description=row.description,
+            )
+            for row in result
+        ]
+
+    async def set_missing_embeddings_for_active_current(
+        self,
+        *,
+        dataset_id: UUID,
+        embeddings_by_relation_id: dict[UUID, list[float]],
+    ) -> int:
+        if not embeddings_by_relation_id:
+            return 0
+
+        source_entity = aliased(Entity)
+        target_entity = aliased(Entity)
+        statement = (
+            select(Relation)
+            .join(Dataset, Relation.dataset_id == Dataset.id)
+            .join(source_entity, Relation.source_entity_id == source_entity.id)
+            .join(target_entity, Relation.target_entity_id == target_entity.id)
+            .where(
+                Relation.id.in_(list(embeddings_by_relation_id)),
+                Relation.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                Relation.embedding.is_(None),
+                source_entity.dataset_id == Dataset.id,
+                source_entity.generation == Dataset.active_generation,
+                source_entity.is_active.is_(True),
+                target_entity.dataset_id == Dataset.id,
+                target_entity.generation == Dataset.active_generation,
+                target_entity.is_active.is_(True),
+            )
+            .order_by(Relation.id)
+        )
+        relations = await self._session.scalars(statement)
+        updated = 0
+        for relation in relations:
+            relation.embedding = embeddings_by_relation_id[relation.id]
+            updated += 1
+        await self._session.flush()
+        return updated
 
     async def list_active_for_recall(
         self,

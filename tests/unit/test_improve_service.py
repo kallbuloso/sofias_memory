@@ -22,6 +22,7 @@ from sofias_memory.infrastructure.postgres.models import (
 )
 from sofias_memory.infrastructure.postgres.models.relation import Relation
 from sofias_memory.infrastructure.postgres.repositories.feedback import UnappliedFeedback
+from sofias_memory.infrastructure.postgres.repositories.relations import RelationEmbeddingCandidate
 from sofias_memory.ports import ProjectionCommand
 from sofias_memory.schemas.improve import ImproveRequest, ImproveResult
 from sofias_memory.services.improve import (
@@ -29,6 +30,7 @@ from sofias_memory.services.improve import (
     ImproveUnitOfWork,
     UnitOfWorkFactory,
     normalize_feedback_score,
+    relation_embedding_text,
     stream_update_weight,
 )
 
@@ -55,9 +57,12 @@ class FakeStore:
         self.datasets: list[Dataset] = []
         self.queries: list[Query] = []
         self.feedback: list[Feedback] = []
+        self.entities: list[Entity] = []
+        self.relations: list[Relation] = []
         self.entities_by_chunk: dict[UUID, list[Entity]] = {}
         self.relations_by_chunk: dict[UUID, list[Relation]] = {}
         self.pipeline_runs: list[PipelineRun] = []
+        self.run_current_steps_on_add: list[str | None] = []
         self.graph_commands: list[ProjectionCommand] = []
         self.committed_operations: list[list[str]] = []
 
@@ -161,6 +166,70 @@ class FakeRelationEvidenceRepository:
         return [relations[relation_id] for relation_id in sorted(relations)]
 
 
+class FakeRelationRepository:
+    def __init__(self, store: FakeStore, operations: list[str]) -> None:
+        self._store = store
+        self._operations = operations
+
+    async def list_missing_embedding_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[RelationEmbeddingCandidate]:
+        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
+        entities_by_id = {entity.id: entity for entity in self._store.entities}
+        candidates: list[RelationEmbeddingCandidate] = []
+        for item in sorted(self._store.relations, key=lambda relation: relation.id):
+            source_entity = entities_by_id.get(item.source_entity_id)
+            target_entity = entities_by_id.get(item.target_entity_id)
+            if (
+                source_entity is None
+                or target_entity is None
+                or item.dataset_id != dataset_id
+                or item.generation != dataset.active_generation
+                or not item.is_active
+                or item.embedding is not None
+                or source_entity.dataset_id != dataset_id
+                or source_entity.generation != dataset.active_generation
+                or not source_entity.is_active
+                or target_entity.dataset_id != dataset_id
+                or target_entity.generation != dataset.active_generation
+                or not target_entity.is_active
+            ):
+                continue
+            candidates.append(
+                RelationEmbeddingCandidate(
+                    relation_id=item.id,
+                    source_name=source_entity.name,
+                    target_name=target_entity.name,
+                    predicate=item.predicate,
+                    description=item.description,
+                )
+            )
+        return candidates
+
+    async def set_missing_embeddings_for_active_current(
+        self,
+        *,
+        dataset_id: UUID,
+        embeddings_by_relation_id: dict[UUID, list[float]],
+    ) -> int:
+        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
+        updated = 0
+        for item in sorted(self._store.relations, key=lambda relation: relation.id):
+            if (
+                item.id in embeddings_by_relation_id
+                and item.dataset_id == dataset_id
+                and item.generation == dataset.active_generation
+                and item.is_active
+                and item.embedding is None
+            ):
+                item.embedding = embeddings_by_relation_id[item.id]
+                updated += 1
+                self._operations.append(f"relation:{item.id}:embedding")
+        return updated
+
+
 class FakeGraphOutboxRepository:
     def __init__(self, store: FakeStore, operations: list[str]) -> None:
         self._store = store
@@ -178,6 +247,7 @@ class FakePipelineRunRepository:
 
     async def add(self, run: PipelineRun) -> PipelineRun:
         self._store.pipeline_runs.append(run)
+        self._store.run_current_steps_on_add.append(run.current_step)
         return run
 
     async def get_by_id(self, run_id: UUID) -> PipelineRun | None:
@@ -191,6 +261,7 @@ class FakeUnitOfWork:
         self.datasets = FakeDatasetRepository(store)
         self.feedback = FakeFeedbackRepository(store, self._operations)
         self.entity_mentions = FakeEntityMentionRepository(store)
+        self.relations = FakeRelationRepository(store, self._operations)
         self.relation_evidence = FakeRelationEvidenceRepository(store)
         self.graph_outbox = FakeGraphOutboxRepository(store, self._operations)
         self.pipeline_runs = FakePipelineRunRepository(store)
@@ -215,19 +286,43 @@ class FakeDrain:
         return type("DrainResult", (), {"processed": self.processed})()
 
 
+class FakeEmbeddingClient:
+    def __init__(self, dimensions: int = 3072) -> None:
+        self.dimensions = dimensions
+        self.calls: list[list[str]] = []
+        self.responses: list[list[float]] | None = None
+        self.failure: Exception | None = None
+
+    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        if self.failure is not None:
+            raise self.failure
+        if self.responses is not None:
+            return self.responses
+        return [[0.25] * self.dimensions for _ in texts]
+
+
 def service_for(
     tmp_path: Path,
     store: FakeStore,
     *,
     drain: FakeDrain | None = None,
-) -> ImproveService:
+) -> tuple[ImproveService, FakeEmbeddingClient, FakeDrain]:
+    embedding_client = FakeEmbeddingClient()
+    resolved_drain = drain or FakeDrain()
+
     def create_uow() -> ImproveUnitOfWork:
         return cast(ImproveUnitOfWork, FakeUnitOfWork(store))
 
-    return ImproveService(
-        make_settings(tmp_path),
-        graph_projection_drain=drain or FakeDrain(),
-        unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
+    return (
+        ImproveService(
+            make_settings(tmp_path),
+            embedding_client=embedding_client,
+            graph_projection_drain=resolved_drain,
+            unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
+        ),
+        embedding_client,
+        resolved_drain,
     )
 
 
@@ -339,6 +434,29 @@ def test_feedback_weight_normalization_and_streaming_formula() -> None:
     assert stream_update_weight(0.333333, 0.5) == 0.35
 
 
+def test_relation_embedding_text_is_deterministic_and_omits_metadata() -> None:
+    candidate = RelationEmbeddingCandidate(
+        relation_id=uuid4(),
+        source_name=" PostgreSQL ",
+        target_name=" Sofias Memory ",
+        predicate="stores",
+        description=" Stores authoritative memory. ",
+    )
+    predicate_only = RelationEmbeddingCandidate(
+        relation_id=uuid4(),
+        source_name="Chunk",
+        target_name="Document",
+        predicate="belongs_to",
+        description=" ",
+    )
+
+    assert (
+        relation_embedding_text(candidate)
+        == "PostgreSQL-›stores: Stores authoritative memory.-›Sofias Memory"
+    )
+    assert relation_embedding_text(predicate_only) == "Chunk-›belongs_to-›Document"
+
+
 @pytest.mark.asyncio
 async def test_answer_and_reference_feedback_resolve_chunk_targets_and_enqueue_updated_weights(
     tmp_path: Path,
@@ -371,8 +489,10 @@ async def test_answer_and_reference_feedback_resolve_chunk_targets_and_enqueue_u
     store.relations_by_chunk = {reference_chunk: [first_relation]}
     drain = FakeDrain(processed=3)
 
-    result = await service_for(tmp_path, store, drain=drain).improve(ImproveRequest())
+    service, embedding_client, _ = service_for(tmp_path, store, drain=drain)
+    result = await service.improve(ImproveRequest())
 
+    assert embedding_client.calls == []
     assert result.feedback_processed == 2
     assert result.feedback_applied == 2
     assert result.feedback_skipped == 0
@@ -401,6 +521,149 @@ async def test_answer_and_reference_feedback_resolve_chunk_targets_and_enqueue_u
     )
     assert any(":applied" in item for item in apply_commit)
     assert any(item.startswith("outbox:entity") for item in apply_commit)
+
+
+@pytest.mark.asyncio
+async def test_relation_embeddings_select_active_current_null_candidates_and_persist_in_order(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store, generation=3)
+    source_entity = entity(dataset.id, generation=3)
+    source_entity.name = "PostgreSQL"
+    target_entity = entity(dataset.id, generation=3)
+    target_entity.name = "Sofias Memory"
+    stale_entity = entity(dataset.id, generation=2)
+    inactive_entity = entity(dataset.id, generation=3)
+    inactive_entity.is_active = False
+    store.entities.extend([source_entity, target_entity, stale_entity, inactive_entity])
+    selected_high_id = relation(dataset.id, source_entity.id, target_entity.id, generation=3)
+    selected_low_id = relation(dataset.id, source_entity.id, target_entity.id, generation=3)
+    selected_high_id.id = UUID("30000000-0000-0000-0000-000000000003")
+    selected_low_id.id = UUID("10000000-0000-0000-0000-000000000001")
+    selected_low_id.predicate = "stores"
+    selected_low_id.description = "Stores authoritative memory."
+    stale_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=2)
+    embedded_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=3)
+    embedded_relation.embedding = [0.9] * 3072
+    inactive_endpoint_relation = relation(
+        dataset.id,
+        inactive_entity.id,
+        target_entity.id,
+        generation=3,
+    )
+    store.relations.extend(
+        [
+            selected_high_id,
+            selected_low_id,
+            stale_relation,
+            embedded_relation,
+            inactive_endpoint_relation,
+        ]
+    )
+    service, embedding_client, drain = service_for(tmp_path, store)
+    embedding_client.responses = [[0.1] * 3072, [0.2] * 3072]
+
+    result = await service.improve(ImproveRequest(stages=["relation_embeddings"]))
+
+    assert result.stages == ["relation_embeddings"]
+    assert result.feedback_processed == 0
+    assert result.feedback_applied == 0
+    assert result.feedback_skipped == 0
+    assert result.entities_updated == 0
+    assert result.relations_updated == 0
+    assert result.relations_embedded == 2
+    assert result.graph_events_enqueued == 0
+    assert result.graph_events_processed == 0
+    assert drain.dataset_ids == []
+    assert embedding_client.calls == [
+        [
+            "PostgreSQL-›stores: Stores authoritative memory.-›Sofias Memory",
+            "PostgreSQL-›uses: Uses projection.-›Sofias Memory",
+        ]
+    ]
+    assert selected_low_id.embedding == [0.1] * 3072
+    assert selected_high_id.embedding == [0.2] * 3072
+    assert stale_relation.embedding is None
+    assert embedded_relation.embedding == [0.9] * 3072
+    assert inactive_endpoint_relation.embedding is None
+
+    rerun = await service.improve(ImproveRequest(stages=["relation_embeddings"]))
+
+    assert rerun.relations_embedded == 0
+    assert len(embedding_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_relation_embedding_provider_validation_and_failure_write_nothing(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    source_entity = entity(dataset.id, generation=0)
+    target_entity = entity(dataset.id, generation=0)
+    store.entities.extend([source_entity, target_entity])
+    target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
+    store.relations.append(target_relation)
+    service, embedding_client, _ = service_for(tmp_path, store)
+    embedding_client.responses = []
+
+    with pytest.raises(Exception, match="invalid response"):
+        await service.improve(ImproveRequest(stages=["relation_embeddings"]))
+
+    assert target_relation.embedding is None
+
+    embedding_client.responses = [[0.1] * 2]
+    with pytest.raises(Exception, match="invalid response"):
+        await service.improve(ImproveRequest(stages=["relation_embeddings"]))
+
+    assert target_relation.embedding is None
+
+    embedding_client.responses = None
+    embedding_client.failure = RuntimeError("secret provider failure")
+    with pytest.raises(Exception, match="unavailable"):
+        await service.improve(ImproveRequest(stages=["relation_embeddings"]))
+
+    assert target_relation.embedding is None
+
+
+@pytest.mark.asyncio
+async def test_omitted_stages_default_to_feedback_weights_then_relation_embeddings(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    chunk_id = uuid4()
+    query = query_for(dataset.id, [chunk_id])
+    store.queries.append(query)
+    store.feedback.append(feedback_for(query.id, target_type="answer", score=1))
+    source_entity = entity(dataset.id, generation=0, weight=0.5)
+    source_entity.name = "A"
+    target_entity = entity(dataset.id, generation=0, weight=0.5)
+    target_entity.name = "B"
+    store.entities.extend([source_entity, target_entity])
+    store.entities_by_chunk[chunk_id] = [source_entity]
+    target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
+    store.relations.append(target_relation)
+    drain = FakeDrain(processed=1)
+    service, embedding_client, _ = service_for(tmp_path, store, drain=drain)
+
+    result = await service.improve(ImproveRequest())
+
+    assert result.stages == ["feedback_weights", "relation_embeddings"]
+    assert result.feedback_processed == 1
+    assert result.entities_updated == 1
+    assert result.relations_embedded == 1
+    assert drain.dataset_ids == [dataset.id]
+    assert embedding_client.calls == [["A-›uses: Uses projection.-›B"]]
+    assert store.run_current_steps_on_add == ["feedback_weights"]
+
+    relation_only_store = FakeStore()
+    seed_dataset(relation_only_store)
+    first_run_service, _, _ = service_for(tmp_path, relation_only_store)
+    await first_run_service.improve(ImproveRequest(stages=["relation_embeddings"]))
+
+    assert relation_only_store.run_current_steps_on_add == ["relation_embeddings"]
 
 
 @pytest.mark.asyncio
@@ -434,7 +697,8 @@ async def test_improve_is_dataset_isolated_and_uses_only_current_active_knowledg
     store.entities_by_chunk[target_chunk] = [active_entity, stale_entity, other_entity]
     store.relations_by_chunk[target_chunk] = [inactive_relation]
 
-    result = await service_for(tmp_path, store).improve(ImproveRequest(dataset="main"))
+    service, _, _ = service_for(tmp_path, store)
+    result = await service.improve(ImproveRequest(dataset="main", stages=["feedback_weights"]))
 
     assert result.feedback_processed == 1
     assert result.entities_updated == 1
@@ -461,8 +725,10 @@ async def test_applied_feedback_is_not_reapplied_and_no_target_feedback_is_consu
     no_target = feedback_for(query.id, target_type="reference", target_id=target_chunk, score=-1)
     store.feedback.extend([already_applied, no_target])
 
-    result = await service_for(tmp_path, store).improve(ImproveRequest())
+    service, embedding_client, _ = service_for(tmp_path, store)
+    result = await service.improve(ImproveRequest(stages=["feedback_weights"]))
 
+    assert embedding_client.calls == []
     assert result.feedback_processed == 1
     assert result.feedback_applied == 0
     assert result.feedback_skipped == 1
@@ -509,6 +775,7 @@ async def test_improve_route_returns_envelope_and_requires_api_key(
                 feedback_skipped=0,
                 entities_updated=1,
                 relations_updated=0,
+                relations_embedded=0,
                 graph_events_enqueued=1,
                 graph_events_processed=1,
             )

@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
-from sofias_memory.api.errors import SofiasMemoryError
+from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.models import Dataset, Entity, PipelineRun, Relation
 from sofias_memory.infrastructure.postgres.repositories.feedback import UnappliedFeedback
+from sofias_memory.infrastructure.postgres.repositories.relations import RelationEmbeddingCandidate
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.ports import ProjectionCommand, entity_upsert_command, relation_upsert_command
@@ -27,7 +28,9 @@ from sofias_memory.services.feedback import (
 from sofias_memory.services.remember import stable_payload_hash
 
 FEEDBACK_WEIGHTS_STAGE = "feedback_weights"
-SUPPORTED_IMPROVE_STAGES = frozenset((FEEDBACK_WEIGHTS_STAGE,))
+RELATION_EMBEDDINGS_STAGE = "relation_embeddings"
+DEFAULT_IMPROVE_STAGES = (FEEDBACK_WEIGHTS_STAGE, RELATION_EMBEDDINGS_STAGE)
+SUPPORTED_IMPROVE_STAGES = frozenset(DEFAULT_IMPROVE_STAGES)
 IMPROVE_RESULT_METRIC_KEY = "improve_result"
 FEEDBACK_WEIGHT_ALPHA = 0.1
 FEEDBACK_WEIGHT_DECIMALS = 4
@@ -60,6 +63,21 @@ class RelationEvidenceRepositoryForImprove(Protocol):
     ) -> list[Relation]: ...
 
 
+class RelationRepositoryForImprove(Protocol):
+    async def list_missing_embedding_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[RelationEmbeddingCandidate]: ...
+
+    async def set_missing_embeddings_for_active_current(
+        self,
+        *,
+        dataset_id: UUID,
+        embeddings_by_relation_id: dict[UUID, list[float]],
+    ) -> int: ...
+
+
 class GraphOutboxRepositoryForImprove(Protocol):
     async def add_projection_command(self, command: ProjectionCommand) -> object: ...
 
@@ -73,6 +91,7 @@ class ImproveUnitOfWork(Protocol):
     datasets: DatasetRepositoryForImprove
     feedback: FeedbackRepositoryForImprove
     entity_mentions: EntityMentionRepositoryForImprove
+    relations: RelationRepositoryForImprove
     relation_evidence: RelationEvidenceRepositoryForImprove
     graph_outbox: GraphOutboxRepositoryForImprove
     pipeline_runs: PipelineRunRepositoryForImprove
@@ -84,6 +103,10 @@ class ImproveUnitOfWork(Protocol):
 
 class GraphProjectionDrain(Protocol):
     async def process_dataset(self, dataset_id: UUID) -> object: ...
+
+
+class EmbeddingClient(Protocol):
+    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]: ...
 
 
 type UnitOfWorkFactory = Callable[[], ImproveUnitOfWork]
@@ -106,6 +129,11 @@ class ImproveFeedbackCounts:
     graph_events_enqueued: int
 
 
+@dataclass(frozen=True)
+class ImproveRelationEmbeddingCounts:
+    relations_embedded: int
+
+
 class ImproveService:
     """Apply durable feedback to authoritative PostgreSQL graph weights."""
 
@@ -113,6 +141,7 @@ class ImproveService:
         self,
         settings: Settings,
         *,
+        embedding_client: EmbeddingClient,
         graph_projection_drain: GraphProjectionDrain,
         session_factory: AsyncSessionFactory | None = None,
         unit_of_work_factory: UnitOfWorkFactory | None = None,
@@ -120,6 +149,7 @@ class ImproveService:
         if unit_of_work_factory is None and session_factory is None:
             raise ValueError("session_factory or unit_of_work_factory is required")
         self._settings = settings
+        self._embedding_client = embedding_client
         self._graph_projection_drain = graph_projection_drain
         self._unit_of_work_factory = unit_of_work_factory or _postgres_unit_of_work_factory(
             cast(AsyncSessionFactory, session_factory)
@@ -136,7 +166,7 @@ class ImproveService:
 
     def _supported_stages(self, request: ImproveRequest) -> list[str]:
         stages = (
-            [FEEDBACK_WEIGHTS_STAGE]
+            list(DEFAULT_IMPROVE_STAGES)
             if request.stages is None
             else [str(stage) for stage in request.stages]
         )
@@ -165,7 +195,7 @@ class ImproveService:
             payload_hash=stable_payload_hash(run_input),
             input=run_input,
             progress=0.0,
-            current_step=FEEDBACK_WEIGHTS_STAGE,
+            current_step=stages[0],
             attempt=1,
             worker_id=None,
             heartbeat_at=None,
@@ -188,21 +218,37 @@ class ImproveService:
         stages: list[str],
     ) -> ImproveResult:
         dataset = await self._load_dataset_snapshot(request.dataset)
-        counts = await self._apply_feedback_weights(dataset)
-        drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
-        graph_events_processed = int(getattr(drain_result, "processed", 0))
+        feedback_counts = ImproveFeedbackCounts(
+            processed=0,
+            applied=0,
+            skipped=0,
+            entities_updated=0,
+            relations_updated=0,
+            graph_events_enqueued=0,
+        )
+        relation_embedding_counts = ImproveRelationEmbeddingCounts(relations_embedded=0)
+        graph_events_processed = 0
+
+        if FEEDBACK_WEIGHTS_STAGE in stages:
+            feedback_counts = await self._apply_feedback_weights(dataset)
+            drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
+            graph_events_processed = int(getattr(drain_result, "processed", 0))
+        if RELATION_EMBEDDINGS_STAGE in stages:
+            relation_embedding_counts = await self._apply_relation_embeddings(dataset)
+
         result = ImproveResult(
             run_id=run_id,
             status=PipelineRunStatus.SUCCEEDED.value,
             dataset_id=dataset.id,
             generation=dataset.active_generation,
             stages=stages,
-            feedback_processed=counts.processed,
-            feedback_applied=counts.applied,
-            feedback_skipped=counts.skipped,
-            entities_updated=counts.entities_updated,
-            relations_updated=counts.relations_updated,
-            graph_events_enqueued=counts.graph_events_enqueued,
+            feedback_processed=feedback_counts.processed,
+            feedback_applied=feedback_counts.applied,
+            feedback_skipped=feedback_counts.skipped,
+            entities_updated=feedback_counts.entities_updated,
+            relations_updated=feedback_counts.relations_updated,
+            relations_embedded=relation_embedding_counts.relations_embedded,
+            graph_events_enqueued=feedback_counts.graph_events_enqueued,
             graph_events_processed=graph_events_processed,
         )
         await self._mark_run_succeeded(run_id, result, dataset_id=dataset.id)
@@ -306,6 +352,45 @@ class ImproveService:
                 graph_events_enqueued=graph_events_enqueued,
             )
 
+    async def _apply_relation_embeddings(
+        self,
+        dataset: ImproveDatasetSnapshot,
+    ) -> ImproveRelationEmbeddingCounts:
+        async with self._unit_of_work_factory() as uow:
+            candidates = await uow.relations.list_missing_embedding_candidates(
+                dataset_id=dataset.id,
+            )
+
+        if not candidates:
+            return ImproveRelationEmbeddingCounts(relations_embedded=0)
+
+        texts = [relation_embedding_text(candidate) for candidate in candidates]
+        try:
+            embeddings = await self._embedding_client.embed_texts(texts)
+        except Exception as exc:
+            raise DependencyUnavailableError(
+                message="Relation embedding provider is unavailable.",
+                cause=exc,
+            ) from exc
+
+        validate_relation_embeddings(
+            embeddings,
+            expected_count=len(candidates),
+            expected_dimensions=self._settings.embedding_dimensions,
+        )
+        embeddings_by_relation_id = {
+            candidate.relation_id: list(embedding)
+            for candidate, embedding in zip(candidates, embeddings, strict=True)
+        }
+
+        async with self._unit_of_work_factory() as uow:
+            relations_embedded = await uow.relations.set_missing_embeddings_for_active_current(
+                dataset_id=dataset.id,
+                embeddings_by_relation_id=embeddings_by_relation_id,
+            )
+            await uow.commit()
+            return ImproveRelationEmbeddingCounts(relations_embedded=relations_embedded)
+
     async def _mark_run_succeeded(
         self,
         run_id: UUID,
@@ -362,6 +447,34 @@ def stream_update_weight(
     updated = previous_weight + alpha * (normalized_feedback - previous_weight)
     clamped = max(0.0, min(1.0, float(updated)))
     return round(clamped, FEEDBACK_WEIGHT_DECIMALS)
+
+
+def relation_embedding_text(candidate: RelationEmbeddingCandidate) -> str:
+    source_name = candidate.source_name.strip()
+    target_name = candidate.target_name.strip()
+    predicate = candidate.predicate.strip()
+    description = candidate.description.strip()
+    relationship_text = predicate if not description else f"{predicate}: {description}"
+    return f"{source_name}-›{relationship_text}-›{target_name}"
+
+
+def validate_relation_embeddings(
+    embeddings: Sequence[Sequence[float]],
+    *,
+    expected_count: int,
+    expected_dimensions: int,
+) -> None:
+    if len(embeddings) != expected_count:
+        raise DependencyUnavailableError(
+            message="Relation embedding provider returned an invalid response.",
+            details={"reason": "count_mismatch"},
+        )
+    for embedding in embeddings:
+        if len(embedding) != expected_dimensions:
+            raise DependencyUnavailableError(
+                message="Relation embedding provider returned an invalid response.",
+                details={"reason": "dimension_mismatch"},
+            )
 
 
 def feedback_target_chunk_ids(feedback: UnappliedFeedback) -> list[UUID]:

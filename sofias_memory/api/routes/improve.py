@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from sofias_memory.api.errors import current_request_id
+from sofias_memory.infrastructure.embeddings import OpenAIEmbeddingClient
 from sofias_memory.infrastructure.neo4j import Neo4jProjection
 from sofias_memory.lifespan import (
     app_neo4j_resource,
@@ -35,6 +36,7 @@ async def improve(
     service = ImproveService(
         settings,
         session_factory=session_factory,
+        embedding_client=OpenAIEmbeddingClient(settings),
         graph_projection_drain=GraphOutboxBatchProcessor(
             session_factory=session_factory,
             processor=outbox_processor,

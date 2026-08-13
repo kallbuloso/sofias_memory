@@ -49,5 +49,6 @@ class ImproveResult(BaseModel):
     feedback_skipped: int
     entities_updated: int
     relations_updated: int
+    relations_embedded: int
     graph_events_enqueued: int
     graph_events_processed: int

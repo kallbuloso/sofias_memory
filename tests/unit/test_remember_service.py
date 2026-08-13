@@ -2,23 +2,29 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi import UploadFile
 
 from sofias_memory.api.errors import SofiasMemoryError
+from sofias_memory.api.middleware import API_KEY_HEADER
 from sofias_memory.api.routes.remember import parse_metadata_json, read_upload_file_bytes
+from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, SourceKind, SourceStatus
 from sofias_memory.infrastructure.postgres.models import Dataset, Document, PipelineRun, Source
 from sofias_memory.loaders.text import (
+    CSV_FILE_MIME_TYPE,
+    HTML_FILE_MIME_TYPE,
+    JSON_FILE_MIME_TYPE,
     MARKDOWN_FILE_MIME_TYPE,
     TEXT_FILE_MIME_TYPE,
     TextFileLoadError,
     prepare_text_file_content,
 )
-from sofias_memory.schemas.remember import RememberTextRequest
+from sofias_memory.schemas.remember import RememberTextRequest, RememberTextResult
 from sofias_memory.services.remember import RememberService, RememberUnitOfWork, UnitOfWorkFactory
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -284,6 +290,56 @@ async def test_remember_markdown_preserves_headings_and_removes_nul(tmp_path: Pa
     assert store.documents[0].normalized_text == "# Title\n\nBody text"
 
 
+def test_json_file_is_validated_and_normalized_deterministically() -> None:
+    original_bytes = b'{"z":2,"a":{"b":1},"list":[true,null]}'
+    prepared_file = prepare_text_file_content("payload.json", original_bytes)
+
+    assert prepared_file.mime_type == JSON_FILE_MIME_TYPE
+    assert prepared_file.storage_extension == ".json"
+    assert prepared_file.text.original_bytes == original_bytes
+    assert prepared_file.text.normalized_text == (
+        '{\n  "a": {\n    "b": 1\n  },\n  "list": [\n    true,\n    null\n  ],\n  "z": 2\n}\n'
+    )
+
+    with pytest.raises(TextFileLoadError, match="valid JSON"):
+        prepare_text_file_content("broken.json", b'{"a":')
+
+
+def test_csv_file_is_validated_and_preserved() -> None:
+    original_bytes = b"name,value\r\nSofias,1\r\nMemory,2"
+    prepared_file = prepare_text_file_content("table.csv", original_bytes)
+
+    assert prepared_file.mime_type == CSV_FILE_MIME_TYPE
+    assert prepared_file.storage_extension == ".csv"
+    assert prepared_file.text.original_bytes == original_bytes
+    assert prepared_file.text.normalized_text == "name,value\nSofias,1\nMemory,2"
+
+    with pytest.raises(TextFileLoadError, match="must not be empty"):
+        prepare_text_file_content("empty.csv", b"")
+    with pytest.raises(TextFileLoadError, match="valid CSV"):
+        prepare_text_file_content("broken.csv", b'"unterminated')
+
+
+def test_html_file_extracts_visible_text_and_ignores_non_visible_content() -> None:
+    original_bytes = (
+        b"<html><head><style>.hidden{}</style><script>alert(1)</script></head>"
+        b"<body><h1>Title</h1><p>Hello <strong>world</strong>.</p>"
+        b"<noscript>ignore me</noscript><ul><li>First</li><li>Second</li></ul></body></html>"
+    )
+    prepared_file = prepare_text_file_content("page.htm", original_bytes)
+
+    assert prepared_file.mime_type == HTML_FILE_MIME_TYPE
+    assert prepared_file.storage_extension == ".html"
+    assert prepared_file.text.normalized_text == "Title\nHello world.\nFirst\nSecond"
+
+    html_file = prepare_text_file_content("page.html", b"<div>Visible<br>Text</div>")
+    assert html_file.mime_type == HTML_FILE_MIME_TYPE
+    assert html_file.text.normalized_text == "Visible\nText"
+
+    with pytest.raises(TextFileLoadError, match="visible text"):
+        prepare_text_file_content("empty.html", b"<script>onlyHidden()</script><style>x{}</style>")
+
+
 @pytest.mark.asyncio
 async def test_remember_file_deduplicates_and_force_creates_next_version(tmp_path: Path) -> None:
     store = FakeStore()
@@ -328,7 +384,7 @@ async def test_remember_file_deduplicates_and_force_creates_next_version(tmp_pat
 @pytest.mark.asyncio
 async def test_remember_file_rejects_unsupported_metadata_and_oversize() -> None:
     with pytest.raises(TextFileLoadError, match="Unsupported"):
-        prepare_text_file_content("data.json", b"{}")
+        prepare_text_file_content("data.pdf", b"%PDF")
 
     with pytest.raises(SofiasMemoryError) as metadata_error:
         parse_metadata_json("[1, 2, 3]")
@@ -338,6 +394,54 @@ async def test_remember_file_rejects_unsupported_metadata_and_oversize() -> None
     with pytest.raises(SofiasMemoryError) as size_error:
         await read_upload_file_bytes(upload, max_bytes=3)
     assert size_error.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_remember_file_route_accepts_new_formats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_mime_types: list[str] = []
+
+    class FakeRememberService:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def remember_file(self, **kwargs: object) -> RememberTextResult:
+            prepared_file = kwargs["prepared_file"]
+            seen_mime_types.append(prepared_file.mime_type)
+            return RememberTextResult(
+                run_id=uuid4(),
+                status=PipelineRunStatus.SUCCEEDED.value,
+                dataset_id=uuid4(),
+                source_id=uuid4(),
+                document_id=uuid4(),
+                content_hash=prepared_file.text.content_sha256,
+                chunks=0,
+                entities=0,
+                relations=0,
+                deduplicated=False,
+            )
+
+    monkeypatch.setattr("sofias_memory.api.routes.remember.RememberService", FakeRememberService)
+    app = create_app(make_settings(tmp_path), enable_postgres_readiness=False, enable_neo4j=False)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        for filename, content in (
+            ("payload.json", b'{"ok": true}'),
+            ("table.csv", b"a,b\n1,2\n"),
+            ("page.html", b"<p>Hello</p>"),
+        ):
+            response = await client.post(
+                "/api/v1/remember/file",
+                headers={API_KEY_HEADER: EXPECTED_API_KEY},
+                files={"file": (filename, content, "application/octet-stream")},
+                data={"mode": "ingest", "wait": "true"},
+            )
+            assert response.status_code == 200
+
+    assert seen_mime_types == [JSON_FILE_MIME_TYPE, CSV_FILE_MIME_TYPE, HTML_FILE_MIME_TYPE]
 
 
 class _BytesFile:

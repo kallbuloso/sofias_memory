@@ -7,12 +7,14 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from sofias_memory.domain import DatasetStatus, SourceStatus
 from sofias_memory.infrastructure.postgres.models import (
     Chunk,
     Dataset,
     Document,
+    Entity,
     Relation,
     RelationEvidence,
     Source,
@@ -61,6 +63,54 @@ class RelationEvidenceRepository:
             )
             is not None
         )
+
+    async def list_active_relations_for_chunks(
+        self,
+        *,
+        dataset_id: UUID,
+        chunk_ids: list[UUID],
+    ) -> list[Relation]:
+        if not chunk_ids:
+            return []
+
+        source_entity = aliased(Entity)
+        target_entity = aliased(Entity)
+        statement = (
+            select(Relation)
+            .join(RelationEvidence, RelationEvidence.relation_id == Relation.id)
+            .join(Chunk, RelationEvidence.chunk_id == Chunk.id)
+            .join(Document, Chunk.document_id == Document.id)
+            .join(Source, Chunk.source_id == Source.id)
+            .join(Dataset, Chunk.dataset_id == Dataset.id)
+            .join(source_entity, Relation.source_entity_id == source_entity.id)
+            .join(target_entity, Relation.target_entity_id == target_entity.id)
+            .where(
+                Chunk.id.in_(chunk_ids),
+                Dataset.id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.dataset_id == Dataset.id,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                source_entity.dataset_id == Dataset.id,
+                source_entity.generation == Dataset.active_generation,
+                source_entity.is_active.is_(True),
+                target_entity.dataset_id == Dataset.id,
+                target_entity.generation == Dataset.active_generation,
+                target_entity.is_active.is_(True),
+                Chunk.dataset_id == Dataset.id,
+                Chunk.generation == Dataset.active_generation,
+                Chunk.is_active.is_(True),
+                Document.dataset_id == Dataset.id,
+                Document.generation == Dataset.active_generation,
+                Document.is_active.is_(True),
+                Source.dataset_id == Dataset.id,
+                Source.status == SourceStatus.ACTIVE,
+            )
+            .order_by(Relation.id)
+        )
+        result = await self._session.scalars(statement)
+        relations_by_id = {relation.id: relation for relation in result}
+        return [relations_by_id[relation_id] for relation_id in sorted(relations_by_id)]
 
     async def list_active_for_recall(
         self,

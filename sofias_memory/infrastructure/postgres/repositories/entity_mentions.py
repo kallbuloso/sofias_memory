@@ -7,7 +7,15 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sofias_memory.infrastructure.postgres.models import EntityMention
+from sofias_memory.domain import DatasetStatus, SourceStatus
+from sofias_memory.infrastructure.postgres.models import (
+    Chunk,
+    Dataset,
+    Document,
+    Entity,
+    EntityMention,
+    Source,
+)
 
 
 class EntityMentionRepository:
@@ -33,3 +41,41 @@ class EntityMentionRepository:
             )
             is not None
         )
+
+    async def list_active_entities_for_chunks(
+        self,
+        *,
+        dataset_id: UUID,
+        chunk_ids: list[UUID],
+    ) -> list[Entity]:
+        if not chunk_ids:
+            return []
+
+        statement = (
+            select(Entity)
+            .join(EntityMention, EntityMention.entity_id == Entity.id)
+            .join(Chunk, EntityMention.chunk_id == Chunk.id)
+            .join(Document, Chunk.document_id == Document.id)
+            .join(Source, Chunk.source_id == Source.id)
+            .join(Dataset, Chunk.dataset_id == Dataset.id)
+            .where(
+                Chunk.id.in_(chunk_ids),
+                Dataset.id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Entity.dataset_id == Dataset.id,
+                Entity.generation == Dataset.active_generation,
+                Entity.is_active.is_(True),
+                Chunk.dataset_id == Dataset.id,
+                Chunk.generation == Dataset.active_generation,
+                Chunk.is_active.is_(True),
+                Document.dataset_id == Dataset.id,
+                Document.generation == Dataset.active_generation,
+                Document.is_active.is_(True),
+                Source.dataset_id == Dataset.id,
+                Source.status == SourceStatus.ACTIVE,
+            )
+            .order_by(Entity.id)
+        )
+        result = await self._session.scalars(statement)
+        entities_by_id = {entity.id: entity for entity in result}
+        return [entities_by_id[entity_id] for entity_id in sorted(entities_by_id)]

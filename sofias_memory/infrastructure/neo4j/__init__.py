@@ -37,6 +37,11 @@ from sofias_memory.infrastructure.neo4j.readiness import (
     Neo4jReadinessSnapshot,
     evaluate_neo4j_readiness,
 )
+from sofias_memory.infrastructure.neo4j.recall import (
+    GRAPH_NEIGHBORHOOD_CYPHER,
+    Neo4jGraphRecall,
+    Neo4jGraphRecallRecord,
+)
 from sofias_memory.infrastructure.neo4j.schema import (
     NEO4J_SCHEMA_NAMES,
     NEO4J_SCHEMA_STATEMENTS,
@@ -58,6 +63,7 @@ __all__ = [
     "ENTITY_UPSERT_CYPHER",
     "GLOBAL_CHUNK_CLEANUP_CYPHER",
     "GLOBAL_ENTITY_CLEANUP_CYPHER",
+    "GRAPH_NEIGHBORHOOD_CYPHER",
     "NEO4J_NOT_READY_DETAIL",
     "NEO4J_SCHEMA_NAMES",
     "NEO4J_SCHEMA_STATEMENTS",
@@ -67,6 +73,8 @@ __all__ = [
     "Neo4jReadinessResult",
     "Neo4jReadinessSnapshot",
     "Neo4jProjection",
+    "Neo4jGraphRecall",
+    "Neo4jGraphRecallRecord",
     "Neo4jResource",
     "Neo4jSchemaStatement",
     "ProjectionEndpointMissingError",

@@ -105,6 +105,34 @@ class RecallReference(BaseModel):
     url: str | None
 
 
+class RecallEntity(BaseModel):
+    """Authoritative entity returned by graph recall."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: UUID
+    name: str
+    entity_type: str
+    description: str
+    score: float
+
+
+class RecallRelation(BaseModel):
+    """Authoritative relation/triplet returned by graph recall."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    relation_id: UUID
+    source_entity_id: UUID
+    target_entity_id: UUID
+    predicate: str
+    description: str
+    confidence: float
+    score: float
+    evidence: str | None = None
+    evidence_chunk_id: UUID | None = None
+
+
 class RecallResult(BaseModel):
     """Recall output with raw context, optional answer, and audit identity."""
 
@@ -115,6 +143,6 @@ class RecallResult(BaseModel):
     answer: str | None
     context: list[RecallContextItem]
     references: list[RecallReference]
-    entities: list[object] = Field(default_factory=list)
-    relations: list[object] = Field(default_factory=list)
+    entities: list[RecallEntity] = Field(default_factory=list)
+    relations: list[RecallRelation] = Field(default_factory=list)
     timings_ms: dict[str, int]

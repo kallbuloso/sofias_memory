@@ -21,9 +21,16 @@ from sofias_memory.infrastructure.postgres.repositories.chunks import (
     ChunkRepository,
     RetrievedChunk,
 )
+from sofias_memory.infrastructure.postgres.repositories.entities import RecalledEntity
+from sofias_memory.infrastructure.postgres.repositories.relation_evidence import (
+    RecalledRelationEvidence,
+)
+from sofias_memory.infrastructure.postgres.repositories.relations import RecalledRelation
+from sofias_memory.infrastructure.postgres.repositories.summaries import RecalledDocumentSummary
 from sofias_memory.schemas.recall import RecallFilters, RecallRequest, RecallResult
 from sofias_memory.services.recall import (
     NO_EVIDENCE_ANSWER,
+    GraphRecallRecord,
     RecallService,
     RecallUnitOfWork,
     UnitOfWorkFactory,
@@ -80,6 +87,10 @@ class FakeStore:
         self.lexical_results: list[RetrievedChunk] = []
         self.queries: list[Query] = []
         self.filters: list[object] = []
+        self.entities: list[RecalledEntity] = []
+        self.relations: list[RecalledRelation] = []
+        self.evidence: list[RecalledRelationEvidence] = []
+        self.summaries: list[RecalledDocumentSummary] = []
         self.commits = 0
 
 
@@ -113,11 +124,61 @@ class FakeQueryRepository:
         return query
 
 
+class FakeEntityRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def list_active_for_recall(self, **kwargs: object) -> list[RecalledEntity]:
+        ids = set(cast(list[UUID], kwargs["entity_ids"]))
+        return [entity for entity in self._store.entities if entity.id in ids]
+
+
+class FakeRelationRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def list_active_for_recall(self, **kwargs: object) -> list[RecalledRelation]:
+        ids = set(cast(list[UUID], kwargs["relation_ids"]))
+        return [relation for relation in self._store.relations if relation.id in ids]
+
+
+class FakeRelationEvidenceRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def list_active_for_recall(self, **kwargs: object) -> list[RecalledRelationEvidence]:
+        self._store.filters.append(kwargs["filters"])
+        ids = set(cast(list[UUID], kwargs["relation_ids"]))
+        filters = cast(RecallFilters, kwargs["filters"])
+        return [
+            evidence
+            for evidence in self._store.evidence
+            if evidence.relation_id in ids
+            and (not filters.source_ids or evidence.source_id in filters.source_ids)
+        ]
+
+
+class FakeSummaryRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def list_active_document_summaries_for_recall(
+        self,
+        **kwargs: object,
+    ) -> list[RecalledDocumentSummary]:
+        ids = set(cast(list[UUID], kwargs["document_ids"]))
+        return [summary for summary in self._store.summaries if summary.document_id in ids]
+
+
 class FakeUnitOfWork:
     def __init__(self, store: FakeStore) -> None:
         self.datasets = FakeDatasetRepository(store)
         self.chunks = FakeRecallChunkRepository(store)
         self.queries = FakeQueryRepository(store)
+        self.entities = FakeEntityRepository(store)
+        self.relations = FakeRelationRepository(store)
+        self.relation_evidence = FakeRelationEvidenceRepository(store)
+        self.summaries = FakeSummaryRepository(store)
         self._store = store
 
     async def __aenter__(self) -> FakeUnitOfWork:
@@ -137,6 +198,7 @@ def service_for(
     settings: Settings | None = None,
     embedding_client: FakeEmbeddingClient | None = None,
     rag_client: FakeRagAnswerClient | None = None,
+    graph_client: object | None = None,
 ) -> tuple[RecallService, FakeEmbeddingClient, FakeRagAnswerClient]:
     embedding = embedding_client or FakeEmbeddingClient()
     rag = rag_client or FakeRagAnswerClient()
@@ -149,6 +211,7 @@ def service_for(
             settings or make_settings(tmp_path),
             embedding_client=embedding,
             rag_answer_client=rag,
+            graph_recall_client=graph_client,  # type: ignore[arg-type]
             unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
         ),
         embedding,
@@ -182,6 +245,31 @@ def retrieved_chunk(dataset_id: UUID, *, chunk_id: UUID | None = None) -> Retrie
         start_char=0,
         end_char=36,
     )
+
+
+class FakeGraphRecallClient:
+    def __init__(self, records: list[GraphRecallRecord] | None = None) -> None:
+        self.records = records or []
+        self.calls: list[dict[str, object]] = []
+
+    async def retrieve(self, **kwargs: object) -> list[GraphRecallRecord]:
+        self.calls.append(dict(kwargs))
+        return self.records
+
+
+class FakeGraphRecord:
+    def __init__(
+        self,
+        *,
+        seed_chunk_id: UUID,
+        seed_entity_id: UUID,
+        neighbor_entity_id: UUID | None = None,
+        relation_id: UUID | None = None,
+    ) -> None:
+        self.seed_chunk_id = seed_chunk_id
+        self.seed_entity_id = seed_entity_id
+        self.neighbor_entity_id = neighbor_entity_id
+        self.relation_id = relation_id
 
 
 def test_recall_request_validation_normalizes_datasets_and_dates() -> None:
@@ -301,9 +389,226 @@ async def test_recall_rejects_unavailable_modes_and_top_k(tmp_path: Path) -> Non
     service, _, _ = service_for(tmp_path, store)
 
     with pytest.raises(SofiasMemoryError, match="not available"):
-        await service.recall(RecallRequest(query="memory", mode="hybrid"))
+        await service.recall(RecallRequest(query="memory", mode="summaries"))
     with pytest.raises(SofiasMemoryError, match="configured maximum"):
         await service.recall(RecallRequest(query="memory", top_k=4))
+
+
+@pytest.mark.asyncio
+async def test_triplets_uses_seed_chunks_graph_ids_and_postgres_hydration(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    high_seed = retrieved_chunk(dataset.id)
+    low_seed = retrieved_chunk(dataset.id)
+    entity_a = UUID("10000000-0000-0000-0000-000000000001")
+    entity_b = UUID("10000000-0000-0000-0000-000000000002")
+    relation_id = UUID("10000000-0000-0000-0000-000000000003")
+    store.vector_results = [high_seed, low_seed]
+    store.lexical_results = [high_seed]
+    store.entities = [
+        RecalledEntity(entity_b, "Neo4j", "Database", "Graph projection.", 0.8),
+        RecalledEntity(entity_a, "PostgreSQL", "Database", "Source of truth.", 1.0),
+    ]
+    store.relations = [
+        RecalledRelation(
+            relation_id,
+            entity_a,
+            entity_b,
+            "projects_to",
+            "Sofias Memory projects graph records.",
+            0.9,
+            0.7,
+        )
+    ]
+    store.evidence = [
+        RecalledRelationEvidence(
+            relation_id=relation_id,
+            chunk_id=high_seed.chunk_id,
+            quote="PostgreSQL is projected to Neo4j.",
+            confidence=0.9,
+            dataset_id=dataset.id,
+            source_id=high_seed.source_id,
+            source_name=high_seed.source_name,
+            source_url=None,
+            document_id=high_seed.document_id,
+            chunk_ordinal=high_seed.ordinal,
+            start_char=0,
+            end_char=32,
+        )
+    ]
+    graph = FakeGraphRecallClient(
+        [
+            FakeGraphRecord(
+                seed_chunk_id=high_seed.chunk_id,
+                seed_entity_id=entity_a,
+                neighbor_entity_id=entity_b,
+                relation_id=relation_id,
+            )
+        ]
+    )
+    service, embedding, rag = service_for(tmp_path, store, graph_client=graph)
+
+    result = await service.recall(RecallRequest(query="graph", mode="triplets"))
+
+    assert embedding.calls == [["graph"]]
+    assert rag.calls == []
+    assert graph.calls[0]["seed_chunk_ids"] == [high_seed.chunk_id, low_seed.chunk_id]
+    assert [entity.entity_id for entity in result.entities] == [entity_a, entity_b]
+    assert result.relations[0].relation_id == relation_id
+    assert result.relations[0].evidence == "PostgreSQL is projected to Neo4j."
+    assert result.references[0].chunk_id == high_seed.chunk_id
+    assert store.queries[-1].mode == "triplets"
+
+
+@pytest.mark.asyncio
+async def test_graph_and_hybrid_generation_and_only_context(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    seed = retrieved_chunk(dataset.id)
+    entity_a = uuid4()
+    entity_b = uuid4()
+    relation_id = uuid4()
+    store.vector_results = [seed]
+    store.entities = [
+        RecalledEntity(entity_a, "Sofias Memory", "System", "Persistent memory.", 1.0),
+        RecalledEntity(entity_b, "Neo4j", "Database", "Graph database.", 0.7),
+    ]
+    store.relations = [
+        RecalledRelation(relation_id, entity_a, entity_b, "uses", "Uses Neo4j.", 0.8, 0.8)
+    ]
+    store.evidence = [
+        RecalledRelationEvidence(
+            relation_id=relation_id,
+            chunk_id=uuid4(),
+            quote="Sofias Memory uses Neo4j as projection.",
+            confidence=0.9,
+            dataset_id=dataset.id,
+            source_id=seed.source_id,
+            source_name=seed.source_name,
+            source_url=None,
+            document_id=seed.document_id,
+            chunk_ordinal=seed.ordinal,
+            start_char=0,
+            end_char=42,
+        )
+    ]
+    store.summaries = [
+        RecalledDocumentSummary(document_id=seed.document_id, text="Document summary.")
+    ]
+    graph = FakeGraphRecallClient(
+        [
+            FakeGraphRecord(
+                seed_chunk_id=seed.chunk_id,
+                seed_entity_id=entity_a,
+                neighbor_entity_id=entity_b,
+                relation_id=relation_id,
+            )
+        ]
+    )
+    service, _, rag = service_for(tmp_path, store, graph_client=graph)
+
+    graph_result = await service.recall(RecallRequest(query="graph?", mode="graph"))
+    hybrid_result = await service.recall(RecallRequest(query="hybrid?", mode="hybrid"))
+    context_only = await service.recall(
+        RecallRequest(query="context?", mode="graph", only_context=True)
+    )
+
+    assert graph_result.answer == "Grounded answer."
+    assert hybrid_result.answer == "Grounded answer."
+    assert context_only.answer is None
+    assert len(rag.calls) == 2
+    assert "[RELATIONS/TRIPLETS]" in rag.calls[0][1]
+    assert "[DOCUMENT SUMMARIES]" in rag.calls[1][1]
+    assert "[GRAPH]" in rag.calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_empty_graph_does_not_call_llm_or_hallucinate(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    service, _, rag = service_for(tmp_path, store, graph_client=FakeGraphRecallClient())
+
+    result = await service.recall(RecallRequest(query="graph?", mode="graph"))
+
+    assert result.answer == NO_EVIDENCE_ANSWER
+    assert result.entities == []
+    assert result.relations == []
+    assert rag.calls == []
+
+
+@pytest.mark.asyncio
+async def test_graph_evidence_respects_source_filters(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    seed = retrieved_chunk(dataset.id)
+    entity_a = uuid4()
+    entity_b = uuid4()
+    relation_id = uuid4()
+    store.vector_results = [seed]
+    store.entities = [
+        RecalledEntity(entity_a, "A", "Concept", "A.", 0.5),
+        RecalledEntity(entity_b, "B", "Concept", "B.", 0.5),
+    ]
+    store.relations = [
+        RecalledRelation(relation_id, entity_a, entity_b, "related", "A to B.", 1.0, 0.5)
+    ]
+    store.evidence = [
+        RecalledRelationEvidence(
+            relation_id=relation_id,
+            chunk_id=uuid4(),
+            quote="Filtered-out quote.",
+            confidence=1.0,
+            dataset_id=dataset.id,
+            source_id=uuid4(),
+            source_name="other.txt",
+            source_url=None,
+            document_id=seed.document_id,
+            chunk_ordinal=0,
+            start_char=0,
+            end_char=19,
+        )
+    ]
+    graph = FakeGraphRecallClient(
+        [
+            FakeGraphRecord(
+                seed_chunk_id=seed.chunk_id,
+                seed_entity_id=entity_a,
+                neighbor_entity_id=entity_b,
+                relation_id=relation_id,
+            )
+        ]
+    )
+    service, _, _ = service_for(tmp_path, store, graph_client=graph)
+
+    result = await service.recall(
+        RecallRequest(
+            query="graph?",
+            mode="triplets",
+            filters=RecallFilters(source_ids=[seed.source_id]),
+        )
+    )
+
+    assert result.relations[0].evidence is None
+    assert {reference.chunk_id for reference in result.references} == {seed.chunk_id}
+
+
+@pytest.mark.asyncio
+async def test_neo4j_failure_is_safe_dependency_error(tmp_path: Path) -> None:
+    class FailingGraphRecallClient:
+        async def retrieve(self, **kwargs: object) -> list[GraphRecallRecord]:
+            raise RuntimeError("bolt://user:secret@example")
+
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    service, _, _ = service_for(tmp_path, store, graph_client=FailingGraphRecallClient())
+
+    with pytest.raises(SofiasMemoryError) as exc_info:
+        await service.recall(RecallRequest(query="graph?", mode="triplets"))
+
+    assert exc_info.value.message == "Neo4j graph recall is unavailable."
+    assert "secret" not in exc_info.value.message
 
 
 @pytest.mark.asyncio
@@ -321,7 +626,7 @@ async def test_recall_route_returns_the_standard_envelope(
             assert request.query == "What is Sofias Memory?"
             return RecallResult(
                 query_id=query_id,
-                mode="chunks",
+                mode=request.mode,
                 answer=None,
                 context=[],
                 references=[],
@@ -335,6 +640,16 @@ async def test_recall_route_returns_the_standard_envelope(
             )
 
     monkeypatch.setattr("sofias_memory.api.routes.recall.RecallService", FakeRecallService)
+    injected_resources: list[object] = []
+
+    def fake_app_neo4j_resource(app: object) -> object:
+        resource = object()
+        injected_resources.append(resource)
+        return resource
+
+    monkeypatch.setattr(
+        "sofias_memory.api.routes.recall.app_neo4j_resource", fake_app_neo4j_resource
+    )
     app = create_app(make_settings(tmp_path), enable_postgres_readiness=False, enable_neo4j=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -343,9 +658,17 @@ async def test_recall_route_returns_the_standard_envelope(
             headers={API_KEY_HEADER: EXPECTED_API_KEY},
             json={"query": "What is Sofias Memory?", "mode": "chunks"},
         )
+        graph_response = await client.post(
+            "/api/v1/recall",
+            headers={API_KEY_HEADER: EXPECTED_API_KEY},
+            json={"query": "What is Sofias Memory?", "mode": "graph"},
+        )
 
     assert response.status_code == 200
+    assert graph_response.status_code == 200
     payload = response.json()
     assert payload["data"]["query_id"] == str(query_id)
     assert payload["data"]["mode"] == "chunks"
     assert payload["meta"]["request_id"]
+    assert graph_response.json()["data"]["mode"] == "graph"
+    assert len(injected_resources) == 1

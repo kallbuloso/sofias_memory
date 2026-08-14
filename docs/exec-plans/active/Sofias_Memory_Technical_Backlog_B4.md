@@ -624,8 +624,9 @@ convergência e idempotência.
 
 ## SM-419 — Improve summaries stage: rebuild supported persisted summaries
 
-**Status:** TODO  
-**Próxima task:** SIM
+**Status:** DONE  
+**Commit:** `a9c8721` — `feat: add summaries improve stage`  
+**Próxima task:** NÃO
 **Prioridade:** P1  
 **Dependências:** SM-405, SM-412, SM-417  
 **PRD:** FR-070 item 5; FR-050 summaries; FR-060 summaries recall
@@ -664,12 +665,62 @@ sem regenerar conhecimento desnecessário.
 - summaries stale são reconstruídos de forma idempotente;
 - recall `mode=summaries` usa o novo estado;
 - falha LLM/embedding não persiste summary parcial.
+### Evidência real pós-smoke
+
+Dataset validado:
+
+- `dataset_id`: `7fae0f62-bd6a-40f5-8143-771a238111dc`;
+- `active_generation`: `0`;
+- 3 documentos elegíveis;
+- 2 document summaries válidos;
+- 1 document summary ausente/inválido;
+- 0 dataset summaries ativos.
+
+Primeira execução:
+
+- `run_id`: `cc8d015f-e870-479d-a109-325e9fbd18b9`;
+- `status=succeeded`;
+- `document_summaries_rebuilt=1`;
+- `dataset_summaries_rebuilt=1`;
+- `summaries_deactivated=0`;
+- nenhum evento/rebuild de grafo.
+
+Segunda execução idempotente:
+
+- `run_id`: `023032fb-2ab2-4025-91f5-7a23bf7058ae`;
+- `status=succeeded`;
+- `document_summaries_rebuilt=0`;
+- `dataset_summaries_rebuilt=0`;
+- `summaries_deactivated=0`.
+
+Smoke stale controlado:
+
+- document `11c96cbb-2693-4f82-b4a4-a45e90d297e7`;
+- marker persistido com `prompt_version=stale-smoke-test`;
+- `run_id`: `bb180d69-c2da-495f-be20-10ae3814973a`;
+- `status=succeeded`;
+- `document_summaries_rebuilt=1`;
+- `dataset_summaries_rebuilt=1`;
+- `summaries_deactivated=0`.
+
+Execução final de convergência:
+
+- `run_id`: `649b5f1e-c76c-4834-b861-2eba81870dd2`;
+- `status=succeeded`;
+- `document_summaries_rebuilt=0`;
+- `dataset_summaries_rebuilt=0`;
+- `summaries_deactivated=0`.
+
+O smoke comprovou reconstrução seletiva de document summary, reconstrução derivada do
+dataset summary, idempotência e convergência, sem `SummaryTargetType.CHUNK`, sem alteração
+do contrato público de Recall e sem efeitos colaterais em Neo4j/outbox.
 
 ---
 
 ## SM-420 — Complete graph_reconciliation: graph hygiene, centrality and change report
 
-**Status:** TODO  
+**Status:** TODO
+**Próxima task:** SIM 
 **Prioridade:** P1  
 **Dependências:** SM-414, SM-417, SM-418  
 **PRD:** FR-070 itens 6, 7 e 9; completa o mesmo stage `graph_reconciliation` iniciado em SM-418

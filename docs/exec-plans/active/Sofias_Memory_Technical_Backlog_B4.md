@@ -2,7 +2,7 @@
 
 **Documento:** Backlog técnico — B4 Core Memory  
 **Escopo:** B4 núcleo funcional de memória sobre B0–B3  
-**Status:** Em execução; SM-401..SM-417 concluídas; SM-418 é a próxima task  
+**Status:** Em execução; SM-401..SM-418 concluídas; SM-419 é a próxima task
 **Pré-requisitos:** GATE-B3 PASSED; ADR-0008 accepted; `AGENTS.md`; `docs/product/Sofias_Memory_PRD_SPECS.md`  
 **Regra:** executar uma task por vez, respeitando dependências, contratos congelados e gates.  
 **Base de reconstrução:** estado real do repositório em `bd426c99d4f1bc96922b00bb62e2598f545306c1`.  
@@ -172,7 +172,8 @@ SM-424  Graph/provenance read-only API
 GATE-B4
 ```
 
-SM-418 é a próxima task.
+SM-401..SM-418 estão DONE. SM-419 é a próxima task. SM-420..SM-424 seguem TODO.
+GATE-B4 segue TODO.
 
 ---
 
@@ -518,15 +519,15 @@ da projeção para entidades ativas preexistentes e deve alimentar SM-418.
 
 ---
 
-# 7. Tasks B4 restantes — TODO
+# 7. SM-418 concluída e tasks B4 restantes
 
 ## SM-418 — Improve graph_reconciliation: reconciliar projeção Neo4j com PostgreSQL
 
-**Status:** TODO  
+**Status:** DONE
+**Commit:** `29d5906` — `feat: add graph reconciliation improve stage`
 **Prioridade:** P0  
 **Dependências:** SM-407, SM-417, ADR-0008  
 **PRD:** FR-070 item 8; FR-110; ADR-0002; ADR-0008  
-**Próxima task:** SIM
 
 ### Objetivo
 
@@ -572,11 +573,59 @@ worker ou dual-write.
 
 Unit tests focados + teste opt-in real dataset-scoped. Não executar reset global local.
 
+### Evidência real pós-smoke
+
+Dataset validado:
+
+- `dataset_id`: `7fae0f62-bd6a-40f5-8143-771a238111dc`;
+- `active_generation`: `0`.
+
+Baseline anterior:
+
+- PostgreSQL active `Entity`: 88;
+- Neo4j `Entity`: 44.
+
+Primeira execução:
+
+- request: `POST /api/v1/improve`, `stages=["graph_reconciliation"]`, `wait=true`;
+- `run_id`: `386726f4-3ba6-4931-963d-9a7eb77d75ab`;
+- `status=succeeded`;
+- `graph_entities_missing=44`;
+- `graph_entities_extra=0`;
+- `graph_chunks_missing=6`;
+- `graph_chunks_extra=0`;
+- `graph_entity_mentions_missing=119`;
+- `graph_entity_mentions_extra=0`;
+- `graph_relations_missing=93`;
+- `graph_relations_extra=0`;
+- `graph_next_missing=4`;
+- `graph_next_extra=0`;
+- `graph_rebuilt=true`;
+- `graph_events_enqueued=0`;
+- `graph_events_processed=0`.
+
+Segunda execução idempotente:
+
+- `run_id`: `2538f69c-64a6-4d9c-96dd-2c12e27a9a18`;
+- `status=succeeded`;
+- todos os `graph_*_missing = 0`;
+- todos os `graph_*_extra = 0`;
+- `graph_rebuilt=false`;
+- `graph_events_enqueued=0`;
+- `graph_events_processed=0`.
+
+O smoke confirmou que o known issue descoberto na SM-417 foi corrigido. A divergência
+histórica não afetava apenas `Entity`: também incluía `Chunk`, `MENTIONED_IN`,
+`RELATES_TO` e `NEXT`. A correção reutilizou `GraphRebuildService` dataset-scoped,
+sem rebuild global e sem `graph_outbox` artificial. A segunda execução comprovou
+convergência e idempotência.
+
 ---
 
 ## SM-419 — Improve summaries stage: rebuild supported persisted summaries
 
 **Status:** TODO  
+**Próxima task:** SIM
 **Prioridade:** P1  
 **Dependências:** SM-405, SM-412, SM-417  
 **PRD:** FR-070 item 5; FR-050 summaries; FR-060 summaries recall

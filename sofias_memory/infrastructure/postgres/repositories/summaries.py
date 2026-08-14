@@ -76,6 +76,55 @@ class SummaryRepository:
         result = await self._session.scalar(statement)
         return cast(Summary | None, result)
 
+    async def list_active_for_target(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+        target_type: SummaryTargetType,
+        target_id: UUID,
+        level: int,
+    ) -> list[Summary]:
+        statement = (
+            select(Summary)
+            .where(
+                Summary.dataset_id == dataset_id,
+                Summary.generation == generation,
+                Summary.target_type == target_type,
+                Summary.target_id == target_id,
+                Summary.level == level,
+                Summary.is_active.is_(True),
+            )
+            .order_by(Summary.created_at.desc(), Summary.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def deactivate_active_for_target_except(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+        target_type: SummaryTargetType,
+        target_id: UUID,
+        level: int,
+        keep_summary_id: UUID | None,
+    ) -> int:
+        summaries = await self.list_active_for_target(
+            dataset_id=dataset_id,
+            generation=generation,
+            target_type=target_type,
+            target_id=target_id,
+            level=level,
+        )
+        deactivated = 0
+        for summary in summaries:
+            if keep_summary_id is not None and summary.id == keep_summary_id:
+                continue
+            summary.is_active = False
+            deactivated += 1
+        return deactivated
+
     async def list_active_document_summaries_for_recall(
         self,
         *,

@@ -533,6 +533,7 @@ def test_fingerprint_payload_has_schema_version_and_prompt_versions() -> None:
     assert payload["schema_version"] == FINGERPRINT_SCHEMA_VERSION
     assert "application" not in payload
     assert payload["prompt_versions"] == {
+        "dataset_summary": "v1",
         "document_summary": "v1",
         "graph_extraction": "v1",
     }

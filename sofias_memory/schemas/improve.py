@@ -57,6 +57,9 @@ class ImproveResult(BaseModel):
     relations_rewired: int
     relations_deactivated: int
     relation_evidence_copied: int
+    document_summaries_rebuilt: int
+    dataset_summaries_rebuilt: int
+    summaries_deactivated: int
     graph_entities_missing: int
     graph_entities_extra: int
     graph_chunks_missing: int

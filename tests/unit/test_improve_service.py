@@ -46,6 +46,7 @@ from sofias_memory.services.improve import (
     relation_embedding_text,
     stream_update_weight,
 )
+from sofias_memory.services.summary_rebuild_service import SummaryRebuildCounts
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
@@ -486,6 +487,27 @@ class FakeGraphReconciliation:
         return self.result
 
 
+class FakeSummaryRebuild:
+    def __init__(
+        self,
+        result: SummaryRebuildCounts | None = None,
+        failure: Exception | None = None,
+    ) -> None:
+        self.result = result or SummaryRebuildCounts(
+            document_summaries_rebuilt=0,
+            dataset_summaries_rebuilt=0,
+            summaries_deactivated=0,
+        )
+        self.failure = failure
+        self.calls: list[tuple[UUID, int]] = []
+
+    async def rebuild_dataset(self, dataset_id: UUID, *, generation: int) -> SummaryRebuildCounts:
+        self.calls.append((dataset_id, generation))
+        if self.failure is not None:
+            raise self.failure
+        return self.result
+
+
 class FakeEmbeddingClient:
     def __init__(self, dimensions: int = 3072) -> None:
         self.dimensions = dimensions
@@ -511,10 +533,18 @@ def service_for(
     *,
     drain: FakeDrain | None = None,
     graph_reconciliation: FakeGraphReconciliation | None = None,
-) -> tuple[ImproveService, FakeEmbeddingClient, FakeDrain, FakeGraphReconciliation]:
+    summary_rebuild: FakeSummaryRebuild | None = None,
+) -> tuple[
+    ImproveService,
+    FakeEmbeddingClient,
+    FakeDrain,
+    FakeGraphReconciliation,
+    FakeSummaryRebuild,
+]:
     embedding_client = FakeEmbeddingClient()
     resolved_drain = drain or FakeDrain()
     resolved_graph_reconciliation = graph_reconciliation or FakeGraphReconciliation()
+    resolved_summary_rebuild = summary_rebuild or FakeSummaryRebuild()
 
     def create_uow() -> ImproveUnitOfWork:
         return cast(ImproveUnitOfWork, FakeUnitOfWork(store))
@@ -525,11 +555,13 @@ def service_for(
             embedding_client=embedding_client,
             graph_projection_drain=resolved_drain,
             graph_reconciliation=resolved_graph_reconciliation,
+            summary_rebuild=resolved_summary_rebuild,
             unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
         ),
         embedding_client,
         resolved_drain,
         resolved_graph_reconciliation,
+        resolved_summary_rebuild,
     )
 
 
@@ -713,7 +745,7 @@ async def test_answer_and_reference_feedback_resolve_chunk_targets_and_enqueue_u
     store.relations_by_chunk = {reference_chunk: [first_relation]}
     drain = FakeDrain(processed=3)
 
-    service, embedding_client, _, _ = service_for(tmp_path, store, drain=drain)
+    service, embedding_client, _, _, _ = service_for(tmp_path, store, drain=drain)
     result = await service.improve(ImproveRequest())
 
     assert embedding_client.calls == []
@@ -785,7 +817,7 @@ async def test_relation_embeddings_select_active_current_null_candidates_and_per
             inactive_endpoint_relation,
         ]
     )
-    service, embedding_client, drain, _ = service_for(tmp_path, store)
+    service, embedding_client, drain, _, _ = service_for(tmp_path, store)
     embedding_client.responses = [[0.1] * 3072, [0.2] * 3072]
 
     result = await service.improve(ImproveRequest(stages=["relation_embeddings"]))
@@ -841,7 +873,7 @@ async def test_entity_deduplication_embeds_active_current_null_entities_and_dete
     existing = entity(dataset.id, generation=2)
     existing.embedding = [0.7] * 3072
     store.entities.extend([second, existing, inactive, first, stale, different_type])
-    service, embedding_client, drain, _ = service_for(tmp_path, store)
+    service, embedding_client, drain, _, _ = service_for(tmp_path, store)
     embedding_client.responses = [
         [1.0] + [0.0] * 3071,
         [0.91, sqrt(1 - 0.91**2)] + [0.0] * 3070,
@@ -915,7 +947,7 @@ async def test_entity_deduplication_merges_safe_pair_rewrites_mentions_and_relat
     target_relation.embedding = [0.2] * 3072
     store.relations.append(target_relation)
     drain = FakeDrain(processed=3)
-    service, embedding_client, _, _ = service_for(tmp_path, store, drain=drain)
+    service, embedding_client, _, _, _ = service_for(tmp_path, store, drain=drain)
 
     result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
 
@@ -974,7 +1006,7 @@ async def test_entity_deduplication_does_not_merge_transitively_without_direct_s
     indirect.embedding = unit_embedding(0.92)
     indirect.created_at = datetime(2026, 1, 3, tzinfo=UTC)
     store.entities.extend([first, bridge, indirect])
-    service, _, drain, _ = service_for(tmp_path, store, drain=FakeDrain(processed=1))
+    service, _, drain, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=1))
 
     result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
 
@@ -1038,7 +1070,7 @@ async def test_entity_merge_handles_relation_self_loop_collision_and_evidence_co
             ),
         ]
     )
-    service, _, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=2))
+    service, _, _, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=2))
 
     result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
 
@@ -1076,7 +1108,7 @@ async def test_entity_embedding_provider_validation_and_failure_write_nothing(
     dataset = seed_dataset(store)
     target = entity(dataset.id, generation=0)
     store.entities.append(target)
-    service, embedding_client, _, _ = service_for(tmp_path, store)
+    service, embedding_client, _, _, _ = service_for(tmp_path, store)
     embedding_client.responses = []
 
     with pytest.raises(Exception, match="invalid response"):
@@ -1109,7 +1141,7 @@ async def test_relation_embedding_provider_validation_and_failure_write_nothing(
     store.entities.extend([source_entity, target_entity])
     target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
     store.relations.append(target_relation)
-    service, embedding_client, _, _ = service_for(tmp_path, store)
+    service, embedding_client, _, _, _ = service_for(tmp_path, store)
     embedding_client.responses = []
 
     with pytest.raises(Exception, match="invalid response"):
@@ -1152,7 +1184,7 @@ async def test_omitted_stages_default_order_includes_deduplication_before_relati
     target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
     store.relations.append(target_relation)
     drain = FakeDrain(processed=1)
-    service, embedding_client, _, _ = service_for(tmp_path, store, drain=drain)
+    service, embedding_client, _, _, _ = service_for(tmp_path, store, drain=drain)
     embedding_client.response_batches = [
         [[1.0] + [0.0] * 3071, [0.0, 1.0] + [0.0] * 3070],
         [[0.3] * 3072],
@@ -1172,7 +1204,7 @@ async def test_omitted_stages_default_order_includes_deduplication_before_relati
 
     relation_only_store = FakeStore()
     seed_dataset(relation_only_store)
-    first_run_service, _, _, _ = service_for(tmp_path, relation_only_store)
+    first_run_service, _, _, _, _ = service_for(tmp_path, relation_only_store)
     await first_run_service.improve(ImproveRequest(stages=["relation_embeddings"]))
 
     assert relation_only_store.run_current_steps_on_add == ["relation_embeddings"]
@@ -1185,7 +1217,7 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
     default_store = FakeStore()
     seed_dataset(default_store)
     default_graph_reconciliation = FakeGraphReconciliation()
-    default_service, _, _, _ = service_for(
+    default_service, _, _, _, default_summary_rebuild = service_for(
         tmp_path,
         default_store,
         graph_reconciliation=default_graph_reconciliation,
@@ -1199,6 +1231,7 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
         "relation_embeddings",
     ]
     assert default_graph_reconciliation.dataset_ids == []
+    assert default_summary_rebuild.calls == []
 
     explicit_store = FakeStore()
     dataset = seed_dataset(explicit_store)
@@ -1215,7 +1248,7 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
         )
     )
     drain = FakeDrain(processed=10)
-    service, embedding_client, resolved_drain, _ = service_for(
+    service, embedding_client, resolved_drain, _, _ = service_for(
         tmp_path,
         explicit_store,
         drain=drain,
@@ -1243,10 +1276,68 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
 
 
 @pytest.mark.asyncio
+async def test_summaries_is_explicit_stage_and_records_metrics(tmp_path: Path) -> None:
+    default_store = FakeStore()
+    seed_dataset(default_store)
+    default_summary_rebuild = FakeSummaryRebuild()
+    default_service, _, _, _, _ = service_for(
+        tmp_path,
+        default_store,
+        summary_rebuild=default_summary_rebuild,
+    )
+
+    default_result = await default_service.improve(ImproveRequest())
+
+    assert default_result.stages == [
+        "feedback_weights",
+        "entity_deduplication",
+        "relation_embeddings",
+    ]
+    assert default_summary_rebuild.calls == []
+
+    explicit_store = FakeStore()
+    dataset = seed_dataset(explicit_store, generation=2)
+    summary_rebuild = FakeSummaryRebuild(
+        SummaryRebuildCounts(
+            document_summaries_rebuilt=2,
+            dataset_summaries_rebuilt=1,
+            summaries_deactivated=3,
+        )
+    )
+    drain = FakeDrain(processed=10)
+    service, embedding_client, resolved_drain, _, _ = service_for(
+        tmp_path,
+        explicit_store,
+        drain=drain,
+        summary_rebuild=summary_rebuild,
+    )
+
+    result = await service.improve(ImproveRequest(stages=["summaries"]))
+
+    assert result.stages == ["summaries"]
+    assert summary_rebuild.calls == [(dataset.id, 2)]
+    assert embedding_client.calls == []
+    assert resolved_drain.dataset_ids == []
+    assert result.feedback_processed == 0
+    assert result.entities_updated == 0
+    assert result.relations_embedded == 0
+    assert result.document_summaries_rebuilt == 2
+    assert result.dataset_summaries_rebuilt == 1
+    assert result.summaries_deactivated == 3
+    assert result.graph_events_enqueued == 0
+    assert result.graph_events_processed == 0
+
+    metrics = explicit_store.pipeline_runs[-1].metrics["improve_result"]
+    assert metrics["document_summaries_rebuilt"] == 2
+    assert metrics["dataset_summaries_rebuilt"] == 1
+    assert metrics["summaries_deactivated"] == 3
+
+
+@pytest.mark.asyncio
 async def test_graph_reconciliation_failure_marks_run_failed(tmp_path: Path) -> None:
     store = FakeStore()
     seed_dataset(store)
-    service, _, _, _ = service_for(
+    service, _, _, _, _ = service_for(
         tmp_path,
         store,
         graph_reconciliation=FakeGraphReconciliation(
@@ -1293,7 +1384,7 @@ async def test_improve_is_dataset_isolated_and_uses_only_current_active_knowledg
     store.entities_by_chunk[target_chunk] = [active_entity, stale_entity, other_entity]
     store.relations_by_chunk[target_chunk] = [inactive_relation]
 
-    service, _, _, _ = service_for(tmp_path, store)
+    service, _, _, _, _ = service_for(tmp_path, store)
     result = await service.improve(ImproveRequest(dataset="main", stages=["feedback_weights"]))
 
     assert result.feedback_processed == 1
@@ -1321,7 +1412,7 @@ async def test_applied_feedback_is_not_reapplied_and_no_target_feedback_is_consu
     no_target = feedback_for(query.id, target_type="reference", target_id=target_chunk, score=-1)
     store.feedback.extend([already_applied, no_target])
 
-    service, embedding_client, _, _ = service_for(tmp_path, store)
+    service, embedding_client, _, _, _ = service_for(tmp_path, store)
     result = await service.improve(ImproveRequest(stages=["feedback_weights"]))
 
     assert embedding_client.calls == []
@@ -1379,6 +1470,9 @@ async def test_improve_route_returns_envelope_and_requires_api_key(
                 relations_rewired=0,
                 relations_deactivated=0,
                 relation_evidence_copied=0,
+                document_summaries_rebuilt=0,
+                dataset_summaries_rebuilt=0,
+                summaries_deactivated=0,
                 graph_entities_missing=0,
                 graph_entities_extra=0,
                 graph_chunks_missing=0,

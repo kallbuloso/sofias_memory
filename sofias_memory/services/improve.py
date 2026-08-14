@@ -47,17 +47,21 @@ from sofias_memory.services.graph_reconciliation_service import (
     GraphReconciliationResult,
 )
 from sofias_memory.services.remember import stable_payload_hash
+from sofias_memory.services.summary_rebuild_service import SummaryRebuildCounts
 
 FEEDBACK_WEIGHTS_STAGE = "feedback_weights"
 RELATION_EMBEDDINGS_STAGE = "relation_embeddings"
 ENTITY_DEDUPLICATION_STAGE = "entity_deduplication"
+SUMMARIES_STAGE = "summaries"
 GRAPH_RECONCILIATION_STAGE = "graph_reconciliation"
 DEFAULT_IMPROVE_STAGES = (
     FEEDBACK_WEIGHTS_STAGE,
     ENTITY_DEDUPLICATION_STAGE,
     RELATION_EMBEDDINGS_STAGE,
 )
-SUPPORTED_IMPROVE_STAGES = frozenset((*DEFAULT_IMPROVE_STAGES, GRAPH_RECONCILIATION_STAGE))
+SUPPORTED_IMPROVE_STAGES = frozenset(
+    (*DEFAULT_IMPROVE_STAGES, SUMMARIES_STAGE, GRAPH_RECONCILIATION_STAGE)
+)
 IMPROVE_RESULT_METRIC_KEY = "improve_result"
 FEEDBACK_WEIGHT_ALPHA = 0.1
 FEEDBACK_WEIGHT_DECIMALS = 4
@@ -178,6 +182,12 @@ class GraphReconciliation(Protocol):
     async def reconcile_dataset(self, dataset_id: UUID) -> GraphReconciliationResult: ...
 
 
+class SummaryRebuild(Protocol):
+    async def rebuild_dataset(
+        self, dataset_id: UUID, *, generation: int
+    ) -> SummaryRebuildCounts: ...
+
+
 class EmbeddingClient(Protocol):
     async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]: ...
 
@@ -269,6 +279,7 @@ class ImproveService:
         embedding_client: EmbeddingClient,
         graph_projection_drain: GraphProjectionDrain,
         graph_reconciliation: GraphReconciliation | None = None,
+        summary_rebuild: SummaryRebuild | None = None,
         session_factory: AsyncSessionFactory | None = None,
         unit_of_work_factory: UnitOfWorkFactory | None = None,
     ) -> None:
@@ -278,6 +289,7 @@ class ImproveService:
         self._embedding_client = embedding_client
         self._graph_projection_drain = graph_projection_drain
         self._graph_reconciliation = graph_reconciliation
+        self._summary_rebuild = summary_rebuild
         self._unit_of_work_factory = unit_of_work_factory or _postgres_unit_of_work_factory(
             cast(AsyncSessionFactory, session_factory)
         )
@@ -366,6 +378,11 @@ class ImproveService:
             graph_events_enqueued=0,
         )
         graph_reconciliation_counts = _empty_graph_reconciliation_counts()
+        summary_rebuild_counts = SummaryRebuildCounts(
+            document_summaries_rebuilt=0,
+            dataset_summaries_rebuilt=0,
+            summaries_deactivated=0,
+        )
         graph_events_processed = 0
 
         for stage in stages:
@@ -380,6 +397,8 @@ class ImproveService:
                 if entity_deduplication_counts.graph_events_enqueued:
                     drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
                     graph_events_processed += int(getattr(drain_result, "processed", 0))
+            elif stage == SUMMARIES_STAGE:
+                summary_rebuild_counts = await self._rebuild_summaries(dataset)
             elif stage == GRAPH_RECONCILIATION_STAGE:
                 graph_reconciliation_counts = await self._reconcile_graph(dataset)
 
@@ -402,6 +421,9 @@ class ImproveService:
             relations_rewired=entity_deduplication_counts.relations_rewired,
             relations_deactivated=entity_deduplication_counts.relations_deactivated,
             relation_evidence_copied=entity_deduplication_counts.relation_evidence_copied,
+            document_summaries_rebuilt=summary_rebuild_counts.document_summaries_rebuilt,
+            dataset_summaries_rebuilt=summary_rebuild_counts.dataset_summaries_rebuilt,
+            summaries_deactivated=summary_rebuild_counts.summaries_deactivated,
             graph_entities_missing=graph_reconciliation_counts.entities_missing,
             graph_entities_extra=graph_reconciliation_counts.entities_extra,
             graph_chunks_missing=graph_reconciliation_counts.chunks_missing,
@@ -568,6 +590,17 @@ class ImproveService:
             raise DependencyUnavailableError(message="Graph reconciliation is unavailable.")
         result = await self._graph_reconciliation.reconcile_dataset(dataset.id)
         return _graph_reconciliation_counts(result)
+
+    async def _rebuild_summaries(
+        self,
+        dataset: ImproveDatasetSnapshot,
+    ) -> SummaryRebuildCounts:
+        if self._summary_rebuild is None:
+            raise DependencyUnavailableError(message="Summary rebuild is unavailable.")
+        return await self._summary_rebuild.rebuild_dataset(
+            dataset.id,
+            generation=dataset.active_generation,
+        )
 
     async def _detect_entity_duplicates(
         self,

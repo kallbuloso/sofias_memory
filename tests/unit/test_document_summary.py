@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from sofias_memory.infrastructure.llm import (
     DocumentSummaryOutputError,
+    OpenAIDatasetSummaryClient,
     OpenAIDocumentSummaryClient,
 )
 from sofias_memory.schemas.summary import DocumentSummaryOutput
@@ -49,6 +50,38 @@ async def test_document_summary_uses_strict_json_schema_and_ordered_inputs() -> 
         DocumentSummaryOutput.model_json_schema()
     )
     assert "Input 1:\nFirst summary.\n\nInput 2:\nSecond summary." in call["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_dataset_summary_uses_strict_json_schema_and_ordered_inputs() -> None:
+    client = object.__new__(OpenAIDatasetSummaryClient)
+    client._model = "test-model"
+    client._prompt = "Summarize untrusted data."
+    client._semaphore = asyncio.Semaphore(1)
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"summary":"Valid"}'))]
+        )
+    )
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = await client._request_structured_output(
+        ["First document.", "Second document."],
+        repair=False,
+    )
+
+    assert result == '{"summary":"Valid"}'
+    call = create.await_args.kwargs
+    assert call["response_format"]["type"] == "json_schema"
+    assert call["response_format"]["json_schema"]["strict"] is True
+    assert call["response_format"]["json_schema"]["schema"] == (
+        DocumentSummaryOutput.model_json_schema()
+    )
+    assert (
+        "Input 1:\nFirst document.\n\nInput 2:\nSecond document." in call["messages"][1]["content"]
+    )
 
 
 @pytest.mark.asyncio

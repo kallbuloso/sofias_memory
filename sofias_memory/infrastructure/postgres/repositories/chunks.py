@@ -31,6 +31,17 @@ class RetrievedChunk:
     end_char: int
 
 
+@dataclass(frozen=True)
+class ChunkSummaryRebuildSnapshot:
+    """Detached active chunk summary metadata for document summary rebuild."""
+
+    id: UUID
+    document_id: UUID
+    generation: int
+    ordinal: int
+    metadata: dict[str, object]
+
+
 class ChunkRepository:
     """Persistence operations for chunk records."""
 
@@ -89,6 +100,24 @@ class ChunkRepository:
             statement = statement.where(Chunk.is_active.is_(True))
         statement = statement.limit(1)
         return await self._session.scalar(statement) is not None
+
+    async def list_active_for_document_summary(
+        self,
+        *,
+        document_id: UUID,
+        generation: int,
+    ) -> list[ChunkSummaryRebuildSnapshot]:
+        statement = (
+            select(Chunk)
+            .where(
+                Chunk.document_id == document_id,
+                Chunk.generation == generation,
+                Chunk.is_active.is_(True),
+            )
+            .order_by(Chunk.ordinal, Chunk.id)
+        )
+        result = await self._session.scalars(statement)
+        return [_chunk_summary_rebuild_snapshot(chunk) for chunk in result]
 
     async def vector_search(
         self,
@@ -178,3 +207,13 @@ class ChunkRepository:
             )
             for row in result
         ]
+
+
+def _chunk_summary_rebuild_snapshot(chunk: Chunk) -> ChunkSummaryRebuildSnapshot:
+    return ChunkSummaryRebuildSnapshot(
+        id=chunk.id,
+        document_id=chunk.document_id,
+        generation=chunk.generation,
+        ordinal=chunk.ordinal,
+        metadata=dict(chunk.metadata_),
+    )

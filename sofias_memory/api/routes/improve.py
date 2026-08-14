@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 
 from sofias_memory.api.errors import current_request_id
 from sofias_memory.infrastructure.embeddings import OpenAIEmbeddingClient
+from sofias_memory.infrastructure.llm import OpenAIDatasetSummaryClient, OpenAIDocumentSummaryClient
 from sofias_memory.infrastructure.neo4j import Neo4jProjection
 from sofias_memory.lifespan import (
     app_neo4j_resource,
@@ -19,6 +20,7 @@ from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.graph_rebuild_service import GraphRebuildService
 from sofias_memory.services.graph_reconciliation_service import GraphReconciliationService
 from sofias_memory.services.improve import ImproveService
+from sofias_memory.services.summary_rebuild_service import SummaryRebuildService
 
 router = APIRouter(tags=["improve"])
 
@@ -32,6 +34,7 @@ async def improve(
     session_factory = app_postgres_session_factory(request.app)
     neo4j_resource = app_neo4j_resource(request.app)
     projection = Neo4jProjection(neo4j_resource)
+    embedding_client = OpenAIEmbeddingClient(settings)
     outbox_processor = GraphOutboxProcessor(
         session_factory=session_factory,
         projection=projection,
@@ -44,7 +47,7 @@ async def improve(
     service = ImproveService(
         settings,
         session_factory=session_factory,
-        embedding_client=OpenAIEmbeddingClient(settings),
+        embedding_client=embedding_client,
         graph_projection_drain=GraphOutboxBatchProcessor(
             session_factory=session_factory,
             processor=outbox_processor,
@@ -53,6 +56,13 @@ async def improve(
             session_factory=session_factory,
             neo4j_resource=neo4j_resource,
             rebuild_service=rebuild_service,
+        ),
+        summary_rebuild=SummaryRebuildService(
+            settings,
+            session_factory=session_factory,
+            embedding_client=embedding_client,
+            document_summary_client=OpenAIDocumentSummaryClient(settings),
+            dataset_summary_client=OpenAIDatasetSummaryClient(settings),
         ),
     )
     result = await service.improve(payload)

@@ -17,6 +17,7 @@ API_KEY_PATTERN = re.compile(rf"^{API_KEY_PREFIX}[A-Za-z0-9_-]{{32,}}$")
 EXPECTED_EMBEDDING_DIMENSIONS = 3072
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_PROMPT_VERSIONS: Mapping[str, str] = {
+    "dataset_summary": "v1",
     "document_summary": "v1",
     "graph_extraction": "v1",
 }

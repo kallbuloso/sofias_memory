@@ -57,5 +57,16 @@ class ImproveResult(BaseModel):
     relations_rewired: int
     relations_deactivated: int
     relation_evidence_copied: int
+    graph_entities_missing: int
+    graph_entities_extra: int
+    graph_chunks_missing: int
+    graph_chunks_extra: int
+    graph_entity_mentions_missing: int
+    graph_entity_mentions_extra: int
+    graph_relations_missing: int
+    graph_relations_extra: int
+    graph_next_missing: int
+    graph_next_extra: int
+    graph_rebuilt: bool
     graph_events_enqueued: int
     graph_events_processed: int

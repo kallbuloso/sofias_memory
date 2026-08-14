@@ -16,6 +16,8 @@ from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
 from sofias_memory.schemas.improve import ImproveRequest, ImproveResult
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
+from sofias_memory.services.graph_rebuild_service import GraphRebuildService
+from sofias_memory.services.graph_reconciliation_service import GraphReconciliationService
 from sofias_memory.services.improve import ImproveService
 
 router = APIRouter(tags=["improve"])
@@ -28,9 +30,15 @@ async def improve(
 ) -> SuccessEnvelope[ImproveResult]:
     settings = app_settings(request.app)
     session_factory = app_postgres_session_factory(request.app)
-    projection = Neo4jProjection(app_neo4j_resource(request.app))
+    neo4j_resource = app_neo4j_resource(request.app)
+    projection = Neo4jProjection(neo4j_resource)
     outbox_processor = GraphOutboxProcessor(
         session_factory=session_factory,
+        projection=projection,
+    )
+    rebuild_service = GraphRebuildService(
+        session_factory=session_factory,
+        neo4j_resource=neo4j_resource,
         projection=projection,
     )
     service = ImproveService(
@@ -40,6 +48,11 @@ async def improve(
         graph_projection_drain=GraphOutboxBatchProcessor(
             session_factory=session_factory,
             processor=outbox_processor,
+        ),
+        graph_reconciliation=GraphReconciliationService(
+            session_factory=session_factory,
+            neo4j_resource=neo4j_resource,
+            rebuild_service=rebuild_service,
         ),
     )
     result = await service.improve(payload)

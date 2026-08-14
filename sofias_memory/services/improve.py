@@ -42,17 +42,22 @@ from sofias_memory.services.feedback import (
     REFERENCE_TARGET_TYPE,
     reference_chunk_ids,
 )
+from sofias_memory.services.graph_reconciliation_service import (
+    GraphReconciliationDiff,
+    GraphReconciliationResult,
+)
 from sofias_memory.services.remember import stable_payload_hash
 
 FEEDBACK_WEIGHTS_STAGE = "feedback_weights"
 RELATION_EMBEDDINGS_STAGE = "relation_embeddings"
 ENTITY_DEDUPLICATION_STAGE = "entity_deduplication"
+GRAPH_RECONCILIATION_STAGE = "graph_reconciliation"
 DEFAULT_IMPROVE_STAGES = (
     FEEDBACK_WEIGHTS_STAGE,
     ENTITY_DEDUPLICATION_STAGE,
     RELATION_EMBEDDINGS_STAGE,
 )
-SUPPORTED_IMPROVE_STAGES = frozenset(DEFAULT_IMPROVE_STAGES)
+SUPPORTED_IMPROVE_STAGES = frozenset((*DEFAULT_IMPROVE_STAGES, GRAPH_RECONCILIATION_STAGE))
 IMPROVE_RESULT_METRIC_KEY = "improve_result"
 FEEDBACK_WEIGHT_ALPHA = 0.1
 FEEDBACK_WEIGHT_DECIMALS = 4
@@ -169,6 +174,10 @@ class GraphProjectionDrain(Protocol):
     async def process_dataset(self, dataset_id: UUID) -> object: ...
 
 
+class GraphReconciliation(Protocol):
+    async def reconcile_dataset(self, dataset_id: UUID) -> GraphReconciliationResult: ...
+
+
 class EmbeddingClient(Protocol):
     async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]: ...
 
@@ -211,6 +220,21 @@ class ImproveEntityDeduplicationCounts:
 
 
 @dataclass(frozen=True)
+class ImproveGraphReconciliationCounts:
+    entities_missing: int
+    entities_extra: int
+    chunks_missing: int
+    chunks_extra: int
+    entity_mentions_missing: int
+    entity_mentions_extra: int
+    relations_missing: int
+    relations_extra: int
+    next_missing: int
+    next_extra: int
+    rebuilt: bool
+
+
+@dataclass(frozen=True)
 class RelationMergePlan:
     relation: Relation
     mapped_source_entity_id: UUID
@@ -244,6 +268,7 @@ class ImproveService:
         *,
         embedding_client: EmbeddingClient,
         graph_projection_drain: GraphProjectionDrain,
+        graph_reconciliation: GraphReconciliation | None = None,
         session_factory: AsyncSessionFactory | None = None,
         unit_of_work_factory: UnitOfWorkFactory | None = None,
     ) -> None:
@@ -252,6 +277,7 @@ class ImproveService:
         self._settings = settings
         self._embedding_client = embedding_client
         self._graph_projection_drain = graph_projection_drain
+        self._graph_reconciliation = graph_reconciliation
         self._unit_of_work_factory = unit_of_work_factory or _postgres_unit_of_work_factory(
             cast(AsyncSessionFactory, session_factory)
         )
@@ -339,6 +365,7 @@ class ImproveService:
             relation_evidence_copied=0,
             graph_events_enqueued=0,
         )
+        graph_reconciliation_counts = _empty_graph_reconciliation_counts()
         graph_events_processed = 0
 
         for stage in stages:
@@ -353,6 +380,8 @@ class ImproveService:
                 if entity_deduplication_counts.graph_events_enqueued:
                     drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
                     graph_events_processed += int(getattr(drain_result, "processed", 0))
+            elif stage == GRAPH_RECONCILIATION_STAGE:
+                graph_reconciliation_counts = await self._reconcile_graph(dataset)
 
         result = ImproveResult(
             run_id=run_id,
@@ -373,6 +402,17 @@ class ImproveService:
             relations_rewired=entity_deduplication_counts.relations_rewired,
             relations_deactivated=entity_deduplication_counts.relations_deactivated,
             relation_evidence_copied=entity_deduplication_counts.relation_evidence_copied,
+            graph_entities_missing=graph_reconciliation_counts.entities_missing,
+            graph_entities_extra=graph_reconciliation_counts.entities_extra,
+            graph_chunks_missing=graph_reconciliation_counts.chunks_missing,
+            graph_chunks_extra=graph_reconciliation_counts.chunks_extra,
+            graph_entity_mentions_missing=graph_reconciliation_counts.entity_mentions_missing,
+            graph_entity_mentions_extra=graph_reconciliation_counts.entity_mentions_extra,
+            graph_relations_missing=graph_reconciliation_counts.relations_missing,
+            graph_relations_extra=graph_reconciliation_counts.relations_extra,
+            graph_next_missing=graph_reconciliation_counts.next_missing,
+            graph_next_extra=graph_reconciliation_counts.next_extra,
+            graph_rebuilt=graph_reconciliation_counts.rebuilt,
             graph_events_enqueued=(
                 feedback_counts.graph_events_enqueued
                 + entity_deduplication_counts.graph_events_enqueued
@@ -519,6 +559,15 @@ class ImproveService:
             )
             await uow.commit()
             return ImproveRelationEmbeddingCounts(relations_embedded=relations_embedded)
+
+    async def _reconcile_graph(
+        self,
+        dataset: ImproveDatasetSnapshot,
+    ) -> ImproveGraphReconciliationCounts:
+        if self._graph_reconciliation is None:
+            raise DependencyUnavailableError(message="Graph reconciliation is unavailable.")
+        result = await self._graph_reconciliation.reconcile_dataset(dataset.id)
+        return _graph_reconciliation_counts(result)
 
     async def _detect_entity_duplicates(
         self,
@@ -951,6 +1000,31 @@ def _empty_entity_merge_counts() -> ImproveEntityDeduplicationCounts:
         relations_deactivated=0,
         relation_evidence_copied=0,
         graph_events_enqueued=0,
+    )
+
+
+def _empty_graph_reconciliation_counts() -> ImproveGraphReconciliationCounts:
+    return _graph_reconciliation_counts(
+        GraphReconciliationResult(diff=GraphReconciliationDiff(), rebuilt=False)
+    )
+
+
+def _graph_reconciliation_counts(
+    result: GraphReconciliationResult,
+) -> ImproveGraphReconciliationCounts:
+    diff = result.diff
+    return ImproveGraphReconciliationCounts(
+        entities_missing=diff.entities_missing,
+        entities_extra=diff.entities_extra,
+        chunks_missing=diff.chunks_missing,
+        chunks_extra=diff.chunks_extra,
+        entity_mentions_missing=diff.entity_mentions_missing,
+        entity_mentions_extra=diff.entity_mentions_extra,
+        relations_missing=diff.relations_missing,
+        relations_extra=diff.relations_extra,
+        next_missing=diff.next_missing,
+        next_extra=diff.next_extra,
+        rebuilt=result.rebuilt,
     )
 
 

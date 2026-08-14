@@ -68,6 +68,7 @@ SETTINGS_ENV_NAMES = {
     "RECALL_MAX_TOP_K",
     "RECALL_RRF_K",
     "ENTITY_DEDUP_SIMILARITY_THRESHOLD",
+    "ENTITY_MERGE_SIMILARITY_THRESHOLD",
     "WORKER_ENABLED",
     "WORKER_POLL_INTERVAL_MS",
     "WORKER_STALE_AFTER_SECONDS",
@@ -114,6 +115,7 @@ def test_minimal_valid_configuration_uses_prd_defaults() -> None:
     assert settings.chunk_max_tokens == 900
     assert settings.recall_default_top_k == 12
     assert settings.entity_dedup_similarity_threshold == 0.90
+    assert settings.entity_merge_similarity_threshold == 0.95
     assert settings.worker_enabled is True
     assert settings.log_document_content is False
 
@@ -251,6 +253,15 @@ def test_default_top_k_greater_than_max_top_k_is_rejected() -> None:
 @pytest.mark.parametrize("value", [0, -0.1, 1.1])
 def test_entity_dedup_similarity_threshold_invalid(value: float) -> None:
     assert_invalid(entity_dedup_similarity_threshold=value)
+
+
+@pytest.mark.parametrize("value", [0, -0.1, 1.1])
+def test_entity_merge_similarity_threshold_invalid(value: float) -> None:
+    assert_invalid(entity_merge_similarity_threshold=value)
+
+
+def test_entity_merge_similarity_threshold_must_not_be_below_dedup_threshold() -> None:
+    assert_invalid(entity_dedup_similarity_threshold=0.90, entity_merge_similarity_threshold=0.89)
 
 
 def test_cors_empty_string_disables_cors() -> None:
@@ -461,6 +472,7 @@ def test_app_version_change_does_not_change_fingerprint() -> None:
         ("recall_max_top_k", 101),
         ("recall_rrf_k", 61),
         ("entity_dedup_similarity_threshold", 0.91),
+        ("entity_merge_similarity_threshold", 0.96),
     ],
 )
 def test_functional_configuration_changes_fingerprint(field_name: str, value: object) -> None:
@@ -524,7 +536,10 @@ def test_fingerprint_payload_has_schema_version_and_prompt_versions() -> None:
         "document_summary": "v1",
         "graph_extraction": "v1",
     }
-    assert payload["improve"] == {"entity_dedup_similarity_threshold": 0.9}
+    assert payload["improve"] == {
+        "entity_dedup_similarity_threshold": 0.9,
+        "entity_merge_similarity_threshold": 0.95,
+    }
 
 
 def test_prompt_versions_are_deterministic_when_provided() -> None:

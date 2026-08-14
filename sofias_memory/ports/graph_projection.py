@@ -178,6 +178,26 @@ def entity_upsert_command(
     )
 
 
+def entity_delete_command(
+    *,
+    entity_id: UUID | str,
+    dataset_id: UUID | str,
+) -> ProjectionCommand:
+    """Build the frozen delete command for one inactive authoritative entity."""
+
+    entity_id_text = str(entity_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="entity",
+        operation="delete",
+        dataset_id=str(dataset_id),
+        aggregate_id=entity_id_text,
+        identity={"id": entity_id_text},
+        endpoints={},
+        properties={},
+    )
+
+
 def chunk_upsert_command(
     *,
     chunk_id: UUID | str,

@@ -42,6 +42,17 @@ class EntityMentionRepository:
             is not None
         )
 
+    async def list_for_entities(self, *, entity_ids: list[UUID]) -> list[EntityMention]:
+        if not entity_ids:
+            return []
+
+        result = await self._session.scalars(
+            select(EntityMention)
+            .where(EntityMention.entity_id.in_(entity_ids))
+            .order_by(EntityMention.id)
+        )
+        return list(result)
+
     async def list_active_entities_for_chunks(
         self,
         *,

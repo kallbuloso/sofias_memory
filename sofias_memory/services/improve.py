@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import Protocol, cast
 from uuid import UUID, uuid4
@@ -12,7 +12,14 @@ from uuid import UUID, uuid4
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
-from sofias_memory.infrastructure.postgres.models import Dataset, Entity, PipelineRun, Relation
+from sofias_memory.infrastructure.postgres.models import (
+    Dataset,
+    Entity,
+    EntityMention,
+    PipelineRun,
+    Relation,
+    RelationEvidence,
+)
 from sofias_memory.infrastructure.postgres.repositories.entities import (
     EntityDuplicateCandidate,
     EntityEmbeddingCandidate,
@@ -21,7 +28,13 @@ from sofias_memory.infrastructure.postgres.repositories.feedback import Unapplie
 from sofias_memory.infrastructure.postgres.repositories.relations import RelationEmbeddingCandidate
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
-from sofias_memory.ports import ProjectionCommand, entity_upsert_command, relation_upsert_command
+from sofias_memory.ports import (
+    ProjectionCommand,
+    entity_delete_command,
+    entity_mention_upsert_command,
+    entity_upsert_command,
+    relation_upsert_command,
+)
 from sofias_memory.schemas.common import ErrorCode, JSONValue, utc_now
 from sofias_memory.schemas.improve import ImproveRequest, ImproveResult
 from sofias_memory.services.feedback import (
@@ -36,8 +49,8 @@ RELATION_EMBEDDINGS_STAGE = "relation_embeddings"
 ENTITY_DEDUPLICATION_STAGE = "entity_deduplication"
 DEFAULT_IMPROVE_STAGES = (
     FEEDBACK_WEIGHTS_STAGE,
-    RELATION_EMBEDDINGS_STAGE,
     ENTITY_DEDUPLICATION_STAGE,
+    RELATION_EMBEDDINGS_STAGE,
 )
 SUPPORTED_IMPROVE_STAGES = frozenset(DEFAULT_IMPROVE_STAGES)
 IMPROVE_RESULT_METRIC_KEY = "improve_result"
@@ -55,6 +68,8 @@ class FeedbackRepositoryForImprove(Protocol):
 
 
 class EntityMentionRepositoryForImprove(Protocol):
+    async def list_for_entities(self, *, entity_ids: list[UUID]) -> list[EntityMention]: ...
+
     async def list_active_entities_for_chunks(
         self,
         *,
@@ -64,6 +79,10 @@ class EntityMentionRepositoryForImprove(Protocol):
 
 
 class RelationEvidenceRepositoryForImprove(Protocol):
+    async def add(self, evidence: RelationEvidence) -> RelationEvidence: ...
+
+    async def list_for_relations(self, *, relation_ids: list[UUID]) -> list[RelationEvidence]: ...
+
     async def list_active_relations_for_chunks(
         self,
         *,
@@ -86,6 +105,13 @@ class EntityRepositoryForImprove(Protocol):
         embeddings_by_entity_id: dict[UUID, list[float]],
     ) -> int: ...
 
+    async def list_active_current_by_ids(
+        self,
+        *,
+        dataset_id: UUID,
+        entity_ids: list[UUID],
+    ) -> list[Entity]: ...
+
     async def list_duplicate_candidates(
         self,
         *,
@@ -107,6 +133,12 @@ class RelationRepositoryForImprove(Protocol):
         dataset_id: UUID,
         embeddings_by_relation_id: dict[UUID, list[float]],
     ) -> int: ...
+
+    async def list_active_current_for_dataset(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[Relation]: ...
 
 
 class GraphOutboxRepositoryForImprove(Protocol):
@@ -170,6 +202,37 @@ class ImproveRelationEmbeddingCounts:
 class ImproveEntityDeduplicationCounts:
     entities_embedded: int
     duplicate_candidates: int
+    entities_merged: int
+    entity_mentions_reassigned: int
+    relations_rewired: int
+    relations_deactivated: int
+    relation_evidence_copied: int
+    graph_events_enqueued: int
+
+
+@dataclass(frozen=True)
+class RelationMergePlan:
+    relation: Relation
+    mapped_source_entity_id: UUID
+    mapped_target_entity_id: UUID
+    changed: bool
+    self_loop: bool
+
+    @property
+    def identity(self) -> tuple[UUID, UUID, str, int]:
+        return (
+            self.mapped_source_entity_id,
+            self.mapped_target_entity_id,
+            self.relation.predicate,
+            self.relation.generation,
+        )
+
+
+@dataclass(frozen=True)
+class RelationMergeCounts:
+    rewired: int
+    deactivated: int
+    evidence_copied: int
 
 
 class ImproveService:
@@ -269,6 +332,12 @@ class ImproveService:
         entity_deduplication_counts = ImproveEntityDeduplicationCounts(
             entities_embedded=0,
             duplicate_candidates=0,
+            entities_merged=0,
+            entity_mentions_reassigned=0,
+            relations_rewired=0,
+            relations_deactivated=0,
+            relation_evidence_copied=0,
+            graph_events_enqueued=0,
         )
         graph_events_processed = 0
 
@@ -276,11 +345,14 @@ class ImproveService:
             if stage == FEEDBACK_WEIGHTS_STAGE:
                 feedback_counts = await self._apply_feedback_weights(dataset)
                 drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
-                graph_events_processed = int(getattr(drain_result, "processed", 0))
+                graph_events_processed += int(getattr(drain_result, "processed", 0))
             elif stage == RELATION_EMBEDDINGS_STAGE:
                 relation_embedding_counts = await self._apply_relation_embeddings(dataset)
             elif stage == ENTITY_DEDUPLICATION_STAGE:
                 entity_deduplication_counts = await self._detect_entity_duplicates(dataset)
+                if entity_deduplication_counts.graph_events_enqueued:
+                    drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
+                    graph_events_processed += int(getattr(drain_result, "processed", 0))
 
         result = ImproveResult(
             run_id=run_id,
@@ -296,7 +368,15 @@ class ImproveService:
             relations_embedded=relation_embedding_counts.relations_embedded,
             entities_embedded=entity_deduplication_counts.entities_embedded,
             entity_duplicate_candidates=entity_deduplication_counts.duplicate_candidates,
-            graph_events_enqueued=feedback_counts.graph_events_enqueued,
+            entities_merged=entity_deduplication_counts.entities_merged,
+            entity_mentions_reassigned=entity_deduplication_counts.entity_mentions_reassigned,
+            relations_rewired=entity_deduplication_counts.relations_rewired,
+            relations_deactivated=entity_deduplication_counts.relations_deactivated,
+            relation_evidence_copied=entity_deduplication_counts.relation_evidence_copied,
+            graph_events_enqueued=(
+                feedback_counts.graph_events_enqueued
+                + entity_deduplication_counts.graph_events_enqueued
+            ),
             graph_events_processed=graph_events_processed,
         )
         await self._mark_run_succeeded(run_id, result, dataset_id=dataset.id)
@@ -480,9 +560,100 @@ class ImproveService:
                 dataset_id=dataset.id,
                 similarity_threshold=self._settings.entity_dedup_similarity_threshold,
             )
+            merge_counts = await self._merge_duplicate_entities(
+                uow,
+                dataset=dataset,
+                candidates=duplicate_candidates,
+            )
+            if merge_counts.graph_events_enqueued:
+                await uow.commit()
         return ImproveEntityDeduplicationCounts(
             entities_embedded=entities_embedded,
             duplicate_candidates=len(duplicate_candidates),
+            entities_merged=merge_counts.entities_merged,
+            entity_mentions_reassigned=merge_counts.entity_mentions_reassigned,
+            relations_rewired=merge_counts.relations_rewired,
+            relations_deactivated=merge_counts.relations_deactivated,
+            relation_evidence_copied=merge_counts.relation_evidence_copied,
+            graph_events_enqueued=merge_counts.graph_events_enqueued,
+        )
+
+    async def _merge_duplicate_entities(
+        self,
+        uow: ImproveUnitOfWork,
+        *,
+        dataset: ImproveDatasetSnapshot,
+        candidates: list[EntityDuplicateCandidate],
+    ) -> ImproveEntityDeduplicationCounts:
+        merge_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.similarity >= self._settings.entity_merge_similarity_threshold
+        ]
+        if not merge_candidates:
+            return _empty_entity_merge_counts()
+
+        entity_ids = sorted(
+            {
+                entity_id
+                for candidate in merge_candidates
+                for entity_id in (candidate.entity_id, candidate.candidate_id)
+            }
+        )
+        active_entities = await uow.entities.list_active_current_by_ids(
+            dataset_id=dataset.id,
+            entity_ids=entity_ids,
+        )
+        entities_by_id = {entity.id: entity for entity in active_entities}
+        merge_plan = plan_entity_merges(entities_by_id, merge_candidates)
+        if not merge_plan:
+            return _empty_entity_merge_counts()
+
+        duplicate_ids = sorted(merge_plan)
+        mentions = await uow.entity_mentions.list_for_entities(entity_ids=duplicate_ids)
+        relations = await uow.relations.list_active_current_for_dataset(dataset_id=dataset.id)
+        relation_evidence = await uow.relation_evidence.list_for_relations(
+            relation_ids=sorted(relation.id for relation in relations)
+        )
+
+        graph_commands: list[ProjectionCommand] = []
+        for duplicate_id in duplicate_ids:
+            survivor = entities_by_id[merge_plan[duplicate_id]]
+            duplicate = entities_by_id[duplicate_id]
+            survivor.aliases = merged_entity_aliases(survivor=survivor, duplicate=duplicate)
+            duplicate.is_active = False
+            graph_commands.append(
+                entity_delete_command(entity_id=duplicate.id, dataset_id=dataset.id)
+            )
+
+        mention_commands = reassign_entity_mentions(
+            mentions=mentions,
+            entity_id_mapping=merge_plan,
+            dataset_id=dataset.id,
+        )
+        graph_commands.extend(mention_commands)
+
+        relation_counts, relation_commands = await merge_relations(
+            uow,
+            relations=relations,
+            relation_evidence=relation_evidence,
+            entity_id_mapping=merge_plan,
+            dataset_id=dataset.id,
+        )
+        graph_commands.extend(relation_commands)
+
+        for command in graph_commands:
+            await uow.graph_outbox.add_projection_command(command)
+
+        return ImproveEntityDeduplicationCounts(
+            entities_embedded=0,
+            duplicate_candidates=0,
+            entities_merged=len(duplicate_ids),
+            entity_mentions_reassigned=len(mention_commands),
+            relations_rewired=relation_counts.rewired,
+            relations_deactivated=relation_counts.deactivated,
+            relation_evidence_copied=relation_counts.evidence_copied,
+            graph_events_enqueued=len(graph_commands),
         )
 
     async def _mark_run_succeeded(
@@ -576,6 +747,165 @@ def validate_embedding_response(
             )
 
 
+def plan_entity_merges(
+    entities_by_id: dict[UUID, Entity],
+    candidates: Sequence[EntityDuplicateCandidate],
+) -> dict[UUID, UUID]:
+    adjacency: dict[UUID, set[UUID]] = {}
+    for candidate in candidates:
+        if (
+            candidate.entity_id not in entities_by_id
+            or candidate.candidate_id not in entities_by_id
+        ):
+            continue
+        adjacency.setdefault(candidate.entity_id, set()).add(candidate.candidate_id)
+        adjacency.setdefault(candidate.candidate_id, set()).add(candidate.entity_id)
+
+    consumed: set[UUID] = set()
+    entity_id_mapping: dict[UUID, UUID] = {}
+    for survivor in sorted(entities_by_id.values(), key=_entity_survivor_sort_key):
+        if survivor.id in consumed:
+            continue
+        direct_neighbors = [
+            entity_id
+            for entity_id in adjacency.get(survivor.id, set())
+            if entity_id not in consumed and entity_id != survivor.id
+        ]
+        for duplicate_id in sorted(
+            direct_neighbors,
+            key=lambda entity_id: _entity_survivor_sort_key(entities_by_id[entity_id]),
+        ):
+            if duplicate_id in consumed:
+                continue
+            entity_id_mapping[duplicate_id] = survivor.id
+            consumed.add(duplicate_id)
+    return entity_id_mapping
+
+
+def merged_entity_aliases(*, survivor: Entity, duplicate: Entity) -> list[str]:
+    survivor_name_key = survivor.name.strip().casefold()
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for raw_alias in [*survivor.aliases, duplicate.name, *duplicate.aliases]:
+        alias = raw_alias.strip()
+        alias_key = alias.casefold()
+        if not alias or alias_key == survivor_name_key or alias_key in seen:
+            continue
+        aliases.append(alias)
+        seen.add(alias_key)
+    return aliases
+
+
+def reassign_entity_mentions(
+    *,
+    mentions: Sequence[EntityMention],
+    entity_id_mapping: dict[UUID, UUID],
+    dataset_id: UUID,
+) -> list[ProjectionCommand]:
+    commands: list[ProjectionCommand] = []
+    for mention in sorted(mentions, key=lambda item: item.id):
+        survivor_id = entity_id_mapping.get(mention.entity_id)
+        if survivor_id is None:
+            continue
+        mention.entity_id = survivor_id
+        commands.append(
+            entity_mention_upsert_command(
+                mention_id=mention.id,
+                dataset_id=dataset_id,
+                entity_id=survivor_id,
+                chunk_id=mention.chunk_id,
+                confidence=float(mention.confidence),
+            )
+        )
+    return commands
+
+
+async def merge_relations(
+    uow: ImproveUnitOfWork,
+    *,
+    relations: Sequence[Relation],
+    relation_evidence: Sequence[RelationEvidence],
+    entity_id_mapping: dict[UUID, UUID],
+    dataset_id: UUID,
+) -> tuple[RelationMergeCounts, list[ProjectionCommand]]:
+    plans = [
+        _relation_merge_plan(relation, entity_id_mapping)
+        for relation in sorted(relations, key=_relation_sort_key)
+    ]
+    evidence_by_relation = _relation_evidence_by_relation(relation_evidence)
+
+    rewired = 0
+    deactivated = 0
+    evidence_copied = 0
+    commands_by_relation_id: dict[UUID, ProjectionCommand] = {}
+    grouped_plans: dict[tuple[UUID, UUID, str, int], list[RelationMergePlan]] = {}
+
+    for plan in plans:
+        if not plan.changed:
+            grouped_plans.setdefault(plan.identity, []).append(plan)
+            continue
+        if plan.self_loop:
+            plan.relation.is_active = False
+            plan.relation.embedding = None
+            deactivated += 1
+            continue
+        grouped_plans.setdefault(plan.identity, []).append(plan)
+
+    for group in grouped_plans.values():
+        if not any(plan.changed for plan in group):
+            continue
+        survivor_plan = min(group, key=_relation_survivor_plan_sort_key)
+        loser_plans = [plan for plan in group if plan.relation.id != survivor_plan.relation.id]
+        survivor = survivor_plan.relation
+
+        if survivor_plan.changed:
+            survivor.source_entity_id = survivor_plan.mapped_source_entity_id
+            survivor.target_entity_id = survivor_plan.mapped_target_entity_id
+            survivor.embedding = None
+            rewired += 1
+
+        if loser_plans:
+            survivor.confidence = max(float(plan.relation.confidence) for plan in group)
+            survivor.importance_weight = max(
+                float(plan.relation.importance_weight) for plan in group
+            )
+
+        for loser_plan in loser_plans:
+            loser = loser_plan.relation
+            if loser.is_active:
+                loser.is_active = False
+                loser.embedding = None
+                deactivated += 1
+            evidence_copied += await _copy_missing_relation_evidence(
+                uow,
+                survivor=survivor,
+                loser=loser,
+                evidence_by_relation=evidence_by_relation,
+            )
+
+        if survivor_plan.changed or loser_plans:
+            commands_by_relation_id[survivor.id] = relation_upsert_command(
+                relation_id=survivor.id,
+                dataset_id=dataset_id,
+                source_entity_id=survivor.source_entity_id,
+                target_entity_id=survivor.target_entity_id,
+                predicate=survivor.predicate,
+                description=survivor.description,
+                confidence=float(survivor.confidence),
+                importance_weight=float(survivor.importance_weight),
+                generation=survivor.generation,
+            )
+
+    return (
+        RelationMergeCounts(
+            rewired=rewired,
+            deactivated=deactivated,
+            evidence_copied=evidence_copied,
+        ),
+        [commands_by_relation_id[relation_id] for relation_id in sorted(commands_by_relation_id)],
+    )
+
+
 def feedback_target_chunk_ids(feedback: UnappliedFeedback) -> list[UUID]:
     if feedback.target_type == REFERENCE_TARGET_TYPE:
         return [feedback.target_id] if feedback.target_id is not None else []
@@ -609,3 +939,86 @@ def _ordered_weight_projection_commands(
         *[entity_commands[entity_id] for entity_id in sorted(entity_commands)],
         *[relation_commands[relation_id] for relation_id in sorted(relation_commands)],
     )
+
+
+def _empty_entity_merge_counts() -> ImproveEntityDeduplicationCounts:
+    return ImproveEntityDeduplicationCounts(
+        entities_embedded=0,
+        duplicate_candidates=0,
+        entities_merged=0,
+        entity_mentions_reassigned=0,
+        relations_rewired=0,
+        relations_deactivated=0,
+        relation_evidence_copied=0,
+        graph_events_enqueued=0,
+    )
+
+
+def _entity_survivor_sort_key(entity: Entity) -> tuple[datetime, UUID]:
+    return (_created_at(entity.created_at), entity.id)
+
+
+def _relation_sort_key(relation: Relation) -> tuple[datetime, UUID]:
+    return (_created_at(relation.created_at), relation.id)
+
+
+def _created_at(value: datetime | None) -> datetime:
+    return value or datetime.min.replace(tzinfo=UTC)
+
+
+def _relation_merge_plan(
+    relation: Relation,
+    entity_id_mapping: dict[UUID, UUID],
+) -> RelationMergePlan:
+    mapped_source = entity_id_mapping.get(relation.source_entity_id, relation.source_entity_id)
+    mapped_target = entity_id_mapping.get(relation.target_entity_id, relation.target_entity_id)
+    changed = (
+        mapped_source != relation.source_entity_id or mapped_target != relation.target_entity_id
+    )
+    return RelationMergePlan(
+        relation=relation,
+        mapped_source_entity_id=mapped_source,
+        mapped_target_entity_id=mapped_target,
+        changed=changed,
+        self_loop=mapped_source == mapped_target,
+    )
+
+
+def _relation_survivor_plan_sort_key(plan: RelationMergePlan) -> tuple[int, datetime, UUID]:
+    canonical_endpoint_priority = 1 if plan.changed else 0
+    return (canonical_endpoint_priority, *_relation_sort_key(plan.relation))
+
+
+def _relation_evidence_by_relation(
+    evidence_items: Sequence[RelationEvidence],
+) -> dict[UUID, list[RelationEvidence]]:
+    result: dict[UUID, list[RelationEvidence]] = {}
+    for evidence in evidence_items:
+        result.setdefault(evidence.relation_id, []).append(evidence)
+    return result
+
+
+async def _copy_missing_relation_evidence(
+    uow: ImproveUnitOfWork,
+    *,
+    survivor: Relation,
+    loser: Relation,
+    evidence_by_relation: dict[UUID, list[RelationEvidence]],
+) -> int:
+    survivor_evidence = evidence_by_relation.setdefault(survivor.id, [])
+    existing_chunk_ids = {evidence.chunk_id for evidence in survivor_evidence}
+    copied = 0
+    for evidence in evidence_by_relation.get(loser.id, []):
+        if evidence.chunk_id in existing_chunk_ids:
+            continue
+        copied_evidence = RelationEvidence(
+            relation_id=survivor.id,
+            chunk_id=evidence.chunk_id,
+            quote=evidence.quote,
+            confidence=evidence.confidence,
+        )
+        await uow.relation_evidence.add(copied_evidence)
+        survivor_evidence.append(copied_evidence)
+        existing_chunk_ids.add(evidence.chunk_id)
+        copied += 1
+    return copied

@@ -153,6 +153,35 @@ class RelationRepository:
         await self._session.flush()
         return updated
 
+    async def list_active_current_for_dataset(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[Relation]:
+        source_entity = aliased(Entity)
+        target_entity = aliased(Entity)
+        statement = (
+            select(Relation)
+            .join(Dataset, Relation.dataset_id == Dataset.id)
+            .join(source_entity, Relation.source_entity_id == source_entity.id)
+            .join(target_entity, Relation.target_entity_id == target_entity.id)
+            .where(
+                Relation.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                source_entity.dataset_id == Dataset.id,
+                source_entity.generation == Dataset.active_generation,
+                source_entity.is_active.is_(True),
+                target_entity.dataset_id == Dataset.id,
+                target_entity.generation == Dataset.active_generation,
+                target_entity.is_active.is_(True),
+            )
+            .order_by(Relation.created_at, Relation.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def list_active_for_recall(
         self,
         *,

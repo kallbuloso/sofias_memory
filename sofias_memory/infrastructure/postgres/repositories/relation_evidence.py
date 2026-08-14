@@ -64,6 +64,17 @@ class RelationEvidenceRepository:
             is not None
         )
 
+    async def list_for_relations(self, *, relation_ids: list[UUID]) -> list[RelationEvidence]:
+        if not relation_ids:
+            return []
+
+        result = await self._session.scalars(
+            select(RelationEvidence)
+            .where(RelationEvidence.relation_id.in_(relation_ids))
+            .order_by(RelationEvidence.relation_id, RelationEvidence.chunk_id)
+        )
+        return list(result)
+
     async def list_active_relations_for_chunks(
         self,
         *,

@@ -126,6 +126,12 @@ class Settings(BaseSettings):
         le=1.0,
         alias="ENTITY_DEDUP_SIMILARITY_THRESHOLD",
     )
+    entity_merge_similarity_threshold: float = Field(
+        default=0.95,
+        gt=0.0,
+        le=1.0,
+        alias="ENTITY_MERGE_SIMILARITY_THRESHOLD",
+    )
 
     worker_enabled: bool = Field(default=True, alias="WORKER_ENABLED")
     worker_poll_interval_ms: int = Field(default=500, gt=0, alias="WORKER_POLL_INTERVAL_MS")
@@ -236,6 +242,11 @@ class Settings(BaseSettings):
             raise ValueError("CHUNK_MIN_TOKENS must be less than or equal to CHUNK_MAX_TOKENS")
         if self.recall_default_top_k > self.recall_max_top_k:
             raise ValueError("RECALL_DEFAULT_TOP_K must be less than or equal to RECALL_MAX_TOP_K")
+        if self.entity_merge_similarity_threshold < self.entity_dedup_similarity_threshold:
+            raise ValueError(
+                "ENTITY_MERGE_SIMILARITY_THRESHOLD must be greater than or equal to "
+                "ENTITY_DEDUP_SIMILARITY_THRESHOLD"
+            )
 
         return self
 
@@ -289,6 +300,7 @@ def build_config_fingerprint_payload(
         },
         "improve": {
             "entity_dedup_similarity_threshold": settings.entity_dedup_similarity_threshold,
+            "entity_merge_similarity_threshold": settings.entity_merge_similarity_threshold,
         },
         "prompt_versions": prompt_version_payload,
     }

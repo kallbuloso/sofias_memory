@@ -52,5 +52,10 @@ class ImproveResult(BaseModel):
     relations_embedded: int
     entities_embedded: int
     entity_duplicate_candidates: int
+    entities_merged: int
+    entity_mentions_reassigned: int
+    relations_rewired: int
+    relations_deactivated: int
+    relation_evidence_copied: int
     graph_events_enqueued: int
     graph_events_processed: int

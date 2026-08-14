@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from sofias_memory.domain import DatasetStatus
 from sofias_memory.infrastructure.postgres.models import Dataset, Entity
@@ -22,6 +23,26 @@ class RecalledEntity:
     entity_type: str
     description: str
     importance_weight: float
+
+
+@dataclass(frozen=True)
+class EntityEmbeddingCandidate:
+    """Detached entity snapshot for Improve entity embedding."""
+
+    entity_id: UUID
+    name: str
+
+
+@dataclass(frozen=True)
+class EntityDuplicateCandidate:
+    """Detected unordered entity duplicate candidate pair."""
+
+    entity_id: UUID
+    entity_name: str
+    candidate_id: UUID
+    candidate_name: str
+    entity_type: str
+    similarity: float
 
 
 class EntityRepository:
@@ -49,6 +70,116 @@ class EntityRepository:
             )
         )
         return cast(Entity | None, result)
+
+    async def list_missing_embedding_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[EntityEmbeddingCandidate]:
+        statement = (
+            select(Entity.id, Entity.name)
+            .join(Dataset, Entity.dataset_id == Dataset.id)
+            .where(
+                Entity.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Entity.generation == Dataset.active_generation,
+                Entity.is_active.is_(True),
+                Entity.embedding.is_(None),
+            )
+            .order_by(Entity.id)
+        )
+        result = await self._session.execute(statement)
+        return [
+            EntityEmbeddingCandidate(
+                entity_id=row.id,
+                name=row.name,
+            )
+            for row in result
+        ]
+
+    async def set_missing_embeddings_for_active_current(
+        self,
+        *,
+        dataset_id: UUID,
+        embeddings_by_entity_id: dict[UUID, list[float]],
+    ) -> int:
+        if not embeddings_by_entity_id:
+            return 0
+
+        statement = (
+            select(Entity)
+            .join(Dataset, Entity.dataset_id == Dataset.id)
+            .where(
+                Entity.id.in_(list(embeddings_by_entity_id)),
+                Entity.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Entity.generation == Dataset.active_generation,
+                Entity.is_active.is_(True),
+                Entity.embedding.is_(None),
+            )
+            .order_by(Entity.id)
+        )
+        entities = await self._session.scalars(statement)
+        updated = 0
+        for entity in entities:
+            entity.embedding = embeddings_by_entity_id[entity.id]
+            updated += 1
+        await self._session.flush()
+        return updated
+
+    async def list_duplicate_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+        similarity_threshold: float,
+    ) -> list[EntityDuplicateCandidate]:
+        entity = aliased(Entity)
+        candidate = aliased(Entity)
+        cosine_distance = entity.embedding.cosine_distance(candidate.embedding)
+        similarity = (literal(1.0) - cosine_distance).label("similarity")
+        normalized_entity_type = func.lower(func.btrim(entity.entity_type))
+        normalized_candidate_type = func.lower(func.btrim(candidate.entity_type))
+        statement = (
+            select(
+                entity.id.label("entity_id"),
+                entity.name.label("entity_name"),
+                candidate.id.label("candidate_id"),
+                candidate.name.label("candidate_name"),
+                entity.entity_type.label("entity_type"),
+                similarity,
+            )
+            .join(Dataset, entity.dataset_id == Dataset.id)
+            .join(
+                candidate,
+                candidate.dataset_id == entity.dataset_id,
+            )
+            .where(
+                entity.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                entity.generation == Dataset.active_generation,
+                entity.is_active.is_(True),
+                entity.embedding.is_not(None),
+                candidate.id > entity.id,
+                candidate.generation == Dataset.active_generation,
+                candidate.is_active.is_(True),
+                candidate.embedding.is_not(None),
+                normalized_entity_type == normalized_candidate_type,
+                similarity >= similarity_threshold,
+            )
+            .order_by(similarity.desc(), entity.id, candidate.id)
+        )
+        result = await self._session.execute(statement)
+        return [
+            EntityDuplicateCandidate(
+                entity_id=row.entity_id,
+                entity_name=row.entity_name,
+                candidate_id=row.candidate_id,
+                candidate_name=row.candidate_name,
+                entity_type=row.entity_type,
+                similarity=float(row.similarity),
+            )
+            for row in result
+        ]
 
     async def list_active_for_recall(
         self,

@@ -13,6 +13,10 @@ from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryErr
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.models import Dataset, Entity, PipelineRun, Relation
+from sofias_memory.infrastructure.postgres.repositories.entities import (
+    EntityDuplicateCandidate,
+    EntityEmbeddingCandidate,
+)
 from sofias_memory.infrastructure.postgres.repositories.feedback import UnappliedFeedback
 from sofias_memory.infrastructure.postgres.repositories.relations import RelationEmbeddingCandidate
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
@@ -29,7 +33,12 @@ from sofias_memory.services.remember import stable_payload_hash
 
 FEEDBACK_WEIGHTS_STAGE = "feedback_weights"
 RELATION_EMBEDDINGS_STAGE = "relation_embeddings"
-DEFAULT_IMPROVE_STAGES = (FEEDBACK_WEIGHTS_STAGE, RELATION_EMBEDDINGS_STAGE)
+ENTITY_DEDUPLICATION_STAGE = "entity_deduplication"
+DEFAULT_IMPROVE_STAGES = (
+    FEEDBACK_WEIGHTS_STAGE,
+    RELATION_EMBEDDINGS_STAGE,
+    ENTITY_DEDUPLICATION_STAGE,
+)
 SUPPORTED_IMPROVE_STAGES = frozenset(DEFAULT_IMPROVE_STAGES)
 IMPROVE_RESULT_METRIC_KEY = "improve_result"
 FEEDBACK_WEIGHT_ALPHA = 0.1
@@ -63,6 +72,28 @@ class RelationEvidenceRepositoryForImprove(Protocol):
     ) -> list[Relation]: ...
 
 
+class EntityRepositoryForImprove(Protocol):
+    async def list_missing_embedding_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[EntityEmbeddingCandidate]: ...
+
+    async def set_missing_embeddings_for_active_current(
+        self,
+        *,
+        dataset_id: UUID,
+        embeddings_by_entity_id: dict[UUID, list[float]],
+    ) -> int: ...
+
+    async def list_duplicate_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+        similarity_threshold: float,
+    ) -> list[EntityDuplicateCandidate]: ...
+
+
 class RelationRepositoryForImprove(Protocol):
     async def list_missing_embedding_candidates(
         self,
@@ -90,6 +121,7 @@ class PipelineRunRepositoryForImprove(Protocol):
 class ImproveUnitOfWork(Protocol):
     datasets: DatasetRepositoryForImprove
     feedback: FeedbackRepositoryForImprove
+    entities: EntityRepositoryForImprove
     entity_mentions: EntityMentionRepositoryForImprove
     relations: RelationRepositoryForImprove
     relation_evidence: RelationEvidenceRepositoryForImprove
@@ -134,6 +166,12 @@ class ImproveRelationEmbeddingCounts:
     relations_embedded: int
 
 
+@dataclass(frozen=True)
+class ImproveEntityDeduplicationCounts:
+    entities_embedded: int
+    duplicate_candidates: int
+
+
 class ImproveService:
     """Apply durable feedback to authoritative PostgreSQL graph weights."""
 
@@ -172,12 +210,13 @@ class ImproveService:
         )
         unsupported = [stage for stage in stages if stage not in SUPPORTED_IMPROVE_STAGES]
         if unsupported:
-            unsupported_json: list[JSONValue] = list(unsupported)
+            unsupported_json: list[JSONValue] = [stage for stage in unsupported]
+            supported_json: list[JSONValue] = [stage for stage in sorted(SUPPORTED_IMPROVE_STAGES)]
             raise SofiasMemoryError(
                 code=ErrorCode.INVALID_REQUEST,
                 status_code=HTTPStatus.BAD_REQUEST,
-                message="Only feedback_weights is available in this checkpoint.",
-                details={"stages": unsupported_json},
+                message="One or more improve stages are not available.",
+                details={"unsupported": unsupported_json, "supported": supported_json},
             )
         return list(dict.fromkeys(stages))
 
@@ -227,14 +266,21 @@ class ImproveService:
             graph_events_enqueued=0,
         )
         relation_embedding_counts = ImproveRelationEmbeddingCounts(relations_embedded=0)
+        entity_deduplication_counts = ImproveEntityDeduplicationCounts(
+            entities_embedded=0,
+            duplicate_candidates=0,
+        )
         graph_events_processed = 0
 
-        if FEEDBACK_WEIGHTS_STAGE in stages:
-            feedback_counts = await self._apply_feedback_weights(dataset)
-            drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
-            graph_events_processed = int(getattr(drain_result, "processed", 0))
-        if RELATION_EMBEDDINGS_STAGE in stages:
-            relation_embedding_counts = await self._apply_relation_embeddings(dataset)
+        for stage in stages:
+            if stage == FEEDBACK_WEIGHTS_STAGE:
+                feedback_counts = await self._apply_feedback_weights(dataset)
+                drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
+                graph_events_processed = int(getattr(drain_result, "processed", 0))
+            elif stage == RELATION_EMBEDDINGS_STAGE:
+                relation_embedding_counts = await self._apply_relation_embeddings(dataset)
+            elif stage == ENTITY_DEDUPLICATION_STAGE:
+                entity_deduplication_counts = await self._detect_entity_duplicates(dataset)
 
         result = ImproveResult(
             run_id=run_id,
@@ -248,6 +294,8 @@ class ImproveService:
             entities_updated=feedback_counts.entities_updated,
             relations_updated=feedback_counts.relations_updated,
             relations_embedded=relation_embedding_counts.relations_embedded,
+            entities_embedded=entity_deduplication_counts.entities_embedded,
+            entity_duplicate_candidates=entity_deduplication_counts.duplicate_candidates,
             graph_events_enqueued=feedback_counts.graph_events_enqueued,
             graph_events_processed=graph_events_processed,
         )
@@ -373,10 +421,11 @@ class ImproveService:
                 cause=exc,
             ) from exc
 
-        validate_relation_embeddings(
+        validate_embedding_response(
             embeddings,
             expected_count=len(candidates),
             expected_dimensions=self._settings.embedding_dimensions,
+            subject="Relation",
         )
         embeddings_by_relation_id = {
             candidate.relation_id: list(embedding)
@@ -390,6 +439,51 @@ class ImproveService:
             )
             await uow.commit()
             return ImproveRelationEmbeddingCounts(relations_embedded=relations_embedded)
+
+    async def _detect_entity_duplicates(
+        self,
+        dataset: ImproveDatasetSnapshot,
+    ) -> ImproveEntityDeduplicationCounts:
+        async with self._unit_of_work_factory() as uow:
+            candidates = await uow.entities.list_missing_embedding_candidates(dataset_id=dataset.id)
+
+        entities_embedded = 0
+        if candidates:
+            texts = [entity_embedding_text(candidate) for candidate in candidates]
+            try:
+                embeddings = await self._embedding_client.embed_texts(texts)
+            except Exception as exc:
+                raise DependencyUnavailableError(
+                    message="Entity embedding provider is unavailable.",
+                    cause=exc,
+                ) from exc
+
+            validate_embedding_response(
+                embeddings,
+                expected_count=len(candidates),
+                expected_dimensions=self._settings.embedding_dimensions,
+                subject="Entity",
+            )
+            embeddings_by_entity_id = {
+                candidate.entity_id: list(embedding)
+                for candidate, embedding in zip(candidates, embeddings, strict=True)
+            }
+            async with self._unit_of_work_factory() as uow:
+                entities_embedded = await uow.entities.set_missing_embeddings_for_active_current(
+                    dataset_id=dataset.id,
+                    embeddings_by_entity_id=embeddings_by_entity_id,
+                )
+                await uow.commit()
+
+        async with self._unit_of_work_factory() as uow:
+            duplicate_candidates = await uow.entities.list_duplicate_candidates(
+                dataset_id=dataset.id,
+                similarity_threshold=self._settings.entity_dedup_similarity_threshold,
+            )
+        return ImproveEntityDeduplicationCounts(
+            entities_embedded=entities_embedded,
+            duplicate_candidates=len(duplicate_candidates),
+        )
 
     async def _mark_run_succeeded(
         self,
@@ -458,21 +552,26 @@ def relation_embedding_text(candidate: RelationEmbeddingCandidate) -> str:
     return f"{source_name}-›{relationship_text}-›{target_name}"
 
 
-def validate_relation_embeddings(
+def entity_embedding_text(candidate: EntityEmbeddingCandidate) -> str:
+    return candidate.name.strip()
+
+
+def validate_embedding_response(
     embeddings: Sequence[Sequence[float]],
     *,
     expected_count: int,
     expected_dimensions: int,
+    subject: str,
 ) -> None:
     if len(embeddings) != expected_count:
         raise DependencyUnavailableError(
-            message="Relation embedding provider returned an invalid response.",
+            message=f"{subject} embedding provider returned an invalid response.",
             details={"reason": "count_mismatch"},
         )
     for embedding in embeddings:
         if len(embedding) != expected_dimensions:
             raise DependencyUnavailableError(
-                message="Relation embedding provider returned an invalid response.",
+                message=f"{subject} embedding provider returned an invalid response.",
                 details={"reason": "dimension_mismatch"},
             )
 

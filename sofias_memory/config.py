@@ -120,6 +120,13 @@ class Settings(BaseSettings):
     recall_max_top_k: int = Field(default=100, gt=0, alias="RECALL_MAX_TOP_K")
     recall_rrf_k: int = Field(default=60, gt=0, alias="RECALL_RRF_K")
 
+    entity_dedup_similarity_threshold: float = Field(
+        default=0.90,
+        gt=0.0,
+        le=1.0,
+        alias="ENTITY_DEDUP_SIMILARITY_THRESHOLD",
+    )
+
     worker_enabled: bool = Field(default=True, alias="WORKER_ENABLED")
     worker_poll_interval_ms: int = Field(default=500, gt=0, alias="WORKER_POLL_INTERVAL_MS")
     worker_stale_after_seconds: int = Field(default=300, gt=0, alias="WORKER_STALE_AFTER_SECONDS")
@@ -279,6 +286,9 @@ def build_config_fingerprint_payload(
             "default_top_k": settings.recall_default_top_k,
             "max_top_k": settings.recall_max_top_k,
             "rrf_k": settings.recall_rrf_k,
+        },
+        "improve": {
+            "entity_dedup_similarity_threshold": settings.entity_dedup_similarity_threshold,
         },
         "prompt_versions": prompt_version_payload,
     }

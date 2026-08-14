@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from math import sqrt
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
@@ -21,6 +22,10 @@ from sofias_memory.infrastructure.postgres.models import (
     Query,
 )
 from sofias_memory.infrastructure.postgres.models.relation import Relation
+from sofias_memory.infrastructure.postgres.repositories.entities import (
+    EntityDuplicateCandidate,
+    EntityEmbeddingCandidate,
+)
 from sofias_memory.infrastructure.postgres.repositories.feedback import UnappliedFeedback
 from sofias_memory.infrastructure.postgres.repositories.relations import RelationEmbeddingCandidate
 from sofias_memory.ports import ProjectionCommand
@@ -29,6 +34,7 @@ from sofias_memory.services.improve import (
     ImproveService,
     ImproveUnitOfWork,
     UnitOfWorkFactory,
+    entity_embedding_text,
     normalize_feedback_score,
     relation_embedding_text,
     stream_update_weight,
@@ -141,6 +147,93 @@ class FakeEntityMentionRepository:
                 ):
                     entities[entity.id] = entity
         return [entities[entity_id] for entity_id in sorted(entities)]
+
+
+class FakeEntityRepository:
+    def __init__(self, store: FakeStore, operations: list[str]) -> None:
+        self._store = store
+        self._operations = operations
+
+    async def list_missing_embedding_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[EntityEmbeddingCandidate]:
+        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
+        return [
+            EntityEmbeddingCandidate(entity_id=item.id, name=item.name)
+            for item in sorted(self._store.entities, key=lambda entity: entity.id)
+            if item.dataset_id == dataset_id
+            and item.generation == dataset.active_generation
+            and item.is_active
+            and item.embedding is None
+        ]
+
+    async def set_missing_embeddings_for_active_current(
+        self,
+        *,
+        dataset_id: UUID,
+        embeddings_by_entity_id: dict[UUID, list[float]],
+    ) -> int:
+        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
+        updated = 0
+        for item in sorted(self._store.entities, key=lambda entity: entity.id):
+            if (
+                item.id in embeddings_by_entity_id
+                and item.dataset_id == dataset_id
+                and item.generation == dataset.active_generation
+                and item.is_active
+                and item.embedding is None
+            ):
+                item.embedding = embeddings_by_entity_id[item.id]
+                updated += 1
+                self._operations.append(f"entity:{item.id}:embedding")
+        return updated
+
+    async def list_duplicate_candidates(
+        self,
+        *,
+        dataset_id: UUID,
+        similarity_threshold: float,
+    ) -> list[EntityDuplicateCandidate]:
+        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
+        entities = [
+            item
+            for item in sorted(self._store.entities, key=lambda entity: entity.id)
+            if item.dataset_id == dataset_id
+            and item.generation == dataset.active_generation
+            and item.is_active
+            and item.embedding is not None
+        ]
+        candidates: list[EntityDuplicateCandidate] = []
+        for index, item in enumerate(entities):
+            for candidate in entities[index + 1 :]:
+                if item.entity_type.strip().casefold() != candidate.entity_type.strip().casefold():
+                    continue
+                similarity = cosine_similarity(
+                    cast(list[float], item.embedding),
+                    cast(list[float], candidate.embedding),
+                )
+                if similarity < similarity_threshold:
+                    continue
+                candidates.append(
+                    EntityDuplicateCandidate(
+                        entity_id=item.id,
+                        entity_name=item.name,
+                        candidate_id=candidate.id,
+                        candidate_name=candidate.name,
+                        entity_type=item.entity_type,
+                        similarity=similarity,
+                    )
+                )
+        return sorted(
+            candidates,
+            key=lambda candidate: (
+                -candidate.similarity,
+                candidate.entity_id,
+                candidate.candidate_id,
+            ),
+        )
 
 
 class FakeRelationEvidenceRepository:
@@ -260,6 +353,7 @@ class FakeUnitOfWork:
         self._operations: list[str] = []
         self.datasets = FakeDatasetRepository(store)
         self.feedback = FakeFeedbackRepository(store, self._operations)
+        self.entities = FakeEntityRepository(store, self._operations)
         self.entity_mentions = FakeEntityMentionRepository(store)
         self.relations = FakeRelationRepository(store, self._operations)
         self.relation_evidence = FakeRelationEvidenceRepository(store)
@@ -425,6 +519,13 @@ def relation(
     )
 
 
+def cosine_similarity(first: list[float], second: list[float]) -> float:
+    dot_product = sum(left * right for left, right in zip(first, second, strict=True))
+    first_norm = sqrt(sum(value * value for value in first))
+    second_norm = sqrt(sum(value * value for value in second))
+    return dot_product / (first_norm * second_norm)
+
+
 def test_feedback_weight_normalization_and_streaming_formula() -> None:
     assert normalize_feedback_score(-1) == 0.0
     assert normalize_feedback_score(0) == 0.5
@@ -455,6 +556,12 @@ def test_relation_embedding_text_is_deterministic_and_omits_metadata() -> None:
         == "PostgreSQL-›stores: Stores authoritative memory.-›Sofias Memory"
     )
     assert relation_embedding_text(predicate_only) == "Chunk-›belongs_to-›Document"
+
+
+def test_entity_embedding_text_is_stripped_name_only() -> None:
+    candidate = EntityEmbeddingCandidate(entity_id=uuid4(), name=" PostgreSQL ")
+
+    assert entity_embedding_text(candidate) == "PostgreSQL"
 
 
 @pytest.mark.asyncio
@@ -595,6 +702,91 @@ async def test_relation_embeddings_select_active_current_null_candidates_and_per
 
 
 @pytest.mark.asyncio
+async def test_entity_deduplication_embeds_active_current_null_entities_and_detects_pairs(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store, generation=2)
+    first = entity(dataset.id, generation=2)
+    first.id = UUID("10000000-0000-0000-0000-000000000001")
+    first.name = " PostgreSQL "
+    first.entity_type = "Database"
+    second = entity(dataset.id, generation=2)
+    second.id = UUID("20000000-0000-0000-0000-000000000002")
+    second.name = "Postgres"
+    second.entity_type = " database "
+    different_type = entity(dataset.id, generation=2)
+    different_type.id = UUID("30000000-0000-0000-0000-000000000003")
+    different_type.entity_type = "System"
+    stale = entity(dataset.id, generation=1)
+    inactive = entity(dataset.id, generation=2)
+    inactive.is_active = False
+    existing = entity(dataset.id, generation=2)
+    existing.embedding = [0.7] * 3072
+    store.entities.extend([second, existing, inactive, first, stale, different_type])
+    service, embedding_client, drain = service_for(tmp_path, store)
+    embedding_client.responses = [
+        [1.0] + [0.0] * 3071,
+        [0.96] + [0.04] * 3071,
+        [0.0, 1.0] + [0.0] * 3070,
+    ]
+
+    result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
+
+    assert result.feedback_processed == 0
+    assert result.relations_embedded == 0
+    assert result.entities_embedded == 3
+    assert result.entity_duplicate_candidates == 1
+    assert result.graph_events_enqueued == 0
+    assert result.graph_events_processed == 0
+    assert drain.dataset_ids == []
+    assert embedding_client.calls == [["PostgreSQL", "Postgres", different_type.name]]
+    assert first.embedding == [1.0] + [0.0] * 3071
+    assert second.embedding == [0.96] + [0.04] * 3071
+    assert different_type.embedding == [0.0, 1.0] + [0.0] * 3070
+    assert stale.embedding is None
+    assert inactive.embedding is None
+    assert existing.embedding == [0.7] * 3072
+    assert store.graph_commands == []
+
+    rerun = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
+
+    assert rerun.entities_embedded == 0
+    assert rerun.entity_duplicate_candidates == 1
+    assert len(embedding_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_entity_embedding_provider_validation_and_failure_write_nothing(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    target = entity(dataset.id, generation=0)
+    store.entities.append(target)
+    service, embedding_client, _ = service_for(tmp_path, store)
+    embedding_client.responses = []
+
+    with pytest.raises(Exception, match="invalid response"):
+        await service.improve(ImproveRequest(stages=["entity_deduplication"]))
+
+    assert target.embedding is None
+
+    embedding_client.responses = [[0.1] * 2]
+    with pytest.raises(Exception, match="invalid response"):
+        await service.improve(ImproveRequest(stages=["entity_deduplication"]))
+
+    assert target.embedding is None
+
+    embedding_client.responses = None
+    embedding_client.failure = RuntimeError("secret provider failure")
+    with pytest.raises(Exception, match="unavailable"):
+        await service.improve(ImproveRequest(stages=["entity_deduplication"]))
+
+    assert target.embedding is None
+
+
+@pytest.mark.asyncio
 async def test_relation_embedding_provider_validation_and_failure_write_nothing(
     tmp_path: Path,
 ) -> None:
@@ -638,8 +830,10 @@ async def test_omitted_stages_default_to_feedback_weights_then_relation_embeddin
     store.queries.append(query)
     store.feedback.append(feedback_for(query.id, target_type="answer", score=1))
     source_entity = entity(dataset.id, generation=0, weight=0.5)
+    source_entity.id = UUID("10000000-0000-0000-0000-000000000001")
     source_entity.name = "A"
     target_entity = entity(dataset.id, generation=0, weight=0.5)
+    target_entity.id = UUID("20000000-0000-0000-0000-000000000002")
     target_entity.name = "B"
     store.entities.extend([source_entity, target_entity])
     store.entities_by_chunk[chunk_id] = [source_entity]
@@ -650,12 +844,14 @@ async def test_omitted_stages_default_to_feedback_weights_then_relation_embeddin
 
     result = await service.improve(ImproveRequest())
 
-    assert result.stages == ["feedback_weights", "relation_embeddings"]
+    assert result.stages == ["feedback_weights", "relation_embeddings", "entity_deduplication"]
     assert result.feedback_processed == 1
     assert result.entities_updated == 1
     assert result.relations_embedded == 1
+    assert result.entities_embedded == 2
+    assert result.entity_duplicate_candidates == 1
     assert drain.dataset_ids == [dataset.id]
-    assert embedding_client.calls == [["A-›uses: Uses projection.-›B"]]
+    assert embedding_client.calls == [["A-›uses: Uses projection.-›B"], ["A", "B"]]
     assert store.run_current_steps_on_add == ["feedback_weights"]
 
     relation_only_store = FakeStore()
@@ -776,6 +972,8 @@ async def test_improve_route_returns_envelope_and_requires_api_key(
                 entities_updated=1,
                 relations_updated=0,
                 relations_embedded=0,
+                entities_embedded=0,
+                entity_duplicate_candidates=0,
                 graph_events_enqueued=1,
                 graph_events_processed=1,
             )

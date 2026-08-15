@@ -11,6 +11,7 @@ from sofias_memory.ports.graph_projection import (
     entity_mention_upsert_command,
     entity_upsert_command,
     projection_command_from_payload,
+    relation_delete_command,
     relation_upsert_command,
     validate_projection_command,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "entity_mention_upsert_command",
     "entity_upsert_command",
     "projection_command_from_payload",
+    "relation_delete_command",
     "relation_upsert_command",
     "validate_projection_command",
 ]

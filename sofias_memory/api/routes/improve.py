@@ -15,6 +15,7 @@ from sofias_memory.lifespan import (
 )
 from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
 from sofias_memory.schemas.improve import ImproveRequest, ImproveResult
+from sofias_memory.services.graph_maintenance_service import GraphMaintenanceService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.graph_rebuild_service import GraphRebuildService
@@ -57,6 +58,7 @@ async def improve(
             neo4j_resource=neo4j_resource,
             rebuild_service=rebuild_service,
         ),
+        graph_maintenance=GraphMaintenanceService(session_factory=session_factory),
         summary_rebuild=SummaryRebuildService(
             settings,
             session_factory=session_factory,

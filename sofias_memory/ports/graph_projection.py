@@ -267,6 +267,31 @@ def relation_upsert_command(
     )
 
 
+def relation_delete_command(
+    *,
+    relation_id: UUID | str,
+    dataset_id: UUID | str,
+    source_entity_id: UUID | str,
+    target_entity_id: UUID | str,
+) -> ProjectionCommand:
+    """Build the frozen delete command for one inactive authoritative relation."""
+
+    relation_id_text = str(relation_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="relation",
+        operation="delete",
+        dataset_id=str(dataset_id),
+        aggregate_id=relation_id_text,
+        identity={"relation_id": relation_id_text},
+        endpoints={
+            "source_entity_id": str(source_entity_id),
+            "target_entity_id": str(target_entity_id),
+        },
+        properties={},
+    )
+
+
 def entity_mention_upsert_command(
     *,
     mention_id: UUID | str,

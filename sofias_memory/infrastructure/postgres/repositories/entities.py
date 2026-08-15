@@ -151,6 +151,25 @@ class EntityRepository:
         result = await self._session.scalars(statement)
         return list(result)
 
+    async def list_active_current_for_dataset(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[Entity]:
+        statement = (
+            select(Entity)
+            .join(Dataset, Entity.dataset_id == Dataset.id)
+            .where(
+                Entity.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Entity.generation == Dataset.active_generation,
+                Entity.is_active.is_(True),
+            )
+            .order_by(Entity.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def list_duplicate_candidates(
         self,
         *,

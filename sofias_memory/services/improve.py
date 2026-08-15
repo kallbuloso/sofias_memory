@@ -42,6 +42,13 @@ from sofias_memory.services.feedback import (
     REFERENCE_TARGET_TYPE,
     reference_chunk_ids,
 )
+from sofias_memory.services.graph_maintenance_service import (
+    GraphMaintenanceCounts,
+    ImportanceComponents,
+    has_importance_marker,
+    importance_components_from_properties,
+    properties_with_importance_marker,
+)
 from sofias_memory.services.graph_reconciliation_service import (
     GraphReconciliationDiff,
     GraphReconciliationResult,
@@ -182,6 +189,12 @@ class GraphReconciliation(Protocol):
     async def reconcile_dataset(self, dataset_id: UUID) -> GraphReconciliationResult: ...
 
 
+class GraphMaintenance(Protocol):
+    async def maintain_dataset(
+        self, dataset_id: UUID, *, generation: int
+    ) -> GraphMaintenanceCounts: ...
+
+
 class SummaryRebuild(Protocol):
     async def rebuild_dataset(
         self, dataset_id: UUID, *, generation: int
@@ -245,6 +258,14 @@ class ImproveGraphReconciliationCounts:
 
 
 @dataclass(frozen=True)
+class ImproveGraphMaintenanceCounts:
+    relations_deactivated: int
+    entities_importance_updated: int
+    relations_importance_updated: int
+    graph_events_enqueued: int
+
+
+@dataclass(frozen=True)
 class RelationMergePlan:
     relation: Relation
     mapped_source_entity_id: UUID
@@ -279,6 +300,7 @@ class ImproveService:
         embedding_client: EmbeddingClient,
         graph_projection_drain: GraphProjectionDrain,
         graph_reconciliation: GraphReconciliation | None = None,
+        graph_maintenance: GraphMaintenance | None = None,
         summary_rebuild: SummaryRebuild | None = None,
         session_factory: AsyncSessionFactory | None = None,
         unit_of_work_factory: UnitOfWorkFactory | None = None,
@@ -289,6 +311,7 @@ class ImproveService:
         self._embedding_client = embedding_client
         self._graph_projection_drain = graph_projection_drain
         self._graph_reconciliation = graph_reconciliation
+        self._graph_maintenance = graph_maintenance
         self._summary_rebuild = summary_rebuild
         self._unit_of_work_factory = unit_of_work_factory or _postgres_unit_of_work_factory(
             cast(AsyncSessionFactory, session_factory)
@@ -378,6 +401,7 @@ class ImproveService:
             graph_events_enqueued=0,
         )
         graph_reconciliation_counts = _empty_graph_reconciliation_counts()
+        graph_maintenance_counts = ImproveGraphMaintenanceCounts(0, 0, 0, 0)
         summary_rebuild_counts = SummaryRebuildCounts(
             document_summaries_rebuilt=0,
             dataset_summaries_rebuilt=0,
@@ -400,6 +424,9 @@ class ImproveService:
             elif stage == SUMMARIES_STAGE:
                 summary_rebuild_counts = await self._rebuild_summaries(dataset)
             elif stage == GRAPH_RECONCILIATION_STAGE:
+                graph_maintenance_counts = await self._maintain_graph(dataset)
+                drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
+                graph_events_processed += int(getattr(drain_result, "processed", 0))
                 graph_reconciliation_counts = await self._reconcile_graph(dataset)
 
         result = ImproveResult(
@@ -424,6 +451,13 @@ class ImproveService:
             document_summaries_rebuilt=summary_rebuild_counts.document_summaries_rebuilt,
             dataset_summaries_rebuilt=summary_rebuild_counts.dataset_summaries_rebuilt,
             summaries_deactivated=summary_rebuild_counts.summaries_deactivated,
+            graph_relations_deactivated=graph_maintenance_counts.relations_deactivated,
+            graph_entities_importance_updated=(
+                graph_maintenance_counts.entities_importance_updated
+            ),
+            graph_relations_importance_updated=(
+                graph_maintenance_counts.relations_importance_updated
+            ),
             graph_entities_missing=graph_reconciliation_counts.entities_missing,
             graph_entities_extra=graph_reconciliation_counts.entities_extra,
             graph_chunks_missing=graph_reconciliation_counts.chunks_missing,
@@ -438,6 +472,7 @@ class ImproveService:
             graph_events_enqueued=(
                 feedback_counts.graph_events_enqueued
                 + entity_deduplication_counts.graph_events_enqueued
+                + graph_maintenance_counts.graph_events_enqueued
             ),
             graph_events_processed=graph_events_processed,
         )
@@ -490,8 +525,12 @@ class ImproveService:
 
                 normalized_score = normalize_feedback_score(feedback.score)
                 for entity in entities:
-                    previous_weight = float(entity.importance_weight)
-                    next_weight = stream_update_weight(previous_weight, normalized_score)
+                    next_weight, next_properties = apply_feedback_to_importance(
+                        properties=dict(entity.properties),
+                        current_importance_weight=float(entity.importance_weight),
+                        normalized_score=normalized_score,
+                    )
+                    entity.properties = next_properties
                     entity.importance_weight = next_weight
                     updated_entities.add(entity.id)
                     entity_commands[entity.id] = entity_upsert_command(
@@ -505,8 +544,12 @@ class ImproveService:
                     )
 
                 for relation in relations:
-                    previous_weight = float(relation.importance_weight)
-                    next_weight = stream_update_weight(previous_weight, normalized_score)
+                    next_weight, next_properties = apply_feedback_to_importance(
+                        properties=dict(relation.properties),
+                        current_importance_weight=float(relation.importance_weight),
+                        normalized_score=normalized_score,
+                    )
+                    relation.properties = next_properties
                     relation.importance_weight = next_weight
                     updated_relations.add(relation.id)
                     relation_commands[relation.id] = relation_upsert_command(
@@ -590,6 +633,23 @@ class ImproveService:
             raise DependencyUnavailableError(message="Graph reconciliation is unavailable.")
         result = await self._graph_reconciliation.reconcile_dataset(dataset.id)
         return _graph_reconciliation_counts(result)
+
+    async def _maintain_graph(
+        self,
+        dataset: ImproveDatasetSnapshot,
+    ) -> ImproveGraphMaintenanceCounts:
+        if self._graph_maintenance is None:
+            raise DependencyUnavailableError(message="Graph maintenance is unavailable.")
+        result = await self._graph_maintenance.maintain_dataset(
+            dataset.id,
+            generation=dataset.active_generation,
+        )
+        return ImproveGraphMaintenanceCounts(
+            relations_deactivated=result.relations_deactivated,
+            entities_importance_updated=result.entities_importance_updated,
+            relations_importance_updated=result.relations_importance_updated,
+            graph_events_enqueued=result.graph_events_enqueued,
+        )
 
     async def _rebuild_summaries(
         self,
@@ -794,6 +854,34 @@ def stream_update_weight(
     updated = previous_weight + alpha * (normalized_feedback - previous_weight)
     clamped = max(0.0, min(1.0, float(updated)))
     return round(clamped, FEEDBACK_WEIGHT_DECIMALS)
+
+
+def apply_feedback_to_importance(
+    *,
+    properties: dict[str, object],
+    current_importance_weight: float,
+    normalized_score: float,
+) -> tuple[float, dict[str, object]]:
+    if not has_importance_marker(properties):
+        return stream_update_weight(current_importance_weight, normalized_score), properties
+
+    components = importance_components_from_properties(
+        properties,
+        fallback_feedback_weight=current_importance_weight,
+    )
+    next_feedback_weight = stream_update_weight(components.feedback_weight, normalized_score)
+    next_properties = properties_with_importance_marker(
+        properties,
+        ImportanceComponents(
+            feedback_weight=next_feedback_weight,
+            centrality_weight=components.centrality_weight,
+        ),
+    )
+    next_components = importance_components_from_properties(
+        next_properties,
+        fallback_feedback_weight=current_importance_weight,
+    )
+    return next_components.effective_weight, next_properties
 
 
 def relation_embedding_text(candidate: RelationEmbeddingCandidate) -> str:

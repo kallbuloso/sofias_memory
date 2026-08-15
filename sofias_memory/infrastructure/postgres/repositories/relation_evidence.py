@@ -123,6 +123,43 @@ class RelationEvidenceRepository:
         relations_by_id = {relation.id: relation for relation in result}
         return [relations_by_id[relation_id] for relation_id in sorted(relations_by_id)]
 
+    async def list_relation_ids_with_authoritative_evidence(
+        self,
+        *,
+        dataset_id: UUID,
+        relation_ids: list[UUID],
+    ) -> set[UUID]:
+        if not relation_ids:
+            return set()
+
+        statement = (
+            select(RelationEvidence.relation_id)
+            .join(Relation, RelationEvidence.relation_id == Relation.id)
+            .join(Chunk, RelationEvidence.chunk_id == Chunk.id)
+            .join(Document, Chunk.document_id == Document.id)
+            .join(Source, Chunk.source_id == Source.id)
+            .join(Dataset, Chunk.dataset_id == Dataset.id)
+            .where(
+                RelationEvidence.relation_id.in_(relation_ids),
+                Dataset.id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.dataset_id == Dataset.id,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                Chunk.dataset_id == Dataset.id,
+                Chunk.generation == Dataset.active_generation,
+                Chunk.is_active.is_(True),
+                Document.dataset_id == Dataset.id,
+                Document.generation == Dataset.active_generation,
+                Document.is_active.is_(True),
+                Source.dataset_id == Dataset.id,
+                Source.status == SourceStatus.ACTIVE,
+            )
+            .distinct()
+        )
+        result = await self._session.scalars(statement)
+        return set(result)
+
     async def list_active_for_recall(
         self,
         *,

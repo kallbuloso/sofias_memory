@@ -33,6 +33,14 @@ from sofias_memory.infrastructure.postgres.repositories.feedback import Unapplie
 from sofias_memory.infrastructure.postgres.repositories.relations import RelationEmbeddingCandidate
 from sofias_memory.ports import ProjectionCommand
 from sofias_memory.schemas.improve import ImproveRequest, ImproveResult
+from sofias_memory.services.graph_maintenance_service import (
+    IMPORTANCE_MARKER_KEY,
+    GraphMaintenanceCounts,
+    properties_with_importance_marker,
+)
+from sofias_memory.services.graph_maintenance_service import (
+    ImportanceComponents as GraphMaintenanceImportanceComponents,
+)
 from sofias_memory.services.graph_reconciliation_service import (
     GraphReconciliationDiff,
     GraphReconciliationResult,
@@ -41,6 +49,7 @@ from sofias_memory.services.improve import (
     ImproveService,
     ImproveUnitOfWork,
     UnitOfWorkFactory,
+    apply_feedback_to_importance,
     entity_embedding_text,
     normalize_feedback_score,
     relation_embedding_text,
@@ -458,12 +467,15 @@ class FakeUnitOfWork:
 
 
 class FakeDrain:
-    def __init__(self, processed: int = 0) -> None:
+    def __init__(self, processed: int = 0, order: list[str] | None = None) -> None:
         self.processed = processed
         self.dataset_ids: list[UUID] = []
+        self.order = order
 
     async def process_dataset(self, dataset_id: UUID) -> object:
         self.dataset_ids.append(dataset_id)
+        if self.order is not None:
+            self.order.append("drain")
         return type("DrainResult", (), {"processed": self.processed})()
 
 
@@ -472,6 +484,7 @@ class FakeGraphReconciliation:
         self,
         result: GraphReconciliationResult | None = None,
         failure: Exception | None = None,
+        order: list[str] | None = None,
     ) -> None:
         self.result = result or GraphReconciliationResult(
             diff=GraphReconciliationDiff(),
@@ -479,9 +492,40 @@ class FakeGraphReconciliation:
         )
         self.failure = failure
         self.dataset_ids: list[UUID] = []
+        self.order = order
 
     async def reconcile_dataset(self, dataset_id: UUID) -> GraphReconciliationResult:
         self.dataset_ids.append(dataset_id)
+        if self.order is not None:
+            self.order.append("reconcile")
+        if self.failure is not None:
+            raise self.failure
+        return self.result
+
+
+class FakeGraphMaintenance:
+    def __init__(
+        self,
+        result: GraphMaintenanceCounts | None = None,
+        failure: Exception | None = None,
+        order: list[str] | None = None,
+    ) -> None:
+        self.result = result or GraphMaintenanceCounts(
+            relations_deactivated=0,
+            entities_importance_updated=0,
+            relations_importance_updated=0,
+            graph_events_enqueued=0,
+        )
+        self.failure = failure
+        self.calls: list[tuple[UUID, int]] = []
+        self.order = order
+
+    async def maintain_dataset(
+        self, dataset_id: UUID, *, generation: int
+    ) -> GraphMaintenanceCounts:
+        self.calls.append((dataset_id, generation))
+        if self.order is not None:
+            self.order.append("maintenance")
         if self.failure is not None:
             raise self.failure
         return self.result
@@ -533,17 +577,20 @@ def service_for(
     *,
     drain: FakeDrain | None = None,
     graph_reconciliation: FakeGraphReconciliation | None = None,
+    graph_maintenance: FakeGraphMaintenance | None = None,
     summary_rebuild: FakeSummaryRebuild | None = None,
 ) -> tuple[
     ImproveService,
     FakeEmbeddingClient,
     FakeDrain,
     FakeGraphReconciliation,
+    FakeGraphMaintenance,
     FakeSummaryRebuild,
 ]:
     embedding_client = FakeEmbeddingClient()
     resolved_drain = drain or FakeDrain()
     resolved_graph_reconciliation = graph_reconciliation or FakeGraphReconciliation()
+    resolved_graph_maintenance = graph_maintenance or FakeGraphMaintenance()
     resolved_summary_rebuild = summary_rebuild or FakeSummaryRebuild()
 
     def create_uow() -> ImproveUnitOfWork:
@@ -555,12 +602,14 @@ def service_for(
             embedding_client=embedding_client,
             graph_projection_drain=resolved_drain,
             graph_reconciliation=resolved_graph_reconciliation,
+            graph_maintenance=resolved_graph_maintenance,
             summary_rebuild=resolved_summary_rebuild,
             unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
         ),
         embedding_client,
         resolved_drain,
         resolved_graph_reconciliation,
+        resolved_graph_maintenance,
         resolved_summary_rebuild,
     )
 
@@ -684,6 +733,63 @@ def test_feedback_weight_normalization_and_streaming_formula() -> None:
     assert stream_update_weight(0.333333, 0.5) == 0.35
 
 
+def test_feedback_updates_feedback_component_when_importance_marker_exists() -> None:
+    without_marker_weight, without_marker_properties = apply_feedback_to_importance(
+        properties={"kept": True},
+        current_importance_weight=0.6,
+        normalized_score=1.0,
+    )
+    marker_properties = properties_with_importance_marker(
+        {"kept": True},
+        components=GraphMaintenanceImportanceComponents(
+            feedback_weight=0.6,
+            centrality_weight=1.0,
+        ),
+    )
+
+    with_marker_weight, with_marker_properties = apply_feedback_to_importance(
+        properties=marker_properties,
+        current_importance_weight=0.8,
+        normalized_score=1.0,
+    )
+
+    assert without_marker_weight == 0.64
+    assert without_marker_properties == {"kept": True}
+    assert with_marker_weight == 0.82
+    assert with_marker_properties["_sofias_memory_importance"] == {
+        "version": "degree-v1",
+        "feedback_weight": 0.64,
+        "centrality_weight": 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"version": "degree-v1", "centrality_weight": 1.0},
+        {"version": "degree-v1", "feedback_weight": 0.6},
+        {"version": "degree-v0", "feedback_weight": 0.6, "centrality_weight": 1.0},
+        ["degree-v1"],
+        {"version": "degree-v1", "feedback_weight": "0.6", "centrality_weight": 1.0},
+        {"version": "degree-v1", "feedback_weight": False, "centrality_weight": 1.0},
+        {"version": "degree-v1", "feedback_weight": float("nan"), "centrality_weight": 1.0},
+        {"version": "degree-v1", "feedback_weight": float("-inf"), "centrality_weight": 1.0},
+        {"version": "degree-v1", "feedback_weight": 1.2, "centrality_weight": 1.0},
+    ],
+)
+def test_feedback_treats_invalid_importance_marker_as_legacy(marker: object) -> None:
+    properties = {IMPORTANCE_MARKER_KEY: marker, "kept": True}
+
+    next_weight, next_properties = apply_feedback_to_importance(
+        properties=properties,
+        current_importance_weight=0.8,
+        normalized_score=1.0,
+    )
+
+    assert next_weight == 0.82
+    assert next_properties == properties
+
+
 def test_relation_embedding_text_is_deterministic_and_omits_metadata() -> None:
     candidate = RelationEmbeddingCandidate(
         relation_id=uuid4(),
@@ -745,7 +851,7 @@ async def test_answer_and_reference_feedback_resolve_chunk_targets_and_enqueue_u
     store.relations_by_chunk = {reference_chunk: [first_relation]}
     drain = FakeDrain(processed=3)
 
-    service, embedding_client, _, _, _ = service_for(tmp_path, store, drain=drain)
+    service, embedding_client, _, _, _, _ = service_for(tmp_path, store, drain=drain)
     result = await service.improve(ImproveRequest())
 
     assert embedding_client.calls == []
@@ -817,7 +923,7 @@ async def test_relation_embeddings_select_active_current_null_candidates_and_per
             inactive_endpoint_relation,
         ]
     )
-    service, embedding_client, drain, _, _ = service_for(tmp_path, store)
+    service, embedding_client, drain, _, _, _ = service_for(tmp_path, store)
     embedding_client.responses = [[0.1] * 3072, [0.2] * 3072]
 
     result = await service.improve(ImproveRequest(stages=["relation_embeddings"]))
@@ -873,7 +979,7 @@ async def test_entity_deduplication_embeds_active_current_null_entities_and_dete
     existing = entity(dataset.id, generation=2)
     existing.embedding = [0.7] * 3072
     store.entities.extend([second, existing, inactive, first, stale, different_type])
-    service, embedding_client, drain, _, _ = service_for(tmp_path, store)
+    service, embedding_client, drain, _, _, _ = service_for(tmp_path, store)
     embedding_client.responses = [
         [1.0] + [0.0] * 3071,
         [0.91, sqrt(1 - 0.91**2)] + [0.0] * 3070,
@@ -947,7 +1053,7 @@ async def test_entity_deduplication_merges_safe_pair_rewrites_mentions_and_relat
     target_relation.embedding = [0.2] * 3072
     store.relations.append(target_relation)
     drain = FakeDrain(processed=3)
-    service, embedding_client, _, _, _ = service_for(tmp_path, store, drain=drain)
+    service, embedding_client, _, _, _, _ = service_for(tmp_path, store, drain=drain)
 
     result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
 
@@ -1006,7 +1112,7 @@ async def test_entity_deduplication_does_not_merge_transitively_without_direct_s
     indirect.embedding = unit_embedding(0.92)
     indirect.created_at = datetime(2026, 1, 3, tzinfo=UTC)
     store.entities.extend([first, bridge, indirect])
-    service, _, drain, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=1))
+    service, _, drain, _, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=1))
 
     result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
 
@@ -1070,7 +1176,7 @@ async def test_entity_merge_handles_relation_self_loop_collision_and_evidence_co
             ),
         ]
     )
-    service, _, _, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=2))
+    service, _, _, _, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=2))
 
     result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
 
@@ -1108,7 +1214,7 @@ async def test_entity_embedding_provider_validation_and_failure_write_nothing(
     dataset = seed_dataset(store)
     target = entity(dataset.id, generation=0)
     store.entities.append(target)
-    service, embedding_client, _, _, _ = service_for(tmp_path, store)
+    service, embedding_client, _, _, _, _ = service_for(tmp_path, store)
     embedding_client.responses = []
 
     with pytest.raises(Exception, match="invalid response"):
@@ -1141,7 +1247,7 @@ async def test_relation_embedding_provider_validation_and_failure_write_nothing(
     store.entities.extend([source_entity, target_entity])
     target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
     store.relations.append(target_relation)
-    service, embedding_client, _, _, _ = service_for(tmp_path, store)
+    service, embedding_client, _, _, _, _ = service_for(tmp_path, store)
     embedding_client.responses = []
 
     with pytest.raises(Exception, match="invalid response"):
@@ -1184,7 +1290,7 @@ async def test_omitted_stages_default_order_includes_deduplication_before_relati
     target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
     store.relations.append(target_relation)
     drain = FakeDrain(processed=1)
-    service, embedding_client, _, _, _ = service_for(tmp_path, store, drain=drain)
+    service, embedding_client, _, _, _, _ = service_for(tmp_path, store, drain=drain)
     embedding_client.response_batches = [
         [[1.0] + [0.0] * 3071, [0.0, 1.0] + [0.0] * 3070],
         [[0.3] * 3072],
@@ -1204,7 +1310,7 @@ async def test_omitted_stages_default_order_includes_deduplication_before_relati
 
     relation_only_store = FakeStore()
     seed_dataset(relation_only_store)
-    first_run_service, _, _, _, _ = service_for(tmp_path, relation_only_store)
+    first_run_service, _, _, _, _, _ = service_for(tmp_path, relation_only_store)
     await first_run_service.improve(ImproveRequest(stages=["relation_embeddings"]))
 
     assert relation_only_store.run_current_steps_on_add == ["relation_embeddings"]
@@ -1217,7 +1323,7 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
     default_store = FakeStore()
     seed_dataset(default_store)
     default_graph_reconciliation = FakeGraphReconciliation()
-    default_service, _, _, _, default_summary_rebuild = service_for(
+    default_service, _, _, _, _, default_summary_rebuild = service_for(
         tmp_path,
         default_store,
         graph_reconciliation=default_graph_reconciliation,
@@ -1247,20 +1353,25 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
             rebuilt=True,
         )
     )
-    drain = FakeDrain(processed=10)
-    service, embedding_client, resolved_drain, _, _ = service_for(
+    order: list[str] = []
+    graph_reconciliation.order = order
+    drain = FakeDrain(processed=10, order=order)
+    graph_maintenance = FakeGraphMaintenance(order=order)
+    service, embedding_client, resolved_drain, _, graph_maintenance, _ = service_for(
         tmp_path,
         explicit_store,
         drain=drain,
         graph_reconciliation=graph_reconciliation,
+        graph_maintenance=graph_maintenance,
     )
 
     result = await service.improve(ImproveRequest(stages=["graph_reconciliation"]))
 
     assert result.stages == ["graph_reconciliation"]
+    assert graph_maintenance.calls == [(dataset.id, 0)]
     assert graph_reconciliation.dataset_ids == [dataset.id]
     assert embedding_client.calls == []
-    assert resolved_drain.dataset_ids == []
+    assert resolved_drain.dataset_ids == [dataset.id]
     assert result.graph_entities_missing == 44
     assert result.graph_chunks_extra == 1
     assert result.graph_entity_mentions_missing == 2
@@ -1268,7 +1379,8 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
     assert result.graph_next_missing == 4
     assert result.graph_rebuilt is True
     assert result.graph_events_enqueued == 0
-    assert result.graph_events_processed == 0
+    assert result.graph_events_processed == 10
+    assert order == ["maintenance", "drain", "reconcile"]
 
     metrics = explicit_store.pipeline_runs[-1].metrics["improve_result"]
     assert metrics["graph_entities_missing"] == 44
@@ -1280,7 +1392,7 @@ async def test_summaries_is_explicit_stage_and_records_metrics(tmp_path: Path) -
     default_store = FakeStore()
     seed_dataset(default_store)
     default_summary_rebuild = FakeSummaryRebuild()
-    default_service, _, _, _, _ = service_for(
+    default_service, _, _, _, _, _ = service_for(
         tmp_path,
         default_store,
         summary_rebuild=default_summary_rebuild,
@@ -1305,7 +1417,7 @@ async def test_summaries_is_explicit_stage_and_records_metrics(tmp_path: Path) -
         )
     )
     drain = FakeDrain(processed=10)
-    service, embedding_client, resolved_drain, _, _ = service_for(
+    service, embedding_client, resolved_drain, _, _, _ = service_for(
         tmp_path,
         explicit_store,
         drain=drain,
@@ -1337,7 +1449,7 @@ async def test_summaries_is_explicit_stage_and_records_metrics(tmp_path: Path) -
 async def test_graph_reconciliation_failure_marks_run_failed(tmp_path: Path) -> None:
     store = FakeStore()
     seed_dataset(store)
-    service, _, _, _, _ = service_for(
+    service, _, _, _, _, _ = service_for(
         tmp_path,
         store,
         graph_reconciliation=FakeGraphReconciliation(
@@ -1384,7 +1496,7 @@ async def test_improve_is_dataset_isolated_and_uses_only_current_active_knowledg
     store.entities_by_chunk[target_chunk] = [active_entity, stale_entity, other_entity]
     store.relations_by_chunk[target_chunk] = [inactive_relation]
 
-    service, _, _, _, _ = service_for(tmp_path, store)
+    service, _, _, _, _, _ = service_for(tmp_path, store)
     result = await service.improve(ImproveRequest(dataset="main", stages=["feedback_weights"]))
 
     assert result.feedback_processed == 1
@@ -1412,7 +1524,7 @@ async def test_applied_feedback_is_not_reapplied_and_no_target_feedback_is_consu
     no_target = feedback_for(query.id, target_type="reference", target_id=target_chunk, score=-1)
     store.feedback.extend([already_applied, no_target])
 
-    service, embedding_client, _, _, _ = service_for(tmp_path, store)
+    service, embedding_client, _, _, _, _ = service_for(tmp_path, store)
     result = await service.improve(ImproveRequest(stages=["feedback_weights"]))
 
     assert embedding_client.calls == []
@@ -1473,6 +1585,9 @@ async def test_improve_route_returns_envelope_and_requires_api_key(
                 document_summaries_rebuilt=0,
                 dataset_summaries_rebuilt=0,
                 summaries_deactivated=0,
+                graph_relations_deactivated=0,
+                graph_entities_importance_updated=0,
+                graph_relations_importance_updated=0,
                 graph_entities_missing=0,
                 graph_entities_extra=0,
                 graph_chunks_missing=0,

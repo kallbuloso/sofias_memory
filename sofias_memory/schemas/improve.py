@@ -60,6 +60,9 @@ class ImproveResult(BaseModel):
     document_summaries_rebuilt: int
     dataset_summaries_rebuilt: int
     summaries_deactivated: int
+    graph_relations_deactivated: int
+    graph_entities_importance_updated: int
+    graph_relations_importance_updated: int
     graph_entities_missing: int
     graph_entities_extra: int
     graph_chunks_missing: int

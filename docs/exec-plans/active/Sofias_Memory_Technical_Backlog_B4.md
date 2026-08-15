@@ -719,7 +719,7 @@ do contrato público de Recall e sem efeitos colaterais em Neo4j/outbox.
 
 ## SM-420 — Complete graph_reconciliation: graph hygiene, centrality and change report
 
-**Status:** TODO
+**Status:** DONE
 **Próxima task:** SIM 
 **Prioridade:** P1  
 **Dependências:** SM-414, SM-417, SM-418  
@@ -766,7 +766,9 @@ Após SM-420, `graph_reconciliation` deve satisfazer conjuntamente os itens apli
 
 ## SM-421 — Dataset management API
 
-**Status:** TODO  
+**Status:** DONE  
+**Commit:** `8d3c2bf` — `feat(api): add dataset management endpoints`  
+**Próxima task:** NÃO
 **Prioridade:** P1  
 **Dependências:** B2 datasets; SM-401; SM-418  
 **PRD:** FR-010; API datasets

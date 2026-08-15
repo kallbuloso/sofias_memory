@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sofias_memory.domain import SourceStatus
+from sofias_memory.domain import SourceKind, SourceStatus
 from sofias_memory.infrastructure.postgres.models import Source
+
+
+@dataclass(frozen=True)
+class SourceListItem:
+    """Detached source metadata for dataset management responses."""
+
+    id: UUID
+    dataset_id: UUID
+    kind: SourceKind
+    name: str
+    mime_type: str
+    original_uri: str | None
+    content_sha256: str
+    normalized_sha256: str | None
+    byte_size: int
+    metadata: dict[str, object]
+    status: SourceStatus
+    version: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class SourceRepository:
@@ -84,3 +106,43 @@ class SourceRepository:
         )
         result = await self._session.scalars(statement)
         return list(result)
+
+    async def list_for_dataset_paginated(
+        self,
+        *,
+        dataset_id: UUID,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[SourceListItem], int]:
+        statement = (
+            select(Source)
+            .where(Source.dataset_id == dataset_id)
+            .order_by(Source.created_at, Source.id)
+            .limit(limit)
+            .offset(offset)
+        )
+        total_statement = (
+            select(func.count()).select_from(Source).where(Source.dataset_id == dataset_id)
+        )
+        result = await self._session.scalars(statement)
+        total = await self._session.scalar(total_statement)
+        return [_source_list_item(source) for source in result], int(total or 0)
+
+
+def _source_list_item(source: Source) -> SourceListItem:
+    return SourceListItem(
+        id=source.id,
+        dataset_id=source.dataset_id,
+        kind=source.kind,
+        name=source.name,
+        mime_type=source.mime_type,
+        original_uri=source.original_uri,
+        content_sha256=source.content_sha256,
+        normalized_sha256=source.normalized_sha256,
+        byte_size=source.byte_size,
+        metadata=dict(source.metadata_),
+        status=source.status,
+        version=source.version,
+        created_at=source.created_at,
+        updated_at=source.updated_at,
+    )

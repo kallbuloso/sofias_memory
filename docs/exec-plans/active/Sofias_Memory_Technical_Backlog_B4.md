@@ -2,7 +2,7 @@
 
 **Documento:** Backlog técnico — B4 Core Memory  
 **Escopo:** B4 núcleo funcional de memória sobre B0–B3  
-**Status:** Em execução; SM-401..SM-418 concluídas; SM-419 é a próxima task
+**Status:** Em execução; SM-401..SM-419 concluídas; SM-420 é a próxima task
 **Pré-requisitos:** GATE-B3 PASSED; ADR-0008 accepted; `AGENTS.md`; `docs/product/Sofias_Memory_PRD_SPECS.md`  
 **Regra:** executar uma task por vez, respeitando dependências, contratos congelados e gates.  
 **Base de reconstrução:** estado real do repositório em `bd426c99d4f1bc96922b00bb62e2598f545306c1`.  
@@ -172,7 +172,7 @@ SM-424  Graph/provenance read-only API
 GATE-B4
 ```
 
-SM-401..SM-418 estão DONE. SM-419 é a próxima task. SM-420..SM-424 seguem TODO.
+SM-401..SM-419 estão DONE. SM-420 é a próxima task. SM-421..SM-424 seguem TODO.
 GATE-B4 segue TODO.
 
 ---

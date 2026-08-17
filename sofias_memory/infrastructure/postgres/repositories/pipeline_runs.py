@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sofias_memory.domain import PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.models import PipelineRun
 
 
@@ -26,6 +27,24 @@ class PipelineRunRepository:
         statement = select(PipelineRun).where(PipelineRun.id == run_id)
         result = await self._session.scalar(statement)
         return cast(PipelineRun | None, result)
+
+    async def has_running_forget_for_source_except(
+        self,
+        *,
+        source_id: UUID,
+        excluded_run_id: UUID,
+    ) -> bool:
+        statement = (
+            select(PipelineRun.id)
+            .where(
+                PipelineRun.source_id == source_id,
+                PipelineRun.pipeline_type == PipelineType.FORGET,
+                PipelineRun.status == PipelineRunStatus.RUNNING,
+                PipelineRun.id != excluded_run_id,
+            )
+            .limit(1)
+        )
+        return await self._session.scalar(statement) is not None
 
     async def get_by_idempotency_key(self, idempotency_key: str) -> PipelineRun | None:
         statement = select(PipelineRun).where(PipelineRun.idempotency_key == idempotency_key)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
@@ -47,6 +48,7 @@ from sofias_memory.services.cognify import (
     document_summary_metadata,
     is_chunk_knowledge_extracted,
 )
+from sofias_memory.services.forget import reset_document_for_recognify
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
@@ -579,6 +581,43 @@ async def test_cognify_processes_pending_source_and_persists_chunks(tmp_path: Pa
     assert store.pipeline_runs[0].pipeline_type == PipelineType.COGNIFY
     assert store.pipeline_runs[0].status == PipelineRunStatus.SUCCEEDED
     assert "normalized_text" not in store.pipeline_runs[0].input
+
+
+@pytest.mark.asyncio
+async def test_cognify_rehydrates_memory_reset_document_from_source_storage(tmp_path: Path) -> None:
+    store = FakeStore()
+    original_text = "Fresh source bytes are normalized again after memory-only forget."
+    forgotten_text = "Forgotten normalized text must never be reused."
+    dataset, source, old_document = seed_pending_source(store, forgotten_text)
+    storage_path = tmp_path / str(dataset.id) / str(source.id) / "original.txt"
+    storage_path.parent.mkdir(parents=True)
+    storage_path.write_text(original_text, encoding="utf-8")
+    source.storage_uri = storage_path.as_uri()
+    source.content_sha256 = sha256(original_text.encode("utf-8")).hexdigest()
+    source.normalized_sha256 = source.content_sha256
+    source.byte_size = len(original_text.encode("utf-8"))
+    old_document.title = "Forgotten title"
+    old_document.language = "pt-BR"
+    old_document.metadata_ = {"document_summary": {"summary_id": str(uuid4())}}
+    old_document.is_active = False
+    reset_document = reset_document_for_recognify(old_document)
+    store.documents.append(reset_document)
+
+    result = await service_for(tmp_path, store, FakeEmbeddingClient()).cognify(CognifyRequest())
+
+    assert result.sources_processed == 1
+    assert source.status == SourceStatus.ACTIVE
+    assert reset_document.normalized_text == original_text
+    assert reset_document.normalized_text != forgotten_text
+    assert reset_document.text_sha256 == sha256(original_text.encode("utf-8")).hexdigest()
+    assert reset_document.token_count > 0
+    assert reset_document.title == source.name
+    assert reset_document.language == "und"
+    assert "forget_memory_reset" not in reset_document.metadata_
+    assert "document_summary" in reset_document.metadata_
+    assert store.chunks
+    assert all(forgotten_text not in chunk.text for chunk in store.chunks)
+    assert all(original_text in chunk.text for chunk in store.chunks)
 
 
 @pytest.mark.asyncio

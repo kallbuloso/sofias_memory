@@ -49,6 +49,26 @@ class DocumentRepository:
         result = await self._session.scalars(statement)
         return list(result)
 
+    async def list_for_source_generation(
+        self,
+        *,
+        source_id: UUID,
+        generation: int,
+        active_only: bool = True,
+    ) -> list[Document]:
+        statement = (
+            select(Document)
+            .where(
+                Document.source_id == source_id,
+                Document.generation == generation,
+            )
+            .order_by(Document.created_at, Document.id)
+        )
+        if active_only:
+            statement = statement.where(Document.is_active.is_(True))
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def get_for_source_generation(
         self,
         *,

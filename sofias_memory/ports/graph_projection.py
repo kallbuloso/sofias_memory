@@ -230,6 +230,26 @@ def chunk_upsert_command(
     )
 
 
+def chunk_delete_command(
+    *,
+    chunk_id: UUID | str,
+    dataset_id: UUID | str,
+) -> ProjectionCommand:
+    """Build the frozen delete command for one inactive authoritative chunk."""
+
+    chunk_id_text = str(chunk_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="chunk",
+        operation="delete",
+        dataset_id=str(dataset_id),
+        aggregate_id=chunk_id_text,
+        identity={"id": chunk_id_text},
+        endpoints={},
+        properties={},
+    )
+
+
 def relation_upsert_command(
     *,
     relation_id: UUID | str,
@@ -315,6 +335,28 @@ def entity_mention_upsert_command(
     )
 
 
+def entity_mention_delete_command(
+    *,
+    mention_id: UUID | str,
+    dataset_id: UUID | str,
+    entity_id: UUID | str,
+    chunk_id: UUID | str,
+) -> ProjectionCommand:
+    """Build the frozen delete command for one non-authoritative mention edge."""
+
+    mention_id_text = str(mention_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="entity_mention",
+        operation="delete",
+        dataset_id=str(dataset_id),
+        aggregate_id=mention_id_text,
+        identity={"mention_id": mention_id_text},
+        endpoints={"entity_id": str(entity_id), "chunk_id": str(chunk_id)},
+        properties={},
+    )
+
+
 def chunk_next_upsert_command(
     *,
     dataset_id: UUID | str,
@@ -329,6 +371,28 @@ def chunk_next_upsert_command(
         schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
         aggregate_type="chunk_next",
         operation="upsert",
+        dataset_id=str(dataset_id),
+        aggregate_id=from_chunk_id_text,
+        identity={"from_chunk_id": from_chunk_id_text, "to_chunk_id": to_chunk_id_text},
+        endpoints={"from_chunk_id": from_chunk_id_text, "to_chunk_id": to_chunk_id_text},
+        properties={},
+    )
+
+
+def chunk_next_delete_command(
+    *,
+    dataset_id: UUID | str,
+    from_chunk_id: UUID | str,
+    to_chunk_id: UUID | str,
+) -> ProjectionCommand:
+    """Build the frozen delete command for one derived consecutive chunk edge."""
+
+    from_chunk_id_text = str(from_chunk_id)
+    to_chunk_id_text = str(to_chunk_id)
+    return ProjectionCommand(
+        schema_version=GRAPH_PROJECTION_SCHEMA_VERSION,
+        aggregate_type="chunk_next",
+        operation="delete",
         dataset_id=str(dataset_id),
         aggregate_id=from_chunk_id_text,
         identity={"from_chunk_id": from_chunk_id_text, "to_chunk_id": to_chunk_id_text},

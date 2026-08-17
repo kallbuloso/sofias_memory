@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -181,6 +181,83 @@ class RelationRepository:
         )
         result = await self._session.scalars(statement)
         return list(result)
+
+    async def list_active_current_by_ids(
+        self,
+        *,
+        dataset_id: UUID,
+        relation_ids: list[UUID],
+    ) -> list[Relation]:
+        if not relation_ids:
+            return []
+
+        source_entity = aliased(Entity)
+        target_entity = aliased(Entity)
+        statement = (
+            select(Relation)
+            .join(Dataset, Relation.dataset_id == Dataset.id)
+            .join(source_entity, Relation.source_entity_id == source_entity.id)
+            .join(target_entity, Relation.target_entity_id == target_entity.id)
+            .where(
+                Relation.id.in_(relation_ids),
+                Relation.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                source_entity.dataset_id == Dataset.id,
+                source_entity.generation == Dataset.active_generation,
+                source_entity.is_active.is_(True),
+                target_entity.dataset_id == Dataset.id,
+                target_entity.generation == Dataset.active_generation,
+                target_entity.is_active.is_(True),
+            )
+            .order_by(Relation.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def list_active_current_incident_entity_ids(
+        self,
+        *,
+        dataset_id: UUID,
+        entity_ids: list[UUID],
+    ) -> set[UUID]:
+        if not entity_ids:
+            return set()
+
+        source_entity = aliased(Entity)
+        target_entity = aliased(Entity)
+        statement = (
+            select(Relation.source_entity_id, Relation.target_entity_id)
+            .join(Dataset, Relation.dataset_id == Dataset.id)
+            .join(source_entity, Relation.source_entity_id == source_entity.id)
+            .join(target_entity, Relation.target_entity_id == target_entity.id)
+            .where(
+                Relation.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                source_entity.dataset_id == Dataset.id,
+                source_entity.generation == Dataset.active_generation,
+                source_entity.is_active.is_(True),
+                target_entity.dataset_id == Dataset.id,
+                target_entity.generation == Dataset.active_generation,
+                target_entity.is_active.is_(True),
+                or_(
+                    Relation.source_entity_id.in_(entity_ids),
+                    Relation.target_entity_id.in_(entity_ids),
+                ),
+            )
+        )
+        result = await self._session.execute(statement)
+        requested_ids = set(entity_ids)
+        incident_ids: set[UUID] = set()
+        for row in result:
+            if row.source_entity_id in requested_ids:
+                incident_ids.add(row.source_entity_id)
+            if row.target_entity_id in requested_ids:
+                incident_ids.add(row.target_entity_id)
+        return incident_ids
 
     async def list_active_for_recall(
         self,

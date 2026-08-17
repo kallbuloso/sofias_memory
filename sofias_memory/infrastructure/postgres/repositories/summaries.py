@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import Executable, Select, select
+from sqlalchemy import Executable, Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sofias_memory.domain import DatasetStatus, SourceStatus, SummaryTargetType
@@ -124,6 +124,47 @@ class SummaryRepository:
             summary.is_active = False
             deactivated += 1
         return deactivated
+
+    async def list_active_for_forget(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+        document_ids: list[UUID],
+        entity_ids: list[UUID],
+        include_dataset_summary: bool,
+    ) -> list[Summary]:
+        clauses = []
+        if document_ids:
+            clauses.append(
+                (Summary.target_type == SummaryTargetType.DOCUMENT)
+                & (Summary.target_id.in_(document_ids))
+            )
+        if entity_ids:
+            clauses.append(
+                (Summary.target_type == SummaryTargetType.ENTITY)
+                & (Summary.target_id.in_(entity_ids))
+            )
+        if include_dataset_summary:
+            clauses.append(
+                (Summary.target_type == SummaryTargetType.DATASET)
+                & (Summary.target_id == dataset_id)
+            )
+        if not clauses:
+            return []
+
+        statement = (
+            select(Summary)
+            .where(
+                Summary.dataset_id == dataset_id,
+                Summary.generation == generation,
+                Summary.is_active.is_(True),
+                or_(*clauses),
+            )
+            .order_by(Summary.target_type, Summary.target_id, Summary.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
 
     async def list_active_document_summaries_for_recall(
         self,

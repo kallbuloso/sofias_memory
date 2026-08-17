@@ -135,6 +135,20 @@ async def test_unit_of_work_explicit_commit_does_not_rollback_on_success() -> No
 
 
 @pytest.mark.asyncio
+async def test_unit_of_work_flushes_without_committing() -> None:
+    fake_session = FakeAsyncSession()
+    uow = PostgresUnitOfWork(make_session_factory(fake_session))
+
+    async with uow:
+        await uow.flush()
+        assert fake_session.flush_calls == 1
+        assert fake_session.commit_calls == 0
+
+    assert fake_session.rollback_calls == 1
+    assert fake_session.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_unit_of_work_explicit_rollback_closes_without_second_rollback() -> None:
     fake_session = FakeAsyncSession()
     uow = PostgresUnitOfWork(make_session_factory(fake_session))

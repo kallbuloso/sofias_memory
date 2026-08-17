@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 from http import HTTPStatus
+from pathlib import Path
 from typing import Protocol, cast
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 from uuid import UUID, uuid4, uuid5
 
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
@@ -18,6 +22,10 @@ from sofias_memory.domain import (
     PipelineType,
     SourceStatus,
     SummaryTargetType,
+)
+from sofias_memory.domain.document_reset import (
+    RESET_DOCUMENT_METADATA_KEY,
+    RESET_DOCUMENT_METADATA_VERSION,
 )
 from sofias_memory.infrastructure.postgres.models import (
     Chunk,
@@ -33,6 +41,18 @@ from sofias_memory.infrastructure.postgres.models import (
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.loaders.text import (
+    CSV_FILE_MIME_TYPE,
+    DOCX_FILE_MIME_TYPE,
+    HTML_FILE_MIME_TYPE,
+    JSON_FILE_MIME_TYPE,
+    MARKDOWN_FILE_MIME_TYPE,
+    PDF_FILE_MIME_TYPE,
+    TEXT_FILE_MIME_TYPE,
+    PreparedText,
+    TextFileLoadError,
+    prepare_text_file_content,
+)
 from sofias_memory.pipelines.chunking import (
     CHUNK_ALGORITHM_VERSION,
     TextChunk,
@@ -64,6 +84,16 @@ KNOWLEDGE_EXTRACTION_VERSION = "v1"
 GRAPH_EXTRACTION_PROMPT_VERSION = DEFAULT_PROMPT_VERSIONS["graph_extraction"]
 DOCUMENT_SUMMARY_VERSION = "v1"
 DOCUMENT_SUMMARY_PROMPT_VERSION = DEFAULT_PROMPT_VERSIONS["document_summary"]
+UNDETERMINED_LANGUAGE = "und"
+SOURCE_EXTENSION_BY_MIME_TYPE = {
+    TEXT_FILE_MIME_TYPE: ".txt",
+    MARKDOWN_FILE_MIME_TYPE: ".md",
+    JSON_FILE_MIME_TYPE: ".json",
+    CSV_FILE_MIME_TYPE: ".csv",
+    HTML_FILE_MIME_TYPE: ".html",
+    PDF_FILE_MIME_TYPE: ".pdf",
+    DOCX_FILE_MIME_TYPE: ".docx",
+}
 
 
 class EmbeddingClient(Protocol):
@@ -215,6 +245,12 @@ class CognifySourceWorkItem:
     document_id: UUID
     generation: int
     normalized_text: str | None
+    source_name: str
+    source_mime_type: str
+    source_storage_uri: str | None
+    source_content_sha256: str
+    source_byte_size: int
+    rehydrate_document: bool
     existing_chunks: tuple[CognifyChunkSnapshot, ...]
     chunks_to_extract: tuple[CognifyChunkSnapshot, ...]
 
@@ -223,6 +259,7 @@ class CognifySourceWorkItem:
 class CognifyPreparedSource:
     work_item: CognifySourceWorkItem
     document_tokens: int | None
+    refreshed_document: PreparedText | None
     new_chunks: tuple[TextChunk, ...]
     embeddings: tuple[list[float], ...]
     extractions: tuple[tuple[UUID, ChunkKnowledgeExtraction], ...]
@@ -461,6 +498,12 @@ class CognifyService:
                 document_id=document.id,
                 generation=dataset.active_generation,
                 normalized_text=document.normalized_text if not chunks else None,
+                source_name=source.name,
+                source_mime_type=source.mime_type,
+                source_storage_uri=source.storage_uri,
+                source_content_sha256=source.content_sha256,
+                source_byte_size=source.byte_size,
+                rehydrate_document=is_reset_document(document),
                 existing_chunks=tuple(chunk_snapshot(chunk) for chunk in chunks),
                 chunks_to_extract=chunks_to_extract,
             )
@@ -499,14 +542,26 @@ class CognifyService:
         return sources
 
     async def _prepare_source(self, work_item: CognifySourceWorkItem) -> CognifyPreparedSource:
+        if work_item.rehydrate_document and work_item.existing_chunks:
+            raise DependencyUnavailableError("Source reset state is inconsistent.")
         if work_item.existing_chunks:
             all_chunk_snapshots = work_item.existing_chunks
             chunks_to_extract = work_item.chunks_to_extract
             document_tokens = None
+            refreshed_document = None
             text_chunks: tuple[TextChunk, ...] = ()
             embeddings: tuple[list[float], ...] = ()
         else:
-            normalized_text = work_item.normalized_text
+            refreshed_document = (
+                await asyncio.to_thread(self._read_reset_document, work_item)
+                if work_item.rehydrate_document
+                else None
+            )
+            normalized_text = (
+                refreshed_document.normalized_text
+                if refreshed_document is not None
+                else work_item.normalized_text
+            )
             if normalized_text is None:
                 raise RuntimeError("new chunk preparation requires normalized text")
             document_tokens = document_token_count(normalized_text, self._tokenizer)
@@ -543,6 +598,7 @@ class CognifyService:
         return CognifyPreparedSource(
             work_item=work_item,
             document_tokens=document_tokens,
+            refreshed_document=refreshed_document,
             new_chunks=text_chunks,
             embeddings=embeddings,
             extractions=tuple(
@@ -620,6 +676,12 @@ class CognifyService:
             if source is None or document is None:
                 raise _snapshot_persistence_error()
 
+            if prepared.refreshed_document is not None:
+                document.title = prepared.work_item.source_name
+                document.language = UNDETERMINED_LANGUAGE
+                document.normalized_text = prepared.refreshed_document.normalized_text
+                document.text_sha256 = prepared.refreshed_document.normalized_sha256
+                document.metadata_ = {}
             if prepared.new_chunks:
                 if prepared.document_tokens is None:
                     raise _snapshot_persistence_error()
@@ -811,6 +873,38 @@ class CognifyService:
                 relations=relations_created,
             )
 
+    def _read_reset_document(self, work_item: CognifySourceWorkItem) -> PreparedText:
+        """Reload and validate source bytes for a content-free reset document."""
+
+        storage_path = source_storage_path_for_cognify(
+            self._settings.data_directory,
+            dataset_id=work_item.dataset_id,
+            source_id=work_item.source_id,
+            storage_uri=work_item.source_storage_uri,
+        )
+        max_bytes = self._settings.max_source_size_mb * 1024 * 1024
+        try:
+            actual_size = storage_path.stat().st_size
+        except OSError as exc:
+            raise DependencyUnavailableError("Source storage is unavailable.") from exc
+        if actual_size > max_bytes or actual_size != work_item.source_byte_size:
+            raise DependencyUnavailableError("Source storage is unavailable.")
+        try:
+            original_bytes = storage_path.read_bytes()
+        except OSError as exc:
+            raise DependencyUnavailableError("Source storage is unavailable.") from exc
+        if len(original_bytes) != work_item.source_byte_size:
+            raise DependencyUnavailableError("Source storage is unavailable.")
+        if sha256(original_bytes).hexdigest() != work_item.source_content_sha256:
+            raise DependencyUnavailableError("Source storage is unavailable.")
+        extension = SOURCE_EXTENSION_BY_MIME_TYPE.get(work_item.source_mime_type)
+        if extension is None:
+            raise DependencyUnavailableError("Source storage is unavailable.")
+        try:
+            return prepare_text_file_content(f"source{extension}", original_bytes).text
+        except TextFileLoadError as exc:
+            raise DependencyUnavailableError("Source storage is unavailable.") from exc
+
     async def _resolve_entity(
         self,
         uow: CognifyUnitOfWork,
@@ -996,6 +1090,15 @@ def is_document_summary_complete(document: Document, summary: Summary | None) ->
     )
 
 
+def is_reset_document(document: Document) -> bool:
+    marker = document.metadata_.get(RESET_DOCUMENT_METADATA_KEY)
+    return (
+        isinstance(marker, Mapping)
+        and marker.get("version") == RESET_DOCUMENT_METADATA_VERSION
+        and document.normalized_text == ""
+    )
+
+
 def chunk_knowledge_summary(chunk: CognifyChunkSnapshot) -> str:
     marker = chunk.metadata.get("knowledge_extraction")
     if not isinstance(marker, dict):
@@ -1132,6 +1235,43 @@ def _projection_command_identity(command: ProjectionCommand) -> tuple[str, str, 
             command.identity["to_chunk_id"],
         )
     return command.aggregate_type, command.aggregate_id, None
+
+
+def source_storage_path_for_cognify(
+    data_directory: Path,
+    *,
+    dataset_id: UUID,
+    source_id: UUID,
+    storage_uri: str | None,
+) -> Path:
+    """Resolve a stored source file without accepting paths outside its source directory."""
+
+    if storage_uri is None:
+        raise DependencyUnavailableError("Source storage is unavailable.")
+    parsed = urlparse(storage_uri)
+    if parsed.scheme != "file" or parsed.netloc:
+        raise DependencyUnavailableError("Source storage is unavailable.")
+    storage_root = data_directory.resolve(strict=False)
+    expected_directory = (storage_root / str(dataset_id) / str(source_id)).resolve(strict=False)
+    raw_path = Path(url2pathname(parsed.path))
+    nominal_path = raw_path.resolve(strict=False)
+    if (
+        not expected_directory.is_relative_to(storage_root)
+        or not nominal_path.is_relative_to(expected_directory)
+        or not raw_path.exists()
+    ):
+        raise DependencyUnavailableError("Source storage is unavailable.")
+    try:
+        resolved_path = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise DependencyUnavailableError("Source storage is unavailable.") from exc
+    if (
+        not resolved_path.is_relative_to(expected_directory)
+        or not resolved_path.is_file()
+        or resolved_path.is_dir()
+    ):
+        raise DependencyUnavailableError("Source storage is unavailable.")
+    return resolved_path
 
 
 def _snapshot_persistence_error() -> SofiasMemoryError:

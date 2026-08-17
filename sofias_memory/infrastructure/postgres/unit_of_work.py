@@ -171,6 +171,12 @@ class PostgresUnitOfWork:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._graph_outbox
 
+    async def flush(self) -> None:
+        """Synchronize pending authoritative changes without committing them."""
+
+        session = self._require_session()
+        await session.flush()
+
     async def commit(self) -> None:
         session = self._require_session()
         await session.commit()

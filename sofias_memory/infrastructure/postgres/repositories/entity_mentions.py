@@ -53,6 +53,54 @@ class EntityMentionRepository:
         )
         return list(result)
 
+    async def list_for_chunks(self, *, chunk_ids: list[UUID]) -> list[EntityMention]:
+        if not chunk_ids:
+            return []
+
+        result = await self._session.scalars(
+            select(EntityMention)
+            .where(EntityMention.chunk_id.in_(chunk_ids))
+            .order_by(EntityMention.id)
+        )
+        return list(result)
+
+    async def list_entity_ids_with_authoritative_mentions(
+        self,
+        *,
+        dataset_id: UUID,
+        entity_ids: list[UUID],
+    ) -> set[UUID]:
+        if not entity_ids:
+            return set()
+
+        statement = (
+            select(EntityMention.entity_id)
+            .join(Entity, EntityMention.entity_id == Entity.id)
+            .join(Chunk, EntityMention.chunk_id == Chunk.id)
+            .join(Document, Chunk.document_id == Document.id)
+            .join(Source, Chunk.source_id == Source.id)
+            .join(Dataset, Chunk.dataset_id == Dataset.id)
+            .where(
+                EntityMention.entity_id.in_(entity_ids),
+                Dataset.id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Entity.dataset_id == Dataset.id,
+                Entity.generation == Dataset.active_generation,
+                Entity.is_active.is_(True),
+                Chunk.dataset_id == Dataset.id,
+                Chunk.generation == Dataset.active_generation,
+                Chunk.is_active.is_(True),
+                Document.dataset_id == Dataset.id,
+                Document.generation == Dataset.active_generation,
+                Document.is_active.is_(True),
+                Source.dataset_id == Dataset.id,
+                Source.status == SourceStatus.ACTIVE,
+            )
+            .distinct()
+        )
+        result = await self._session.scalars(statement)
+        return set(result)
+
     async def list_active_entities_for_chunks(
         self,
         *,

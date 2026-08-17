@@ -25,6 +25,7 @@ from sofias_memory.api.middleware import (
 from sofias_memory.api.routes.cognify import router as cognify_router
 from sofias_memory.api.routes.datasets import router as datasets_router
 from sofias_memory.api.routes.feedback import router as feedback_router
+from sofias_memory.api.routes.forget import router as forget_router
 from sofias_memory.api.routes.health import (
     ReadinessCheckRegistry,
     ReadinessCheckResult,
@@ -117,6 +118,7 @@ def create_app(
     application.include_router(recall_router, prefix="/api/v1")
     application.include_router(feedback_router, prefix="/api/v1")
     application.include_router(improve_router, prefix="/api/v1")
+    application.include_router(forget_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

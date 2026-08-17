@@ -50,6 +50,11 @@ class SourceRepository:
         result = await self._session.scalar(statement)
         return cast(Source | None, result)
 
+    async def get_by_id_for_update(self, source_id: UUID) -> Source | None:
+        statement = select(Source).where(Source.id == source_id).with_for_update()
+        result = await self._session.scalar(statement)
+        return cast(Source | None, result)
+
     async def get_by_content_hash(
         self,
         *,

@@ -49,6 +49,10 @@ class RelationRepository:
         await self._session.flush()
         return relation
 
+    async def get_by_id(self, relation_id: UUID) -> Relation | None:
+        result = await self._session.scalar(select(Relation).where(Relation.id == relation_id))
+        return cast(Relation | None, result)
+
     async def get_active_by_identity(
         self,
         *,
@@ -212,6 +216,48 @@ class RelationRepository:
                 target_entity.is_active.is_(True),
             )
             .order_by(Relation.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def get_active_current_by_id(
+        self,
+        *,
+        dataset_id: UUID,
+        relation_id: UUID,
+    ) -> Relation | None:
+        relations = await self.list_active_current_by_ids(
+            dataset_id=dataset_id,
+            relation_ids=[relation_id],
+        )
+        return relations[0] if relations else None
+
+    async def list_active_current_predicates(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[str]:
+        source_entity = aliased(Entity)
+        target_entity = aliased(Entity)
+        statement = (
+            select(Relation.predicate)
+            .join(Dataset, Relation.dataset_id == Dataset.id)
+            .join(source_entity, Relation.source_entity_id == source_entity.id)
+            .join(target_entity, Relation.target_entity_id == target_entity.id)
+            .where(
+                Relation.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Relation.generation == Dataset.active_generation,
+                Relation.is_active.is_(True),
+                source_entity.dataset_id == Dataset.id,
+                source_entity.generation == Dataset.active_generation,
+                source_entity.is_active.is_(True),
+                target_entity.dataset_id == Dataset.id,
+                target_entity.generation == Dataset.active_generation,
+                target_entity.is_active.is_(True),
+            )
+            .distinct()
+            .order_by(Relation.predicate)
         )
         result = await self._session.scalars(statement)
         return list(result)

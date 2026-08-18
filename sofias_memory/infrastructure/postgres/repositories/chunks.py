@@ -139,6 +139,54 @@ class ChunkRepository:
         result = await self._session.scalars(statement)
         return [_chunk_summary_rebuild_snapshot(chunk) for chunk in result]
 
+    async def get_active_current_reference(self, chunk_id: UUID) -> RetrievedChunk | None:
+        """Authoritative single-chunk lookup used to hydrate stored references."""
+
+        statement = (
+            select(
+                Chunk.id,
+                Chunk.dataset_id,
+                Chunk.source_id,
+                Source.name,
+                Source.original_uri,
+                Chunk.document_id,
+                Chunk.ordinal,
+                Chunk.text,
+                Chunk.start_char,
+                Chunk.end_char,
+            )
+            .join(Document, Chunk.document_id == Document.id)
+            .join(Source, Chunk.source_id == Source.id)
+            .join(Dataset, Chunk.dataset_id == Dataset.id)
+            .where(
+                Chunk.id == chunk_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Chunk.is_active.is_(True),
+                Document.is_active.is_(True),
+                Source.status == SourceStatus.ACTIVE,
+                Source.dataset_id == Dataset.id,
+                Document.dataset_id == Dataset.id,
+                Chunk.generation == Dataset.active_generation,
+                Document.generation == Dataset.active_generation,
+            )
+        )
+        result = await self._session.execute(statement)
+        row = result.first()
+        if row is None:
+            return None
+        return RetrievedChunk(
+            chunk_id=row.id,
+            dataset_id=row.dataset_id,
+            source_id=row.source_id,
+            source_name=row.name,
+            source_url=row.original_uri,
+            document_id=row.document_id,
+            ordinal=row.ordinal,
+            text=row.text,
+            start_char=row.start_char,
+            end_char=row.end_char,
+        )
+
     async def vector_search(
         self,
         *,

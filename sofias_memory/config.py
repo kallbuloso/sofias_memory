@@ -121,6 +121,13 @@ class Settings(BaseSettings):
     recall_max_top_k: int = Field(default=100, gt=0, alias="RECALL_MAX_TOP_K")
     recall_rrf_k: int = Field(default=60, gt=0, alias="RECALL_RRF_K")
 
+    graph_subgraph_max_depth: int = Field(default=3, gt=0, alias="GRAPH_SUBGRAPH_MAX_DEPTH")
+    graph_subgraph_max_relations: int = Field(
+        default=200, gt=0, alias="GRAPH_SUBGRAPH_MAX_RELATIONS"
+    )
+    graph_path_max_depth: int = Field(default=4, gt=0, alias="GRAPH_PATH_MAX_DEPTH")
+    provenance_max_evidence: int = Field(default=50, gt=0, alias="PROVENANCE_MAX_EVIDENCE")
+
     entity_dedup_similarity_threshold: float = Field(
         default=0.90,
         gt=0.0,

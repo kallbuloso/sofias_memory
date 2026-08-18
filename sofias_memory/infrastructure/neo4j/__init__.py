@@ -7,6 +7,11 @@ from sofias_memory.infrastructure.neo4j.driver import (
     create_async_neo4j_driver,
     create_neo4j_resource_from_settings,
 )
+from sofias_memory.infrastructure.neo4j.graph_read import (
+    GraphPathRecord,
+    GraphRelationEdge,
+    Neo4jGraphRead,
+)
 from sofias_memory.infrastructure.neo4j.projection import (
     CHUNK_DELETE_CYPHER,
     CHUNK_NEXT_DELETE_CYPHER,
@@ -64,11 +69,14 @@ __all__ = [
     "GLOBAL_CHUNK_CLEANUP_CYPHER",
     "GLOBAL_ENTITY_CLEANUP_CYPHER",
     "GRAPH_NEIGHBORHOOD_CYPHER",
+    "GraphPathRecord",
+    "GraphRelationEdge",
     "NEO4J_NOT_READY_DETAIL",
     "NEO4J_SCHEMA_NAMES",
     "NEO4J_SCHEMA_STATEMENTS",
     "Neo4jDriverFactory",
     "Neo4jCatalogObject",
+    "Neo4jGraphRead",
     "Neo4jReadinessChecker",
     "Neo4jReadinessResult",
     "Neo4jReadinessSnapshot",

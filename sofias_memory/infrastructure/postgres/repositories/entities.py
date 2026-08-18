@@ -151,6 +151,38 @@ class EntityRepository:
         result = await self._session.scalars(statement)
         return list(result)
 
+    async def get_active_current_by_id(
+        self,
+        *,
+        dataset_id: UUID,
+        entity_id: UUID,
+    ) -> Entity | None:
+        entities = await self.list_active_current_by_ids(
+            dataset_id=dataset_id,
+            entity_ids=[entity_id],
+        )
+        return entities[0] if entities else None
+
+    async def list_active_current_entity_types(
+        self,
+        *,
+        dataset_id: UUID,
+    ) -> list[str]:
+        statement = (
+            select(Entity.entity_type)
+            .join(Dataset, Entity.dataset_id == Dataset.id)
+            .where(
+                Entity.dataset_id == dataset_id,
+                Dataset.status == DatasetStatus.ACTIVE,
+                Entity.generation == Dataset.active_generation,
+                Entity.is_active.is_(True),
+            )
+            .distinct()
+            .order_by(Entity.entity_type)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def list_active_current_for_dataset(
         self,
         *,

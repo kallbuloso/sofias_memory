@@ -10,7 +10,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from sofias_memory.domain import SourceStatus
+from sofias_memory.domain import DatasetStatus, SourceStatus
 from sofias_memory.infrastructure.postgres.models import (
     Chunk,
     Dataset,
@@ -57,6 +57,27 @@ class DatasetRepository:
         statement = select(Dataset).where(Dataset.slug == slug)
         result = await self._session.scalar(statement)
         return cast(Dataset | None, result)
+
+    async def get_by_slug_for_update(self, slug: str) -> Dataset | None:
+        statement = select(Dataset).where(Dataset.slug == slug).with_for_update()
+        result = await self._session.scalar(statement)
+        return cast(Dataset | None, result)
+
+    async def get_by_id_for_update(self, dataset_id: UUID) -> Dataset | None:
+        statement = select(Dataset).where(Dataset.id == dataset_id).with_for_update()
+        result = await self._session.scalar(statement)
+        return cast(Dataset | None, result)
+
+    async def list_ids_for_everything_forget(self) -> list[UUID]:
+        """Enumerate authoritative forget targets: active datasets and recoverable retries."""
+
+        statement = (
+            select(Dataset.id)
+            .where(Dataset.status.in_((DatasetStatus.ACTIVE, DatasetStatus.DELETING)))
+            .order_by(Dataset.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
 
     async def get_by_name(self, name: str) -> Dataset | None:
         statement = select(Dataset).where(Dataset.name == name)

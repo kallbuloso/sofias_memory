@@ -37,7 +37,12 @@ from sofias_memory.infrastructure.postgres.models import (
 )
 from sofias_memory.infrastructure.postgres.repositories.sources import SourceRepository
 from sofias_memory.ports import ProjectionCommand
-from sofias_memory.schemas.forget import ForgetRequest, ForgetResult
+from sofias_memory.schemas.forget import (
+    ForgetDatasetResult,
+    ForgetEverythingResult,
+    ForgetRequest,
+    ForgetResult,
+)
 from sofias_memory.services.forget import (
     RESET_DOCUMENT_LANGUAGE,
     RESET_DOCUMENT_METADATA_KEY,
@@ -50,8 +55,11 @@ from sofias_memory.services.forget import (
     StorageDeleteStatus,
     UnitOfWorkFactory,
     delete_source_storage,
+    forget_dataset_run_input,
+    forget_run_input,
     reset_document_for_recognify,
     source_storage_path,
+    stable_payload_hash,
 )
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -118,6 +126,22 @@ class FakeDatasetRepository:
     async def get_by_slug(self, slug: str) -> Dataset | None:
         return next((dataset for dataset in self._store.datasets if dataset.slug == slug), None)
 
+    async def get_by_slug_for_update(self, slug: str) -> Dataset | None:
+        return await self.get_by_slug(slug)
+
+    async def get_by_id(self, dataset_id: UUID) -> Dataset | None:
+        return next((dataset for dataset in self._store.datasets if dataset.id == dataset_id), None)
+
+    async def get_by_id_for_update(self, dataset_id: UUID) -> Dataset | None:
+        return await self.get_by_id(dataset_id)
+
+    async def list_ids_for_everything_forget(self) -> list[UUID]:
+        return sorted(
+            dataset.id
+            for dataset in self._store.datasets
+            if dataset.status in (DatasetStatus.ACTIVE, DatasetStatus.DELETING)
+        )
+
 
 class FakeSourceRepository:
     def __init__(self, store: FakeStore) -> None:
@@ -128,6 +152,19 @@ class FakeSourceRepository:
 
     async def get_by_id_for_update(self, source_id: UUID) -> Source | None:
         return await self.get_by_id(source_id)
+
+    async def list_for_dataset_not_deleted(self, dataset_id: UUID) -> list[Source]:
+        return sorted(
+            (
+                source
+                for source in self._store.sources
+                if source.dataset_id == dataset_id and source.status != SourceStatus.DELETED
+            ),
+            key=lambda item: item.id,
+        )
+
+    async def list_for_dataset_for_update(self, dataset_id: UUID) -> list[Source]:
+        return await self.list_for_dataset_not_deleted(dataset_id)
 
 
 class FakeDocumentRepository:
@@ -153,6 +190,23 @@ class FakeDocumentRepository:
             and (document.is_active or not active_only)
         ]
 
+    async def list_active_current_for_dataset(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+    ) -> list[Document]:
+        return sorted(
+            (
+                document
+                for document in self._store.documents
+                if document.dataset_id == dataset_id
+                and document.generation == generation
+                and document.is_active
+            ),
+            key=lambda item: (item.source_id, item.id),
+        )
+
 
 class FakeChunkRepository:
     def __init__(self, store: FakeStore) -> None:
@@ -174,6 +228,23 @@ class FakeChunkRepository:
                 and (chunk.is_active or not active_only)
             ],
             key=lambda item: (item.ordinal, item.id),
+        )
+
+    async def list_active_current_for_dataset(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+    ) -> list[Chunk]:
+        return sorted(
+            (
+                chunk
+                for chunk in self._store.chunks
+                if chunk.dataset_id == dataset_id
+                and chunk.generation == generation
+                and chunk.is_active
+            ),
+            key=lambda item: (item.document_id, item.ordinal, item.id),
         )
 
 
@@ -263,6 +334,19 @@ class FakeEntityRepository:
             key=lambda item: item.id,
         )
 
+    async def list_active_current_for_dataset(self, *, dataset_id: UUID) -> list[Entity]:
+        dataset = dataset_by_id(self._store, dataset_id)
+        return sorted(
+            (
+                entity
+                for entity in self._store.entities
+                if entity.dataset_id == dataset_id
+                and entity.generation == dataset.active_generation
+                and entity.is_active
+            ),
+            key=lambda item: item.id,
+        )
+
 
 class FakeRelationRepository:
     def __init__(self, store: FakeStore) -> None:
@@ -312,6 +396,21 @@ class FakeRelationRepository:
                 result.add(relation.target_entity_id)
         self._store.incident_entity_results.append(result)
         return result
+
+    async def list_active_current_for_dataset(self, *, dataset_id: UUID) -> list[Relation]:
+        dataset = dataset_by_id(self._store, dataset_id)
+        return sorted(
+            (
+                relation
+                for relation in self._store.relations
+                if relation.dataset_id == dataset_id
+                and relation.generation == dataset.active_generation
+                and relation.is_active
+                and authoritative_entity(self._store, dataset_id, relation.source_entity_id)
+                and authoritative_entity(self._store, dataset_id, relation.target_entity_id)
+            ),
+            key=lambda item: item.id,
+        )
 
 
 class FakeSummaryRepository:
@@ -375,18 +474,71 @@ class FakePipelineRunRepository:
     async def get_by_id(self, run_id: UUID) -> PipelineRun | None:
         return next((run for run in self._store.runs if run.id == run_id), None)
 
-    async def has_running_forget_for_source_except(
+    async def find_latest_forget_for_source_except(
         self,
         *,
         source_id: UUID,
         excluded_run_id: UUID,
-    ) -> bool:
-        return any(
-            run.id != excluded_run_id
-            and run.source_id == source_id
-            and run.pipeline_type == PipelineType.FORGET
-            and run.status == PipelineRunStatus.RUNNING
-            for run in self._store.runs
+    ) -> PipelineRun | None:
+        # ``reversed`` approximates ``ORDER BY created_at DESC``: test runs are
+        # never given a real timestamp, but they are always appended in
+        # creation order, so the most recently appended match is "latest".
+        return next(
+            (
+                run
+                for run in reversed(self._store.runs)
+                if run.id != excluded_run_id
+                and run.source_id == source_id
+                and run.pipeline_type == PipelineType.FORGET
+            ),
+            None,
+        )
+
+    async def find_running_forget_for_dataset_except(
+        self,
+        *,
+        dataset_id: UUID,
+        source_ids: list[UUID],
+        excluded_run_id: UUID,
+    ) -> PipelineRun | None:
+        requested_sources = set(source_ids)
+        return next(
+            (
+                run
+                for run in sorted(self._store.runs, key=lambda item: item.id)
+                if run.id != excluded_run_id
+                and run.pipeline_type == PipelineType.FORGET
+                and run.status == PipelineRunStatus.RUNNING
+                and (
+                    run.dataset_id == dataset_id
+                    or (run.source_id is not None and run.source_id in requested_sources)
+                    or (run.dataset_id is None and run.source_id is None)
+                )
+            ),
+            None,
+        )
+
+    async def find_latest_forget_for_dataset_except(
+        self,
+        *,
+        dataset_id: UUID,
+        source_ids: list[UUID],
+        excluded_run_id: UUID,
+    ) -> PipelineRun | None:
+        requested_sources = set(source_ids)
+        return next(
+            (
+                run
+                for run in reversed(self._store.runs)
+                if run.id != excluded_run_id
+                and run.pipeline_type == PipelineType.FORGET
+                and (
+                    run.dataset_id == dataset_id
+                    or (run.source_id is not None and run.source_id in requested_sources)
+                    or (run.dataset_id is None and run.source_id is None)
+                )
+            ),
+            None,
         )
 
 
@@ -655,6 +807,7 @@ async def test_reentrant_forget_skips_post_commit_work_owned_by_running_forget(
     source = source_by_id(store, ids.source_id)
     source.status = SourceStatus.DELETING
     owner_run_id = uuid4()
+    request = ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=True)
     store.runs.append(
         PipelineRun(
             id=owner_run_id,
@@ -663,7 +816,7 @@ async def test_reentrant_forget_skips_post_commit_work_owned_by_running_forget(
             source_id=ids.source_id,
             status=PipelineRunStatus.RUNNING,
             idempotency_key=None,
-            payload_hash=HASH,
+            payload_hash=stable_payload_hash(forget_run_input(request)),
             input={},
             progress=0.5,
             current_step="forget_source",
@@ -680,9 +833,7 @@ async def test_reentrant_forget_skips_post_commit_work_owned_by_running_forget(
     )
     drain = FakeDrain(store)
 
-    result = await service_for(store, tmp_path, drain=drain).forget_source(
-        ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=True)
-    )
+    result = await service_for(store, tmp_path, drain=drain).forget_source(request)
 
     assert result.source_status == SourceStatus.DELETING
     assert result.graph_events_enqueued == 0
@@ -691,6 +842,673 @@ async def test_reentrant_forget_skips_post_commit_work_owned_by_running_forget(
     assert source.status == SourceStatus.DELETING
     assert store.graph_commands == []
     assert store.runs[-1].status == PipelineRunStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_source_forget_conflict_with_different_semantics_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A different concurrent operation on the same source must fail, not no-op.
+
+    Two source forgets with different ``memory_only`` are not semantically
+    equivalent (FR-090 section 23), unlike the reentrant case above where the
+    running request is a true duplicate.
+    """
+
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    source = source_by_id(store, ids.source_id)
+    source.status = SourceStatus.DELETING
+    other_request = ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=False)
+    store.runs.append(
+        PipelineRun(
+            id=uuid4(),
+            pipeline_type=PipelineType.FORGET,
+            dataset_id=ids.dataset_id,
+            source_id=ids.source_id,
+            status=PipelineRunStatus.RUNNING,
+            idempotency_key=None,
+            payload_hash=stable_payload_hash(forget_run_input(other_request)),
+            input={},
+            progress=0.5,
+            current_step="forget_source",
+            attempt=1,
+            worker_id=None,
+            heartbeat_at=None,
+            config_fingerprint=HASH,
+            error_code=None,
+            error_message=None,
+            metrics={},
+            started_at=None,
+            finished_at=None,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_source(
+            ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=True)
+        )
+
+    assert error.value.status_code == 409
+    assert source.status == SourceStatus.DELETING
+
+
+def test_determine_forget_scope_validates_all_three_scopes() -> None:
+    from sofias_memory.services.forget import ForgetScope, determine_forget_scope
+
+    assert determine_forget_scope(ForgetRequest(source_id=uuid4())) == ForgetScope.SOURCE
+    assert (
+        determine_forget_scope(ForgetRequest(dataset="my-dataset", memory_only=True))
+        == ForgetScope.DATASET
+    )
+    assert (
+        determine_forget_scope(ForgetRequest(everything=True, confirm="DELETE EVERYTHING"))
+        == ForgetScope.EVERYTHING
+    )
+
+    with pytest.raises(SofiasMemoryError) as no_target:
+        determine_forget_scope(ForgetRequest())
+    assert no_target.value.status_code == 400
+
+    with pytest.raises(SofiasMemoryError) as no_confirm:
+        determine_forget_scope(ForgetRequest(everything=True))
+    assert no_confirm.value.status_code == 400
+
+    bad_confirms = (
+        "delete everything",
+        "DELETE EVERYTHING ",
+        " DELETE EVERYTHING",
+        "Delete Everything",
+    )
+    for bad_confirm in bad_confirms:
+        with pytest.raises(SofiasMemoryError):
+            determine_forget_scope(ForgetRequest(everything=True, confirm=bad_confirm))
+
+    with pytest.raises(SofiasMemoryError) as with_source:
+        determine_forget_scope(
+            ForgetRequest(everything=True, confirm="DELETE EVERYTHING", source_id=uuid4())
+        )
+    assert with_source.value.status_code == 400
+
+    with pytest.raises(SofiasMemoryError) as with_dataset:
+        determine_forget_scope(
+            ForgetRequest(dataset="main", everything=True, confirm="DELETE EVERYTHING")
+        )
+    assert with_dataset.value.status_code == 400
+
+    with pytest.raises(SofiasMemoryError) as with_memory_only:
+        determine_forget_scope(
+            ForgetRequest(everything=True, confirm="DELETE EVERYTHING", memory_only=True)
+        )
+    assert with_memory_only.value.status_code == 400
+
+    with pytest.raises(SofiasMemoryError) as stray_confirm:
+        determine_forget_scope(ForgetRequest(source_id=uuid4(), confirm="DELETE EVERYTHING"))
+    assert stray_confirm.value.status_code == 400
+
+    for scope_request in (
+        ForgetRequest(source_id=uuid4(), wait=False),
+        ForgetRequest(dataset="main", wait=False),
+        ForgetRequest(everything=True, confirm="DELETE EVERYTHING", wait=False),
+    ):
+        with pytest.raises(SofiasMemoryError) as wait_false:
+            determine_forget_scope(scope_request)
+        assert wait_false.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_dataset_memory_only_forget_deactivates_whole_dataset_and_stays_isolated(
+    tmp_path: Path,
+) -> None:
+    store, ids, storage_path = seed_forget_graph(tmp_path)
+    service = service_for(store, tmp_path)
+
+    result = await service.forget_dataset(ForgetRequest(dataset="main", memory_only=True))
+
+    dataset = dataset_by_id(store, ids.dataset_id)
+    other_dataset = dataset_by_id(store, ids.other_dataset_id)
+    assert isinstance(result, ForgetDatasetResult)
+    assert result.memory_only is True
+    assert dataset.status == DatasetStatus.ACTIVE
+    assert result.sources_affected == 2
+    assert result.sources_pending == 2
+    assert result.sources_deleted == 0
+    assert result.documents_deactivated == 2
+    assert result.chunks_deactivated == 3
+    assert result.summaries_deactivated == 3
+    assert result.entities_deactivated == 3
+    assert result.relations_deactivated == 2
+    assert result.graph_events_enqueued == 12
+    assert result.graph_events_processed == 12
+    assert result.storage_deleted == 0
+
+    assert source_by_id(store, ids.source_id).status == SourceStatus.PENDING
+    assert source_by_id(store, ids.other_source_id).status == SourceStatus.PENDING
+    assert source_by_id(store, ids.source_id).storage_uri == storage_path.as_uri()
+    assert storage_path.exists()
+    reset_documents = [
+        document
+        for document in store.documents
+        if document.is_active and document.source_id in {ids.source_id, ids.other_source_id}
+    ]
+    assert len(reset_documents) == 2
+
+    # Isolation: the untouched "other" dataset and its entity must be unaffected.
+    assert other_dataset.status == DatasetStatus.ACTIVE
+    assert entity_by_id(store, ids.other_entity_id).is_active is True
+
+
+@pytest.mark.asyncio
+async def test_dataset_full_forget_deletes_storage_and_finalizes_sources_deleted(
+    tmp_path: Path,
+) -> None:
+    store, ids, storage_path = seed_forget_graph(tmp_path)
+    service = service_for(store, tmp_path)
+
+    result = await service.forget_dataset(ForgetRequest(dataset="main", memory_only=False))
+
+    dataset = dataset_by_id(store, ids.dataset_id)
+    assert dataset.status == DatasetStatus.ACTIVE
+    assert result.sources_deleted == 2
+    assert result.sources_pending == 0
+    assert result.storage_deleted == 1
+    assert result.storage_already_absent == 0
+    assert source_by_id(store, ids.source_id).status == SourceStatus.DELETED
+    assert source_by_id(store, ids.source_id).storage_uri is None
+    assert source_by_id(store, ids.other_source_id).status == SourceStatus.DELETED
+    assert not storage_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_dataset_forget_missing_dataset_returns_404_without_pipeline_run(
+    tmp_path: Path,
+) -> None:
+    store, _ids, _storage_path = seed_forget_graph(tmp_path)
+    service = service_for(store, tmp_path)
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service.forget_dataset(ForgetRequest(dataset="does-not-exist"))
+
+    assert error.value.status_code == 404
+    assert store.runs == []
+
+
+@pytest.mark.asyncio
+async def test_dataset_forget_without_explicit_target_is_rejected(tmp_path: Path) -> None:
+    store, _ids, _storage_path = seed_forget_graph(tmp_path)
+    service = service_for(store, tmp_path)
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service.forget_dataset(ForgetRequest())
+
+    assert error.value.status_code == 400
+    assert store.runs == []
+
+
+@pytest.mark.asyncio
+async def test_dataset_forget_reentrant_duplicate_skips_post_commit_work(tmp_path: Path) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    dataset = dataset_by_id(store, ids.dataset_id)
+    dataset.status = DatasetStatus.DELETING
+    for src in store.sources:
+        if src.dataset_id == ids.dataset_id:
+            src.status = SourceStatus.DELETING
+    request = ForgetRequest(dataset="main", memory_only=True)
+    store.runs.append(
+        PipelineRun(
+            id=uuid4(),
+            pipeline_type=PipelineType.FORGET,
+            dataset_id=ids.dataset_id,
+            source_id=None,
+            status=PipelineRunStatus.RUNNING,
+            idempotency_key=None,
+            payload_hash=stable_payload_hash(forget_dataset_run_input(request)),
+            input={},
+            progress=0.5,
+            current_step="forget_dataset",
+            attempt=1,
+            worker_id=None,
+            heartbeat_at=None,
+            config_fingerprint=HASH,
+            error_code=None,
+            error_message=None,
+            metrics={},
+            started_at=None,
+            finished_at=None,
+        )
+    )
+    drain = FakeDrain(store)
+
+    result = await service_for(store, tmp_path, drain=drain).forget_dataset(request)
+
+    assert result.graph_events_enqueued == 0
+    assert result.graph_events_processed == 0
+    assert drain.calls == 0
+    assert dataset.status == DatasetStatus.DELETING
+
+
+@pytest.mark.asyncio
+async def test_dataset_forget_conflict_with_different_semantics_is_rejected(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    dataset = dataset_by_id(store, ids.dataset_id)
+    dataset.status = DatasetStatus.DELETING
+    for src in store.sources:
+        if src.dataset_id == ids.dataset_id:
+            src.status = SourceStatus.DELETING
+    other_request = ForgetRequest(dataset="main", memory_only=False)
+    store.runs.append(
+        PipelineRun(
+            id=uuid4(),
+            pipeline_type=PipelineType.FORGET,
+            dataset_id=ids.dataset_id,
+            source_id=None,
+            status=PipelineRunStatus.RUNNING,
+            idempotency_key=None,
+            payload_hash=stable_payload_hash(forget_dataset_run_input(other_request)),
+            input={},
+            progress=0.5,
+            current_step="forget_dataset",
+            attempt=1,
+            worker_id=None,
+            heartbeat_at=None,
+            config_fingerprint=HASH,
+            error_code=None,
+            error_message=None,
+            metrics={},
+            started_at=None,
+            finished_at=None,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_dataset(
+            ForgetRequest(dataset="main", memory_only=True)
+        )
+
+    assert error.value.status_code == 409
+    assert dataset.status == DatasetStatus.DELETING
+
+
+@pytest.mark.asyncio
+async def test_everything_forget_covers_all_datasets_and_does_not_create_main(
+    tmp_path: Path,
+) -> None:
+    store, ids, storage_path = seed_forget_graph(tmp_path)
+    service = service_for(store, tmp_path)
+
+    result = await service.forget_everything(
+        ForgetRequest(everything=True, confirm="DELETE EVERYTHING")
+    )
+
+    assert isinstance(result, ForgetEverythingResult)
+    assert result.datasets_affected == 2
+    assert result.sources_affected == 2
+    assert result.sources_deleted == 2
+    assert result.documents_deactivated == 2
+    assert result.chunks_deactivated == 3
+    assert result.entities_deactivated == 3 + 1
+    assert result.relations_deactivated == 2
+    assert result.storage_deleted == 1
+    assert not storage_path.exists()
+
+    assert dataset_by_id(store, ids.dataset_id).status == DatasetStatus.ACTIVE
+    assert dataset_by_id(store, ids.other_dataset_id).status == DatasetStatus.ACTIVE
+    assert entity_by_id(store, ids.other_entity_id).is_active is False
+    assert len(store.datasets) == 2
+
+
+def make_forget_run(
+    *,
+    dataset_id: UUID | None,
+    source_id: UUID | None,
+    payload_hash: str,
+    status: PipelineRunStatus,
+) -> PipelineRun:
+    return PipelineRun(
+        id=uuid4(),
+        pipeline_type=PipelineType.FORGET,
+        dataset_id=dataset_id,
+        source_id=source_id,
+        status=status,
+        idempotency_key=None,
+        payload_hash=payload_hash,
+        input={},
+        progress=0.5,
+        current_step="forget",
+        attempt=1,
+        worker_id=None,
+        heartbeat_at=None,
+        config_fingerprint=HASH,
+        error_code=None,
+        error_message=None,
+        metrics={},
+        started_at=None,
+        finished_at=None,
+    )
+
+
+# ----------------------------------------------------------------------
+# Corrective round: post-commit race closure, retry-intent recovery, and
+# everything's no-partial-success contract.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dataset_forget_blocked_by_running_source_forget_same_dataset_while_active(
+    tmp_path: Path,
+) -> None:
+    """A Source forget's mutation may have committed while the dataset was
+    still `active`, and its own drain/storage/finalize is still RUNNING.
+    A fresh dataset forget must detect this before deciding ACTIVE means safe."""
+
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.dataset_id,
+            source_id=ids.source_id,
+            payload_hash="different-source-forget-attempt",
+            status=PipelineRunStatus.RUNNING,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_dataset(
+            ForgetRequest(dataset="main", memory_only=False)
+        )
+
+    assert error.value.status_code == 409
+    assert dataset_by_id(store, ids.dataset_id).status == DatasetStatus.ACTIVE
+    assert source_by_id(store, ids.source_id).status == SourceStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_dataset_forget_allowed_when_running_forget_targets_different_dataset(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.other_dataset_id,
+            source_id=None,
+            payload_hash="unrelated-dataset-forget",
+            status=PipelineRunStatus.RUNNING,
+        )
+    )
+
+    result = await service_for(store, tmp_path).forget_dataset(
+        ForgetRequest(dataset="main", memory_only=True)
+    )
+
+    assert result.sources_pending == 2
+    assert dataset_by_id(store, ids.dataset_id).status == DatasetStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_source_forget_blocked_by_running_dataset_forget_same_dataset(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.dataset_id,
+            source_id=None,
+            payload_hash="dataset-scope-attempt",
+            status=PipelineRunStatus.RUNNING,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_source(
+            ForgetRequest(dataset="main", source_id=ids.source_id)
+        )
+
+    assert error.value.status_code == 409
+    assert source_by_id(store, ids.source_id).status == SourceStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_source_retry_after_failed_full_forget_rejects_memory_only_intent(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    source = source_by_id(store, ids.source_id)
+    source.status = SourceStatus.DELETING
+    full_request = ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=False)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.dataset_id,
+            source_id=ids.source_id,
+            payload_hash=stable_payload_hash(forget_run_input(full_request)),
+            status=PipelineRunStatus.FAILED,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_source(
+            ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=True)
+        )
+
+    assert error.value.status_code == 409
+    assert source.status == SourceStatus.DELETING
+
+
+@pytest.mark.asyncio
+async def test_source_retry_after_failed_memory_only_forget_rejects_full_intent(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    source = source_by_id(store, ids.source_id)
+    source.status = SourceStatus.DELETING
+    memory_only_request = ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=True)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.dataset_id,
+            source_id=ids.source_id,
+            payload_hash=stable_payload_hash(forget_run_input(memory_only_request)),
+            status=PipelineRunStatus.FAILED,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_source(
+            ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=False)
+        )
+
+    assert error.value.status_code == 409
+    assert source.status == SourceStatus.DELETING
+
+
+@pytest.mark.asyncio
+async def test_source_retry_after_failed_full_forget_with_same_intent_resumes(
+    tmp_path: Path,
+) -> None:
+    store, ids, storage_path = seed_forget_graph(tmp_path)
+    source = source_by_id(store, ids.source_id)
+    source.status = SourceStatus.DELETING
+    request = ForgetRequest(dataset="main", source_id=ids.source_id, memory_only=False)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.dataset_id,
+            source_id=ids.source_id,
+            payload_hash=stable_payload_hash(forget_run_input(request)),
+            status=PipelineRunStatus.FAILED,
+        )
+    )
+
+    result = await service_for(store, tmp_path).forget_source(request)
+
+    assert result.source_status == SourceStatus.DELETED
+    assert not storage_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_dataset_retry_after_failed_full_forget_rejects_memory_only_intent(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    dataset = dataset_by_id(store, ids.dataset_id)
+    dataset.status = DatasetStatus.DELETING
+    for src in store.sources:
+        if src.dataset_id == ids.dataset_id:
+            src.status = SourceStatus.DELETING
+    full_request = ForgetRequest(dataset="main", memory_only=False)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.dataset_id,
+            source_id=None,
+            payload_hash=stable_payload_hash(forget_dataset_run_input(full_request)),
+            status=PipelineRunStatus.FAILED,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_dataset(
+            ForgetRequest(dataset="main", memory_only=True)
+        )
+
+    assert error.value.status_code == 409
+    assert dataset.status == DatasetStatus.DELETING
+
+
+@pytest.mark.asyncio
+async def test_dataset_retry_after_failed_memory_only_forget_rejects_full_intent(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    dataset = dataset_by_id(store, ids.dataset_id)
+    dataset.status = DatasetStatus.DELETING
+    for src in store.sources:
+        if src.dataset_id == ids.dataset_id:
+            src.status = SourceStatus.DELETING
+    memory_only_request = ForgetRequest(dataset="main", memory_only=True)
+    store.runs.append(
+        make_forget_run(
+            dataset_id=ids.dataset_id,
+            source_id=None,
+            payload_hash=stable_payload_hash(forget_dataset_run_input(memory_only_request)),
+            status=PipelineRunStatus.FAILED,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_dataset(
+            ForgetRequest(dataset="main", memory_only=False)
+        )
+
+    assert error.value.status_code == 409
+    assert dataset.status == DatasetStatus.DELETING
+
+
+@pytest.mark.asyncio
+async def test_everything_forget_aborts_without_partial_success_on_conflict(
+    tmp_path: Path,
+) -> None:
+    store, ids, _storage_path = seed_forget_graph(tmp_path)
+    ordered_targets = sorted(
+        (ids.dataset_id, ids.other_dataset_id),
+    )
+    first_target = ordered_targets[0]
+    store.runs.append(
+        make_forget_run(
+            dataset_id=first_target,
+            source_id=None,
+            payload_hash="unrelated-dataset-scope-attempt",
+            status=PipelineRunStatus.RUNNING,
+        )
+    )
+
+    with pytest.raises(SofiasMemoryError) as error:
+        await service_for(store, tmp_path).forget_everything(
+            ForgetRequest(everything=True, confirm="DELETE EVERYTHING")
+        )
+
+    assert error.value.status_code == 409
+    assert store.runs[-1].status == PipelineRunStatus.FAILED
+    assert store.runs[-1].status != PipelineRunStatus.SUCCEEDED
+    # The conflicted dataset was never mutated by this run.
+    assert dataset_by_id(store, first_target).status == DatasetStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_everything_forget_retry_converges_after_partial_failure(
+    tmp_path: Path,
+) -> None:
+    store, ids, storage_path = seed_forget_graph(tmp_path)
+    ordered_targets = sorted((ids.dataset_id, ids.other_dataset_id))
+    first_target = ordered_targets[0]
+    blocking_run = make_forget_run(
+        dataset_id=first_target,
+        source_id=None,
+        payload_hash="unrelated-dataset-scope-attempt",
+        status=PipelineRunStatus.RUNNING,
+    )
+    store.runs.append(blocking_run)
+
+    with pytest.raises(SofiasMemoryError):
+        await service_for(store, tmp_path).forget_everything(
+            ForgetRequest(everything=True, confirm="DELETE EVERYTHING")
+        )
+
+    # The blocking operation finished; a retry should now converge cleanly.
+    store.runs.remove(blocking_run)
+    result = await service_for(store, tmp_path).forget_everything(
+        ForgetRequest(everything=True, confirm="DELETE EVERYTHING")
+    )
+
+    assert result.status == "succeeded"
+    assert dataset_by_id(store, ids.dataset_id).status == DatasetStatus.ACTIVE
+    assert dataset_by_id(store, ids.other_dataset_id).status == DatasetStatus.ACTIVE
+    assert not storage_path.exists()
+    assert store.runs[-1].status == PipelineRunStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_full_dataset_forget_removes_storage_for_pending_and_failed_sources(
+    tmp_path: Path,
+) -> None:
+    """FR-090: forgetting a dataset must not skip sources just because they
+    were never `active` — a PENDING/FAILED source's storage must not survive."""
+
+    store, ids, storage_path = seed_forget_graph(tmp_path)
+
+    pending_source_id = uuid4()
+    real_pending_path = tmp_path / str(ids.dataset_id) / str(pending_source_id) / "original.txt"
+    real_pending_path.parent.mkdir(parents=True)
+    real_pending_path.write_text("pending", encoding="utf-8")
+    pending_source = source(
+        pending_source_id,
+        ids.dataset_id,
+        status=SourceStatus.PENDING,
+        storage_uri=real_pending_path.as_uri(),
+    )
+
+    failed_source_id = uuid4()
+    failed_storage_path = tmp_path / str(ids.dataset_id) / str(failed_source_id) / "original.txt"
+    failed_storage_path.parent.mkdir(parents=True)
+    failed_storage_path.write_text("failed", encoding="utf-8")
+    failed_source = source(
+        failed_source_id,
+        ids.dataset_id,
+        status=SourceStatus.FAILED,
+        storage_uri=failed_storage_path.as_uri(),
+    )
+
+    store.sources.extend([pending_source, failed_source])
+
+    result = await service_for(store, tmp_path).forget_dataset(
+        ForgetRequest(dataset="main", memory_only=False)
+    )
+
+    assert result.sources_affected == 4
+    assert result.sources_deleted == 4
+    assert not real_pending_path.exists()
+    assert not failed_storage_path.exists()
+    assert not storage_path.exists()
+    assert source_by_id(store, pending_source.id).status == SourceStatus.DELETED
+    assert source_by_id(store, failed_source.id).status == SourceStatus.DELETED
+    assert source_by_id(store, pending_source.id).storage_uri is None
+    assert source_by_id(store, failed_source.id).storage_uri is None
 
 
 @pytest.mark.asyncio
@@ -787,7 +1605,7 @@ async def test_retry_after_unlink_success_before_finalization_clears_storage_uri
     service = service_for(store, tmp_path)
     request = ForgetRequest(dataset="main", source_id=ids.source_id)
 
-    run_id = await service._create_running_run(request)  # noqa: SLF001
+    run_id = await service._create_running_run(request, ids.source_id)  # noqa: SLF001
     mutation = await service._apply_authoritative_forget(run_id, request)  # noqa: SLF001
     storage_delete = delete_source_storage(
         tmp_path,
@@ -951,7 +1769,7 @@ async def test_forget_route_returns_envelope_and_requires_api_key(
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
 
-        async def forget_source(self, request: ForgetRequest) -> ForgetResult:
+        async def forget(self, request: ForgetRequest) -> ForgetResult:
             return ForgetResult(
                 run_id=uuid4(),
                 status="succeeded",

@@ -369,6 +369,13 @@ class RememberService:
     ) -> Dataset:
         dataset = await uow.datasets.get_by_slug(dataset_slug)
         if dataset is not None:
+            if dataset.status != DatasetStatus.ACTIVE:
+                raise SofiasMemoryError(
+                    code=ErrorCode.INVALID_REQUEST,
+                    status_code=HTTPStatus.NOT_FOUND,
+                    message="Dataset does not exist.",
+                    details={"dataset": dataset_slug},
+                )
             return dataset
         if dataset_slug != DEFAULT_DATASET_SLUG:
             raise SofiasMemoryError(

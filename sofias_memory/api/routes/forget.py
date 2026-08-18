@@ -12,7 +12,7 @@ from sofias_memory.lifespan import (
     app_settings,
 )
 from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
-from sofias_memory.schemas.forget import ForgetRequest, ForgetResult
+from sofias_memory.schemas.forget import ForgetRequest, ForgetResponseData
 from sofias_memory.services.forget import ForgetService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
@@ -20,11 +20,11 @@ from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 router = APIRouter(tags=["forget"])
 
 
-@router.post("/forget", response_model=SuccessEnvelope[ForgetResult])
+@router.post("/forget", response_model=SuccessEnvelope[ForgetResponseData])
 async def forget(
     payload: ForgetRequest,
     request: Request,
-) -> SuccessEnvelope[ForgetResult]:
+) -> SuccessEnvelope[ForgetResponseData]:
     settings = app_settings(request.app)
     session_factory = app_postgres_session_factory(request.app)
     projection = Neo4jProjection(app_neo4j_resource(request.app))
@@ -37,8 +37,8 @@ async def forget(
             processor=processor,
         ),
     )
-    result = await service.forget_source(payload)
-    return SuccessEnvelope[ForgetResult](
+    result = await service.forget(payload)
+    return SuccessEnvelope[ForgetResponseData](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
     )

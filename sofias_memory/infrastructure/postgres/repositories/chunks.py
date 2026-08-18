@@ -101,6 +101,26 @@ class ChunkRepository:
         statement = statement.limit(1)
         return await self._session.scalar(statement) is not None
 
+    async def list_active_current_for_dataset(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+    ) -> list[Chunk]:
+        """All authoritative chunks for a dataset forget/everything mutation."""
+
+        statement = (
+            select(Chunk)
+            .where(
+                Chunk.dataset_id == dataset_id,
+                Chunk.generation == generation,
+                Chunk.is_active.is_(True),
+            )
+            .order_by(Chunk.document_id, Chunk.ordinal, Chunk.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def list_active_for_document_summary(
         self,
         *,

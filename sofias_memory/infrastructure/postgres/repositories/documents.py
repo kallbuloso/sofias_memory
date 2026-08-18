@@ -88,6 +88,31 @@ class DocumentRepository:
         result = await self._session.scalar(statement)
         return cast(Document | None, result)
 
+    async def list_active_current_for_dataset(
+        self,
+        *,
+        dataset_id: UUID,
+        generation: int,
+    ) -> list[Document]:
+        """All authoritative documents for a dataset forget/everything mutation.
+
+        Scoped only by ``dataset_id``/``generation``: dataset-scoped forget
+        touches every source in the dataset, so no per-source or per-entity
+        orphan detection is needed here, unlike source-scoped forget.
+        """
+
+        statement = (
+            select(Document)
+            .where(
+                Document.dataset_id == dataset_id,
+                Document.generation == generation,
+                Document.is_active.is_(True),
+            )
+            .order_by(Document.source_id, Document.created_at, Document.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def list_active_for_summary_rebuild(
         self,
         *,

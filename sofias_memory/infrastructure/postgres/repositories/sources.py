@@ -112,6 +112,45 @@ class SourceRepository:
         result = await self._session.scalars(statement)
         return list(result)
 
+    async def list_for_dataset_not_deleted(self, dataset_id: UUID) -> list[Source]:
+        """Plain, unlocked read of every non-terminal source of a dataset.
+
+        Used for read-only concurrency checks and storage cleanup where taking
+        a row lock would be unnecessary; the authoritative mutation and the
+        finalize step use :meth:`list_for_dataset_for_update` instead.
+        """
+
+        statement = (
+            select(Source)
+            .where(
+                Source.dataset_id == dataset_id,
+                Source.status != SourceStatus.DELETED,
+            )
+            .order_by(Source.id)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def list_for_dataset_for_update(self, dataset_id: UUID) -> list[Source]:
+        """Lock every non-terminal source of a dataset, in deterministic id order.
+
+        Sources already ``deleted`` are excluded: they carry no authoritative
+        content or storage left to forget, and locking them would only widen
+        the deadlock surface of dataset/everything forget without any benefit.
+        """
+
+        statement = (
+            select(Source)
+            .where(
+                Source.dataset_id == dataset_id,
+                Source.status != SourceStatus.DELETED,
+            )
+            .order_by(Source.id)
+            .with_for_update()
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def list_for_dataset_paginated(
         self,
         *,

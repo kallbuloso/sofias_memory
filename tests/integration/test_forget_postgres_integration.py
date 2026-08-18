@@ -16,12 +16,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.errors import SofiasMemoryError
 from sofias_memory.config import Settings
-from sofias_memory.domain import SourceStatus
+from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType, SourceStatus
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
+from sofias_memory.infrastructure.postgres.models import PipelineRun
+from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.ports import chunk_delete_command
 from sofias_memory.schemas.forget import ForgetRequest
-from sofias_memory.services.forget import ForgetService
+from sofias_memory.services.forget import (
+    ForgetService,
+    forget_dataset_run_input,
+    stable_payload_hash,
+)
 
 FORGET_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_FORGET_POSTGRES_TESTS"
 FORGET_POSTGRES_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_FORGET_TEST_DATABASE_URL"
@@ -397,6 +403,284 @@ async def _unreachable_drain(dataset_id: UUID) -> SimpleNamespace:
     raise AssertionError(f"drain must not run for a rejected target: {dataset_id}")
 
 
+def _settings_for(postgres_engine: AsyncEngine, tmp_path: Path) -> Settings:
+    return Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        api_key="sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        database_url=str(postgres_engine.url),
+        neo4j_password="test-neo4j-password",
+        llm_api_key="test-llm-key",
+        app_env="test",
+        data_directory=tmp_path,
+    )
+
+
+async def insert_pipeline_run(
+    session_factory: AsyncSessionFactory,
+    *,
+    dataset_id: UUID | None,
+    source_id: UUID | None,
+    status: PipelineRunStatus,
+    payload_hash: str,
+) -> UUID:
+    run_id = uuid4()
+    async with PostgresUnitOfWork(session_factory) as uow:
+        await uow.pipeline_runs.add(
+            PipelineRun(
+                id=run_id,
+                pipeline_type=PipelineType.FORGET,
+                dataset_id=dataset_id,
+                source_id=source_id,
+                status=status,
+                idempotency_key=None,
+                payload_hash=payload_hash,
+                input={},
+                progress=0.5,
+                current_step="forget",
+                attempt=1,
+                worker_id=None,
+                heartbeat_at=None,
+                config_fingerprint="a" * 64,
+                error_code=None,
+                error_message=None,
+                metrics={},
+                started_at=None,
+                finished_at=None,
+            )
+        )
+        await uow.commit()
+    return run_id
+
+
+async def dataset_status(engine: AsyncEngine, dataset_id: UUID) -> str:
+    async with engine.connect() as connection:
+        return str(
+            await connection.scalar(
+                text("SELECT status FROM datasets WHERE id = :dataset_id"),
+                {"dataset_id": dataset_id},
+            )
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_forget_reentrant_skips_concurrent_post_commit_drain(
+    postgres_engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    """Scenario A: two concurrent, identical dataset forgets apply the
+    authoritative mutation exactly once; the second call observes the first's
+    RUNNING PipelineRun and completes as a reentrant no-op instead of
+    disputing drain with it."""
+
+    class BlockingDrain:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def process_dataset(self, dataset_id: UUID) -> SimpleNamespace:
+            del dataset_id
+            self.calls += 1
+            self.entered.set()
+            await self.release.wait()
+            return SimpleNamespace(processed=0)
+
+    ids = ForgetIds()
+    session_factory = create_session_factory(postgres_engine)
+    drain = BlockingDrain()
+    service = ForgetService(
+        _settings_for(postgres_engine, tmp_path),
+        session_factory=session_factory,
+        graph_projection_drain=drain,
+    )
+    request = ForgetRequest(dataset=f"forget-{ids.dataset_id}", memory_only=True)
+    try:
+        await insert_forget_fixture(postgres_engine, ids)
+
+        first = asyncio.create_task(service.forget_dataset(request))
+        await asyncio.wait_for(drain.entered.wait(), timeout=5)
+        outbox_after_first_commit = await graph_outbox_count(postgres_engine, ids.dataset_id)
+        assert outbox_after_first_commit > 0
+
+        reentrant = await asyncio.wait_for(service.forget_dataset(request), timeout=5)
+
+        assert reentrant.graph_events_enqueued == 0
+        assert reentrant.graph_events_processed == 0
+        assert drain.calls == 1
+        assert (
+            await graph_outbox_count(postgres_engine, ids.dataset_id) == outbox_after_first_commit
+        )
+        assert await dataset_status(postgres_engine, ids.dataset_id) == "deleting"
+
+        drain.release.set()
+        owner = await asyncio.wait_for(first, timeout=5)
+
+        assert owner.status == "succeeded"
+        assert await dataset_status(postgres_engine, ids.dataset_id) == "active"
+        assert (
+            await graph_outbox_count(postgres_engine, ids.dataset_id) == outbox_after_first_commit
+        )
+    finally:
+        drain.release.set()
+        await cleanup_forget_fixture(postgres_engine, ids)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_forget_blocked_by_running_source_forget_post_commit(
+    postgres_engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    """Scenario B: a source-scoped forget's mutation already committed and its
+    PipelineRun is still RUNNING (mid drain/storage/finalize). A dataset
+    forget on the same dataset must detect this before touching anything,
+    even though the dataset row itself is still `active`."""
+
+    ids = ForgetIds()
+    session_factory = create_session_factory(postgres_engine)
+    try:
+        await insert_forget_fixture(postgres_engine, ids)
+
+        # Simulate a source forget's committed mutation: the source is
+        # `deleting`, its owning PipelineRun is still RUNNING, and the
+        # dataset row was never touched (mirrors real source-forget behavior).
+        async with PostgresUnitOfWork(session_factory) as uow:
+            source = await uow.sources.get_by_id(ids.source_id)
+            assert source is not None
+            source.status = SourceStatus.DELETING
+            await uow.commit()
+        await insert_pipeline_run(
+            session_factory,
+            dataset_id=ids.dataset_id,
+            source_id=ids.source_id,
+            status=PipelineRunStatus.RUNNING,
+            payload_hash="b" * 64,
+        )
+
+        outbox_before = await graph_outbox_count(postgres_engine, ids.dataset_id)
+        service = ForgetService(
+            _settings_for(postgres_engine, tmp_path),
+            session_factory=session_factory,
+            graph_projection_drain=SimpleNamespace(process_dataset=_unreachable_drain),
+        )
+
+        with pytest.raises(SofiasMemoryError) as exc_info:
+            await service.forget_dataset(
+                ForgetRequest(dataset=f"forget-{ids.dataset_id}", memory_only=False)
+            )
+
+        assert exc_info.value.status_code == 409
+        assert await dataset_status(postgres_engine, ids.dataset_id) == "active"
+        assert await graph_outbox_count(postgres_engine, ids.dataset_id) == outbox_before
+    finally:
+        await cleanup_forget_fixture(postgres_engine, ids)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_forget_retry_after_failed_owner_preserves_intent(
+    postgres_engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    """Scenario C: a dataset left `deleting` by a FAILED attempt may only be
+    resumed by a request with the same persisted intent; a divergent
+    ``memory_only`` must be rejected instead of silently taking over."""
+
+    ids = ForgetIds()
+    session_factory = create_session_factory(postgres_engine)
+    full_request = ForgetRequest(dataset=f"forget-{ids.dataset_id}", memory_only=False)
+    try:
+        await insert_forget_fixture(postgres_engine, ids)
+
+        async with PostgresUnitOfWork(session_factory) as uow:
+            dataset = await uow.datasets.get_by_id(ids.dataset_id)
+            assert dataset is not None
+            dataset.status = DatasetStatus.DELETING
+            source1 = await uow.sources.get_by_id(ids.source_id)
+            source2 = await uow.sources.get_by_id(ids.other_source_id)
+            assert source1 is not None
+            assert source2 is not None
+            source1.status = SourceStatus.DELETING
+            source2.status = SourceStatus.DELETING
+            await uow.commit()
+        await insert_pipeline_run(
+            session_factory,
+            dataset_id=ids.dataset_id,
+            source_id=None,
+            status=PipelineRunStatus.FAILED,
+            payload_hash=stable_payload_hash(forget_dataset_run_input(full_request)),
+        )
+
+        service = ForgetService(
+            _settings_for(postgres_engine, tmp_path),
+            session_factory=session_factory,
+            graph_projection_drain=SimpleNamespace(process_dataset=_unreachable_drain),
+        )
+
+        with pytest.raises(SofiasMemoryError) as exc_info:
+            await service.forget_dataset(
+                ForgetRequest(dataset=f"forget-{ids.dataset_id}", memory_only=True)
+            )
+        assert exc_info.value.status_code == 409
+        assert await dataset_status(postgres_engine, ids.dataset_id) == "deleting"
+
+        service_with_real_drain = ForgetService(
+            _settings_for(postgres_engine, tmp_path),
+            session_factory=session_factory,
+            graph_projection_drain=SimpleNamespace(
+                process_dataset=lambda dataset_id: _noop_drain_result()
+            ),
+        )
+        result = await service_with_real_drain.forget_dataset(full_request)
+
+        assert result.status == "succeeded"
+        assert await dataset_status(postgres_engine, ids.dataset_id) == "active"
+    finally:
+        await cleanup_forget_fixture(postgres_engine, ids)
+
+
+async def _noop_drain_result() -> SimpleNamespace:
+    return SimpleNamespace(processed=0)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_forget_does_not_affect_other_dataset(
+    postgres_engine: AsyncEngine,
+    tmp_path: Path,
+) -> None:
+    """Scenario D: forgetting dataset A must never mutate dataset B's rows."""
+
+    ids_a = ForgetIds()
+    ids_b = ForgetIds()
+    session_factory = create_session_factory(postgres_engine)
+    service = ForgetService(
+        _settings_for(postgres_engine, tmp_path),
+        session_factory=session_factory,
+        graph_projection_drain=SimpleNamespace(
+            process_dataset=lambda dataset_id: _noop_drain_result()
+        ),
+    )
+    try:
+        await insert_forget_fixture(postgres_engine, ids_a)
+        await insert_forget_fixture(postgres_engine, ids_b)
+
+        result = await service.forget_dataset(
+            ForgetRequest(dataset=f"forget-{ids_a.dataset_id}", memory_only=False)
+        )
+
+        assert result.status == "succeeded"
+        assert await dataset_status(postgres_engine, ids_a.dataset_id) == "active"
+        assert await source_status(postgres_engine, ids_a.source_id) == "deleted"
+        assert await dataset_status(postgres_engine, ids_b.dataset_id) == "active"
+        assert await source_status(postgres_engine, ids_b.source_id) == "active"
+        assert await chunk_is_active(postgres_engine, ids_b.forgotten_chunk_id) is True
+    finally:
+        await cleanup_forget_fixture(postgres_engine, ids_a)
+        await cleanup_forget_fixture(postgres_engine, ids_b)
+
+
 class ForgetIds:
     def __init__(self) -> None:
         self.dataset_id = uuid4()
@@ -556,6 +840,22 @@ async def insert_forget_fixture(engine: AsyncEngine, ids: ForgetIds) -> None:
 
 async def cleanup_forget_fixture(engine: AsyncEngine, ids: ForgetIds) -> None:
     async with engine.begin() as connection:
+        # pipeline_runs.dataset_id/source_id use ON DELETE SET NULL, not
+        # CASCADE: deleting the dataset first would leave any test-inserted
+        # run orphaned with NULL/NULL, which then matches the
+        # everything-scope wildcard in find_running_forget_for_dataset_except
+        # and silently poisons every later test in the same session. Always
+        # delete pipeline_runs for this fixture's identities first.
+        await connection.execute(
+            text(
+                """
+                DELETE FROM pipeline_runs
+                WHERE dataset_id = :dataset_id
+                   OR source_id IN (:source_id, :other_source_id)
+                """
+            ),
+            _ids_dict(ids),
+        )
         await connection.execute(
             text("DELETE FROM graph_outbox WHERE dataset_id = :dataset_id"),
             {"dataset_id": ids.dataset_id},

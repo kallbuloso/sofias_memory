@@ -2,7 +2,7 @@
 
 **Documento:** Backlog técnico — B4 Core Memory  
 **Escopo:** B4 núcleo funcional de memória sobre B0–B3  
-**Status:** Em execução; SM-401..SM-419 concluídas; SM-420 é a próxima task
+**Status:** GATE-B4 PASSED; SM-401..SM-424 concluídas
 **Pré-requisitos:** GATE-B3 PASSED; ADR-0008 accepted; `AGENTS.md`; `docs/product/Sofias_Memory_PRD_SPECS.md`  
 **Regra:** executar uma task por vez, respeitando dependências, contratos congelados e gates.  
 **Base de reconstrução:** estado real do repositório em `bd426c99d4f1bc96922b00bb62e2598f545306c1`.  
@@ -172,8 +172,8 @@ SM-424  Graph/provenance read-only API
 GATE-B4
 ```
 
-SM-401..SM-419 estão DONE. SM-420 é a próxima task. SM-421..SM-424 seguem TODO.
-GATE-B4 segue TODO.
+SM-401..SM-424 estão DONE.
+GATE-B4 — PASSED.
 
 ---
 
@@ -825,7 +825,9 @@ Implementar a API pública mínima de datasets que ainda falta no HEAD atual.
 
 ## SM-422 — Forget source e memory-only de source
 
-**Status:** TODO  
+**Status:** DONE  
+**Commit:** `6450979` — `feat(forget): implement SM-422 source forget`  
+**Próxima task:** NÃO
 **Prioridade:** P0  
 **Dependências:** SM-407, SM-418, SM-421  
 **PRD:** FR-090; FR-110; ADR-0008
@@ -865,11 +867,23 @@ e recuperação por retry explícito.
 - falha parcial é recuperável por retry explícito síncrono;
 - PostgreSQL permanece autoridade.
 
+### Evidência de fechamento
+
+- forget de source síncrono concluído, cobrindo `memory_only` e full;
+- PostgreSQL autoritativo; memória derivada removida/desativada conforme contrato;
+- projeção Neo4j atualizada via `graph_outbox`;
+- deleção segura de storage; concorrência/reentrância corrigida;
+- smoke real (PostgreSQL + Neo4j reais) aprovado.
+- stale `RUNNING` `PipelineRun` recovery após término anormal de processo **não** foi
+  implementado neste escopo; permanece dívida explícita B5 (ver seção 9).
+
 ---
 
 ## SM-423 — Forget dataset e everything
 
-**Status:** TODO  
+**Status:** DONE  
+**Commit:** `180919e` — `feat(forget): implement SM-423 dataset and everything forget`  
+**Próxima task:** NÃO
 **Prioridade:** P0  
 **Dependências:** SM-422  
 **PRD:** FR-090
@@ -908,11 +922,28 @@ memory-only de dataset e everything com confirmação explícita, usando execuç
 - dados externos ao Sofias no Neo4j são preservados;
 - operação é idempotente.
 
+### Evidência de fechamento
+
+- forget de dataset e forget everything síncronos concluídos;
+- confirmação exata `confirm="DELETE EVERYTHING"` obrigatória (rejeição estrita de
+  qualquer outra string, incluindo variações de digitação);
+- forget de conteúdo de dataset preserva a row do `Dataset` (`ACTIVE → DELETING →
+  ACTIVE`), sem deletar o dataset em si;
+- storage limpo; projeção Neo4j removida apenas no escopo autoritativo do PostgreSQL;
+  dados externos ao Sofias no Neo4j preservados; `main` não é criado por forget;
+- smoke real (PostgreSQL + Neo4j reais) aprovado.
+- **Importante:** esta story cobre a semântica de esquecimento de memória/conteúdo via
+  `POST /api/v1/forget`. Ela não substitui e não elimina a obrigação futura do endpoint
+  administrativo `DELETE /api/v1/datasets/{dataset_id}` (deleção assíncrona quando
+  houver artefatos), que permanece pendência explícita B5 (ver seção 9 e GATE-B4).
+
 ---
 
 ## SM-424 — Graph/provenance read-only API
 
-**Status:** TODO  
+**Status:** DONE  
+**Commit:** `2b5efc8` — `feat(graph): implement SM-424 graph and provenance API`  
+**Próxima task:** NÃO
 **Prioridade:** P1  
 **Dependências:** SM-408, SM-418, SM-422  
 **PRD:** FR-110
@@ -947,11 +978,20 @@ Implementar endpoints read-only de graph/provenance previstos no PRD, sem Cypher
 - ausência de evidência retorna resposta segura;
 - limites impedem expansão ilimitada do grafo.
 
+### Evidência de fechamento
+
+- seis endpoints read-only de graph/provenance implementados;
+- PostgreSQL autoritativo; Neo4j usado apenas para projeção/travessia;
+- projeção stale/cross-dataset filtrada corretamente;
+- provenance rastreável até Source/Document/Chunk/Evidence;
+- nenhum Cypher arbitrário exposto;
+- integration real (PostgreSQL + Neo4j reais) e HTTP smoke aprovados.
+
 ---
 
 # 8. GATE-B4 — Core Memory funcional síncrono concluído
 
-**Status:** TODO  
+**Status:** DONE / PASSED  
 **Prioridade:** P0  
 **Dependências:** SM-401..SM-424  
 **Tipo:** FUNCTIONAL / INTEGRATION GATE síncrono
@@ -998,11 +1038,34 @@ Antes do MVP operacional final, B5 ainda precisa implementar:
 - `wait=false` real;
 - runs/retry/cancel operacionais;
 - heartbeat;
-- stale recovery;
+- stale recovery, incluindo recovery de `PipelineRun` presa em `RUNNING` após término
+  anormal de processo;
 - cancellation cooperativo;
 - dataset deletion assíncrona quando houver artefatos, conforme FR-010;
 - lifecycle operacional correspondente;
 - lifecycle de worker.
+
+## Nota de fechamento
+
+`GATE-B4` foi executado e aprovado (`GATE-B4 PASSED — CORE MEMORY FUNCIONAL SÍNCRONO
+CONCLUÍDO`). Evidência combinada:
+
+- gate original A→M: PASS;
+- cenário N descobriu um bug real na ordem do stage `graph_reconciliation` (ordem antiga
+  `maintenance → drain → reconcile` permitia que o `entity_upsert`/`MERGE` de maintenance
+  reparasse silenciosamente uma `Entity` ausente antes da medição do drift, mascarando
+  divergência real de projeção);
+- fix em `2aa3833` — nova ordem `reconcile → maintain → drain` — com regressões
+  dedicadas (ordem unitária; PostgreSQL + Neo4j real cobrindo entity ausente com
+  importância ainda não calculada, relation hygiene, e importância sem drift); suíte
+  completa após o fix: 881 passed, 33 skipped;
+- continuation N→U: 143 checks PASS; continuation V-only (ambiente descartável
+  dedicado): 42 checks PASS, incluindo confirmação inválida rejeitada sem mutação,
+  confirmação exata `"DELETE EVERYTHING"` aceita, datasets authoritative com row
+  preservada, storage removido, sentinels externos do Neo4j preservados e `main`
+  permanecendo ausente durante toda a execução.
+
+Nenhum item da lista "Pendências explícitas para B5" acima foi implementado neste gate.
 
 ## Validação esperada
 
@@ -1043,7 +1106,8 @@ B5 deverá cuidar de execução operacional assíncrona e não deve ser antecipa
 - retries por etapa;
 - run retry/cancel operacional;
 - heartbeat;
-- stale recovery;
+- stale recovery, incluindo recovery de `PipelineRun` presa em `RUNNING` após término
+  anormal de processo;
 - lock por dataset;
 - múltiplos pipelines concorrentes controlados;
 - lifecycle de worker.

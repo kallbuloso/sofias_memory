@@ -424,10 +424,19 @@ class ImproveService:
             elif stage == SUMMARIES_STAGE:
                 summary_rebuild_counts = await self._rebuild_summaries(dataset)
             elif stage == GRAPH_RECONCILIATION_STAGE:
+                # Reconciliation must observe the Neo4j projection before graph
+                # maintenance (hygiene + importance) can enqueue and drain its own
+                # entity/relation upserts. Maintenance's entity_upsert commands use
+                # Cypher MERGE, which silently recreates a missing Entity node; if
+                # maintenance/drain ran first, genuine missing-projection drift
+                # would be masked before reconciliation ever reads "actual". Running
+                # reconciliation first captures and repairs real drift; maintenance
+                # then applies its own authoritative changes afterward exactly as
+                # it always did, converging to the same correct final state.
+                graph_reconciliation_counts = await self._reconcile_graph(dataset)
                 graph_maintenance_counts = await self._maintain_graph(dataset)
                 drain_result = await self._graph_projection_drain.process_dataset(dataset.id)
                 graph_events_processed += int(getattr(drain_result, "processed", 0))
-                graph_reconciliation_counts = await self._reconcile_graph(dataset)
 
         result = ImproveResult(
             run_id=run_id,

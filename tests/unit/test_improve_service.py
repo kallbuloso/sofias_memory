@@ -1380,7 +1380,7 @@ async def test_graph_reconciliation_is_explicit_stage_and_not_default(
     assert result.graph_rebuilt is True
     assert result.graph_events_enqueued == 0
     assert result.graph_events_processed == 10
-    assert order == ["maintenance", "drain", "reconcile"]
+    assert order == ["reconcile", "maintenance", "drain"]
 
     metrics = explicit_store.pipeline_runs[-1].metrics["improve_result"]
     assert metrics["graph_entities_missing"] == 44

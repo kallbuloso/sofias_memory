@@ -720,6 +720,29 @@ Transformar os models já existentes em uma API de persistência operacional com
 - concorrência/update races relevantes possuem testes PostgreSQL reais;
 - migrations, se existirem, são reversíveis e justificadas pelo ADR.
 
+### Decisão de sequenciamento — partial unique operational constraint deferida
+
+ADR-0009 §D exige, como invariante final do runtime B5, um backstop físico em
+PostgreSQL equivalente a `UNIQUE(dataset_id) WHERE dataset_id IS NOT NULL AND
+status IN ('running', 'cancelling')`. A migration `0008` desta story adiciona
+`pipeline_runs.next_attempt_at`, `pipeline_runs.retry_of_run_id` e o unique
+`(run_id, ordinal)` de `pipeline_steps`, mas **não** ativa fisicamente esse
+backstop.
+
+Motivo comprovado empiricamente: os write pipelines B4 ainda síncronos
+(`forget.py`, `remember.py`, `cognify.py`, `improve.py`) criam `PipelineRun`
+diretamente em `RUNNING` e resolvem conflito de concorrência por checagem em
+nível de aplicação **após** esse insert (ex.: `forget_dataset` cria a run
+RUNNING e só depois verifica `find_running_forget_for_dataset_except`).
+Ativar a constraint agora rejeita esse insert antes da checagem da aplicação
+rodar, quebrando cenários reentrantes/concorrentes já cobertos por testes
+PostgreSQL reais existentes (`test_forget_postgres_integration.py`).
+
+Esta é uma decisão de sequenciamento de rollout, não uma revisão do
+invariante do ADR-0009 — que permanece Accepted e inalterado. A ativação
+física fica registrada como obrigação de cutover em SM-513 (ver abaixo) e
+verificação obrigatória em GATE-B5.
+
 ---
 
 ## SM-503 — PostgreSQL queue claiming and dataset/global serialization
@@ -1223,6 +1246,28 @@ Completar o contrato público de Remember com `mode=full` e execução assíncro
 - wait=true usa exatamente o mesmo run;
 - duplicate submission não duplica Source/memória/run indevidamente.
 
+### Obrigação de cutover — ativar a partial unique operational constraint
+
+SM-502 deferiu deliberadamente a ativação física do backstop de ADR-0009 §D
+(`UNIQUE(dataset_id) WHERE dataset_id IS NOT NULL AND status IN ('running',
+'cancelling')`) porque Forget/Remember/Cognify/Improve B4 ainda criavam
+`PipelineRun` diretamente em `RUNNING` fora do claimant.
+
+Após esta story (Remember migrado) e com Cognify/Improve/Forget já operando
+pelo engine B5 (SM-510/SM-511/SM-512), esta é a obrigação de fechamento antes
+do GATE-B5:
+
+- confirmar por inspeção que nenhum public write pipeline cria mais
+  `PipelineRun` diretamente em `RUNNING` fora do claimant do SM-503;
+- criar uma nova migration adicionando o unique parcial
+  `UNIQUE(dataset_id) WHERE dataset_id IS NOT NULL AND status IN ('running',
+  'cancelling')` (ou equivalente aprovado no ADR) sobre `pipeline_runs`;
+- reintroduzir/expandir a cobertura de teste PostgreSQL real removida em
+  SM-502 para essa constraint (bloqueio de segunda run RUNNING/CANCELLING no
+  mesmo dataset, convivência com múltiplos QUEUED, liberação após terminal).
+
+Número de migration não reservado agora.
+
 ---
 
 ## SM-514 — Run cancellation and manual retry API
@@ -1465,7 +1510,12 @@ Provar que o Sofias Memory opera como MVP assíncrono durável em uma única apl
 - same-dataset writes nunca executam simultaneamente;
 - datasets diferentes podem executar conforme `WORKER_MAX_CONCURRENT_DATASETS`;
 - operação global respeita barrier;
-- nenhum DB lock fica aberto durante chamada de provider/Neo4j.
+- nenhum DB lock fica aberto durante chamada de provider/Neo4j;
+- a partial unique operational constraint de ADR-0009 §D
+  (`UNIQUE(dataset_id) WHERE dataset_id IS NOT NULL AND status IN ('running',
+  'cancelling')`), deliberadamente deferida em SM-502 e ativada conforme a
+  obrigação de cutover de SM-513, está fisicamente presente em
+  `pipeline_runs` e comprovada por teste PostgreSQL real.
 
 ### H. Retry
 

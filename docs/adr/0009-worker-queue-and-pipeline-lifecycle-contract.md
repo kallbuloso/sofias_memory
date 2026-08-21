@@ -151,9 +151,33 @@ States mirror `PipelineRunStatus` (`queued`, `running`, `succeeded`, `failed`,
   "first claim" to "submission".
 - **Ordinal:** stable, zero-based, assigned from the registered step order for that
   `pipeline_type`. Ordinals are never renumbered across retries or resumes.
-- **Transitions:** `queued → running → succeeded`, `running → failed`,
-  `running → cancelling → cancelled`. A step never observes `cancelling` unless the
-  owning run is `cancelling`.
+- **Transitions — the unambiguous, complete matrix (corrects an earlier draft of
+  this ADR, where §B's summary and §I's recovery rules disagreed):**
+
+  | From | To | When |
+  |---|---|---|
+  | — | `queued` | materialization (§C) |
+  | `queued` | `running` | engine starts executing this step |
+  | `queued` | `cancelled` | owning run is cancelled before this step ever started |
+  | `running` | `succeeded` | step completes with no error |
+  | `running` | `failed` | permanent error, or a retryable error with the run's attempt ceiling already exhausted |
+  | `running` | `queued` | **only** a retryable error with attempts remaining (§K), or `RUNNING`-stale recovery reconciling an abandoned claim (§I) |
+  | `running` | `cancelled` | **only** `CANCELLING`-stale recovery classifying the orphaned step as case A or B (safe/reconciled, §I) |
+
+  `succeeded`, `failed`, and `cancelled` are terminal for that `PipelineStep` row.
+  Manual retry (§M) never reopens a `failed` step in the same run — it creates a
+  new `PipelineRun` with fresh `PipelineStep` rows instead.
+
+  **`PipelineStepStatus.CANCELLING` is not part of this matrix.** The enum value
+  is preserved for schema compatibility (it mirrors `PipelineRunStatus`, §A), but
+  the B5 engine's normal cancellation path never routes a step through it: because
+  cancellation is observed only at the safe checkpoint between steps (§N), the
+  step actively executing when a run enters `cancelling` simply keeps running to
+  its own `succeeded`/`failed` outcome under the normal matrix above, while the
+  run itself stays `cancelling` until that checkpoint; steps that were `queued`
+  and never got to start go directly `queued → cancelled` once the run finalizes.
+  A future story must not introduce step-level `cancelling` usage "because the
+  enum exists" without a documented reason and an ADR update.
 - **`attempt`:** increments each time this specific step is executed (§L). Does not
   reset when the owning run is reclaimed for a later `PipelineRun.attempt`.
 - **`input_hash`:** `CHAR(64)` sha256 hex of everything that semantically determines
@@ -292,6 +316,9 @@ of them alone is claimed sufficient:
    `dataset_id = X AND status IN ('running','cancelling')`, so that even a future
    bug in the claim query's transaction logic cannot silently produce two
    concurrent writers for one dataset; the write would fail loudly instead.
+   **Physical activation of this mechanism is deferred** past SM-502 and SM-503,
+   to after the last direct-`RUNNING` B4 writer is migrated (see the rollout
+   amendment below) — the contract remains required before `GATE-B5`.
 
 ### Advisory lock arbitration
 
@@ -375,22 +402,39 @@ precheck" step above:
    anymore (no eligible dataset-scoped candidate remains claimable while G is
    pending), so G's exclusive pg_try_advisory_xact_lock(GLOBAL_BARRIER_KEY)
    succeeds on a subsequent poll tick and G is claimed;
-6. after G reaches a terminal state (or is requeued for automatic retry per
-   §K, in which case it remains the oldest eligible global candidate and the
-   guard stays in effect), normal claiming resumes for all dataset-scoped
-   candidates, including any that accumulated created_at > G.created_at while
-   G was pending.
+6. after G reaches a terminal state, normal claiming resumes for all
+   dataset-scoped candidates, including any that accumulated
+   created_at > G.created_at while G was pending.
 ```
+
+**Fairness only applies while G is queued AND eligible** (the same eligibility
+predicate as claim itself, §D: `next_attempt_at IS NULL OR next_attempt_at <=
+now()`) — the fairness precheck (step 1.5 of the dataset-scoped claim algorithm
+above) is defined in terms of "an eligible queued global run", not merely "a
+queued global run". This has a direct consequence for automatic retry (§K) that
+this ADR states explicitly to avoid ambiguity:
+
+- while G sits `queued` with `next_attempt_at > now()` (durable retry backoff,
+  §K), G is **not** eligible, the fairness precheck's `NOT EXISTS` over eligible
+  global candidates finds none, and dataset-scoped claims proceed completely
+  normally for the entire backoff window — G does **not** hold the barrier
+  during its own backoff;
+- once `next_attempt_at <= now()`, G becomes eligible again, its `created_at`
+  precedence is honored again exactly as in step 3 above, and any
+  dataset-scoped run newer than G is withheld until G is claimed or requeued
+  again.
 
 This is a pure PostgreSQL predicate added to the existing per-candidate claim
 loop -- no in-memory mutex, no separate scheduler, no priority queue beyond the
 single `created_at`-ordering rule already frozen above. It only ever *withholds*
-a claim attempt; it never revokes, preempts, or cancels an already-`running`
-dataset-scoped run. A pending global run therefore bounds new dataset-scoped
-throughput to zero only for the (expected to be short, single-replica MVP)
-duration between "global becomes the oldest eligible candidate" and "currently
-running dataset-scoped work drains" -- not indefinitely, and not retroactively
-against work already in flight.
+a claim attempt while an eligible global candidate is pending; it never revokes,
+preempts, or cancels an already-`running` dataset-scoped run, and it never holds
+the barrier during a global run's own retry backoff. A pending *eligible* global
+run therefore bounds new dataset-scoped throughput to zero only for the
+(expected to be short, single-replica MVP) duration between "global becomes the
+oldest eligible candidate" and "currently running dataset-scoped work drains" --
+not indefinitely, not during its own backoff, and not retroactively against work
+already in flight.
 
 **Key derivation:** advisory locks use a 64-bit (or two-32-bit-int) key space with
 no built-in namespacing, so this ADR freezes a deterministic, collision-safe-enough
@@ -423,7 +467,7 @@ width is smaller than 64 bits.
 
 ### Partial unique index (defense in depth)
 
-SM-503 must also add a partial unique constraint equivalent to:
+The final, required backstop is a partial unique constraint equivalent to:
 
 ```text
 UNIQUE (dataset_id) WHERE status IN ('running', 'cancelling') AND dataset_id IS NOT NULL
@@ -431,12 +475,37 @@ UNIQUE (dataset_id) WHERE status IN ('running', 'cancelling') AND dataset_id IS 
 
 so that even if the advisory-lock arbitration above were ever bypassed by a future
 code path, the database itself refuses to let a second dataset-scoped run become
-`running`/`cancelling` for the same `dataset_id` — the `UPDATE` in step 6 above
-would fail with a constraint violation instead of silently committing a second
-writer. This is a correctness backstop, not a replacement for the advisory-lock
-arbitration (which is still required, because a partial unique index alone offers
-no equivalent protection for the global-vs-dataset-scoped barrier, only for
-dataset-vs-dataset).
+`running`/`cancelling` for the same `dataset_id` — an `UPDATE`/`INSERT` producing a
+second such row would fail with a constraint violation instead of silently
+committing a second writer. This is a correctness backstop, not a replacement for
+the advisory-lock arbitration (which is still required, because a partial unique
+index alone offers no equivalent protection for the global-vs-dataset-scoped
+barrier, only for dataset-vs-dataset).
+
+> **Rollout amendment (recorded during SM-502 implementation, ADR remains
+> Accepted):** this constraint's *contract* is frozen and required before
+> `GATE-B5` — that has not changed. Its *physical activation*, however, is
+> deliberately **deferred** past both SM-502 and SM-503. SM-502 implemented the
+> persistence layer and empirically confirmed, against real PostgreSQL
+> integration tests, that B4's still-synchronous public write pipelines
+> (`forget.py` in particular, plus `remember.py`/`cognify.py`/`improve.py`)
+> create `PipelineRun` rows directly as `RUNNING` and resolve concurrency
+> conflicts via an application-level check that runs *after* that insert —
+> activating the constraint before those writers are migrated rejects that
+> insert before the application's own conflict handling ever runs, breaking
+> real, already-tested B4 behavior (see `test_forget_postgres_integration.py`'s
+> reentrant/conflict scenarios). SM-503 builds the claimant and advisory-lock
+> arbitration described in this section, but **still must not** activate this
+> index while any direct-`RUNNING` B4 writer exists — SM-503's claimant and
+> this constraint govern the *same* `pipeline_runs` table, and the constraint
+> would reject B4's legacy inserts exactly as it did when first attempted in
+> SM-502. Physical activation happens only after SM-510 (Cognify),
+> SM-511 (Improve), SM-512 (Forget), and SM-513 (Remember) have each moved
+> their public write path onto the B5 claimant, at which point a follow-up
+> migration adds this index and a real PostgreSQL test proves it, verified as
+> a `GATE-B5` requirement. This is a rollout-sequencing decision, not a
+> reduction of the invariant: no `RUNNING`/`CANCELLING` same-dataset collision
+> is ever considered acceptable in the final B5 runtime.
 
 ### Frozen properties
 
@@ -1306,7 +1375,9 @@ This ADR does not create a migration. It freezes what SM-502/SM-506 must add:
   (§M).
 - **`UNIQUE (dataset_id) WHERE status IN ('running', 'cancelling') AND dataset_id
   IS NOT NULL`** (partial unique index) — the defense-in-depth backstop for
-  same-dataset serialization (§D, §E); required by this revision, not optional.
+  same-dataset serialization (§D, §E); required before `GATE-B5`, but **not**
+  part of SM-502's migration (rollout amendment, §D) — added by a follow-up
+  migration after SM-513, once no direct-`RUNNING` B4 writer remains.
 - Index supporting the claim query's eligibility predicate, e.g.
   `(status, next_attempt_at)` and confirmation that the existing
   `ix_pipeline_runs_dataset_id_status` and `ix_pipeline_runs_status` indexes remain
@@ -1424,17 +1495,19 @@ story, or ever for items reserved beyond B5:
 Implementing SM-502 onward becomes mechanical against this contract instead of
 ad hoc: claim, serialization, heartbeat, stale recovery, retry, cancellation, and
 `wait` semantics are all specified before any worker code exists. The two new
-`pipeline_runs` columns, one new `pipeline_runs` partial unique index, and two new
-`graph_outbox` columns are the only schema surface this ADR commits B5 to;
-everything else is behavior on the existing schema. Same-dataset and global-barrier
-exclusion now require SM-503 to implement PostgreSQL transaction-level advisory
-lock arbitration correctly (§D) — this is more implementation surface than a
-`NOT EXISTS`-only approach would have been, which is the direct cost of closing the
-race that approach left open; the partial unique index gives SM-503 a
-schema-enforced backstop to test against while implementing the advisory-lock
-logic. `ADR-0010` remains a deliberately separate, smaller decision closer to its
-own implementation (SM-515), keeping this ADR focused on the shared runtime every
-other B5 story depends on.
+`pipeline_runs` columns and two new `graph_outbox` columns are the schema surface
+SM-502/SM-506 commit B5 to immediately; the `pipeline_runs` partial unique index
+is committed to the same degree architecturally, but its physical activation is
+deferred to a follow-up migration after SM-513 (rollout amendment, §D) — everything
+else is behavior on the existing schema. Same-dataset and global-barrier exclusion
+require SM-503 to implement PostgreSQL transaction-level advisory lock arbitration
+correctly (§D) — this is more implementation surface than a `NOT EXISTS`-only
+approach would have been, which is the direct cost of closing the race that
+approach left open; SM-503's advisory-lock logic must therefore stand on its own
+correctness during the interval before the partial unique index is activated,
+without a schema-enforced backstop yet in place. `ADR-0010` remains a deliberately
+separate, smaller decision closer to its own implementation (SM-515), keeping this
+ADR focused on the shared runtime every other B5 story depends on.
 
 ## Alternatives Rejected
 

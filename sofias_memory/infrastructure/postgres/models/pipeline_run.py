@@ -61,6 +61,20 @@ class PipelineRun(Base):
             postgresql_where=sql_text("idempotency_key IS NOT NULL"),
         ),
         Index("ix_pipeline_runs_created_at", "created_at"),
+        Index("ix_pipeline_runs_status_next_attempt_at", "status", "next_attempt_at"),
+        Index("ix_pipeline_runs_retry_of_run_id", "retry_of_run_id"),
+        # ADR-0009 SS D's partial unique operational-run backstop
+        # (UNIQUE(dataset_id) WHERE dataset_id IS NOT NULL AND status IN
+        # ('running', 'cancelling')) is intentionally NOT yet declared here.
+        # B4's still-synchronous public write pipelines create PipelineRun
+        # rows directly as RUNNING and rely on an application-level conflict
+        # check running after that insert; activating this constraint now
+        # would reject that insert before the app's own check runs. Physical
+        # activation is deferred to a follow-up migration once the last
+        # direct-RUNNING B4 writer is migrated to the B5 runtime (tracked in
+        # docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B5.md,
+        # SM-502/SM-513, verified at GATE-B5). This is a rollout-sequencing
+        # decision, not a change to ADR-0009's final invariant.
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -99,3 +113,9 @@ class PipelineRun(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_of_run_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("pipeline_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )

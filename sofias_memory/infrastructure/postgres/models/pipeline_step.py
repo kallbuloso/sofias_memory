@@ -39,7 +39,7 @@ class PipelineStep(Base):
             name="input_hash_hex",
         ),
         Index("ix_pipeline_steps_run_id", "run_id"),
-        Index("ix_pipeline_steps_run_id_ordinal", "run_id", "ordinal"),
+        Index("uq_pipeline_steps_run_id_ordinal", "run_id", "ordinal", unique=True),
         Index("ix_pipeline_steps_status", "status"),
     )
 

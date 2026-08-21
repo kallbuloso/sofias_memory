@@ -38,6 +38,64 @@ class PipelineRunRepository:
         result = await self._session.scalar(statement)
         return cast(PipelineRun | None, result)
 
+    async def get_by_id_for_update(self, run_id: UUID) -> PipelineRun | None:
+        """Row-locked read for a single-run transition (no queue-wide claim)."""
+
+        statement = select(PipelineRun).where(PipelineRun.id == run_id).with_for_update()
+        result = await self._session.scalar(statement)
+        return cast(PipelineRun | None, result)
+
+    async def list_by_status(
+        self,
+        status: PipelineRunStatus,
+        *,
+        limit: int | None = None,
+    ) -> list[PipelineRun]:
+        """Runs in one status, oldest first (recovery/observability primitive).
+
+        Not a claim query: no locking, no same-dataset/global-barrier
+        arbitration. SM-503 owns queue claiming; SM-507 owns stale recovery
+        scanning.
+        """
+
+        statement = (
+            select(PipelineRun)
+            .where(PipelineRun.status == status)
+            .order_by(PipelineRun.created_at, PipelineRun.id)
+        )
+        if limit is not None:
+            statement = statement.limit(limit)
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def list_page(
+        self,
+        *,
+        statuses: list[PipelineRunStatus] | None = None,
+        dataset_id: UUID | None = None,
+        pipeline_type: PipelineType | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[PipelineRun]:
+        """Filtered, paginated listing for the future Runs API (SM-508).
+
+        Newest first. Filters are optional and additive; no filter means no
+        restriction on that dimension.
+        """
+
+        statement = select(PipelineRun).order_by(
+            PipelineRun.created_at.desc(), PipelineRun.id.desc()
+        )
+        if statuses:
+            statement = statement.where(PipelineRun.status.in_(statuses))
+        if dataset_id is not None:
+            statement = statement.where(PipelineRun.dataset_id == dataset_id)
+        if pipeline_type is not None:
+            statement = statement.where(PipelineRun.pipeline_type == pipeline_type)
+        statement = statement.limit(limit).offset(offset)
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def find_latest_forget_for_source_except(
         self,
         *,

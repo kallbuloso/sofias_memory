@@ -12,16 +12,36 @@ from sofias_memory.domain.enums import (
     SourceStatus,
     SummaryTargetType,
 )
+from sofias_memory.domain.pipeline_lifecycle import (
+    RUN_TRANSITIONS,
+    STEP_TRANSITIONS,
+    PipelineProgressOutOfBoundsError,
+    PipelineRunTransitionError,
+    PipelineStepTransitionError,
+    PipelineTransitionError,
+    validate_progress,
+    validate_run_transition,
+    validate_step_transition,
+)
 
 __all__ = [
+    "RUN_TRANSITIONS",
+    "STEP_TRANSITIONS",
     "DatasetStatus",
     "GraphOutboxOperation",
     "GraphOutboxStatus",
     "MemoryEntryType",
+    "PipelineProgressOutOfBoundsError",
     "PipelineRunStatus",
+    "PipelineRunTransitionError",
     "PipelineStepStatus",
+    "PipelineStepTransitionError",
+    "PipelineTransitionError",
     "PipelineType",
     "SourceKind",
     "SourceStatus",
     "SummaryTargetType",
+    "validate_progress",
+    "validate_run_transition",
+    "validate_step_transition",
 ]

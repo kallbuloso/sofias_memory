@@ -59,6 +59,8 @@ def test_pipeline_runs_columns_types_nullability_and_fks_are_exact() -> None:
         "created_at",
         "started_at",
         "finished_at",
+        "next_attempt_at",
+        "retry_of_run_id",
     ]
 
     columns = PipelineRun.__table__.c
@@ -76,6 +78,7 @@ def test_pipeline_runs_columns_types_nullability_and_fks_are_exact() -> None:
     assert columns.source_id.nullable is True
     assert fks["fk_pipeline_runs_dataset_id_datasets"].ondelete == "SET NULL"
     assert fks["fk_pipeline_runs_source_id_sources"].ondelete == "SET NULL"
+    assert fks["fk_pipeline_runs_retry_of_run_id_pipeline_runs"].ondelete == "SET NULL"
     assert columns.idempotency_key.nullable is True
     assert columns.payload_hash.type.length == 64
     assert isinstance(columns.input.type, JSONB)
@@ -91,6 +94,10 @@ def test_pipeline_runs_columns_types_nullability_and_fks_are_exact() -> None:
     assert columns.created_at.type.timezone is True
     assert columns.started_at.nullable is True
     assert columns.finished_at.nullable is True
+    assert columns.next_attempt_at.nullable is True
+    assert columns.next_attempt_at.type.timezone is True
+    assert columns.retry_of_run_id.nullable is True
+    assert isinstance(columns.retry_of_run_id.type, PostgreSQLUUID)
     assert "updated_at" not in columns
 
 
@@ -111,6 +118,8 @@ def test_pipeline_runs_checks_and_indexes_are_exact() -> None:
         "ix_pipeline_runs_heartbeat_at",
         "ix_pipeline_runs_status",
         "uq_pipeline_runs_idempotency_key",
+        "ix_pipeline_runs_status_next_attempt_at",
+        "ix_pipeline_runs_retry_of_run_id",
     }
     assert index_columns(model_indexes["ix_pipeline_runs_status"]) == ["status"]
     assert index_columns(model_indexes["ix_pipeline_runs_dataset_id_status"]) == [
@@ -124,6 +133,15 @@ def test_pipeline_runs_checks_and_indexes_are_exact() -> None:
     assert str(idempotency_index.dialect_options["postgresql"]["where"]) == (
         "idempotency_key IS NOT NULL"
     )
+    assert index_columns(model_indexes["ix_pipeline_runs_status_next_attempt_at"]) == [
+        "status",
+        "next_attempt_at",
+    ]
+    assert index_columns(model_indexes["ix_pipeline_runs_retry_of_run_id"]) == ["retry_of_run_id"]
+    # ADR-0009 SS D's UNIQUE(dataset_id) WHERE ... IN ('running', 'cancelling')
+    # operational backstop is deliberately NOT yet declared on the ORM model
+    # (see pipeline_run.py's __table_args__ comment and backlog SM-502/SM-513
+    # for the recorded deferred-cutover decision) -- it is not asserted here.
 
 
 def test_pipeline_steps_columns_fks_checks_and_indexes_are_exact() -> None:
@@ -168,15 +186,15 @@ def test_pipeline_steps_columns_fks_checks_and_indexes_are_exact() -> None:
     )
     assert set(model_indexes) == {
         "ix_pipeline_steps_run_id",
-        "ix_pipeline_steps_run_id_ordinal",
+        "uq_pipeline_steps_run_id_ordinal",
         "ix_pipeline_steps_status",
     }
     assert index_columns(model_indexes["ix_pipeline_steps_run_id"]) == ["run_id"]
-    assert index_columns(model_indexes["ix_pipeline_steps_run_id_ordinal"]) == [
+    assert index_columns(model_indexes["uq_pipeline_steps_run_id_ordinal"]) == [
         "run_id",
         "ordinal",
     ]
-    assert model_indexes["ix_pipeline_steps_run_id_ordinal"].unique is False
+    assert model_indexes["uq_pipeline_steps_run_id_ordinal"].unique is True
     assert index_columns(model_indexes["ix_pipeline_steps_status"]) == ["status"]
 
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, func, literal, or_, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from sofias_memory.domain import PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.models import PipelineRun
@@ -95,6 +97,223 @@ class PipelineRunRepository:
         statement = statement.limit(limit).offset(offset)
         result = await self._session.scalars(statement)
         return list(result)
+
+    # -- SM-503 queue claiming primitives (ADR-0009 SS D) -------------------
+    #
+    # These queries implement the claim algorithm's building blocks. None of
+    # them decide *when* to claim -- that orchestration lives in
+    # services.pipeline_queue_claimer. Temporal eligibility always uses
+    # PostgreSQL's own ``now()``, never a Python-side clock, per ADR-0009 SS 5.
+
+    async def list_eligible_candidate_ids(self, *, limit: int) -> list[UUID]:
+        """Small ordered batch of claimable run ids -- no lock, no ownership.
+
+        One representative per serialization scope: the oldest eligible
+        ``queued`` run for each non-null ``dataset_id``, plus the oldest
+        eligible global (``dataset_id IS NULL``) run. This closes a
+        head-of-line blocking gap a plain top-N-by-``created_at`` scan has --
+        a congested dataset with many queued runs could otherwise fill the
+        entire scan window and starve an unrelated, immediately-claimable
+        dataset out of discovery entirely. Only one representative can ever
+        be claimed per scope at a time anyway (same-dataset serialization,
+        ADR-0009 SS E; at most one global, SS F), so later runs of the same
+        scope contribute nothing to discovery while their oldest sibling is
+        still queued.
+
+        A second, distinct head-of-line gap remains even with one
+        representative per scope: if more distinct scopes are congested
+        (already RUNNING/CANCELLING, so every one of their queued
+        representatives is certain to fail revalidation) than fit in
+        ``limit``, those certain-to-fail representatives alone can fill the
+        whole scan window and still starve a free scope. This query closes
+        that gap too by excluding, at discovery time, any representative
+        whose scope already has a *committed* RUNNING/CANCELLING conflict --
+        same-dataset conflict or a global conflict for a dataset-scoped
+        candidate; any dataset-scoped conflict or another global conflict for
+        a global candidate. This mirrors ``_arbitrate_dataset_scoped`` /
+        ``_arbitrate_global``'s committed-conflict checks exactly, but purely
+        as a pre-filter -- it is evaluated on the same MVCC snapshot as the
+        rest of this query, so it can go stale by the time a candidate is
+        actually locked. That is fine: it is discovery only.
+
+        This is a discovery/liveness optimization only, not a correctness
+        mechanism: neither ``DISTINCT ON`` nor this conflict pre-filter is
+        ever treated as an exclusion primitive. Every representative still
+        goes through the unchanged per-candidate ``FOR UPDATE SKIP LOCKED``
+        + advisory-lock arbitration + committed-state revalidation before it
+        can be claimed -- a scope that looked free here but changed by the
+        time its candidate transaction opens simply fails that later
+        arbitration/revalidation and is skipped, exactly as before this
+        pre-filter existed.
+
+        Representatives are then ordered by ``(created_at, id)``, the single
+        total ordering ADR-0009 SS 6 requires everywhere (claim order and
+        fairness precedence alike).
+        """
+
+        conflict = aliased(PipelineRun)
+        eligible = and_(
+            PipelineRun.status == PipelineRunStatus.QUEUED,
+            or_(
+                PipelineRun.next_attempt_at.is_(None),
+                PipelineRun.next_attempt_at <= func.now(),
+            ),
+        )
+        no_known_conflict = ~exists().where(
+            conflict.status.in_((PipelineRunStatus.RUNNING, PipelineRunStatus.CANCELLING)),
+            or_(
+                # dataset-scoped candidate: same dataset already committed, or
+                # a global run already committed (blocks every dataset).
+                and_(
+                    PipelineRun.dataset_id.is_not(None),
+                    conflict.dataset_id == PipelineRun.dataset_id,
+                ),
+                and_(PipelineRun.dataset_id.is_not(None), conflict.dataset_id.is_(None)),
+                # global candidate: any dataset-scoped run already committed,
+                # or a *different* global run already committed.
+                and_(PipelineRun.dataset_id.is_(None), conflict.dataset_id.is_not(None)),
+                and_(
+                    PipelineRun.dataset_id.is_(None),
+                    conflict.dataset_id.is_(None),
+                    conflict.id != PipelineRun.id,
+                ),
+            ),
+        )
+        representatives = (
+            select(PipelineRun.id, PipelineRun.created_at)
+            .distinct(PipelineRun.dataset_id)
+            .where(eligible, no_known_conflict)
+            .order_by(PipelineRun.dataset_id, PipelineRun.created_at.asc(), PipelineRun.id.asc())
+            .subquery()
+        )
+        statement = (
+            select(representatives.c.id)
+            .order_by(representatives.c.created_at.asc(), representatives.c.id.asc())
+            .limit(limit)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def get_database_now(self) -> datetime:
+        """PostgreSQL's own ``now()``, read inside the caller's current
+        transaction -- the single time authority for a claim (ADR-0009 SS 5):
+        eligibility, fairness, and the persisted ``started_at``/
+        ``heartbeat_at`` this claim writes all derive from this same value,
+        never from the application's Python clock."""
+
+        result = await self._session.scalar(select(func.now()))
+        assert result is not None  # noqa: S101 - PostgreSQL now() is never NULL
+        return cast(datetime, result)
+
+    async def get_eligible_for_update(self, run_id: UUID) -> PipelineRun | None:
+        """Lock one candidate row with ``FOR UPDATE SKIP LOCKED``.
+
+        Returns ``None`` -- never blocks, never raises -- when the row is
+        already locked by a concurrent claimer, or is no longer ``queued``
+        and temporally eligible by the time this runs (ADR-0009 SS 7: SKIP
+        LOCKED protects only this one row's identity, not cross-row
+        same-dataset/global conflicts -- those are the advisory-lock and
+        revalidation queries below).
+        """
+
+        statement = (
+            select(PipelineRun)
+            .where(
+                PipelineRun.id == run_id,
+                PipelineRun.status == PipelineRunStatus.QUEUED,
+                or_(
+                    PipelineRun.next_attempt_at.is_(None),
+                    PipelineRun.next_attempt_at <= func.now(),
+                ),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        result = await self._session.scalar(statement)
+        return cast(PipelineRun | None, result)
+
+    async def exists_dataset_conflict(self, dataset_id: UUID) -> bool:
+        """Another RUNNING/CANCELLING run already owns this dataset (persisted)."""
+
+        statement = select(
+            exists().where(
+                PipelineRun.dataset_id == dataset_id,
+                PipelineRun.status.in_((PipelineRunStatus.RUNNING, PipelineRunStatus.CANCELLING)),
+            )
+        )
+        result = await self._session.scalar(statement)
+        return bool(result)
+
+    async def exists_any_dataset_scoped_conflict(self) -> bool:
+        """Any dataset-scoped run is RUNNING/CANCELLING anywhere (global claim step 4)."""
+
+        statement = select(
+            exists().where(
+                PipelineRun.dataset_id.is_not(None),
+                PipelineRun.status.in_((PipelineRunStatus.RUNNING, PipelineRunStatus.CANCELLING)),
+            )
+        )
+        result = await self._session.scalar(statement)
+        return bool(result)
+
+    async def exists_other_global_conflict(self, *, exclude_run_id: UUID) -> bool:
+        """Another global (dataset_id IS NULL) run is already RUNNING/CANCELLING."""
+
+        statement = select(
+            exists().where(
+                PipelineRun.dataset_id.is_(None),
+                PipelineRun.id != exclude_run_id,
+                PipelineRun.status.in_((PipelineRunStatus.RUNNING, PipelineRunStatus.CANCELLING)),
+            )
+        )
+        result = await self._session.scalar(statement)
+        return bool(result)
+
+    async def exists_eligible_global_with_precedence(
+        self,
+        *,
+        before_created_at: datetime,
+        before_id: UUID,
+    ) -> bool:
+        """A QUEUED, temporally-eligible global run precedes ``(created_at, id)``.
+
+        The fairness starvation guard (ADR-0009 SS D "Global barrier fairness"):
+        used only to withhold a dataset-scoped candidate, never to decide a
+        global candidate's own claim. Row-value comparison gives a single
+        deterministic total order, resolving created_at ties by id (SS Q).
+        """
+
+        statement = select(
+            exists().where(
+                PipelineRun.dataset_id.is_(None),
+                PipelineRun.status == PipelineRunStatus.QUEUED,
+                or_(
+                    PipelineRun.next_attempt_at.is_(None),
+                    PipelineRun.next_attempt_at <= func.now(),
+                ),
+                tuple_(PipelineRun.created_at, PipelineRun.id)
+                < tuple_(literal(before_created_at), literal(before_id)),
+            )
+        )
+        result = await self._session.scalar(statement)
+        return bool(result)
+
+    async def try_advisory_lock_shared(self, key: int) -> bool:
+        """Non-blocking ``pg_try_advisory_xact_lock_shared`` on this session's
+        current transaction. Released automatically at COMMIT/ROLLBACK."""
+
+        result = await self._session.execute(
+            text("SELECT pg_try_advisory_xact_lock_shared(:key)"), {"key": key}
+        )
+        return bool(result.scalar())
+
+    async def try_advisory_lock_exclusive(self, key: int) -> bool:
+        """Non-blocking ``pg_try_advisory_xact_lock`` on this session's current
+        transaction. Released automatically at COMMIT/ROLLBACK."""
+
+        result = await self._session.execute(
+            text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": key}
+        )
+        return bool(result.scalar())
 
     async def find_latest_forget_for_source_except(
         self,

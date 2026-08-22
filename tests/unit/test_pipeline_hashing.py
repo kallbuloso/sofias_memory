@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from sofias_memory.pipelines.hashing import canonical_json, canonical_step_input_hash
+import json
+from hashlib import sha256
+
+from sofias_memory.pipelines.hashing import (
+    canonical_json,
+    canonical_step_input_hash,
+    canonical_work_payload_hash,
+)
 
 
 def test_canonical_json_sorts_keys() -> None:
@@ -53,3 +60,44 @@ def test_canonical_step_input_hash_semantically_equivalent_input_matches() -> No
         definition_id="step:v1", semantic_input={"nested": {"x": 1, "y": 2}, "a": 1}
     )
     assert first == second
+
+
+# --- canonical_work_payload_hash: B4 payload_hash compatibility (SM-509 -----
+# audit Finding 4). Deliberately NOT built on canonical_json(), which is
+# ensure_ascii=True and would silently diverge from B4's historical
+# services.remember.stable_payload_hash encoding.
+
+
+def b4_stable_payload_hash(payload: object) -> str:
+    """Reproduces B4's historical canonicalization exactly (mirrors
+    ``services.remember.stable_payload_hash`` without importing it), so this
+    test proves byte-for-byte compatibility rather than merely agreement
+    with itself."""
+
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def test_canonical_work_payload_hash_matches_b4_canonicalization_for_ascii_payload() -> None:
+    payload = {"dataset": "docs", "name": "note"}
+    assert canonical_work_payload_hash(payload) == b4_stable_payload_hash(payload)
+
+
+def test_canonical_work_payload_hash_matches_b4_canonicalization_for_unicode_payload() -> None:
+    payload = {"dataset": "manutenção", "metadata": {"cidade": "São Paulo"}}
+    assert canonical_work_payload_hash(payload) == b4_stable_payload_hash(payload)
+
+
+def test_canonical_work_payload_hash_is_deterministic_for_unicode_payload() -> None:
+    payload = {"dataset": "manutenção", "metadata": {"cidade": "São Paulo"}}
+    assert canonical_work_payload_hash(payload) == canonical_work_payload_hash(dict(payload))
+
+
+def test_canonical_work_payload_hash_differs_from_ascii_safe_canonical_json_encoding() -> None:
+    """Proves this function is NOT reusing ``canonical_json`` (which would
+    escape non-ASCII characters as ``\\uXXXX`` and produce a different
+    digest for the same logical payload)."""
+
+    payload = {"cidade": "São Paulo"}
+    ascii_safe_digest = sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    assert canonical_work_payload_hash(payload) != ascii_safe_digest

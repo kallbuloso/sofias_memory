@@ -15,6 +15,7 @@ from sofias_memory.domain.enums import (
 from sofias_memory.domain.pipeline_lifecycle import (
     RUN_TRANSITIONS,
     STEP_TRANSITIONS,
+    TERMINAL_RUN_STATUSES,
     PipelineProgressOutOfBoundsError,
     PipelineRunTransitionError,
     PipelineStepTransitionError,
@@ -27,6 +28,7 @@ from sofias_memory.domain.pipeline_lifecycle import (
 __all__ = [
     "RUN_TRANSITIONS",
     "STEP_TRANSITIONS",
+    "TERMINAL_RUN_STATUSES",
     "DatasetStatus",
     "GraphOutboxOperation",
     "GraphOutboxStatus",

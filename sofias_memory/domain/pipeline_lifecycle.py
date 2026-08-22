@@ -80,6 +80,18 @@ RUN_TRANSITIONS: frozenset[tuple[PipelineRunStatus, PipelineRunStatus]] = frozen
 # it: cancellation is observed only between steps (SS N), so the actively
 # executing step simply runs to its own succeeded/failed outcome, and a
 # queued-but-never-started step goes directly queued -> cancelled.
+TERMINAL_RUN_STATUSES: frozenset[PipelineRunStatus] = frozenset(
+    {
+        PipelineRunStatus.SUCCEEDED,
+        PipelineRunStatus.FAILED,
+        PipelineRunStatus.CANCELLED,
+    }
+)
+"""A run in one of these statuses is immutable (SS A: no outgoing
+transitions) -- shared by idempotent resubmission (SM-509 SS S: safe replay
+vs. worker-availability gating) and the wait=true waiter (SM-509 SS R:
+queued/running/cancelling are all "still in flight")."""
+
 STEP_TRANSITIONS: frozenset[tuple[PipelineStepStatus, PipelineStepStatus]] = frozenset(
     {
         (PipelineStepStatus.QUEUED, PipelineStepStatus.RUNNING),

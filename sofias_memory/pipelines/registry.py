@@ -194,6 +194,9 @@ class PipelineRegistry:
             by_type[definition.pipeline_type] = definition
         self._definitions: Mapping[PipelineType, PipelineDefinition] = by_type
 
+    def __len__(self) -> int:
+        return len(self._definitions)
+
     def get(self, pipeline_type: PipelineType) -> PipelineDefinition:
         try:
             return self._definitions[pipeline_type]
@@ -223,6 +226,21 @@ class PipelineRegistry:
         ]
 
 
+def build_default_pipeline_registry() -> PipelineRegistry:
+    """The production registry (SM-505 SS 30/31).
+
+    Empty at this checkpoint: B4's Cognify/Improve/Forget/Remember pipelines
+    have not been migrated onto :class:`PipelineDefinition` yet (that is
+    SM-510..SM-513's job). An empty registry is a normal, healthy production
+    state, not a placeholder to be filled with a fake definition just to make
+    SM-505's worker "do something" -- the worker (SM-505) must recognize an
+    empty registry and simply not call the claimer, staying idle but
+    operational/ready.
+    """
+
+    return PipelineRegistry([])
+
+
 __all__ = [
     "InputDeriver",
     "PipelineDefinition",
@@ -232,6 +250,7 @@ __all__ = [
     "StepPlan",
     "StepResult",
     "UnknownPipelineTypeError",
+    "build_default_pipeline_registry",
     "no_op_compensate",
     "no_op_persist",
 ]

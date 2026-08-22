@@ -55,6 +55,10 @@ from sofias_memory.infrastructure.postgres.readiness import (
     PostgresReadinessChecker,
 )
 from sofias_memory.lifespan import lifespan
+from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
+from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+
+WORKER_NOT_READY_DETAIL = "worker not ready"
 
 
 def create_app(
@@ -67,6 +71,9 @@ def create_app(
     neo4j_resource: Neo4jResource | None = None,
     neo4j_readiness_checker: Neo4jReadinessChecker | None = None,
     postgres_session_factory: AsyncSessionFactory | None = None,
+    enable_worker: bool = True,
+    pipeline_registry: PipelineRegistry | None = None,
+    pipeline_worker_coordinator: PipelineWorkerCoordinator | None = None,
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else load_settings()
     application = FastAPI(
@@ -98,6 +105,31 @@ def create_app(
         application.state.neo4j_readiness_checker = neo4j_checker
         resolved_readiness_checks = (
             ("neo4j", _neo4j_readiness_check(neo4j_checker)),
+            *resolved_readiness_checks,
+        )
+    if pipeline_worker_coordinator is not None:
+        application.state.pipeline_worker = pipeline_worker_coordinator
+        resolved_readiness_checks = (
+            ("worker", _worker_readiness_check(pipeline_worker_coordinator)),
+            *resolved_readiness_checks,
+        )
+    elif enable_worker:
+        resolved_registry = (
+            pipeline_registry
+            if pipeline_registry is not None
+            else build_default_pipeline_registry()
+        )
+        worker_coordinator = PipelineWorkerCoordinator(
+            application.state.postgres_session_factory,
+            resolved_registry,
+            enabled=resolved_settings.worker_enabled,
+            poll_interval_ms=resolved_settings.worker_poll_interval_ms,
+            stale_after_seconds=resolved_settings.worker_stale_after_seconds,
+            max_concurrent_datasets=resolved_settings.worker_max_concurrent_datasets,
+        )
+        application.state.pipeline_worker = worker_coordinator
+        resolved_readiness_checks = (
+            ("worker", _worker_readiness_check(worker_coordinator)),
             *resolved_readiness_checks,
         )
     application.state.readiness_checks = validate_readiness_checks(resolved_readiness_checks)
@@ -163,6 +195,27 @@ def _neo4j_readiness_check(
         return ReadinessCheckResult(
             ready=result.ready,
             detail=None if result.ready else NEO4J_NOT_READY_DETAIL,
+        )
+
+    return check
+
+
+def _worker_readiness_check(
+    coordinator: PipelineWorkerCoordinator,
+) -> Callable[[], Awaitable[ReadinessCheckResult]]:
+    """ADR-0009 SS U, SM-505 SS 37: ``WORKER_ENABLED=false`` is always
+    ``not ready`` (no synchronous fallback exists); ``WORKER_ENABLED=true``
+    is ready only once the coordinator has started and not (yet) stopped.
+    Deliberately minimal -- no queue/heartbeat diagnostics here, that is
+    SM-516."""
+
+    async def check() -> ReadinessCheckResult:
+        if not coordinator.enabled:
+            return ReadinessCheckResult(ready=False, detail=WORKER_NOT_READY_DETAIL)
+        ready = coordinator.is_running
+        return ReadinessCheckResult(
+            ready=ready,
+            detail=None if ready else WORKER_NOT_READY_DETAIL,
         )
 
     return check

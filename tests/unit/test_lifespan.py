@@ -52,7 +52,7 @@ def read_log_records(stream: StringIO) -> list[dict[str, object]]:
 
 
 def create_lifespan_test_app(settings: Settings) -> FastAPI:
-    return create_app(settings, enable_neo4j=False)
+    return create_app(settings, enable_neo4j=False, enable_worker=False)
 
 
 def test_lifespan_executes_startup(log_stream: StringIO) -> None:

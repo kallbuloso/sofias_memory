@@ -19,6 +19,9 @@ and heartbeat; SM-507 owns stale recovery.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -50,6 +53,42 @@ STEP_INPUT_UNRESOLVABLE_MESSAGE = "A pipeline step's input could not be resolved
 UNEXPECTED_STEP_ERROR_MESSAGE = "An unexpected internal error occurred while executing this step."
 
 
+async def _run_transactional_phase[T](coro: Coroutine[Any, Any, T]) -> T:
+    """Cancellation-safe wrapper for one short, already-open PostgreSQL
+    transaction (SM-505 forced-shutdown audit / ADR-0009 SS O, SS T).
+
+    SM-505's worker calls ``task.cancel()`` on an execution task once its
+    shutdown grace period expires (ADR-0009 SS T). ``PipelineEngine.execute``
+    never holds a transaction open across a step's external ``execute()``
+    call (SS 17/18), so that call is exactly where a forced cancellation is
+    *meant* to land -- but the engine's own short transactional phases
+    (``_prepare``, the step-start checkpoint, ``_commit_success`` including
+    ``step.persist(...)``, and ``_commit_failure``) must never be interrupted
+    mid-flight: a business mutation committing while its own ``PipelineStep``
+    row transition does not (or vice versa) would violate the "Commit
+    boundary preference" invariant this exact story's engine amendment
+    exists to satisfy.
+
+    ``asyncio.shield()`` alone is insufficient: if the *caller* awaiting the
+    shield is cancelled, the shielded inner task keeps running independently
+    but is left orphaned unless something explicitly awaits it afterward
+    (never abandon a shielded inner task -- SM-505 SS 4). This wrapper
+    guarantees the inner transaction always reaches its own natural
+    conclusion -- COMMIT or ROLLBACK -- before any cancellation is allowed to
+    propagate further: the ``CancelledError`` is deferred, never dropped,
+    and re-raised only once nothing transactional is left running.
+    """
+
+    task: asyncio.Task[T] = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(task)
+        raise
+
+
 class PipelineEngineInvariantError(RuntimeError):
     """A persisted state was encountered that ADR-0009's contract should
     make impossible given a correctly-functioning claim/engine. Raised
@@ -67,6 +106,15 @@ class PipelineExecutionResult:
     run_id: UUID
     status: PipelineRunStatus | None
     abandoned: bool = False
+    paused_for_shutdown: bool = False
+    """SM-505/ADR-0009 SS T amendment: this execution stopped at a safe,
+    per-step checkpoint because the caller's ``stop_requested`` callable
+    returned ``True`` before the next step started -- never because of
+    fencing (``abandoned``) and never a business cancellation. The run is
+    left ``RUNNING`` with whatever progress already committed; nothing was
+    mutated by this call beyond that. Distinct from ``abandoned`` because the
+    worker needs to tell "a newer claim superseded me" apart from "I chose to
+    stop before starting more work"."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +147,7 @@ class _StepOutcome:
 @dataclass(frozen=True, slots=True)
 class _CheckpointOutcome:
     abandoned: bool = False
+    paused_for_shutdown: bool = False
     terminal_status: PipelineRunStatus | None = None
     step_attempt: int | None = None
 
@@ -165,10 +214,27 @@ class PipelineEngine:
         self._retry_policy = retry_policy or RetryPolicy()
         self._resources = resources or {}
 
-    async def execute(self, claimed_run: ClaimedRun) -> PipelineExecutionResult:
+    async def execute(
+        self,
+        claimed_run: ClaimedRun,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> PipelineExecutionResult:
+        """Run one already-claimed attempt to its own conclusion.
+
+        ``stop_requested`` is SM-505's process-local, cooperative shutdown
+        signal (ADR-0009 SS T amendment) -- a zero-argument callable, never an
+        ``asyncio.Event`` directly, to keep this module free of an asyncio
+        dependency. Checked only at the safe per-step checkpoint, and only
+        after business cancellation (``CANCELLING``) has already been ruled
+        out for that same checkpoint: cancellation intent always takes
+        precedence over a worker-local shutdown pause. When ``None`` (the
+        default), behavior is identical to before this parameter existed.
+        """
+
         definition = self._registry.get(claimed_run.pipeline_type)
 
-        prepared = await self._prepare(claimed_run, definition)
+        prepared = await _run_transactional_phase(self._prepare(claimed_run, definition))
         if prepared.abandoned:
             return PipelineExecutionResult(run_id=claimed_run.run_id, status=None, abandoned=True)
         if prepared.terminal_status is not None:
@@ -189,16 +255,23 @@ class PipelineEngine:
         for step_row in prepared.pending_steps:
             step_def = steps_by_name[step_row.name]
 
-            checkpoint = await self._checkpoint_before_step(
-                claimed_run,
-                step_row,
-                step_def,
-                run_input=run_input,
-                step_outputs=step_outputs,
+            checkpoint = await _run_transactional_phase(
+                self._checkpoint_before_step(
+                    claimed_run,
+                    step_row,
+                    step_def,
+                    run_input=run_input,
+                    step_outputs=step_outputs,
+                    stop_requested=stop_requested,
+                )
             )
             if checkpoint.abandoned:
                 return PipelineExecutionResult(
                     run_id=claimed_run.run_id, status=None, abandoned=True
+                )
+            if checkpoint.paused_for_shutdown:
+                return PipelineExecutionResult(
+                    run_id=claimed_run.run_id, status=None, paused_for_shutdown=True
                 )
             if checkpoint.terminal_status is not None:
                 return PipelineExecutionResult(
@@ -413,6 +486,7 @@ class PipelineEngine:
         *,
         run_input: dict[str, Any],
         step_outputs: dict[str, dict[str, Any]],
+        stop_requested: Callable[[], bool] | None = None,
     ) -> _CheckpointOutcome:
         async with PostgresUnitOfWork(self._session_factory) as uow:
             run = await uow.pipeline_runs.get_by_id_for_update(claimed_run.run_id)
@@ -443,6 +517,15 @@ class PipelineEngine:
                     f"Run {claimed_run.run_id} has unexpected status {run.status!s} "
                     "at a step checkpoint."
                 )
+
+            # ADR-0009 SS T amendment (checkpoint ordering, SM-505 SS 18):
+            # business cancellation has already been ruled out above -- only
+            # now, with the run confirmed RUNNING, may a process-local
+            # shutdown pause take effect. Nothing is mutated: exiting this
+            # ``async with`` block without a commit rolls back, releasing the
+            # row lock exactly as an unclaimed candidate would.
+            if stop_requested is not None and stop_requested():
+                return _CheckpointOutcome(paused_for_shutdown=True)
 
             expected_hash = step_def.compute_input_hash(
                 run_input=run_input, step_outputs=step_outputs
@@ -554,15 +637,17 @@ class PipelineEngine:
     ) -> _PersistOutcome:
         if outcome.kind == "success":
             try:
-                return await self._commit_success(
-                    claimed_run=claimed_run,
-                    step_id=step_id,
-                    expected_step_attempt=expected_step_attempt,
-                    outcome=outcome,
-                    succeeded_count=succeeded_count,
-                    total_steps=total_steps,
-                    step_def=step_def,
-                    context=context,
+                return await _run_transactional_phase(
+                    self._commit_success(
+                        claimed_run=claimed_run,
+                        step_id=step_id,
+                        expected_step_attempt=expected_step_attempt,
+                        outcome=outcome,
+                        succeeded_count=succeeded_count,
+                        total_steps=total_steps,
+                        step_def=step_def,
+                        context=context,
+                    )
                 )
             except _StepPersistFailure as failure:
                 # persist() raised: the success transaction above has
@@ -574,11 +659,13 @@ class PipelineEngine:
                     kind=failure.kind, code=failure.code, message=failure.message
                 )
 
-        return await self._commit_failure(
-            claimed_run=claimed_run,
-            step_id=step_id,
-            expected_step_attempt=expected_step_attempt,
-            outcome=outcome,
+        return await _run_transactional_phase(
+            self._commit_failure(
+                claimed_run=claimed_run,
+                step_id=step_id,
+                expected_step_attempt=expected_step_attempt,
+                outcome=outcome,
+            )
         )
 
     async def _commit_success(

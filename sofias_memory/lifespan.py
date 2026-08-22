@@ -5,14 +5,17 @@ from contextlib import asynccontextmanager
 from typing import cast
 
 from fastapi import FastAPI
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from sofias_memory.config import Settings
 from sofias_memory.infrastructure.neo4j import Neo4jResource, ensure_neo4j_schema
 from sofias_memory.infrastructure.postgres import AsyncSessionFactory, dispose_async_engine
 from sofias_memory.observability.logging import configure_logging, get_logger
+from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 
 NEO4J_STARTUP_PROBE_QUERY = "RETURN 1 AS ok"
+POSTGRES_STARTUP_PROBE_QUERY = text("SELECT 1")
 
 
 def app_settings(app: FastAPI) -> Settings:
@@ -36,6 +39,13 @@ def app_neo4j_resource(app: FastAPI) -> Neo4jResource:
     return resource
 
 
+def app_pipeline_worker(app: FastAPI) -> PipelineWorkerCoordinator:
+    coordinator = getattr(app.state, "pipeline_worker", None)
+    if not isinstance(coordinator, PipelineWorkerCoordinator):
+        raise RuntimeError("pipeline worker coordinator is not configured")
+    return coordinator
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app_settings(app)
@@ -52,8 +62,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception as exc:
                 logger.error("neo4j_startup_failed", exception_type=type(exc).__name__)
                 raise
+
+        worker = cast(PipelineWorkerCoordinator | None, getattr(app.state, "pipeline_worker", None))
+        if worker is not None and worker.enabled:
+            # ADR-0009 SS T / PRD 21.1: the worker only starts once PostgreSQL
+            # is proven healthy. `create_async_engine_from_settings` never
+            # opens a connection by itself, so a small startup probe -- not a
+            # second readiness framework, just the same query pattern already
+            # used for Neo4j above -- is what actually proves connectivity
+            # before the worker is allowed to begin claiming.
+            session_factory = app_postgres_session_factory(app)
+            try:
+                await _probe_postgres(session_factory)
+            except Exception as exc:
+                logger.error("postgres_startup_probe_failed", exception_type=type(exc).__name__)
+                raise
+            await worker.start()
+
         yield
     finally:
+        worker = cast(PipelineWorkerCoordinator | None, getattr(app.state, "pipeline_worker", None))
+        if worker is not None:
+            # ADR-0009 SS T: stop accepting new claims and let in-flight work
+            # reach a safe checkpoint *before* Neo4j/PostgreSQL are closed --
+            # closing those out from under a still-unwinding execution task
+            # would turn a graceful shutdown into a broken-connection crash.
+            # No-op internally if the worker was never started (disabled).
+            await worker.stop()
         neo4j_resource = getattr(app.state, "neo4j_resource", None)
         if neo4j_resource is not None:
             await neo4j_resource.close()
@@ -78,3 +113,11 @@ def _safe_application_metadata(settings: Settings) -> dict[str, str]:
 async def _bootstrap_neo4j(resource: Neo4jResource) -> None:
     await resource.driver.execute_query(NEO4J_STARTUP_PROBE_QUERY, database_=resource.database)
     await ensure_neo4j_schema(resource)
+
+
+async def _probe_postgres(session_factory: AsyncSessionFactory) -> None:
+    session = session_factory()
+    try:
+        await session.execute(POSTGRES_STARTUP_PROBE_QUERY)
+    finally:
+        await session.close()

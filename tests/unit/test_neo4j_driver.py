@@ -311,6 +311,7 @@ def test_lifespan_closes_neo4j_resource_on_shutdown() -> None:
     app = create_app(
         make_settings(),
         enable_postgres_readiness=False,
+        enable_worker=False,
         neo4j_resource=cast(Neo4jResource, fake_resource),
     )
 
@@ -337,6 +338,7 @@ def test_lifespan_logs_do_not_leak_neo4j_password(
             create_app(
                 make_settings(),
                 enable_postgres_readiness=False,
+                enable_worker=False,
                 neo4j_resource=cast(Neo4jResource, FakeNeo4jResource()),
             )
         ):
@@ -379,6 +381,7 @@ async def test_readiness_reports_injected_neo4j_resource() -> None:
     app = create_app(
         make_settings(),
         enable_postgres_readiness=False,
+        enable_worker=False,
         neo4j_resource=cast(Neo4jResource, fake_resource),
     )
 

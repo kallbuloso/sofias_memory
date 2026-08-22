@@ -275,7 +275,12 @@ async def test_info_does_not_execute_readiness_checks() -> None:
 @pytest.mark.asyncio
 async def test_health_endpoints_continue_working_independently() -> None:
     async with make_client(
-        create_app(make_settings(), enable_postgres_readiness=False, enable_neo4j=False)
+        create_app(
+            make_settings(),
+            enable_postgres_readiness=False,
+            enable_neo4j=False,
+            enable_worker=False,
+        )
     ) as client:
         live_response = await client.get("/health/live")
         ready_response = await client.get("/health/ready")

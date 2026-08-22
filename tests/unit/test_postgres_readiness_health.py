@@ -78,6 +78,7 @@ async def test_ready_route_reports_postgres_ready_when_checker_is_healthy() -> N
         make_settings(),
         postgres_readiness_checker=as_checker(fake_checker),
         enable_neo4j=False,
+        enable_worker=False,
     )
 
     async with make_client(app) as client:
@@ -100,6 +101,7 @@ async def test_ready_route_reports_postgres_not_ready_when_checker_fails() -> No
         make_settings(),
         postgres_readiness_checker=as_checker(fake_checker),
         enable_neo4j=False,
+        enable_worker=False,
     )
 
     async with make_client(app) as client:
@@ -124,6 +126,7 @@ async def test_ready_route_keeps_overall_not_ready_when_other_components_are_not
         ),
         postgres_readiness_checker=as_checker(fake_checker),
         enable_neo4j=False,
+        enable_worker=False,
     )
 
     async with make_client(app) as client:

@@ -370,6 +370,7 @@ async def test_get_without_body_and_health_continue_working(log_stream: StringIO
         make_settings(max_request_body_mb=1),
         enable_postgres_readiness=False,
         enable_neo4j=False,
+        enable_worker=False,
     )
 
     async with make_client(app) as client:

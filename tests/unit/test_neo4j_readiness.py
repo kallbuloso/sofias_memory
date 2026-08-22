@@ -676,6 +676,7 @@ def test_create_app_registers_neo4j_readiness_check() -> None:
     app = create_app(
         make_settings(),
         enable_postgres_readiness=False,
+        enable_worker=False,
         neo4j_resource=as_neo4j_resource(FakeNeo4jResource()),
         neo4j_readiness_checker=as_neo4j_checker(checker),
     )
@@ -692,6 +693,7 @@ async def test_ready_route_reports_postgres_and_neo4j_ready() -> None:
         postgres_readiness_checker=as_postgres_checker(postgres_checker),
         neo4j_resource=as_neo4j_resource(FakeNeo4jResource()),
         neo4j_readiness_checker=as_neo4j_checker(neo4j_checker),
+        enable_worker=False,
     )
 
     async with make_client(app) as client:
@@ -717,6 +719,7 @@ async def test_ready_route_reports_neo4j_not_ready_with_safe_detail() -> None:
         enable_postgres_readiness=False,
         neo4j_resource=as_neo4j_resource(FakeNeo4jResource()),
         neo4j_readiness_checker=as_neo4j_checker(neo4j_checker),
+        enable_worker=False,
     )
 
     async with make_client(app) as client:
@@ -782,6 +785,7 @@ def test_lifespan_probes_database_before_bootstrap(monkeypatch: pytest.MonkeyPat
         create_app(
             make_settings(),
             enable_postgres_readiness=False,
+            enable_worker=False,
             neo4j_resource=as_neo4j_resource(resource),
         )
     ):
@@ -809,6 +813,7 @@ def test_lifespan_bootstraps_once_and_closes_once(monkeypatch: pytest.MonkeyPatc
         create_app(
             make_settings(),
             enable_postgres_readiness=False,
+            enable_worker=False,
             neo4j_resource=as_neo4j_resource(resource),
         )
     ):

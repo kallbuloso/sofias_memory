@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, exists, func, literal, or_, select, text, tuple_
+from sqlalchemy import and_, exists, func, literal, or_, select, text, tuple_, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -415,6 +416,44 @@ class PipelineRunRepository:
         )
         result = await self._session.scalar(statement)
         return cast(PipelineRun | None, result)
+
+    async def heartbeat_if_owned(
+        self,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        attempt: int,
+    ) -> bool:
+        """Guarded ``heartbeat_at = now()`` update (ADR-0009 SS H, SM-505 SS 8).
+
+        Short, standalone statement -- callers commit it immediately in its
+        own transaction, never inside a step's business transaction or across
+        a ``SELECT ... FOR UPDATE``. Fencing uses ``(run_id, worker_id,
+        attempt)``, the same triple the engine uses (SS 16), not
+        ``worker_id`` alone: the same process-boot ``worker_id`` is reused
+        across every run it ever claims, so ``attempt`` is what distinguishes
+        a still-owned claim from one already superseded by a reclaim.
+
+        Only ``RUNNING``/``CANCELLING`` rows are eligible -- ``QUEUED``
+        (including a run awaiting ``next_attempt_at``) never receives a
+        heartbeat (ADR-0009 SS H). Returns ``True`` when a row was updated,
+        ``False`` when ownership/status no longer match -- the caller must
+        treat ``False`` as ordinary "stop heartbeating this run", never as an
+        error.
+        """
+
+        statement = (
+            update(PipelineRun)
+            .where(
+                PipelineRun.id == run_id,
+                PipelineRun.worker_id == worker_id,
+                PipelineRun.attempt == attempt,
+                PipelineRun.status.in_((PipelineRunStatus.RUNNING, PipelineRunStatus.CANCELLING)),
+            )
+            .values(heartbeat_at=func.now())
+        )
+        result = cast(CursorResult[Any], await self._session.execute(statement))
+        return bool(result.rowcount)
 
     async def get_by_idempotency_key(self, idempotency_key: str) -> PipelineRun | None:
         statement = select(PipelineRun).where(PipelineRun.idempotency_key == idempotency_key)

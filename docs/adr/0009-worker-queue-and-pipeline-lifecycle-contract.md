@@ -985,8 +985,60 @@ context:    PipelineContext carries run_id, dataset_id, resolved Settings-derive
             and the current step's persisted input/output — not raw secrets.
 steps:      PipelineStep Protocol per PRD section 14.3:
               async def execute(context) -> StepResult
+              async def persist(context, result, uow) -> None
               async def compensate(context, result) -> None
 ```
+
+> **Amendment (recorded during SM-504 implementation, ADR remains
+> Accepted):** the two-line `execute`/`compensate` Protocol above left the
+> "Commit boundary preference" below (business mutation + `PipelineStep`
+> row landing in the same transaction) with no actual mechanism to satisfy
+> it — a step's `execute()` runs outside any held lock/transaction (by
+> design, so it can safely call an LLM/embedding/HTTP dependency), so it
+> cannot itself be where an authoritative PostgreSQL mutation and the
+> engine-owned `PipelineStep` transition commit together, and letting a
+> step open and commit its *own* separate transaction for the mutation
+> reopens exactly the crash window this section exists to close. `persist`
+> is the missing third phase, not a new saga/transaction framework:
+>
+> - `execute(context) -> StepResult` — the external/computation phase.
+>   Runs outside any held lock or long transaction; may call an LLM,
+>   embedding provider, HTTP, or the filesystem; returns a `StepResult`;
+>   never transitions `PipelineRun`/`PipelineStep` and never opens its own
+>   transaction.
+> - `persist(context, result, uow) -> None` — the short, PostgreSQL-only
+>   transactional phase. Called by the **engine**, inside the exact same
+>   short transaction the engine already opens to finalize the step (§17's
+>   checkpoint pattern extended to the success path): the engine has
+>   already fenced/locked `PipelineRun`+`PipelineStep` in this transaction
+>   before calling `persist`, and transitions the step to `succeeded` (with
+>   `output`/`metrics`) immediately afterward, in the same transaction, the
+>   same commit. `persist` applies only that step's own authoritative
+>   PostgreSQL mutation via the supplied `uow` (the project's existing
+>   `PostgresUnitOfWork` — reused rather than a new narrow interface,
+>   since it is already the transaction/repository boundary every
+>   synchronous B4 service and this engine itself use; introducing a
+>   second, parallel abstraction for the same boundary would be
+>   architectural duplication, not simplification). `persist` never calls
+>   `commit`, never opens an independent transaction, never calls an LLM/
+>   embedding/HTTP/Neo4j dependency, and never transitions
+>   `PipelineRun`/`PipelineStep` itself — the engine, not the step, owns
+>   lifecycle transitions. A step with no authoritative mutation of its own
+>   implements `persist` as a no-op.
+> - `compensate(context, result) -> None` — unchanged from the original
+>   text below: exceptional, never invoked automatically by retry or
+>   cancellation, not the mechanism replay-safety relies on.
+>
+> If `persist` raises (typed retryable/permanent, or an unexpected
+> exception classified permanent per the same fail-safe rule as `execute`
+> failures), the engine's transaction rolls back in full — no partial
+> business mutation and no `succeeded` transition survive — and the engine
+> then records that failure (retry scheduling or permanent failure) in a
+> **separate**, fresh short transaction, exactly like an `execute`-phase
+> failure already does. This is a corrected clarification of this
+> section's original Protocol, not a reduction of the "Commit boundary
+> preference" invariant below, which now has a real mechanism instead of
+> being aspirational.
 
 - Only pipelines internal to `sofias_memory/pipelines/` are executable; no dynamic
   import driven by request data (existing AGENTS.md/PRD invariant, restated here
@@ -1027,7 +1079,10 @@ effect on retry.
 **Commit boundary preference:** whenever a step mutates authoritative PostgreSQL
 state, the business mutation and that step's own `PipelineStep` row transition to
 `succeeded` (with its `output`/`metrics`) should be committed in the **same**
-PostgreSQL transaction whenever architecturally possible. This closes the gap
+PostgreSQL transaction whenever architecturally possible — concretely, via the
+step's `persist(context, result, uow)` phase (SM-504 amendment above), called by
+the engine inside its own success transaction, never a transaction the step opens
+independently. This closes the gap
 where a crash between "business state committed" and "step marked succeeded"
 would otherwise make the skip/resume rule (§B) re-execute a step whose effect
 already landed — the two facts land together, so resume's `status = succeeded`

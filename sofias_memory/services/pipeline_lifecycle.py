@@ -10,7 +10,6 @@ Callers own the UnitOfWork/transaction boundary; nothing here commits.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -25,20 +24,15 @@ from sofias_memory.domain import (
 )
 from sofias_memory.infrastructure.postgres.models import PipelineRun, PipelineStep
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.pipelines.registry import StepPlan
 
-
-@dataclass(frozen=True, slots=True)
-class StepPlan:
-    """One caller-resolved step to materialize alongside a new PipelineRun.
-
-    The real pipeline registry/engine is SM-504's job. SM-502 only persists
-    whatever step plan the caller already resolved (name, ordinal, and an
-    optional pre-known ``input_hash``, ADR-0009 SS B).
-    """
-
-    name: str
-    ordinal: int
-    input_hash: str | None = None
+__all__ = [
+    "StepPlan",
+    "apply_run_progress",
+    "create_run_with_steps",
+    "transition_run",
+    "transition_step",
+]
 
 
 async def create_run_with_steps(
@@ -204,8 +198,16 @@ def transition_step(
     elif target == PipelineStepStatus.QUEUED:
         # ADR-0009 SS I: RUNNING-stale recovery resets an orphaned step to a
         # clean slate so the engine re-executes it on the next normal claim.
+        # ADR-0009 SS 28 (SM-504 focused extension): a retryable failure also
+        # lands here (RUNNING -> QUEUED) and may carry the last attempt's
+        # safe error, visible on the step while its owning run awaits
+        # automatic retry -- this never touches PipelineRun.error_code/
+        # error_message, which stay reserved for a FAILED terminal run (SS
+        # 30).
         step.started_at = None
         step.finished_at = None
+        if error is not None:
+            step.error = error
 
     step.status = target
 

@@ -38,6 +38,7 @@ from sofias_memory.api.routes.info import router as info_router
 from sofias_memory.api.routes.provenance import router as provenance_router
 from sofias_memory.api.routes.recall import router as recall_router
 from sofias_memory.api.routes.remember import router as remember_router
+from sofias_memory.api.routes.runs import router as runs_router
 from sofias_memory.config import Settings, load_settings
 from sofias_memory.infrastructure.neo4j import (
     NEO4J_NOT_READY_DETAIL,
@@ -176,6 +177,7 @@ def create_app(
     application.include_router(forget_router, prefix="/api/v1")
     application.include_router(graph_router, prefix="/api/v1")
     application.include_router(provenance_router, prefix="/api/v1")
+    application.include_router(runs_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

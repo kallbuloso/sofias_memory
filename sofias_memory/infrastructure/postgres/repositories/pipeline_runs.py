@@ -6,13 +6,36 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, exists, func, literal, or_, select, text, tuple_, update
+from sqlalchemy import Select, and_, exists, func, literal, or_, select, text, tuple_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from sofias_memory.domain import PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.models import PipelineRun
+
+type _SelectAny = Select[Any]
+
+
+def _apply_list_page_filters(
+    statement: _SelectAny,
+    *,
+    statuses: list[PipelineRunStatus] | None,
+    dataset_id: UUID | None,
+    pipeline_type: PipelineType | None,
+) -> _SelectAny:
+    """Shared predicate set for :meth:`PipelineRunRepository.list_page` and
+    :meth:`PipelineRunRepository.count_page` (SM-508) -- count and list must
+    never drift on what they consider a match."""
+
+    if statuses:
+        statement = statement.where(PipelineRun.status.in_(statuses))
+    if dataset_id is not None:
+        statement = statement.where(PipelineRun.dataset_id == dataset_id)
+    if pipeline_type is not None:
+        statement = statement.where(PipelineRun.pipeline_type == pipeline_type)
+    return statement
+
 
 FORGET_TARGET_CONFLICT_ERROR_CODE = "FORGET_TARGET_CONFLICT"
 """Marks a FORGET run rejected pre-mutation by a conflict check.
@@ -80,24 +103,39 @@ class PipelineRunRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> list[PipelineRun]:
-        """Filtered, paginated listing for the future Runs API (SM-508).
+        """Filtered, paginated listing for the Runs API (SM-508).
 
         Newest first. Filters are optional and additive; no filter means no
         restriction on that dimension.
         """
 
-        statement = select(PipelineRun).order_by(
-            PipelineRun.created_at.desc(), PipelineRun.id.desc()
-        )
-        if statuses:
-            statement = statement.where(PipelineRun.status.in_(statuses))
-        if dataset_id is not None:
-            statement = statement.where(PipelineRun.dataset_id == dataset_id)
-        if pipeline_type is not None:
-            statement = statement.where(PipelineRun.pipeline_type == pipeline_type)
+        statement = _apply_list_page_filters(
+            select(PipelineRun),
+            statuses=statuses,
+            dataset_id=dataset_id,
+            pipeline_type=pipeline_type,
+        ).order_by(PipelineRun.created_at.desc(), PipelineRun.id.desc())
         statement = statement.limit(limit).offset(offset)
         result = await self._session.scalars(statement)
         return list(result)
+
+    async def count_page(
+        self,
+        *,
+        statuses: list[PipelineRunStatus] | None = None,
+        dataset_id: UUID | None = None,
+        pipeline_type: PipelineType | None = None,
+    ) -> int:
+        """Total matching rows for :meth:`list_page`'s identical filter set (SM-508)."""
+
+        statement = _apply_list_page_filters(
+            select(func.count()).select_from(PipelineRun),
+            statuses=statuses,
+            dataset_id=dataset_id,
+            pipeline_type=pipeline_type,
+        )
+        result = await self._session.scalar(statement)
+        return int(result or 0)
 
     # -- SM-503 queue claiming primitives (ADR-0009 SS D) -------------------
     #

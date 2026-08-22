@@ -13,9 +13,11 @@ definitions (SM-504 story requirement).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Protocol
+from uuid import UUID
 
 from sofias_memory.domain import PipelineType
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -101,6 +103,85 @@ def no_op_persist(context: PipelineContext, result: StepResult, uow: PostgresUni
     del context, result, uow
 
 
+class CancellationRecoveryMode(StrEnum):
+    """A step's own declared safety contract for stale-``CANCELLING``
+    recovery (ADR-0009 SS I "CANCELLING stale" cases A/B/C, SM-507).
+
+    Not persisted -- a code-level, per-step-definition property read only by
+    :class:`~sofias_memory.services.pipeline_recovery.PipelineRecoveryService`
+    when it finds an orphaned ``RUNNING`` step under a stale ``CANCELLING``
+    run. Recovery never guesses a step's safety by name/heuristic; a step
+    that does not explicitly declare ``ATOMIC`` or ``RECONCILABLE`` is
+    ``AMBIGUOUS`` by default, fail-safe.
+    """
+
+    ATOMIC = "atomic"
+    """This step's authoritative PostgreSQL mutation (if any) only ever
+    commits together with its own ``PipelineStep.status = succeeded``
+    transition (ADR-0009 SS O "Commit boundary preference"). An orphaned
+    ``RUNNING`` row is therefore proof, by that same guarantee, that no
+    authoritative effect was committed -- safe to cancel with no check."""
+
+    RECONCILABLE = "reconcilable"
+    """This step's own :attr:`PipelineStepDefinition.cancellation_reconcile`
+    callback can determine, from durable PostgreSQL state alone, whether the
+    orphaned attempt's effect is safely known/idempotent. Requires that
+    callback to be set."""
+
+    AMBIGUOUS = "ambiguous"
+    """Default. Recovery cannot prove a safe outcome; the run fails
+    (``CANCEL_RECOVERY_AMBIGUOUS``) rather than guessing ``CANCELLED``."""
+
+
+class CancellationRecoveryOutcome(StrEnum):
+    """What a :data:`CancellationReconcileCallback` decided (SM-507)."""
+
+    SAFE = "safe"
+    """Durable state proves the orphaned attempt's effect is a known,
+    reconciled/idempotent-safe end state -- recovery may report ``CANCELLED``."""
+
+    INCONCLUSIVE = "inconclusive"
+    """Durable state does not prove a safe outcome -- recovery must treat
+    this exactly like :attr:`CancellationRecoveryMode.AMBIGUOUS` (case C)."""
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineCancellationRecoveryContext:
+    """Plain-data context for a :data:`CancellationReconcileCallback`
+    (ADR-0009 SS I case B, SM-507).
+
+    PostgreSQL-only by construction: no Neo4j resource, provider client,
+    filesystem helper, or service-locator map is ever included here -- only
+    already-persisted identity/state the callback needs to reconcile durable
+    evidence for one orphaned step attempt. The callback additionally
+    receives the recovery service's own open :class:`PostgresUnitOfWork` as a
+    separate argument (never embedded on this dataclass), scoped to one short
+    recovery transaction.
+    """
+
+    run_id: UUID
+    pipeline_type: PipelineType
+    dataset_id: UUID | None
+    source_id: UUID | None
+    run_input: Mapping[str, Any]
+    step_id: UUID
+    step_name: str
+    step_attempt: int
+    input_hash: str | None
+    output: Mapping[str, Any]
+    metrics: Mapping[str, Any]
+
+
+CancellationReconcileCallback = Callable[
+    [PipelineCancellationRecoveryContext, PostgresUnitOfWork],
+    Coroutine[Any, Any, CancellationRecoveryOutcome],
+]
+"""``(context, uow) -> CancellationRecoveryOutcome``. PostgreSQL-only (ADR-0009
+SS I case B, SM-507 SS 9/34): must never call ``execute()``, an LLM/embedding
+client, HTTP, Neo4j, or the filesystem -- only read/reconcile against the
+supplied ``uow``'s repositories."""
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineStepDefinition:
     """One step's code-level identity, contract, and input-derivation rule.
@@ -110,18 +191,32 @@ class PipelineStepDefinition:
     otherwise-identical semantic input, so a registry change that alters a
     step's behavior is detectable as drift without a new
     ``pipeline_version``/``step_version`` column.
+
+    ``cancellation_recovery_mode``/``cancellation_reconcile`` are SM-507's
+    ADR-0009 SS I case A/B/C contract (Gate B): declared once per step
+    definition, never inferred from the step's name.
     """
 
     name: str
     definition_id: str
     step: PipelineStep
     input_deriver: InputDeriver
+    cancellation_recovery_mode: CancellationRecoveryMode = CancellationRecoveryMode.AMBIGUOUS
+    cancellation_reconcile: CancellationReconcileCallback | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("PipelineStepDefinition.name must not be empty")
         if not self.definition_id:
             raise ValueError("PipelineStepDefinition.definition_id must not be empty")
+        if (
+            self.cancellation_recovery_mode == CancellationRecoveryMode.RECONCILABLE
+            and self.cancellation_reconcile is None
+        ):
+            raise ValueError(
+                f"PipelineStepDefinition {self.name!r} declares RECONCILABLE cancellation "
+                "recovery but supplies no cancellation_reconcile callback."
+            )
 
     def compute_input_hash(
         self,
@@ -242,7 +337,11 @@ def build_default_pipeline_registry() -> PipelineRegistry:
 
 
 __all__ = [
+    "CancellationRecoveryMode",
+    "CancellationRecoveryOutcome",
+    "CancellationReconcileCallback",
     "InputDeriver",
+    "PipelineCancellationRecoveryContext",
     "PipelineDefinition",
     "PipelineRegistry",
     "PipelineStep",

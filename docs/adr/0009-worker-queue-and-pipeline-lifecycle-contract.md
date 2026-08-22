@@ -793,11 +793,93 @@ constraints → config check → **worker** → readiness true), a startup recov
 scans for `RUNNING`/`CANCELLING` runs whose heartbeat already satisfies the stale
 predicate (this catches runs abandoned by a crash of the *previous* process, which
 by definition cannot still be heartbeating) and applies the same reclassification
-above. This is the same code path as periodic in-process stale detection (SM-505
-may run it periodically too), not a separate one-off startup-only algorithm.
+above. The normal, heartbeat-based reconciliation machinery above is shared between
+this startup pass and any future periodic in-process pass (SM-505 may run one) —
+it is not a separate one-off startup-only algorithm. The pre-B5 legacy rollout
+exception below is the one part of this section that is **not** shared: it is
+startup-only, for the reason given there.
 
 `created_at` alone is never used as stale evidence (explicitly rejected by backlog
 §5.1 and SM-507's "Não fazer") — only `status` + `heartbeat_at`.
+
+#### Pre-B5 legacy rollout exception (recorded during SM-507 implementation, ADR remains Accepted)
+
+The stale predicate above is `heartbeat_at < now() - WORKER_STALE_AFTER_SECONDS`,
+which is only ever `TRUE` for a non-`NULL` `heartbeat_at` — SQL's three-valued logic
+makes `NULL < cutoff` unknown, not `TRUE`. During the B4 → B5 transition, the
+still-synchronous public write services (`remember`/`cognify`/`improve`/`forget`)
+create `PipelineRun` rows **directly** `RUNNING`, with `attempt=1`, `worker_id=NULL`,
+`heartbeat_at=NULL`, and **no** `PipelineStep` rows — no durable B5 execution plan
+exists for the engine to resume. These rows do not satisfy the stale predicate
+above and are not covered by it.
+
+The discovery scan candidate set at startup is therefore wider than the normal
+predicate — it also includes `heartbeat_at IS NULL` — but **classification** after
+locking each candidate is exactly four cases, and only one of them behaves like the
+normal machinery above:
+
+```text
+A. heartbeat_at IS NOT NULL, genuinely stale (< now() - stale_after)
+   → normal RUNNING/CANCELLING §I recovery above (→ QUEUED, or terminal).
+
+B. heartbeat_at IS NULL, zero PipelineStep rows
+   → pre-B5 legacy rollout exception (startup-only, this subsection).
+
+C. heartbeat_at IS NULL, one or more PipelineStep rows
+   → invalid/unproven state (a correctly-functioning B5 claim always sets
+     heartbeat_at in the same transaction it sets RUNNING, per §D/§G, so this
+     combination is not evidence of legacy debt) — fail closed, this subsection.
+
+D. heartbeat_at IS NOT NULL and recent
+   → not a candidate at all; untouched.
+```
+
+Cases B and C are **both** resolved by this subsection, and neither is ever
+resolved by the normal §I machinery (case A) — `heartbeat_at IS NULL` is never
+valid liveness evidence for a stale-reclaim decision, so it never produces
+`QUEUED` and never produces `CANCELLED`, regardless of whether `PipelineStep` rows
+happen to exist:
+
+```text
+RUNNING, heartbeat_at IS NULL (case B or C)
+→ do not materialize steps;
+→ do not execute anything;
+→ do not transition to QUEUED, under any circumstance;
+→ terminalize fail-safe:
+     CONFIG_FINGERPRINT_MISMATCH when the fingerprint differs;
+     otherwise WORKER_LOST.
+
+CANCELLING, heartbeat_at IS NULL (case B or C)
+→ do not transition to CANCELLED, under any circumstance;
+→ terminalize FAILED (CANCEL_RECOVERY_AMBIGUOUS), never WORKER_LOST — a
+  persisted cancellation *intent* exists, but no plan/evidence recovery could
+  use to prove that intent was safely honored.
+```
+
+For case B (`CANCELLING`, zero steps): there is no orphaned `PipelineStep` to
+classify into case A/B/C of the `CANCELLING`-stale matrix above, and therefore no
+durable evidence recovery could use to prove a safe `CANCELLED` outcome. Recovery
+must not report `CANCELLED` for it on the assumption that "no steps" trivially
+satisfies that matrix's case A — it terminalizes `FAILED`
+(`CANCEL_RECOVERY_AMBIGUOUS`) instead, exactly as an ordinary case-C outcome would.
+Case C (`CANCELLING`, steps present but `heartbeat_at IS NULL`) terminalizes the
+same way, for the same reason: no valid liveness evidence to trust any
+classification against.
+
+This is a rollout-sequencing exception, not a change to the normal B5 stale
+predicate or to `PipelineRunStatus`/`PipelineStepStatus`. It:
+
+- **must never** be applied by a periodic in-process pass while any direct-`RUNNING`
+  B4 writer still exists — an in-flight, legitimately-executing B4 synchronous
+  request of *this same process* can also have `heartbeat_at IS NULL` while it is
+  still genuinely running (B4 never heartbeats), so treating `NULL` heartbeat as
+  abandoned mid-process, not just at boot, would race a live request. It is safe
+  only at startup, before this process has served any request itself.
+- **does not** introduce a new persisted status, a new migration, or a
+  `pipeline_version`/rollout-mode column.
+- is expected to become vacuous, not to be explicitly removed, once SM-510..SM-513
+  migrate every direct-`RUNNING` B4 writer onto the B5 claimant (the same rollout
+  boundary already governing the partial unique index in §D).
 
 ---
 

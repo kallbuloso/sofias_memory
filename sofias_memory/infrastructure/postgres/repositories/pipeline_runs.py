@@ -455,6 +455,72 @@ class PipelineRunRepository:
         result = cast(CursorResult[Any], await self._session.execute(statement))
         return bool(result.rowcount)
 
+    # -- SM-507 stale recovery primitives (ADR-0009 SS I) --------------------
+    #
+    # Discovery/claim only -- these never decide *whether* a candidate is
+    # still stale after locking (Python-side re-check in
+    # services.pipeline_recovery, mirroring the SM-506 graph_outbox claim
+    # pattern) and never execute business logic.
+
+    async def list_stale_candidate_ids(
+        self,
+        *,
+        stale_after_seconds: float,
+        include_null_heartbeat: bool,
+        limit: int,
+    ) -> list[UUID]:
+        """RUNNING/CANCELLING candidates whose heartbeat already satisfies
+        the stale predicate (ADR-0009 SS H/SS I): ``heartbeat_at`` strictly
+        older than ``now() - stale_after_seconds``.
+
+        ``include_null_heartbeat`` additionally matches a legacy pre-B5 run
+        with no heartbeat at all -- the startup pass only (ADR-0009 SS I
+        "Startup behavior", backlog SS 6): a NULL heartbeat can only mean
+        "abandoned by a now-dead process" at process boot, before this
+        process's own worker has claimed anything. A future periodic
+        in-process pass must never set this ``True`` while B4 direct-RUNNING
+        writers still exist (backlog SS 6).
+
+        ``created_at`` is never used as staleness evidence (ADR-0009 SS I,
+        backlog SS 5.1) -- only ``status`` + ``heartbeat_at``, both read
+        against PostgreSQL's own ``now()``.
+        """
+
+        stale_cutoff = func.now() - func.make_interval(0, 0, 0, 0, 0, 0, stale_after_seconds)
+        heartbeat_condition = PipelineRun.heartbeat_at < stale_cutoff
+        if include_null_heartbeat:
+            heartbeat_condition = or_(PipelineRun.heartbeat_at.is_(None), heartbeat_condition)
+        statement = (
+            select(PipelineRun.id)
+            .where(
+                PipelineRun.status.in_((PipelineRunStatus.RUNNING, PipelineRunStatus.CANCELLING)),
+                heartbeat_condition,
+            )
+            .order_by(PipelineRun.created_at, PipelineRun.id)
+            .limit(limit)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def get_stale_for_update(self, run_id: UUID) -> PipelineRun | None:
+        """Lock exactly one candidate row, identified by id, with ``FOR
+        UPDATE SKIP LOCKED`` (ADR-0009 SS I/SS 17: race-safe by construction,
+        even though startup recovery is normally a single process).
+
+        No status/staleness predicate here -- the caller re-validates both
+        against the just-locked, guaranteed-committed row (see
+        ``services.pipeline_recovery``), the same split responsibility
+        SM-506's ``GraphOutboxRepository.claim_one`` already established.
+        Returns ``None`` when the row is already locked by a concurrent
+        recovery pass, or no longer exists.
+        """
+
+        statement = (
+            select(PipelineRun).where(PipelineRun.id == run_id).with_for_update(skip_locked=True)
+        )
+        result = await self._session.scalar(statement)
+        return cast(PipelineRun | None, result)
+
     async def get_by_idempotency_key(self, idempotency_key: str) -> PipelineRun | None:
         statement = select(PipelineRun).where(PipelineRun.idempotency_key == idempotency_key)
         result = await self._session.scalar(statement)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from io import StringIO
+from typing import cast
 
 import pytest
 from fastapi import FastAPI
@@ -9,7 +10,8 @@ from fastapi.testclient import TestClient
 
 from sofias_memory.app import create_app
 from sofias_memory.config import Settings
-from sofias_memory.lifespan import app_settings
+from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
+from sofias_memory.lifespan import app_settings, lifespan
 from sofias_memory.observability.logging import clear_log_context, configure_logging
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -159,3 +161,84 @@ def test_create_app_uses_injected_settings_without_loading_environment(
     app = create_app(make_settings())
 
     assert isinstance(app, FastAPI)
+
+
+# --- SM-507 SS 29/53: recovery must finish before the worker's poll loop
+# starts claiming, and never runs at all when the worker is disabled.
+# Fakes only -- no real PostgreSQL/Neo4j needed to prove ordering.
+
+
+class _FakeSession:
+    async def execute(self, statement: object) -> None:
+        del statement
+
+    async def close(self) -> None:
+        return None
+
+
+class _FakeSessionFactory:
+    def __call__(self) -> object:
+        return _FakeSession()
+
+
+class _RecordingRecoveryService:
+    def __init__(self) -> None:
+        self.called = False
+
+    async def recover_startup(self) -> int:
+        self.called = True
+        return 0
+
+
+class _OrderingWorkerCoordinator:
+    """Records whether recovery had already run by the time ``start()`` fires."""
+
+    def __init__(self, *, enabled: bool, recovery: _RecordingRecoveryService) -> None:
+        self.enabled = enabled
+        self._recovery = recovery
+        self.start_called = False
+        self.recovery_had_run_before_start: bool | None = None
+
+    async def start(self) -> None:
+        self.start_called = True
+        self.recovery_had_run_before_start = self._recovery.called
+
+    async def stop(self) -> None:
+        return None
+
+
+def _bare_app_for_lifespan(
+    *, worker_enabled: bool, recovery: _RecordingRecoveryService
+) -> tuple[FastAPI, _OrderingWorkerCoordinator]:
+    app = FastAPI()
+    app.state.settings = make_settings()
+    app.state.postgres_session_factory = cast(AsyncSessionFactory, _FakeSessionFactory())
+    worker = _OrderingWorkerCoordinator(enabled=worker_enabled, recovery=recovery)
+    app.state.pipeline_worker = worker
+    app.state.pipeline_recovery = recovery
+    return app, worker
+
+
+@pytest.mark.asyncio
+async def test_recovery_completes_before_worker_start_when_enabled() -> None:
+    recovery = _RecordingRecoveryService()
+    app, worker = _bare_app_for_lifespan(worker_enabled=True, recovery=recovery)
+
+    async with lifespan(app):
+        pass
+
+    assert worker.start_called
+    assert recovery.called
+    assert worker.recovery_had_run_before_start is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_never_runs_when_worker_disabled() -> None:
+    recovery = _RecordingRecoveryService()
+    app, worker = _bare_app_for_lifespan(worker_enabled=False, recovery=recovery)
+
+    async with lifespan(app):
+        pass
+
+    assert not worker.start_called
+    assert not recovery.called

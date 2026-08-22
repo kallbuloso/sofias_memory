@@ -46,3 +46,18 @@ allowed to be resolved"."""
 UNEXPECTED_STEP_ERROR_CODE = "STEP_UNEXPECTED_ERROR"
 """Fail-safe classification for an untyped/unexpected exception raised by a
 step (ADR-0009 SS 22): never retried automatically, sanitized message only."""
+
+CONFIG_FINGERPRINT_MISMATCH_ERROR_CODE = "CONFIG_FINGERPRINT_MISMATCH"
+"""Stale RUNNING recovery found a different config_fingerprint than the
+current process (ADR-0009 SS I/SS J, SM-507). Never resumed."""
+
+WORKER_LOST_ERROR_CODE = "WORKER_LOST"
+"""Stale recovery could not safely resume this run: attempts exhausted, no
+durable step plan exists (legacy pre-B5 run), or persisted state violates an
+engine invariant (ADR-0009 SS I/SS X, SM-507)."""
+
+CANCEL_RECOVERY_AMBIGUOUS_ERROR_CODE = "CANCEL_RECOVERY_AMBIGUOUS"
+"""Stale CANCELLING recovery could not prove the orphaned step's effect was
+either uncommitted or safely reconciled (ADR-0009 SS I case C, SM-507). The
+run fails rather than falsely reporting CANCELLED; manual retry is the path
+forward."""

@@ -12,6 +12,7 @@ from sofias_memory.config import Settings
 from sofias_memory.infrastructure.neo4j import Neo4jResource, ensure_neo4j_schema
 from sofias_memory.infrastructure.postgres import AsyncSessionFactory, dispose_async_engine
 from sofias_memory.observability.logging import configure_logging, get_logger
+from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 
 NEO4J_STARTUP_PROBE_QUERY = "RETURN 1 AS ok"
@@ -77,6 +78,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception as exc:
                 logger.error("postgres_startup_probe_failed", exception_type=type(exc).__name__)
                 raise
+
+            # ADR-0009 SS I "Startup behavior" / SM-507: stale-run recovery
+            # must finish completely before the worker's poll loop begins
+            # claiming (recovery_finished < first_claim). A PostgreSQL
+            # failure during this pass aborts startup entirely -- it must
+            # never be swallowed and let the worker start over possibly
+            # stale state (SM-507 SS 30).
+            recovery = cast(
+                PipelineRecoveryService | None, getattr(app.state, "pipeline_recovery", None)
+            )
+            if recovery is not None:
+                try:
+                    recovered = await recovery.recover_startup()
+                except Exception as exc:
+                    logger.error(
+                        "pipeline_recovery_startup_failed", exception_type=type(exc).__name__
+                    )
+                    raise
+                logger.info("pipeline_recovery_startup_complete", recovered=recovered)
+
             await worker.start()
 
         yield

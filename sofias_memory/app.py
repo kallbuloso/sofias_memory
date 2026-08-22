@@ -58,6 +58,7 @@ from sofias_memory.infrastructure.postgres.readiness import (
 from sofias_memory.lifespan import lifespan
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
+from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 
 WORKER_NOT_READY_DETAIL = "worker not ready"
@@ -142,6 +143,12 @@ def create_app(
             graph_outbox_processor=graph_outbox_processor,
         )
         application.state.pipeline_worker = worker_coordinator
+        application.state.pipeline_recovery = PipelineRecoveryService(
+            application.state.postgres_session_factory,
+            resolved_registry,
+            stale_after_seconds=resolved_settings.worker_stale_after_seconds,
+            config_fingerprint=resolved_settings.config_fingerprint(),
+        )
         resolved_readiness_checks = (
             ("worker", _worker_readiness_check(worker_coordinator)),
             *resolved_readiness_checks,

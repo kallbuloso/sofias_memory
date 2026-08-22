@@ -41,6 +41,7 @@ from sofias_memory.api.routes.remember import router as remember_router
 from sofias_memory.config import Settings, load_settings
 from sofias_memory.infrastructure.neo4j import (
     NEO4J_NOT_READY_DETAIL,
+    Neo4jProjection,
     Neo4jReadinessChecker,
     Neo4jResource,
     create_neo4j_resource_from_settings,
@@ -56,6 +57,7 @@ from sofias_memory.infrastructure.postgres.readiness import (
 )
 from sofias_memory.lifespan import lifespan
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
+from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 
 WORKER_NOT_READY_DETAIL = "worker not ready"
@@ -119,6 +121,17 @@ def create_app(
             if pipeline_registry is not None
             else build_default_pipeline_registry()
         )
+        active_neo4j_resource = cast(
+            Neo4jResource | None, getattr(application.state, "neo4j_resource", None)
+        )
+        graph_outbox_processor = (
+            GraphOutboxProcessor(
+                session_factory=application.state.postgres_session_factory,
+                projection=Neo4jProjection(active_neo4j_resource),
+            )
+            if active_neo4j_resource is not None
+            else None
+        )
         worker_coordinator = PipelineWorkerCoordinator(
             application.state.postgres_session_factory,
             resolved_registry,
@@ -126,6 +139,7 @@ def create_app(
             poll_interval_ms=resolved_settings.worker_poll_interval_ms,
             stale_after_seconds=resolved_settings.worker_stale_after_seconds,
             max_concurrent_datasets=resolved_settings.worker_max_concurrent_datasets,
+            graph_outbox_processor=graph_outbox_processor,
         )
         application.state.pipeline_worker = worker_coordinator
         resolved_readiness_checks = (

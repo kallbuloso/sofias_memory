@@ -107,6 +107,7 @@ EXPECTED_INDEXES = frozenset(
         "ix_graph_outbox_status_created_at",
         "ix_graph_outbox_dataset_id",
         "ix_graph_outbox_aggregate",
+        "ix_graph_outbox_status_processing_started_at",
     }
 )
 EMBEDDING_COLUMNS = (

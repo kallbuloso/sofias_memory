@@ -35,7 +35,13 @@ class FakeGraphOutboxRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def list_processable_ids_for_dataset(self, dataset_id: UUID) -> list[int]:
+    async def list_processable_ids_for_dataset(
+        self,
+        dataset_id: UUID,
+        *,
+        max_attempts: int,
+    ) -> list[int]:
+        del max_attempts
         return list(type(self).ids)
 
 

@@ -142,6 +142,24 @@ def non_empty_registry() -> PipelineRegistry:
     return PipelineRegistry([definition])
 
 
+@dataclass
+class FakeGraphOutboxProcessor:
+    """Records ``claim_and_process_one`` calls; drains a queued script of
+    results/exceptions, then returns ``None`` (no more claimable work)."""
+
+    script: list[object] = field(default_factory=list)
+    calls: int = 0
+
+    async def claim_and_process_one(self) -> object | None:
+        self.calls += 1
+        if not self.script:
+            return None
+        outcome = self.script.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 def make_coordinator(
     *,
     enabled: bool = True,
@@ -151,6 +169,7 @@ def make_coordinator(
     poll_interval_ms: int = 5,
     max_concurrent_datasets: int = 1,
     shutdown_grace_seconds: float = 1.0,
+    graph_outbox_processor: FakeGraphOutboxProcessor | None = None,
 ) -> tuple[PipelineWorkerCoordinator, FakeClaimer, FakeEngine]:
     resolved_claimer = claimer or FakeClaimer()
     resolved_engine = engine or FakeEngine()
@@ -164,6 +183,7 @@ def make_coordinator(
         claimer=resolved_claimer,  # type: ignore[arg-type]
         engine=resolved_engine,  # type: ignore[arg-type]
         shutdown_grace_seconds=shutdown_grace_seconds,
+        graph_outbox_processor=graph_outbox_processor,  # type: ignore[arg-type]
     )
     return coordinator, resolved_claimer, resolved_engine
 
@@ -438,3 +458,75 @@ def test_pipeline_execution_result_can_signal_shutdown_pause() -> None:
     assert result.paused_for_shutdown is True
     assert result.status is None
     assert result.abandoned is False
+
+
+# --- SM-506 autonomous graph outbox consumer wiring -------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_graph_outbox_processor_configured_means_no_outbox_polling() -> None:
+    """Backwards-compatible default: a coordinator built without a processor
+    (e.g. Neo4j disabled) never starts an outbox task."""
+
+    coordinator, _, _ = make_coordinator(graph_outbox_processor=None)
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+    # No assertion beyond "does not raise" -- absence of a processor means
+    # absence of the outbox task entirely (backlog SS 39).
+
+
+@pytest.mark.asyncio
+async def test_empty_pipeline_registry_still_drains_graph_outbox() -> None:
+    """Backlog SS 30: the autonomous outbox consumer must not be gated by
+    ``len(registry) == 0`` the way the pipeline claim loop is."""
+
+    processor = FakeGraphOutboxProcessor(script=[object(), object()])
+    coordinator, claimer, _ = make_coordinator(
+        registry=PipelineRegistry([]),
+        graph_outbox_processor=processor,
+    )
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.sleep(0.2)
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+    assert claimer.calls == 0  # empty registry: pipeline claim loop stays idle
+    assert processor.calls >= 2  # outbox loop is unaffected by registry contents
+
+
+@pytest.mark.asyncio
+async def test_outbox_burst_stops_after_failure_and_resumes_next_poll() -> None:
+    """Backlog SS 13: a projection failure ends the current burst instead of
+    busy-spinning the remaining attempt budget in the same tick; the next
+    poll tick tries again."""
+
+    processor = FakeGraphOutboxProcessor(
+        script=[object(), RuntimeError("neo4j unavailable"), object()]
+    )
+    coordinator, _, _ = make_coordinator(
+        graph_outbox_processor=processor,
+        poll_interval_ms=20,
+    )
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.sleep(0.3)
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+    # The burst that hit the RuntimeError stopped immediately (did not loop
+    # trying to claim more in that same tick); the third scripted outcome was
+    # only reachable on a later poll tick.
+    assert processor.calls >= 3
+
+
+@pytest.mark.asyncio
+async def test_shutdown_awaits_in_flight_outbox_task_within_grace() -> None:
+    processor = FakeGraphOutboxProcessor(script=[object()])
+    coordinator, _, _ = make_coordinator(
+        graph_outbox_processor=processor,
+        shutdown_grace_seconds=1.0,
+    )
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+    assert coordinator._outbox_task is None  # noqa: SLF001 - internal state check
+    assert processor.calls >= 1

@@ -211,6 +211,8 @@ def test_graph_outbox_columns_types_no_fks_and_indexes_are_exact() -> None:
         "attempt",
         "created_at",
         "processed_at",
+        "processing_started_at",
+        "worker_id",
     ]
 
     columns = GraphOutbox.__table__.c
@@ -233,11 +235,14 @@ def test_graph_outbox_columns_types_no_fks_and_indexes_are_exact() -> None:
     assert checks["ck_graph_outbox_attempt_non_negative"] == "attempt >= 0"
     assert columns.created_at.type.timezone is True
     assert columns.processed_at.nullable is True
+    assert columns.processing_started_at.nullable is True
+    assert columns.worker_id.nullable is True
     assert set(model_indexes) == {
         "ix_graph_outbox_aggregate",
         "ix_graph_outbox_dataset_id",
         "ix_graph_outbox_status",
         "ix_graph_outbox_status_created_at",
+        "ix_graph_outbox_status_processing_started_at",
     }
     assert index_columns(model_indexes["ix_graph_outbox_status"]) == ["status"]
     assert index_columns(model_indexes["ix_graph_outbox_status_created_at"]) == [
@@ -248,6 +253,10 @@ def test_graph_outbox_columns_types_no_fks_and_indexes_are_exact() -> None:
     assert index_columns(model_indexes["ix_graph_outbox_aggregate"]) == [
         "aggregate_type",
         "aggregate_id",
+    ]
+    assert index_columns(model_indexes["ix_graph_outbox_status_processing_started_at"]) == [
+        "status",
+        "processing_started_at",
     ]
 
 

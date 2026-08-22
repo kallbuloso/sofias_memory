@@ -49,6 +49,7 @@ class GraphOutbox(Base):
         Index("ix_graph_outbox_status_created_at", "status", "created_at"),
         Index("ix_graph_outbox_dataset_id", "dataset_id"),
         Index("ix_graph_outbox_aggregate", "aggregate_type", "aggregate_id"),
+        Index("ix_graph_outbox_status_processing_started_at", "status", "processing_started_at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -68,3 +69,7 @@ class GraphOutbox(Base):
         server_default=sql_text("now()"),
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    worker_id: Mapped[str | None] = mapped_column(Text(), nullable=True)

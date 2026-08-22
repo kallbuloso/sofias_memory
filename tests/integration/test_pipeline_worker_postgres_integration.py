@@ -22,14 +22,20 @@ from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import delete, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from sofias_memory.domain import PipelineRunStatus, PipelineStepStatus, PipelineType
+from sofias_memory.domain import (
+    GraphOutboxOperation,
+    GraphOutboxStatus,
+    PipelineRunStatus,
+    PipelineStepStatus,
+    PipelineType,
+)
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
-from sofias_memory.infrastructure.postgres.models import Dataset, PipelineRun
+from sofias_memory.infrastructure.postgres.models import Dataset, GraphOutbox, PipelineRun
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.pipelines.context import PipelineContext
 from sofias_memory.pipelines.registry import (
@@ -38,6 +44,7 @@ from sofias_memory.pipelines.registry import (
     PipelineStepDefinition,
     StepResult,
 )
+from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_lifecycle import StepPlan, create_run_with_steps
 from sofias_memory.services.pipeline_queue_claimer import PipelineRunClaimer
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
@@ -452,6 +459,7 @@ def make_coordinator(
     stale_after_seconds: int = 1,
     shutdown_grace_seconds: float = 5.0,
     claimer: Any = None,
+    graph_outbox_processor: Any = None,
 ) -> PipelineWorkerCoordinator:
     return PipelineWorkerCoordinator(
         session_factory,
@@ -462,6 +470,7 @@ def make_coordinator(
         max_concurrent_datasets=max_concurrent_datasets,
         claimer=claimer,
         shutdown_grace_seconds=shutdown_grace_seconds,
+        graph_outbox_processor=graph_outbox_processor,
     )
 
 
@@ -1330,3 +1339,185 @@ async def test_p_transient_claim_failure_recovers_next_poll(postgres_engine: Asy
         assert coordinator.is_running is False  # stopped cleanly afterward, not crashed mid-run
     finally:
         await cleanup_worker_fixture(postgres_engine, ids)
+
+
+# === SM-506: autonomous graph_outbox consumer inside this coordinator ========
+#
+# S: empty PipelineRegistry must not gate the outbox loop.
+# T: shutdown lets an in-flight (fake, controllable) apply finish within grace.
+# U: grace expiry cancels the apply task without falsely marking DONE/FAILED;
+#    the row stays PROCESSING, recoverable by a later stale replay -- proven
+#    at the repository level by ``test_graph_outbox_worker_postgres_integration.py``.
+
+
+def entity_outbox_payload(dataset_id: UUID, entity_id: UUID) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "aggregate_type": "entity",
+        "operation": "upsert",
+        "dataset_id": str(dataset_id),
+        "aggregate_id": str(entity_id),
+        "identity": {"id": str(entity_id)},
+        "properties": {
+            "id": str(entity_id),
+            "dataset_id": str(dataset_id),
+            "name": "Worker Coordinator Outbox Entity",
+            "entity_type": "test",
+            "description": "Created by pipeline worker coordinator SM-506 scenario.",
+            "importance_weight": 0.5,
+            "generation": 1,
+        },
+    }
+
+
+async def insert_outbox_event(session_factory: Any) -> int:
+    dataset_id = uuid4()
+    entity_id = uuid4()
+    async with PostgresUnitOfWork(session_factory) as uow:
+        event = GraphOutbox(
+            dataset_id=dataset_id,
+            aggregate_type="entity",
+            aggregate_id=entity_id,
+            operation=GraphOutboxOperation.UPSERT,
+            payload=entity_outbox_payload(dataset_id, entity_id),
+            status=GraphOutboxStatus.PENDING,
+            attempt=0,
+            processed_at=None,
+        )
+        await uow.graph_outbox.add(event)
+        await uow.commit()
+        return event.id
+
+
+async def cleanup_outbox_event(session_factory: Any, outbox_id: int) -> None:
+    async with session_factory() as session:
+        await session.execute(delete(GraphOutbox).where(GraphOutbox.id == outbox_id))
+        await session.commit()
+
+
+async def read_outbox_status(session_factory: Any, outbox_id: int) -> GraphOutboxStatus | None:
+    async with PostgresUnitOfWork(session_factory) as uow:
+        event = await uow.graph_outbox.get_by_id(outbox_id)
+        return None if event is None else event.status
+
+
+class NoopProjection:
+    """Fake :class:`GraphProjectionPort` -- these scenarios are about the
+    coordinator's outbox-loop lifecycle, not Neo4j content, so no real Neo4j
+    connection is needed for S/T/U."""
+
+    async def apply(self, command: object) -> None:
+        del command
+
+
+@dataclass
+class PausableProjection:
+    """Blocks ``apply`` on ``proceed`` after signalling ``entered`` -- the
+    same controllable-in-flight-work pattern already used for the pipeline
+    step fakes above (``PausableStep``), applied to the graph outbox apply
+    phase instead."""
+
+    entered: asyncio.Event = field(default_factory=asyncio.Event)
+    proceed: asyncio.Event = field(default_factory=asyncio.Event)
+    applied: int = 0
+
+    async def apply(self, command: object) -> None:
+        del command
+        self.entered.set()
+        await asyncio.wait_for(self.proceed.wait(), timeout=TEST_TIMEOUT)
+        self.applied += 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_s_empty_registry_still_drains_graph_outbox(postgres_engine: AsyncEngine) -> None:
+    session_factory = create_session_factory(postgres_engine)
+    outbox_id = await insert_outbox_event(session_factory)
+    try:
+        registry = PipelineRegistry([])  # no PipelineRun is ever executable
+        processor = GraphOutboxProcessor(
+            session_factory=session_factory, projection=NoopProjection()
+        )
+        coordinator = make_coordinator(session_factory, registry, graph_outbox_processor=processor)
+        await coordinator.start()
+
+        async def is_done() -> bool:
+            return await read_outbox_status(session_factory, outbox_id) == GraphOutboxStatus.DONE
+
+        try:
+            await wait_until(is_done)
+        finally:
+            await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+        status = await read_outbox_status(session_factory, outbox_id)
+        assert status == GraphOutboxStatus.DONE
+    finally:
+        await cleanup_outbox_event(session_factory, outbox_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_t_shutdown_lets_in_flight_apply_finish_within_grace(
+    postgres_engine: AsyncEngine,
+) -> None:
+    session_factory = create_session_factory(postgres_engine)
+    outbox_id = await insert_outbox_event(session_factory)
+    try:
+        projection = PausableProjection()
+        registry = PipelineRegistry([])
+        processor = GraphOutboxProcessor(session_factory=session_factory, projection=projection)
+        coordinator = make_coordinator(
+            session_factory,
+            registry,
+            graph_outbox_processor=processor,
+            shutdown_grace_seconds=5.0,
+        )
+        await coordinator.start()
+        await asyncio.wait_for(projection.entered.wait(), timeout=TEST_TIMEOUT)
+
+        stop_task = asyncio.ensure_future(coordinator.stop())
+        await asyncio.sleep(0.05)  # shutdown signal observed; apply still in flight
+        assert not stop_task.done()
+        projection.proceed.set()
+        await asyncio.wait_for(stop_task, timeout=TEST_TIMEOUT)
+
+        assert projection.applied == 1
+        status = await read_outbox_status(session_factory, outbox_id)
+        assert status == GraphOutboxStatus.DONE
+    finally:
+        await cleanup_outbox_event(session_factory, outbox_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_u_grace_expiry_cancels_apply_without_marking_terminal(
+    postgres_engine: AsyncEngine,
+) -> None:
+    session_factory = create_session_factory(postgres_engine)
+    outbox_id = await insert_outbox_event(session_factory)
+    try:
+        projection = PausableProjection()
+        registry = PipelineRegistry([])
+        processor = GraphOutboxProcessor(session_factory=session_factory, projection=projection)
+        coordinator = make_coordinator(
+            session_factory,
+            registry,
+            graph_outbox_processor=processor,
+            shutdown_grace_seconds=0.1,
+        )
+        await coordinator.start()
+        await asyncio.wait_for(projection.entered.wait(), timeout=TEST_TIMEOUT)
+
+        # Never set ``proceed`` -- the apply hangs past the short grace
+        # period, forcing the coordinator to cancel the outbox task.
+        await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+        assert projection.applied == 0  # cancelled mid-apply, never completed
+        status = await read_outbox_status(session_factory, outbox_id)
+        # Never falsely DONE or FAILED just because the process is shutting
+        # down -- the claim already committed PROCESSING before apply began
+        # (ADR-0009 SS V), so it stays exactly there, recoverable later by
+        # stale reclaim (proven at the repository level, scenario D).
+        assert status == GraphOutboxStatus.PROCESSING
+    finally:
+        await cleanup_outbox_event(session_factory, outbox_id)

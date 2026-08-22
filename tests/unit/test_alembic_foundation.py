@@ -99,6 +99,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
         "0006_create_summaries_memory_queries_feedback.py",
         "0007_create_pipeline_and_graph_outbox.py",
         "0008_pipeline_run_retry_and_operational_constraints.py",
+        "0009_graph_outbox_processing_lease.py",
     ]
 
 

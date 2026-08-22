@@ -27,6 +27,7 @@ from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWor
 from sofias_memory.observability.logging import get_logger
 from sofias_memory.pipelines.engine import PipelineEngine
 from sofias_memory.pipelines.registry import PipelineRegistry
+from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_queue_claimer import (
     ClaimedRun,
     PipelineRunClaimer,
@@ -43,6 +44,12 @@ without a concrete need) -- a documented, test-overridable code constant."""
 HEARTBEAT_INTERVAL_FRACTION = 1.0 / 3.0
 MIN_HEARTBEAT_INTERVAL_SECONDS = 0.25
 MAX_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+DEFAULT_GRAPH_OUTBOX_BATCH_SIZE = 50
+"""Bounded per-poll-tick claim-and-process burst for the autonomous graph
+outbox consumer (ADR-0009 SS V, backlog SS 12). Each iteration claims,
+applies, and finalizes exactly one row (short lease, no batch of rows left
+PROCESSING at once) -- not a single query claiming many rows up front."""
 
 
 def heartbeat_interval_seconds(stale_after_seconds: int) -> float:
@@ -82,6 +89,7 @@ class PipelineWorkerCoordinator:
         claimer: PipelineRunClaimer | None = None,
         engine: PipelineEngine | None = None,
         shutdown_grace_seconds: float = DEFAULT_WORKER_SHUTDOWN_GRACE_SECONDS,
+        graph_outbox_processor: GraphOutboxProcessor | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._registry = registry
@@ -92,6 +100,7 @@ class PipelineWorkerCoordinator:
         self._claimer = claimer or PipelineRunClaimer(session_factory)
         self._engine = engine or PipelineEngine(session_factory, registry)
         self._shutdown_grace_seconds = shutdown_grace_seconds
+        self._graph_outbox_processor = graph_outbox_processor
 
         self.worker_id = new_worker_id()
 
@@ -101,6 +110,8 @@ class PipelineWorkerCoordinator:
         self._active_claims: dict[asyncio.Task[None], ClaimedRun] = {}
         self._started = False
         self._stopped = False
+
+        self._outbox_task: asyncio.Task[None] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -124,6 +135,10 @@ class PipelineWorkerCoordinator:
         self._started = True
         self._stop_event.clear()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="pipeline-worker-poll")
+        if self._graph_outbox_processor is not None:
+            self._outbox_task = asyncio.create_task(
+                self._outbox_loop(), name="pipeline-worker-graph-outbox"
+            )
 
     async def stop(self) -> None:
         """No-op when disabled or never started. Otherwise: stop issuing new
@@ -141,6 +156,15 @@ class PipelineWorkerCoordinator:
         if poll_task is not None:
             await poll_task
             self._poll_task = None
+
+        outbox_task = self._outbox_task
+        if outbox_task is not None:
+            _done, pending = await asyncio.wait({outbox_task}, timeout=self._shutdown_grace_seconds)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._outbox_task = None
 
         claims_snapshot = list(self._active_claims.values())
         if self._active_tasks:
@@ -239,6 +263,37 @@ class PipelineWorkerCoordinator:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
 
+    # -- autonomous graph outbox consumer (SM-506) ------------------------
+
+    async def _outbox_loop(self) -> None:
+        """Independent of the pipeline claim loop and of registry contents
+        (backlog SS 30): even with an empty ``PipelineRegistry``, a pending
+        ``graph_outbox`` row must still converge autonomously."""
+
+        while not self._stop_event.is_set():
+            try:
+                await self._drain_outbox_burst()
+            except Exception as exc:  # noqa: BLE001 - SS 37 infra-failure containment
+                # A projection failure already marked its own row FAILED
+                # (GraphOutboxProcessor); this only stops the current burst
+                # early so a persistently unavailable Neo4j cannot busy-spin
+                # the remaining attempt budget within one tick (backlog SS 13).
+                logger.warning(
+                    "graph_outbox_autonomous_burst_failed",
+                    worker_id=self.worker_id,
+                    exception_type=type(exc).__name__,
+                )
+            await self._wait_for_next_poll_or_stop()
+
+    async def _drain_outbox_burst(self) -> None:
+        assert self._graph_outbox_processor is not None  # noqa: S101 - only called when set
+        for _ in range(DEFAULT_GRAPH_OUTBOX_BATCH_SIZE):
+            if self._stop_event.is_set():
+                return
+            result = await self._graph_outbox_processor.claim_and_process_one()
+            if result is None:
+                return
+
     # -- heartbeat --------------------------------------------------------
 
     async def _heartbeat_loop(self, claimed: ClaimedRun) -> None:
@@ -284,6 +339,7 @@ class PipelineWorkerCoordinator:
 
 
 __all__ = [
+    "DEFAULT_GRAPH_OUTBOX_BATCH_SIZE",
     "DEFAULT_WORKER_SHUTDOWN_GRACE_SECONDS",
     "HEARTBEAT_INTERVAL_FRACTION",
     "MAX_HEARTBEAT_INTERVAL_SECONDS",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import TracebackType
 from typing import Self
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
 
 from sofias_memory.infrastructure.postgres.repositories import (
     ChunkRepository,
@@ -170,6 +170,19 @@ class PostgresUnitOfWork:
         if self._graph_outbox is None:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._graph_outbox
+
+    def savepoint(self) -> AsyncSessionTransaction:
+        """A nested transaction (SAVEPOINT) inside this unit of work.
+
+        Lets one operation of a multi-part write be rolled back on its own
+        without discarding -- or poisoning -- the surrounding transaction,
+        which is what per-item failure isolation needs when the whole batch
+        must still commit exactly once (AGENTS SS 15). Never commits the
+        outer transaction: leaving the block normally only releases the
+        savepoint.
+        """
+
+        return self._require_session().begin_nested()
 
     async def flush(self) -> None:
         """Synchronize pending authoritative changes without committing them."""

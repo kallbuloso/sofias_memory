@@ -12,6 +12,7 @@ from sofias_memory.config import Settings
 from sofias_memory.infrastructure.neo4j import Neo4jResource, ensure_neo4j_schema
 from sofias_memory.infrastructure.postgres import AsyncSessionFactory, dispose_async_engine
 from sofias_memory.observability.logging import configure_logging, get_logger
+from sofias_memory.pipelines.registry import PipelineRegistry
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 
@@ -38,6 +39,21 @@ def app_neo4j_resource(app: FastAPI) -> Neo4jResource:
     if not isinstance(resource, Neo4jResource):
         raise RuntimeError("Neo4j resource is not configured")
     return resource
+
+
+def app_pipeline_registry(app: FastAPI) -> PipelineRegistry:
+    """The one closed registry this process submits against and executes with.
+
+    Resolved once in ``create_app`` and stored on ``app.state`` so a route can
+    never build a second, divergent registry: "the steps a submission
+    materializes" and "the steps the worker executes" must stay the same
+    definition (ADR-0009 SS O, SM-509 Part J).
+    """
+
+    registry = getattr(app.state, "pipeline_registry", None)
+    if not isinstance(registry, PipelineRegistry):
+        raise RuntimeError("pipeline registry is not configured")
+    return registry
 
 
 def app_pipeline_worker(app: FastAPI) -> PipelineWorkerCoordinator:

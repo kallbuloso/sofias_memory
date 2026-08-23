@@ -71,6 +71,41 @@ class EntityRepository:
         )
         return cast(Entity | None, result)
 
+    async def advance_active_generation(
+        self,
+        *,
+        dataset_id: UUID,
+        target_generation: int,
+    ) -> list[Entity]:
+        """Carry every still-active entity of a dataset into ``target_generation``.
+
+        Required by the Cognify ``rebuild=true`` activation step (SM-510).
+        ``uq_entities_dataset_id_canonical_key_active`` makes a dataset's
+        active entity set canonical *across* generations -- two active rows
+        with the same ``canonical_key`` can never coexist -- so a new
+        generation cannot own a parallel copy of the entity graph. Entities
+        are therefore carried forward in the very same transaction that flips
+        ``Dataset.active_generation``, which is what keeps every
+        ``generation == Dataset.active_generation`` reader consistent before
+        and after the flip. Rows are locked in deterministic id order.
+        """
+
+        statement = (
+            select(Entity)
+            .where(
+                Entity.dataset_id == dataset_id,
+                Entity.is_active.is_(True),
+                Entity.generation < target_generation,
+            )
+            .order_by(Entity.id)
+            .with_for_update()
+        )
+        entities = list(await self._session.scalars(statement))
+        for entity in entities:
+            entity.generation = target_generation
+        await self._session.flush()
+        return entities
+
     async def list_missing_embedding_candidates(
         self,
         *,

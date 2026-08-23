@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -207,7 +207,7 @@ class PipelineEngine:
         registry: PipelineRegistry,
         *,
         retry_policy: RetryPolicy | None = None,
-        resources: dict[str, Any] | None = None,
+        resources: Mapping[str, Any] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._registry = registry

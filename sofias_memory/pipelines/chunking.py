@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -29,14 +30,28 @@ class TextChunk:
     section_path: tuple[str, ...]
 
 
+@lru_cache(maxsize=8)
+def _encoding_for_model(embedding_model: str) -> Encoding:
+    """Resolve a tiktoken encoding once per model name.
+
+    ``tiktoken.encoding_for_model`` re-reads and re-parses the BPE ranks on
+    every call (~1s), and the resulting ``Encoding`` is immutable and
+    stateless, so building it once per process is both safe and materially
+    cheaper -- notably now that a ``CognifyService`` is constructed at
+    application startup rather than per request (SM-510).
+    """
+
+    try:
+        return tiktoken.encoding_for_model(embedding_model)
+    except KeyError:
+        return tiktoken.get_encoding("cl100k_base")
+
+
 class TextTokenizer:
     """Small tiktoken wrapper tied to the configured embedding model."""
 
     def __init__(self, embedding_model: str) -> None:
-        try:
-            self._encoding = tiktoken.encoding_for_model(embedding_model)
-        except KeyError:
-            self._encoding = tiktoken.get_encoding("cl100k_base")
+        self._encoding = _encoding_for_model(embedding_model)
 
     @property
     def encoding(self) -> Encoding:

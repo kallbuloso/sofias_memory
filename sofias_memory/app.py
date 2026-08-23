@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
-from typing import cast
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from typing import Any, cast
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -40,6 +40,11 @@ from sofias_memory.api.routes.recall import router as recall_router
 from sofias_memory.api.routes.remember import router as remember_router
 from sofias_memory.api.routes.runs import router as runs_router
 from sofias_memory.config import Settings, load_settings
+from sofias_memory.infrastructure.embeddings import OpenAIEmbeddingClient
+from sofias_memory.infrastructure.llm import (
+    OpenAIDocumentSummaryClient,
+    OpenAIKnowledgeExtractionClient,
+)
 from sofias_memory.infrastructure.neo4j import (
     NEO4J_NOT_READY_DETAIL,
     Neo4jProjection,
@@ -58,6 +63,8 @@ from sofias_memory.infrastructure.postgres.readiness import (
 )
 from sofias_memory.lifespan import lifespan
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
+from sofias_memory.pipelines.steps.cognify import COGNIFY_SERVICE_RESOURCE
+from sofias_memory.services.cognify import CognifyService
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
@@ -111,6 +118,34 @@ def create_app(
             ("neo4j", _neo4j_readiness_check(neo4j_checker)),
             *resolved_readiness_checks,
         )
+    # Resolved unconditionally: the Cognify route submits against the same
+    # closed registry the worker executes with (ADR-0009 SS O), so it must be
+    # reachable even when a test injects its own coordinator.
+    resolved_registry = (
+        pipeline_registry if pipeline_registry is not None else build_default_pipeline_registry()
+    )
+    application.state.pipeline_registry = resolved_registry
+
+    active_neo4j_resource = cast(
+        Neo4jResource | None, getattr(application.state, "neo4j_resource", None)
+    )
+    graph_outbox_processor = (
+        GraphOutboxProcessor(
+            session_factory=application.state.postgres_session_factory,
+            projection=Neo4jProjection(active_neo4j_resource),
+        )
+        if active_neo4j_resource is not None
+        else None
+    )
+    # ADR-0009 SS O / PipelineContext.resources: LLM, embedding and summary
+    # dependencies belong to the worker process, built once here, never per
+    # HTTP request inside a route.
+    pipeline_resources = build_pipeline_resources(
+        resolved_settings,
+        session_factory=application.state.postgres_session_factory,
+    )
+    application.state.pipeline_resources = pipeline_resources
+
     if pipeline_worker_coordinator is not None:
         application.state.pipeline_worker = pipeline_worker_coordinator
         resolved_readiness_checks = (
@@ -118,22 +153,6 @@ def create_app(
             *resolved_readiness_checks,
         )
     elif enable_worker:
-        resolved_registry = (
-            pipeline_registry
-            if pipeline_registry is not None
-            else build_default_pipeline_registry()
-        )
-        active_neo4j_resource = cast(
-            Neo4jResource | None, getattr(application.state, "neo4j_resource", None)
-        )
-        graph_outbox_processor = (
-            GraphOutboxProcessor(
-                session_factory=application.state.postgres_session_factory,
-                projection=Neo4jProjection(active_neo4j_resource),
-            )
-            if active_neo4j_resource is not None
-            else None
-        )
         worker_coordinator = PipelineWorkerCoordinator(
             application.state.postgres_session_factory,
             resolved_registry,
@@ -142,6 +161,7 @@ def create_app(
             stale_after_seconds=resolved_settings.worker_stale_after_seconds,
             max_concurrent_datasets=resolved_settings.worker_max_concurrent_datasets,
             graph_outbox_processor=graph_outbox_processor,
+            resources=pipeline_resources,
         )
         application.state.pipeline_worker = worker_coordinator
         application.state.pipeline_recovery = PipelineRecoveryService(
@@ -195,6 +215,55 @@ def create_app(
     application.add_middleware(RequestIdMiddleware)
 
     return application
+
+
+def build_pipeline_resources(
+    settings: Settings,
+    *,
+    session_factory: AsyncSessionFactory,
+) -> Mapping[str, Any]:
+    """The engine's explicitly-populated ``PipelineContext.resources`` map.
+
+    Not a service locator: the key set is fixed and known here, nothing is
+    ever resolved from request data, and a step that finds its resource
+    absent fails with a typed, permanent error rather than constructing a
+    provider client of its own.
+
+    Each value is materialized on first access rather than eagerly, because
+    an OpenAI-compatible client builds a full TLS/HTTP transport in its
+    constructor (~0.3s each) -- a cost every ``create_app`` would otherwise
+    pay even in a process that never claims a run.
+    """
+
+    def build_cognify_service() -> CognifyService:
+        return CognifyService(
+            settings,
+            session_factory=session_factory,
+            embedding_client=OpenAIEmbeddingClient(settings),
+            knowledge_extraction_client=OpenAIKnowledgeExtractionClient(settings),
+            document_summary_client=OpenAIDocumentSummaryClient(settings),
+        )
+
+    return _PipelineResources({COGNIFY_SERVICE_RESOURCE: build_cognify_service})
+
+
+class _PipelineResources(Mapping[str, Any]):
+    """Fixed-key resource mapping whose values are built on first access."""
+
+    def __init__(self, factories: dict[str, Callable[[], Any]]) -> None:
+        self._factories = factories
+        self._values: dict[str, Any] = {}
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._values:
+            self._values[key] = self._factories[key]()
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._factories)
+
+    def __len__(self) -> int:
+        return len(self._factories)
 
 
 def _postgres_readiness_check(

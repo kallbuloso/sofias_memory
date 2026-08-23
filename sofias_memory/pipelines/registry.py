@@ -322,18 +322,23 @@ class PipelineRegistry:
 
 
 def build_default_pipeline_registry() -> PipelineRegistry:
-    """The production registry (SM-505 SS 30/31).
+    """The production registry (SM-505 SS 30/31, SM-510).
 
-    Empty at this checkpoint: B4's Cognify/Improve/Forget/Remember pipelines
-    have not been migrated onto :class:`PipelineDefinition` yet (that is
-    SM-510..SM-513's job). An empty registry is a normal, healthy production
-    state, not a placeholder to be filled with a fake definition just to make
-    SM-505's worker "do something" -- the worker (SM-505) must recognize an
-    empty registry and simply not call the claimer, staying idle but
-    operational/ready.
+    Contains exactly one pipeline at this checkpoint: ``COGNIFY``, migrated
+    onto :class:`PipelineDefinition` by SM-510. ``IMPROVE``, ``FORGET`` and
+    ``REMEMBER`` are deliberately absent until SM-511..SM-513 migrate them --
+    a partially-populated registry is a normal, healthy production state, and
+    submitting an unregistered ``PipelineType`` raises
+    :class:`UnknownPipelineTypeError` before any PostgreSQL write rather than
+    creating a run no worker could execute.
+
+    The step-definition import is deferred to call time purely to keep this
+    module free of a cycle: concrete steps import the contracts defined here.
     """
 
-    return PipelineRegistry([])
+    from sofias_memory.pipelines.steps.cognify import build_cognify_pipeline_definition
+
+    return PipelineRegistry([build_cognify_pipeline_definition()])
 
 
 __all__ = [

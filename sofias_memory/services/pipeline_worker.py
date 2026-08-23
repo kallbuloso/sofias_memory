@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Mapping
+from typing import Any
 
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -90,7 +92,16 @@ class PipelineWorkerCoordinator:
         engine: PipelineEngine | None = None,
         shutdown_grace_seconds: float = DEFAULT_WORKER_SHUTDOWN_GRACE_SECONDS,
         graph_outbox_processor: GraphOutboxProcessor | None = None,
+        resources: Mapping[str, Any] | None = None,
     ) -> None:
+        """``resources`` is the explicitly-populated
+        :attr:`PipelineContext.resources` map handed to the engine this
+        coordinator builds (LLM/embedding/summary clients, SM-510). Ignored
+        when an ``engine`` is injected -- that engine already carries its own
+        resources. Graph projection is not among them: it converges through
+        ``graph_outbox_processor``'s own autonomous loop, never from inside a
+        pipeline step."""
+
         self._session_factory = session_factory
         self._registry = registry
         self._enabled = enabled
@@ -98,7 +109,7 @@ class PipelineWorkerCoordinator:
         self._heartbeat_interval_seconds = heartbeat_interval_seconds(stale_after_seconds)
         self._max_concurrent_datasets = max_concurrent_datasets
         self._claimer = claimer or PipelineRunClaimer(session_factory)
-        self._engine = engine or PipelineEngine(session_factory, registry)
+        self._engine = engine or PipelineEngine(session_factory, registry, resources=resources)
         self._shutdown_grace_seconds = shutdown_grace_seconds
         self._graph_outbox_processor = graph_outbox_processor
 

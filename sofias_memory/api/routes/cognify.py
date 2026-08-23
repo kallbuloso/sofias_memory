@@ -1,55 +1,216 @@
-"""Cognify route."""
+"""Cognify route (SM-510).
+
+A pure submission/observation boundary: it validates the request, submits a
+durable ``PipelineRun`` through the shared SM-509 contract, and -- when the
+caller asked to wait -- observes the run's persisted terminal state. It never
+executes a pipeline step, never constructs a provider client, and never
+builds a result from anything other than PostgreSQL.
+"""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from http import HTTPStatus
+from typing import Annotated, Any, cast
+from uuid import UUID
 
-from sofias_memory.api.errors import current_request_id
-from sofias_memory.infrastructure.embeddings import OpenAIEmbeddingClient
-from sofias_memory.infrastructure.llm import (
-    OpenAIDocumentSummaryClient,
-    OpenAIKnowledgeExtractionClient,
-)
-from sofias_memory.infrastructure.neo4j import Neo4jProjection
+from fastapi import APIRouter, Header, Request, Response
+
+from sofias_memory.api.errors import SofiasMemoryError, current_request_id
+from sofias_memory.domain import PipelineRunStatus, PipelineType
+from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
+from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.lifespan import (
-    app_neo4j_resource,
+    app_pipeline_registry,
+    app_pipeline_worker,
     app_postgres_session_factory,
     app_settings,
 )
 from sofias_memory.schemas.cognify import CognifyRequest, CognifyResult
-from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
-from sofias_memory.services.cognify import CognifyService
-from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
-from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
+from sofias_memory.schemas.common import ErrorCode, JSONValue, ResponseMeta, SuccessEnvelope
+from sofias_memory.services.cognify import (
+    COGNIFY_RESULT_METRIC_KEY,
+    cognify_run_input,
+    dataset_not_found_error,
+)
+from sofias_memory.services.pipeline_submission import (
+    PipelineSubmissionService,
+    PreparationHook,
+    SubmissionOutcome,
+    SubmissionTargets,
+    SubmissionUnitOfWork,
+)
+from sofias_memory.services.pipeline_waiter import PipelineRunWaiter
+
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
 router = APIRouter(tags=["cognify"])
 
 
-@router.post("/cognify", response_model=SuccessEnvelope[CognifyResult])
+@router.post(
+    "/cognify",
+    response_model=SuccessEnvelope[CognifyResult],
+    responses={
+        HTTPStatus.ACCEPTED: {
+            "description": (
+                "The run was accepted durably and has not reached a terminal state "
+                "(wait=false, or wait=true timed out). Poll GET /api/v1/runs/{run_id}."
+            )
+        }
+    },
+)
 async def cognify(
     payload: CognifyRequest,
     request: Request,
+    response: Response,
+    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
 ) -> SuccessEnvelope[CognifyResult]:
+    _validate_request(payload)
+
     settings = app_settings(request.app)
     session_factory = app_postgres_session_factory(request.app)
-    projection = Neo4jProjection(app_neo4j_resource(request.app))
-    outbox_processor = GraphOutboxProcessor(
+    work_input = cognify_run_input(payload)
+
+    submission = PipelineSubmissionService(
+        registry=app_pipeline_registry(request.app),
+        worker=app_pipeline_worker(request.app),
+        config_fingerprint=settings.config_fingerprint(),
         session_factory=session_factory,
-        projection=projection,
     )
-    service = CognifyService(
-        settings,
+    outcome = await submission.submit(
+        pipeline_type=PipelineType.COGNIFY,
+        work_input=work_input,
+        idempotency_key=idempotency_key,
+        prepare=_dataset_preparation_hook(payload.dataset),
+    )
+
+    status = outcome.status
+    if payload.wait and not outcome.terminal:
+        waited = await PipelineRunWaiter(session_factory=session_factory).wait_for_terminal(
+            outcome.run_id,
+            timeout_seconds=settings.request_wait_timeout_seconds,
+        )
+        status = waited.status
+
+    return await _respond(
+        response,
         session_factory=session_factory,
-        embedding_client=OpenAIEmbeddingClient(settings),
-        knowledge_extraction_client=OpenAIKnowledgeExtractionClient(settings),
-        document_summary_client=OpenAIDocumentSummaryClient(settings),
-        graph_projection_drain=GraphOutboxBatchProcessor(
-            session_factory=session_factory,
-            processor=outbox_processor,
-        ),
+        outcome=outcome,
+        status=status,
     )
-    result = await service.cognify(payload)
+
+
+def _validate_request(payload: CognifyRequest) -> None:
+    if payload.rebuild and payload.source_ids is not None:
+        raise SofiasMemoryError(
+            code=ErrorCode.INVALID_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
+            message="Cognify rebuild always covers the whole dataset and rejects source_ids.",
+            details={"rebuild": payload.rebuild},
+        )
+
+
+def _dataset_preparation_hook(dataset_slug: str) -> PreparationHook:
+    """Resolve the target dataset inside the submission transaction.
+
+    PostgreSQL-only and read-only: it creates nothing, so it owns no
+    uniqueness race of its own and a losing idempotency race can roll it back
+    with no external effect (see ``PreparationHook``'s contract). Dataset
+    existence is deliberately checked here rather than in the handler, so it
+    is validated in the very same transaction as the run that targets it.
+    """
+
+    async def prepare(uow: SubmissionUnitOfWork) -> SubmissionTargets:
+        # Same narrowing the submission service itself performs: the shared
+        # Protocol only declares the run/step repositories it needs, while a
+        # hook may use any repository of the real UnitOfWork it is handed.
+        dataset = await cast(PostgresUnitOfWork, uow).datasets.get_by_slug(dataset_slug)
+        if dataset is None:
+            raise dataset_not_found_error(dataset_slug)
+        return SubmissionTargets(dataset_id=dataset.id, source_id=None)
+
+    return prepare
+
+
+async def _respond(
+    response: Response,
+    *,
+    session_factory: AsyncSessionFactory,
+    outcome: SubmissionOutcome,
+    status: PipelineRunStatus,
+) -> SuccessEnvelope[CognifyResult]:
+    if status == PipelineRunStatus.SUCCEEDED:
+        result = await _succeeded_result(session_factory, run_id=outcome.run_id)
+    elif status == PipelineRunStatus.FAILED:
+        raise await _failed_run_error(session_factory, run_id=outcome.run_id)
+    else:
+        # Queued/running/cancelling: accepted, not finished. Cancelled: a
+        # terminal, non-error outcome the caller can observe -- neither
+        # carries business counters, and neither is ever fabricated.
+        result = CognifyResult(run_id=outcome.run_id, status=status)
+        if status != PipelineRunStatus.CANCELLED:
+            response.status_code = HTTPStatus.ACCEPTED
+
     return SuccessEnvelope[CognifyResult](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
     )
+
+
+async def _succeeded_result(
+    session_factory: AsyncSessionFactory,
+    *,
+    run_id: UUID,
+) -> CognifyResult:
+    metrics = await _run_metrics(session_factory, run_id=run_id)
+    persisted = metrics.get(COGNIFY_RESULT_METRIC_KEY)
+    if not isinstance(persisted, dict):
+        raise SofiasMemoryError(
+            code=ErrorCode.INTERNAL_ERROR,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            message="Cognify run succeeded without a persisted result.",
+            details={"run_id": str(run_id)},
+        )
+    return CognifyResult(
+        run_id=run_id,
+        status=PipelineRunStatus.SUCCEEDED,
+        dataset_id=UUID(str(persisted["dataset_id"])),
+        generation=int(persisted["generation"]),
+        sources_processed=int(persisted["sources_processed"]),
+        chunks=int(persisted["chunks"]),
+        entities=int(persisted["entities"]),
+        relations=int(persisted["relations"]),
+    )
+
+
+async def _failed_run_error(
+    session_factory: AsyncSessionFactory,
+    *,
+    run_id: UUID,
+) -> SofiasMemoryError:
+    async with PostgresUnitOfWork(session_factory) as uow:
+        run = await uow.pipeline_runs.get_by_id(run_id)
+        error_code = run.error_code if run is not None else None
+    details: dict[str, JSONValue] = {
+        "run_id": str(run_id),
+        "status": PipelineRunStatus.FAILED.value,
+    }
+    if error_code is not None:
+        # Only the engine's own stable step error code -- never a traceback,
+        # provider payload, or internal path (ADR-0009 SS X).
+        details["step_error_code"] = error_code
+    return SofiasMemoryError(
+        code=ErrorCode.INTERNAL_ERROR,
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        message="Cognify run failed.",
+        details=details,
+    )
+
+
+async def _run_metrics(
+    session_factory: AsyncSessionFactory,
+    *,
+    run_id: UUID,
+) -> dict[str, Any]:
+    async with PostgresUnitOfWork(session_factory) as uow:
+        run = await uow.pipeline_runs.get_by_id(run_id)
+        return dict(run.metrics) if run is not None else {}

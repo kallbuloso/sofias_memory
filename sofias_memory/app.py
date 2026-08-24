@@ -42,6 +42,7 @@ from sofias_memory.api.routes.runs import router as runs_router
 from sofias_memory.config import Settings, load_settings
 from sofias_memory.infrastructure.embeddings import OpenAIEmbeddingClient
 from sofias_memory.infrastructure.llm import (
+    OpenAIDatasetSummaryClient,
     OpenAIDocumentSummaryClient,
     OpenAIKnowledgeExtractionClient,
 )
@@ -64,10 +65,19 @@ from sofias_memory.infrastructure.postgres.readiness import (
 from sofias_memory.lifespan import lifespan
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
 from sofias_memory.pipelines.steps.cognify import COGNIFY_SERVICE_RESOURCE
+from sofias_memory.pipelines.steps.improve import (
+    IMPROVE_RESOURCES_RESOURCE,
+    ImprovePipelineResources,
+)
 from sofias_memory.services.cognify import CognifyService
+from sofias_memory.services.graph_maintenance_service import GraphMaintenanceService
+from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
+from sofias_memory.services.graph_rebuild_service import GraphRebuildService
+from sofias_memory.services.graph_reconciliation_service import GraphReconciliationService
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from sofias_memory.services.summary_rebuild_service import SummaryRebuildService
 
 WORKER_NOT_READY_DETAIL = "worker not ready"
 
@@ -143,6 +153,7 @@ def create_app(
     pipeline_resources = build_pipeline_resources(
         resolved_settings,
         session_factory=application.state.postgres_session_factory,
+        neo4j_resource=active_neo4j_resource,
     )
     application.state.pipeline_resources = pipeline_resources
 
@@ -221,6 +232,7 @@ def build_pipeline_resources(
     settings: Settings,
     *,
     session_factory: AsyncSessionFactory,
+    neo4j_resource: Neo4jResource | None = None,
 ) -> Mapping[str, Any]:
     """The engine's explicitly-populated ``PipelineContext.resources`` map.
 
@@ -244,7 +256,53 @@ def build_pipeline_resources(
             document_summary_client=OpenAIDocumentSummaryClient(settings),
         )
 
-    return _PipelineResources({COGNIFY_SERVICE_RESOURCE: build_cognify_service})
+    def build_improve_resources() -> ImprovePipelineResources:
+        # One shared embedding client, reused for entity/relation embedding
+        # candidates and by summary_rebuild, mirroring B4's own wiring
+        # (SM-511 SS 12: avoid duplicating OpenAI-compatible clients without
+        # a concrete need).
+        embedding_client = OpenAIEmbeddingClient(settings)
+        graph_reconciliation: GraphReconciliationService | None = None
+        graph_outbox_drain: GraphOutboxBatchProcessor | None = None
+        if neo4j_resource is not None:
+            projection = Neo4jProjection(neo4j_resource)
+            rebuild_service = GraphRebuildService(
+                session_factory=session_factory,
+                neo4j_resource=neo4j_resource,
+                projection=projection,
+            )
+            graph_reconciliation = GraphReconciliationService(
+                session_factory=session_factory,
+                neo4j_resource=neo4j_resource,
+                rebuild_service=rebuild_service,
+            )
+            graph_outbox_drain = GraphOutboxBatchProcessor(
+                session_factory=session_factory,
+                processor=GraphOutboxProcessor(
+                    session_factory=session_factory, projection=projection
+                ),
+            )
+        return ImprovePipelineResources(
+            settings=settings,
+            embedding_client=embedding_client,
+            graph_maintenance=GraphMaintenanceService(session_factory=session_factory),
+            summary_rebuild=SummaryRebuildService(
+                settings,
+                session_factory=session_factory,
+                embedding_client=embedding_client,
+                document_summary_client=OpenAIDocumentSummaryClient(settings),
+                dataset_summary_client=OpenAIDatasetSummaryClient(settings),
+            ),
+            graph_reconciliation=graph_reconciliation,
+            graph_outbox_drain=graph_outbox_drain,
+        )
+
+    return _PipelineResources(
+        {
+            COGNIFY_SERVICE_RESOURCE: build_cognify_service,
+            IMPROVE_RESOURCES_RESOURCE: build_improve_resources,
+        }
+    )
 
 
 class _PipelineResources(Mapping[str, Any]):

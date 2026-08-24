@@ -43,6 +43,35 @@ class GraphMaintenanceCounts:
     graph_events_enqueued: int
 
 
+@dataclass(frozen=True)
+class EntityImportanceUpdate:
+    entity_id: UUID
+    properties: dict[str, object]
+    importance_weight: float
+
+
+@dataclass(frozen=True)
+class RelationImportanceUpdate:
+    relation_id: UUID
+    properties: dict[str, object]
+    importance_weight: float
+
+
+@dataclass(frozen=True)
+class GraphMaintenancePlan:
+    """Read-only computed plan (SM-511, ADR-0009 SS O): everything
+    ``apply_maintenance_plan`` needs to reproduce the exact same mutation a
+    fresh, engine-owned unit of work will commit. ``None`` fields are never
+    present -- an ineligible dataset (missing/inactive/generation mismatch)
+    is represented as ``None`` at the call site, not as an empty plan, so a
+    stale plan can never be silently applied to the wrong generation."""
+
+    dataset_id: UUID
+    relation_deactivate_ids: tuple[UUID, ...]
+    entity_updates: tuple[EntityImportanceUpdate, ...]
+    relation_updates: tuple[RelationImportanceUpdate, ...]
+
+
 class DatasetRepositoryForGraphMaintenance(Protocol):
     async def get_by_id(self, dataset_id: UUID) -> Dataset | None: ...
 
@@ -50,9 +79,17 @@ class DatasetRepositoryForGraphMaintenance(Protocol):
 class EntityRepositoryForGraphMaintenance(Protocol):
     async def list_active_current_for_dataset(self, *, dataset_id: UUID) -> list[Entity]: ...
 
+    async def get_active_current_by_id(
+        self, *, dataset_id: UUID, entity_id: UUID
+    ) -> Entity | None: ...
+
 
 class RelationRepositoryForGraphMaintenance(Protocol):
     async def list_active_current_for_dataset(self, *, dataset_id: UUID) -> list[Relation]: ...
+
+    async def get_active_current_by_id(
+        self, *, dataset_id: UUID, relation_id: UUID
+    ) -> Relation | None: ...
 
 
 class RelationEvidenceRepositoryForGraphMaintenance(Protocol):
@@ -104,69 +141,86 @@ class GraphMaintenanceService:
         *,
         generation: int,
     ) -> GraphMaintenanceCounts:
+        """Convenience wrapper (still used by non-pipeline callers, if any):
+        compute the plan and apply it in one owned transaction. The B5
+        Improve pipeline step never calls this -- it calls
+        :meth:`compute_maintenance_plan` from ``execute`` and
+        :func:`apply_maintenance_plan` from ``persist`` against the engine's
+        own unit of work, so the mutation and the step's ``succeeded``
+        transition land in one commit (ADR-0009 SS O)."""
+
         async with self._unit_of_work_factory() as uow:
-            dataset = await uow.datasets.get_by_id(dataset_id)
-            if (
-                dataset is None
-                or dataset.status != DatasetStatus.ACTIVE
-                or dataset.active_generation != generation
-            ):
+            plan = await compute_maintenance_plan_with_uow(
+                uow, dataset_id=dataset_id, generation=generation
+            )
+            if plan is None:
                 return GraphMaintenanceCounts(0, 0, 0, 0)
-
-            entities = await uow.entities.list_active_current_for_dataset(dataset_id=dataset_id)
-            relations = await uow.relations.list_active_current_for_dataset(dataset_id=dataset_id)
-            valid_relation_ids = (
-                await uow.relation_evidence.list_relation_ids_with_authoritative_evidence(
-                    dataset_id=dataset_id,
-                    relation_ids=[relation.id for relation in relations],
-                )
-            )
-
-            graph_commands: list[ProjectionCommand] = []
-            relations_deactivated = 0
-            active_relations: list[Relation] = []
-            for relation in relations:
-                if relation.id not in valid_relation_ids:
-                    relation.is_active = False
-                    relation.embedding = None
-                    relations_deactivated += 1
-                    graph_commands.append(
-                        relation_delete_command(
-                            relation_id=relation.id,
-                            dataset_id=dataset_id,
-                            source_entity_id=relation.source_entity_id,
-                            target_entity_id=relation.target_entity_id,
-                        )
-                    )
-                    continue
-                active_relations.append(relation)
-
-            centrality_by_entity_id = entity_centrality(
-                entities=entities,
-                relations=active_relations,
-            )
-            entities_importance_updated = update_entity_importance(
-                entities,
-                centrality_by_entity_id,
-                graph_commands,
-            )
-            relations_importance_updated = update_relation_importance(
-                active_relations,
-                centrality_by_entity_id,
-                graph_commands,
-            )
-
-            for command in graph_commands:
-                await uow.graph_outbox.add_projection_command(command)
-            if graph_commands:
+            counts = await apply_maintenance_plan(uow, plan)
+            if plan.relation_deactivate_ids or plan.entity_updates or plan.relation_updates:
                 await uow.commit()
+            return counts
 
-            return GraphMaintenanceCounts(
-                relations_deactivated=relations_deactivated,
-                entities_importance_updated=entities_importance_updated,
-                relations_importance_updated=relations_importance_updated,
-                graph_events_enqueued=len(graph_commands),
+    async def compute_maintenance_plan(
+        self,
+        dataset_id: UUID,
+        *,
+        generation: int,
+    ) -> GraphMaintenancePlan | None:
+        """Read-only: never mutates, never commits (ADR-0009 SS O ``execute``
+        phase). ``None`` means the dataset is not eligible for maintenance
+        right now (missing, inactive, or generation has already moved on)."""
+
+        async with self._unit_of_work_factory() as uow:
+            return await compute_maintenance_plan_with_uow(
+                uow, dataset_id=dataset_id, generation=generation
             )
+
+
+async def compute_maintenance_plan_with_uow(
+    uow: GraphMaintenanceUnitOfWork,
+    *,
+    dataset_id: UUID,
+    generation: int,
+) -> GraphMaintenancePlan | None:
+    """Read-only planning against an already-open unit of work -- the form
+    the B5 Improve ``graph_maintain`` step uses directly inside its own
+    ``persist`` (this stage has no external dependency at all, so its whole
+    read+compute+apply sequence safely lives in one PostgreSQL-only phase;
+    see SM-511 report). ``None`` means the dataset is not eligible right now."""
+
+    dataset = await uow.datasets.get_by_id(dataset_id)
+    if (
+        dataset is None
+        or dataset.status != DatasetStatus.ACTIVE
+        or dataset.active_generation != generation
+    ):
+        return None
+
+    entities = await uow.entities.list_active_current_for_dataset(dataset_id=dataset_id)
+    relations = await uow.relations.list_active_current_for_dataset(dataset_id=dataset_id)
+    valid_relation_ids = await uow.relation_evidence.list_relation_ids_with_authoritative_evidence(
+        dataset_id=dataset_id,
+        relation_ids=[relation.id for relation in relations],
+    )
+
+    relation_deactivate_ids: list[UUID] = []
+    active_relations: list[Relation] = []
+    for relation in relations:
+        if relation.id not in valid_relation_ids:
+            relation_deactivate_ids.append(relation.id)
+            continue
+        active_relations.append(relation)
+
+    centrality_by_entity_id = entity_centrality(entities=entities, relations=active_relations)
+    entity_updates = _plan_entity_importance_updates(entities, centrality_by_entity_id)
+    relation_updates = _plan_relation_importance_updates(active_relations, centrality_by_entity_id)
+
+    return GraphMaintenancePlan(
+        dataset_id=dataset_id,
+        relation_deactivate_ids=tuple(relation_deactivate_ids),
+        entity_updates=entity_updates,
+        relation_updates=relation_updates,
+    )
 
 
 def update_entity_importance(
@@ -244,6 +298,159 @@ def update_relation_importance(
             )
         )
     return updated
+
+
+def _plan_entity_importance_updates(
+    entities: Sequence[Entity],
+    centrality_by_entity_id: dict[UUID, float],
+) -> tuple[EntityImportanceUpdate, ...]:
+    """Read-only twin of :func:`update_entity_importance`: same diff logic,
+    but returns a plan instead of mutating ``entities`` in place."""
+
+    updates: list[EntityImportanceUpdate] = []
+    for entity in sorted(entities, key=lambda item: item.id):
+        centrality = centrality_by_entity_id.get(entity.id, 0.0)
+        current_properties = dict(entity.properties)
+        current_weight = float(entity.importance_weight)
+        next_components = next_importance_components(current_properties, current_weight, centrality)
+        next_properties = properties_with_importance_marker(current_properties, next_components)
+        next_weight = next_components.effective_weight
+        if not _importance_changed(
+            current_properties, current_weight, next_properties, next_weight
+        ):
+            continue
+        updates.append(
+            EntityImportanceUpdate(
+                entity_id=entity.id,
+                properties=next_properties,
+                importance_weight=next_weight,
+            )
+        )
+    return tuple(updates)
+
+
+def _plan_relation_importance_updates(
+    relations: Sequence[Relation],
+    centrality_by_entity_id: dict[UUID, float],
+) -> tuple[RelationImportanceUpdate, ...]:
+    """Read-only twin of :func:`update_relation_importance`."""
+
+    updates: list[RelationImportanceUpdate] = []
+    for relation in sorted(relations, key=lambda item: item.id):
+        centrality = round(
+            (
+                centrality_by_entity_id.get(relation.source_entity_id, 0.0)
+                + centrality_by_entity_id.get(relation.target_entity_id, 0.0)
+            )
+            / 2.0,
+            IMPORTANCE_DECIMALS,
+        )
+        current_properties = dict(relation.properties)
+        current_weight = float(relation.importance_weight)
+        next_components = next_importance_components(current_properties, current_weight, centrality)
+        next_properties = properties_with_importance_marker(current_properties, next_components)
+        next_weight = next_components.effective_weight
+        if not _importance_changed(
+            current_properties, current_weight, next_properties, next_weight
+        ):
+            continue
+        updates.append(
+            RelationImportanceUpdate(
+                relation_id=relation.id,
+                properties=next_properties,
+                importance_weight=next_weight,
+            )
+        )
+    return tuple(updates)
+
+
+async def apply_maintenance_plan(
+    uow: GraphMaintenanceUnitOfWork,
+    plan: GraphMaintenancePlan,
+) -> GraphMaintenanceCounts:
+    """Impure application half (ADR-0009 SS O ``persist`` phase): mutates
+    freshly-loaded rows attached to ``uow`` and enqueues ``graph_outbox``
+    commands. Never commits -- the caller (the engine, or
+    :meth:`GraphMaintenanceService.maintain_dataset`'s own transaction) owns
+    that. Re-fetches every row by id rather than reusing whatever instance
+    computed the plan, since the plan may have been computed against a
+    different (read-only) unit of work / session than this one."""
+
+    graph_commands: list[ProjectionCommand] = []
+    relations_deactivated = 0
+    for relation_id in plan.relation_deactivate_ids:
+        relation = await uow.relations.get_active_current_by_id(
+            dataset_id=plan.dataset_id, relation_id=relation_id
+        )
+        if relation is None or not relation.is_active:
+            continue
+        relation.is_active = False
+        relation.embedding = None
+        relations_deactivated += 1
+        graph_commands.append(
+            relation_delete_command(
+                relation_id=relation.id,
+                dataset_id=plan.dataset_id,
+                source_entity_id=relation.source_entity_id,
+                target_entity_id=relation.target_entity_id,
+            )
+        )
+
+    entities_importance_updated = 0
+    for update in plan.entity_updates:
+        entity = await uow.entities.get_active_current_by_id(
+            dataset_id=plan.dataset_id, entity_id=update.entity_id
+        )
+        if entity is None:
+            continue
+        entity.properties = update.properties
+        entity.importance_weight = update.importance_weight
+        entities_importance_updated += 1
+        graph_commands.append(
+            entity_upsert_command(
+                entity_id=entity.id,
+                dataset_id=entity.dataset_id,
+                name=entity.name,
+                entity_type=entity.entity_type,
+                description=entity.description,
+                importance_weight=update.importance_weight,
+                generation=entity.generation,
+            )
+        )
+
+    relations_importance_updated = 0
+    for relation_update in plan.relation_updates:
+        relation = await uow.relations.get_active_current_by_id(
+            dataset_id=plan.dataset_id, relation_id=relation_update.relation_id
+        )
+        if relation is None:
+            continue
+        relation.properties = relation_update.properties
+        relation.importance_weight = relation_update.importance_weight
+        relations_importance_updated += 1
+        graph_commands.append(
+            relation_upsert_command(
+                relation_id=relation.id,
+                dataset_id=relation.dataset_id,
+                source_entity_id=relation.source_entity_id,
+                target_entity_id=relation.target_entity_id,
+                predicate=relation.predicate,
+                description=relation.description,
+                confidence=float(relation.confidence),
+                importance_weight=relation_update.importance_weight,
+                generation=relation.generation,
+            )
+        )
+
+    for command in graph_commands:
+        await uow.graph_outbox.add_projection_command(command)
+
+    return GraphMaintenanceCounts(
+        relations_deactivated=relations_deactivated,
+        entities_importance_updated=entities_importance_updated,
+        relations_importance_updated=relations_importance_updated,
+        graph_events_enqueued=len(graph_commands),
+    )
 
 
 def entity_centrality(

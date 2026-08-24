@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 import pytest
@@ -29,13 +30,21 @@ from sofias_memory.infrastructure.postgres import (
     create_session_factory,
     dispose_async_engine,
 )
-from sofias_memory.schemas.improve import ImproveRequest
+from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.pipelines.context import PipelineContext
+from sofias_memory.pipelines.steps.improve import (
+    GRAPH_RECONCILIATION_STAGE,
+    IMPROVE_RESOURCES_RESOURCE,
+    GraphDrainStep,
+    GraphMaintainStep,
+    GraphReconcileStep,
+    ImprovePipelineResources,
+)
 from sofias_memory.services.graph_maintenance_service import GraphMaintenanceService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.graph_rebuild_service import GraphRebuildService
 from sofias_memory.services.graph_reconciliation_service import GraphReconciliationService
-from sofias_memory.services.improve import ImproveService
 from tests.integration.test_graph_maintenance_postgres_integration import (
     GRAPH_MAINTENANCE_POSTGRES_TEST_DATABASE_NAME,
     graph_maintenance_test_database_url,
@@ -47,10 +56,23 @@ NEO4J_TESTS_ENV = "SOFIAS_MEMORY_RUN_GRAPH_RECONCILIATION_ORDER_NEO4J_TESTS"
 
 class NoOpEmbeddingClient:
     """graph_reconciliation never calls embed_texts; this exists only to
-    satisfy ImproveService's required constructor parameter."""
+    satisfy :class:`ImprovePipelineResources`'s required field."""
 
     async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
         raise AssertionError("embed_texts must not be called for graph_reconciliation")
+
+
+@dataclass(frozen=True)
+class GraphReconciliationStageResult:
+    """Just the fields these regression tests assert on, aggregated from the
+    three B5 operational steps (SM-511) the same way
+    ``pipelines.steps.improve.FinalizeResultStep`` does in production."""
+
+    graph_entities_missing: int
+    graph_entities_extra: int
+    graph_rebuilt: bool
+    graph_relations_deactivated: int
+    graph_entities_importance_updated: int
 
 
 @pytest_asyncio.fixture()
@@ -146,10 +168,10 @@ async def entity_properties(engine: AsyncEngine, entity_id: UUID) -> dict[str, o
         return dict(record)
 
 
-def build_improve_service(
+def build_improve_resources(
     session_factory,
     neo4j_resource,
-) -> tuple[ImproveService, Neo4jProjection]:
+) -> tuple[ImprovePipelineResources, Neo4jProjection]:
     projection = Neo4jProjection(neo4j_resource)
     outbox_processor = GraphOutboxProcessor(session_factory=session_factory, projection=projection)
     rebuild_service = GraphRebuildService(
@@ -157,21 +179,66 @@ def build_improve_service(
         neo4j_resource=neo4j_resource,
         projection=projection,
     )
-    return ImproveService(
-        load_settings(),
-        session_factory=session_factory,
+    resources = ImprovePipelineResources(
+        settings=load_settings(),
         embedding_client=NoOpEmbeddingClient(),
-        graph_projection_drain=GraphOutboxBatchProcessor(
-            session_factory=session_factory,
-            processor=outbox_processor,
-        ),
+        graph_maintenance=GraphMaintenanceService(session_factory=session_factory),
+        summary_rebuild=None,  # type: ignore[arg-type] - unused by graph_reconciliation
         graph_reconciliation=GraphReconciliationService(
             session_factory=session_factory,
             neo4j_resource=neo4j_resource,
             rebuild_service=rebuild_service,
         ),
-        graph_maintenance=GraphMaintenanceService(session_factory=session_factory),
-    ), projection
+        graph_outbox_drain=GraphOutboxBatchProcessor(
+            session_factory=session_factory,
+            processor=outbox_processor,
+        ),
+    )
+    return resources, projection
+
+
+async def run_graph_reconciliation_stage(
+    *,
+    session_factory,
+    resources: ImprovePipelineResources,
+    dataset_id: UUID,
+) -> GraphReconciliationStageResult:
+    """Drives the three real B5 operational steps (SM-511:
+    ``graph_reconcile`` -> ``graph_maintain`` -> ``graph_drain``) exactly the
+    way the pipeline engine would, against real PostgreSQL + Neo4j -- the
+    frozen GATE-B4 order invariant this file regression-tests."""
+
+    context = PipelineContext(
+        run_id=uuid4(),
+        pipeline_type=None,  # type: ignore[arg-type] - unused by these steps
+        dataset_id=dataset_id,
+        source_id=None,
+        run_input={"dataset": str(dataset_id), "stages": [GRAPH_RECONCILIATION_STAGE]},
+        step_outputs={},
+        session_factory=session_factory,
+        resources={IMPROVE_RESOURCES_RESOURCE: resources},
+    )
+
+    reconcile_result = await GraphReconcileStep().execute(context)
+
+    maintain_result = await GraphMaintainStep().execute(context)
+    async with PostgresUnitOfWork(session_factory) as uow:
+        await GraphMaintainStep().persist(context, maintain_result, uow)
+        await uow.commit()
+
+    await GraphDrainStep().execute(context)
+
+    reconcile_output = reconcile_result.output
+    maintain_output = maintain_result.output
+    return GraphReconciliationStageResult(
+        graph_entities_missing=int(reconcile_output.get("entities_missing", 0)),
+        graph_entities_extra=int(reconcile_output.get("entities_extra", 0)),
+        graph_rebuilt=bool(reconcile_output.get("rebuilt", False)),
+        graph_relations_deactivated=int(maintain_output.get("relations_deactivated", 0)),
+        graph_entities_importance_updated=int(
+            maintain_output.get("entities_importance_updated", 0)
+        ),
+    )
 
 
 @pytest.mark.integration
@@ -185,7 +252,7 @@ async def test_reconciliation_detects_missing_entity_despite_fresh_importance_re
     neo4j_resource = create_neo4j_resource_from_settings(load_settings())
     try:
         await seed_two_active_entities(postgres_engine, ids)
-        service, projection = build_improve_service(session_factory, neo4j_resource)
+        resources, projection = build_improve_resources(session_factory, neo4j_resource)
 
         rebuild_service = GraphRebuildService(
             session_factory=session_factory,
@@ -213,11 +280,10 @@ async def test_reconciliation_detects_missing_entity_despite_fresh_importance_re
         e1_before = await entity_properties(postgres_engine, ids.e1_id)
         assert e1_before["is_active"] is True
 
-        result_1 = await service.improve(
-            ImproveRequest(
-                dataset="reconciliation-order-" + str(ids.dataset_id),
-                stages=["graph_reconciliation"],
-            )
+        result_1 = await run_graph_reconciliation_stage(
+            session_factory=session_factory,
+            resources=resources,
+            dataset_id=ids.dataset_id,
         )
 
         assert result_1.graph_entities_missing == 1
@@ -233,11 +299,10 @@ async def test_reconciliation_detects_missing_entity_despite_fresh_importance_re
         e1_after = await entity_properties(postgres_engine, ids.e1_id)
         assert "_sofias_memory_importance" in e1_after["properties"]
 
-        result_2 = await service.improve(
-            ImproveRequest(
-                dataset="reconciliation-order-" + str(ids.dataset_id),
-                stages=["graph_reconciliation"],
-            )
+        result_2 = await run_graph_reconciliation_stage(
+            session_factory=session_factory,
+            resources=resources,
+            dataset_id=ids.dataset_id,
         )
         assert result_2.graph_entities_missing == 0
         assert result_2.graph_entities_extra == 0
@@ -282,7 +347,7 @@ async def test_reconciliation_order_preserves_relation_hygiene(
                 },
             )
 
-        service, projection = build_improve_service(session_factory, neo4j_resource)
+        resources, projection = build_improve_resources(session_factory, neo4j_resource)
         rebuild_service = GraphRebuildService(
             session_factory=session_factory,
             neo4j_resource=neo4j_resource,
@@ -290,11 +355,10 @@ async def test_reconciliation_order_preserves_relation_hygiene(
         )
         await rebuild_service.rebuild_dataset(ids.dataset_id)
 
-        result = await service.improve(
-            ImproveRequest(
-                dataset="reconciliation-order-" + str(ids.dataset_id),
-                stages=["graph_reconciliation"],
-            )
+        result = await run_graph_reconciliation_stage(
+            session_factory=session_factory,
+            resources=resources,
+            dataset_id=ids.dataset_id,
         )
         assert result.graph_relations_deactivated == 1
 
@@ -313,11 +377,10 @@ async def test_reconciliation_order_preserves_relation_hygiene(
             record2 = await projected.single()
             assert record2 is not None and record2["c"] == 0
 
-        result_2 = await service.improve(
-            ImproveRequest(
-                dataset="reconciliation-order-" + str(ids.dataset_id),
-                stages=["graph_reconciliation"],
-            )
+        result_2 = await run_graph_reconciliation_stage(
+            session_factory=session_factory,
+            resources=resources,
+            dataset_id=ids.dataset_id,
         )
         assert result_2.graph_relations_deactivated == 0
         assert result_2.graph_entities_missing == 0
@@ -347,7 +410,7 @@ async def test_reconciliation_order_still_computes_importance_without_drift(
     neo4j_resource = create_neo4j_resource_from_settings(load_settings())
     try:
         await seed_two_active_entities(postgres_engine, ids)
-        service, projection = build_improve_service(session_factory, neo4j_resource)
+        resources, projection = build_improve_resources(session_factory, neo4j_resource)
         rebuild_service = GraphRebuildService(
             session_factory=session_factory,
             neo4j_resource=neo4j_resource,
@@ -355,11 +418,10 @@ async def test_reconciliation_order_still_computes_importance_without_drift(
         )
         await rebuild_service.rebuild_dataset(ids.dataset_id)
 
-        result_1 = await service.improve(
-            ImproveRequest(
-                dataset="reconciliation-order-" + str(ids.dataset_id),
-                stages=["graph_reconciliation"],
-            )
+        result_1 = await run_graph_reconciliation_stage(
+            session_factory=session_factory,
+            resources=resources,
+            dataset_id=ids.dataset_id,
         )
         assert result_1.graph_entities_missing == 0
         assert result_1.graph_entities_extra == 0
@@ -369,11 +431,10 @@ async def test_reconciliation_order_still_computes_importance_without_drift(
         e1_after = await entity_properties(postgres_engine, ids.e1_id)
         assert "_sofias_memory_importance" in e1_after["properties"]
 
-        result_2 = await service.improve(
-            ImproveRequest(
-                dataset="reconciliation-order-" + str(ids.dataset_id),
-                stages=["graph_reconciliation"],
-            )
+        result_2 = await run_graph_reconciliation_stage(
+            session_factory=session_factory,
+            resources=resources,
+            dataset_id=ids.dataset_id,
         )
         assert result_2.graph_entities_importance_updated == 0
     finally:

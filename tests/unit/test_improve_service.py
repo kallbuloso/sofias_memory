@@ -1,677 +1,54 @@
+"""Unit tests for Improve's pure/reusable primitives (SM-511).
+
+Since ``services.improve`` no longer owns run lifecycle (that moved to
+``pipelines.steps.improve``, ADR-0009 SS O), this file exercises only the
+pure business-logic helpers: feedback-weight math, embedding-text
+formatting, entity-merge planning, and relation-merge planning. Step-level
+(execute/persist) behavior lives in ``test_improve_pipeline_steps.py``;
+route/submission behavior lives in ``test_improve_routes.py``.
+"""
+
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from math import sqrt
-from pathlib import Path
-from typing import cast
 from uuid import UUID, uuid4
 
-import httpx
 import pytest
 
-from sofias_memory.api.errors import DependencyUnavailableError
-from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
-from sofias_memory.config import Settings
-from sofias_memory.domain import DatasetStatus, PipelineRunStatus
+from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.infrastructure.postgres.models import (
-    Dataset,
     Entity,
     EntityMention,
-    Feedback,
-    PipelineRun,
-    Query,
+    Relation,
     RelationEvidence,
 )
-from sofias_memory.infrastructure.postgres.models.relation import Relation
-from sofias_memory.infrastructure.postgres.repositories.entities import (
-    EntityDuplicateCandidate,
-    EntityEmbeddingCandidate,
-)
+from sofias_memory.infrastructure.postgres.repositories.entities import EntityDuplicateCandidate
 from sofias_memory.infrastructure.postgres.repositories.feedback import UnappliedFeedback
 from sofias_memory.infrastructure.postgres.repositories.relations import RelationEmbeddingCandidate
-from sofias_memory.ports import ProjectionCommand
-from sofias_memory.schemas.improve import ImproveRequest, ImproveResult
-from sofias_memory.services.graph_maintenance_service import (
-    IMPORTANCE_MARKER_KEY,
-    GraphMaintenanceCounts,
-    properties_with_importance_marker,
-)
-from sofias_memory.services.graph_maintenance_service import (
-    ImportanceComponents as GraphMaintenanceImportanceComponents,
-)
-from sofias_memory.services.graph_reconciliation_service import (
-    GraphReconciliationDiff,
-    GraphReconciliationResult,
-)
+from sofias_memory.services.feedback import ANSWER_TARGET_TYPE, REFERENCE_TARGET_TYPE
 from sofias_memory.services.improve import (
-    ImproveService,
-    ImproveUnitOfWork,
-    UnitOfWorkFactory,
+    DEFAULT_IMPROVE_STAGES,
+    SUPPORTED_IMPROVE_STAGES,
     apply_feedback_to_importance,
+    apply_relation_merge_plan,
     entity_embedding_text,
+    feedback_target_chunk_ids,
+    improve_run_input,
+    merged_entity_aliases,
     normalize_feedback_score,
+    normalize_improve_stages,
+    plan_entity_merges,
+    plan_relation_merges,
+    reassign_entity_mentions,
     relation_embedding_text,
     stream_update_weight,
+    validate_embedding_response,
 )
-from sofias_memory.services.summary_rebuild_service import SummaryRebuildCounts
 
-EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
-NEO4J_PASSWORD = "fake-neo4j-password"
-LLM_API_KEY = "sk-fake-test-key"
 
-
-def make_settings(tmp_path: Path) -> Settings:
-    return Settings(
-        _env_file=None,  # type: ignore[call-arg]
-        api_key=EXPECTED_API_KEY,
-        database_url=DATABASE_URL,
-        neo4j_password=NEO4J_PASSWORD,
-        llm_api_key=LLM_API_KEY,
-        app_env="test",
-        data_directory=tmp_path,
-    )
-
-
-class FakeStore:
-    def __init__(self) -> None:
-        self.datasets: list[Dataset] = []
-        self.queries: list[Query] = []
-        self.feedback: list[Feedback] = []
-        self.entities: list[Entity] = []
-        self.entity_mentions: list[EntityMention] = []
-        self.relations: list[Relation] = []
-        self.relation_evidence: list[RelationEvidence] = []
-        self.entities_by_chunk: dict[UUID, list[Entity]] = {}
-        self.relations_by_chunk: dict[UUID, list[Relation]] = {}
-        self.pipeline_runs: list[PipelineRun] = []
-        self.run_current_steps_on_add: list[str | None] = []
-        self.graph_commands: list[ProjectionCommand] = []
-        self.committed_operations: list[list[str]] = []
-
-
-class FakeDatasetRepository:
-    def __init__(self, store: FakeStore) -> None:
-        self._store = store
-
-    async def get_by_slug(self, slug: str) -> Dataset | None:
-        return next((dataset for dataset in self._store.datasets if dataset.slug == slug), None)
-
-
-class FakeFeedbackRepository:
-    def __init__(self, store: FakeStore, operations: list[str]) -> None:
-        self._store = store
-        self._operations = operations
-
-    async def list_unapplied_for_dataset(self, dataset_id: UUID) -> list[UnappliedFeedback]:
-        query_by_id = {query.id: query for query in self._store.queries}
-        result: list[UnappliedFeedback] = []
-        for feedback in self._store.feedback:
-            query = query_by_id.get(feedback.query_id)
-            if (
-                query is None
-                or feedback.applied_at is not None
-                or dataset_id not in query.dataset_ids
-            ):
-                continue
-            result.append(
-                UnappliedFeedback(
-                    id=feedback.id,
-                    query_id=feedback.query_id,
-                    target_type=feedback.target_type,
-                    target_id=feedback.target_id,
-                    score=feedback.score,
-                    references=dict(query.references or {}),
-                )
-            )
-        return result
-
-    async def mark_applied(
-        self,
-        feedback_id: UUID,
-        *,
-        applied_at: datetime,
-    ) -> Feedback | None:
-        feedback = next(
-            (item for item in self._store.feedback if item.id == feedback_id),
-            None,
-        )
-        if feedback is None:
-            return None
-        feedback.applied_at = applied_at
-        self._operations.append(f"feedback:{feedback_id}:applied")
-        return feedback
-
-
-class FakeEntityMentionRepository:
-    def __init__(self, store: FakeStore) -> None:
-        self._store = store
-
-    async def list_for_entities(self, *, entity_ids: list[UUID]) -> list[EntityMention]:
-        return [
-            mention
-            for mention in sorted(self._store.entity_mentions, key=lambda item: item.id)
-            if mention.entity_id in entity_ids
-        ]
-
-    async def list_active_entities_for_chunks(
-        self,
-        *,
-        dataset_id: UUID,
-        chunk_ids: list[UUID],
-    ) -> list[Entity]:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        entities: dict[UUID, Entity] = {}
-        for chunk_id in chunk_ids:
-            for entity in self._store.entities_by_chunk.get(chunk_id, []):
-                if (
-                    entity.dataset_id == dataset_id
-                    and entity.generation == dataset.active_generation
-                    and entity.is_active
-                ):
-                    entities[entity.id] = entity
-        return [entities[entity_id] for entity_id in sorted(entities)]
-
-
-class FakeEntityRepository:
-    def __init__(self, store: FakeStore, operations: list[str]) -> None:
-        self._store = store
-        self._operations = operations
-
-    async def list_missing_embedding_candidates(
-        self,
-        *,
-        dataset_id: UUID,
-    ) -> list[EntityEmbeddingCandidate]:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        return [
-            EntityEmbeddingCandidate(entity_id=item.id, name=item.name)
-            for item in sorted(self._store.entities, key=lambda entity: entity.id)
-            if item.dataset_id == dataset_id
-            and item.generation == dataset.active_generation
-            and item.is_active
-            and item.embedding is None
-        ]
-
-    async def set_missing_embeddings_for_active_current(
-        self,
-        *,
-        dataset_id: UUID,
-        embeddings_by_entity_id: dict[UUID, list[float]],
-    ) -> int:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        updated = 0
-        for item in sorted(self._store.entities, key=lambda entity: entity.id):
-            if (
-                item.id in embeddings_by_entity_id
-                and item.dataset_id == dataset_id
-                and item.generation == dataset.active_generation
-                and item.is_active
-                and item.embedding is None
-            ):
-                item.embedding = embeddings_by_entity_id[item.id]
-                updated += 1
-                self._operations.append(f"entity:{item.id}:embedding")
-        return updated
-
-    async def list_active_current_by_ids(
-        self,
-        *,
-        dataset_id: UUID,
-        entity_ids: list[UUID],
-    ) -> list[Entity]:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        return [
-            item
-            for item in sorted(
-                self._store.entities,
-                key=lambda entity: (
-                    entity.created_at or datetime.min.replace(tzinfo=UTC),
-                    entity.id,
-                ),
-            )
-            if item.id in entity_ids
-            and item.dataset_id == dataset_id
-            and item.generation == dataset.active_generation
-            and item.is_active
-        ]
-
-    async def list_duplicate_candidates(
-        self,
-        *,
-        dataset_id: UUID,
-        similarity_threshold: float,
-    ) -> list[EntityDuplicateCandidate]:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        entities = [
-            item
-            for item in sorted(self._store.entities, key=lambda entity: entity.id)
-            if item.dataset_id == dataset_id
-            and item.generation == dataset.active_generation
-            and item.is_active
-            and item.embedding is not None
-        ]
-        candidates: list[EntityDuplicateCandidate] = []
-        for index, item in enumerate(entities):
-            for candidate in entities[index + 1 :]:
-                if item.entity_type.strip().casefold() != candidate.entity_type.strip().casefold():
-                    continue
-                similarity = cosine_similarity(
-                    cast(list[float], item.embedding),
-                    cast(list[float], candidate.embedding),
-                )
-                if similarity < similarity_threshold:
-                    continue
-                candidates.append(
-                    EntityDuplicateCandidate(
-                        entity_id=item.id,
-                        entity_name=item.name,
-                        candidate_id=candidate.id,
-                        candidate_name=candidate.name,
-                        entity_type=item.entity_type,
-                        similarity=similarity,
-                    )
-                )
-        return sorted(
-            candidates,
-            key=lambda candidate: (
-                -candidate.similarity,
-                candidate.entity_id,
-                candidate.candidate_id,
-            ),
-        )
-
-
-class FakeRelationEvidenceRepository:
-    def __init__(self, store: FakeStore) -> None:
-        self._store = store
-
-    async def add(self, evidence: RelationEvidence) -> RelationEvidence:
-        self._store.relation_evidence.append(evidence)
-        return evidence
-
-    async def list_for_relations(self, *, relation_ids: list[UUID]) -> list[RelationEvidence]:
-        return [
-            evidence
-            for evidence in sorted(
-                self._store.relation_evidence,
-                key=lambda item: (item.relation_id, item.chunk_id),
-            )
-            if evidence.relation_id in relation_ids
-        ]
-
-    async def list_active_relations_for_chunks(
-        self,
-        *,
-        dataset_id: UUID,
-        chunk_ids: list[UUID],
-    ) -> list[Relation]:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        relations: dict[UUID, Relation] = {}
-        for chunk_id in chunk_ids:
-            for relation in self._store.relations_by_chunk.get(chunk_id, []):
-                if (
-                    relation.dataset_id == dataset_id
-                    and relation.generation == dataset.active_generation
-                    and relation.is_active
-                ):
-                    relations[relation.id] = relation
-        return [relations[relation_id] for relation_id in sorted(relations)]
-
-
-class FakeRelationRepository:
-    def __init__(self, store: FakeStore, operations: list[str]) -> None:
-        self._store = store
-        self._operations = operations
-
-    async def list_missing_embedding_candidates(
-        self,
-        *,
-        dataset_id: UUID,
-    ) -> list[RelationEmbeddingCandidate]:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        entities_by_id = {entity.id: entity for entity in self._store.entities}
-        candidates: list[RelationEmbeddingCandidate] = []
-        for item in sorted(self._store.relations, key=lambda relation: relation.id):
-            source_entity = entities_by_id.get(item.source_entity_id)
-            target_entity = entities_by_id.get(item.target_entity_id)
-            if (
-                source_entity is None
-                or target_entity is None
-                or item.dataset_id != dataset_id
-                or item.generation != dataset.active_generation
-                or not item.is_active
-                or item.embedding is not None
-                or source_entity.dataset_id != dataset_id
-                or source_entity.generation != dataset.active_generation
-                or not source_entity.is_active
-                or target_entity.dataset_id != dataset_id
-                or target_entity.generation != dataset.active_generation
-                or not target_entity.is_active
-            ):
-                continue
-            candidates.append(
-                RelationEmbeddingCandidate(
-                    relation_id=item.id,
-                    source_name=source_entity.name,
-                    target_name=target_entity.name,
-                    predicate=item.predicate,
-                    description=item.description,
-                )
-            )
-        return candidates
-
-    async def set_missing_embeddings_for_active_current(
-        self,
-        *,
-        dataset_id: UUID,
-        embeddings_by_relation_id: dict[UUID, list[float]],
-    ) -> int:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        updated = 0
-        for item in sorted(self._store.relations, key=lambda relation: relation.id):
-            if (
-                item.id in embeddings_by_relation_id
-                and item.dataset_id == dataset_id
-                and item.generation == dataset.active_generation
-                and item.is_active
-                and item.embedding is None
-            ):
-                item.embedding = embeddings_by_relation_id[item.id]
-                updated += 1
-                self._operations.append(f"relation:{item.id}:embedding")
-        return updated
-
-    async def list_active_current_for_dataset(
-        self,
-        *,
-        dataset_id: UUID,
-    ) -> list[Relation]:
-        dataset = next(dataset for dataset in self._store.datasets if dataset.id == dataset_id)
-        entities_by_id = {entity.id: entity for entity in self._store.entities}
-        relations: list[Relation] = []
-        for item in sorted(
-            self._store.relations,
-            key=lambda relation: (
-                relation.created_at or datetime.min.replace(tzinfo=UTC),
-                relation.id,
-            ),
-        ):
-            source_entity = entities_by_id.get(item.source_entity_id)
-            target_entity = entities_by_id.get(item.target_entity_id)
-            if (
-                source_entity is None
-                or target_entity is None
-                or item.dataset_id != dataset_id
-                or item.generation != dataset.active_generation
-                or not item.is_active
-                or source_entity.dataset_id != dataset_id
-                or source_entity.generation != dataset.active_generation
-                or not source_entity.is_active
-                or target_entity.dataset_id != dataset_id
-                or target_entity.generation != dataset.active_generation
-                or not target_entity.is_active
-            ):
-                continue
-            relations.append(item)
-        return relations
-
-
-class FakeGraphOutboxRepository:
-    def __init__(self, store: FakeStore, operations: list[str]) -> None:
-        self._store = store
-        self._operations = operations
-
-    async def add_projection_command(self, command: ProjectionCommand) -> object:
-        self._store.graph_commands.append(command)
-        self._operations.append(f"outbox:{command.aggregate_type}:{command.aggregate_id}")
-        return object()
-
-
-class FakePipelineRunRepository:
-    def __init__(self, store: FakeStore) -> None:
-        self._store = store
-
-    async def add(self, run: PipelineRun) -> PipelineRun:
-        self._store.pipeline_runs.append(run)
-        self._store.run_current_steps_on_add.append(run.current_step)
-        return run
-
-    async def get_by_id(self, run_id: UUID) -> PipelineRun | None:
-        return next((run for run in self._store.pipeline_runs if run.id == run_id), None)
-
-
-class FakeUnitOfWork:
-    def __init__(self, store: FakeStore) -> None:
-        self._store = store
-        self._operations: list[str] = []
-        self.datasets = FakeDatasetRepository(store)
-        self.feedback = FakeFeedbackRepository(store, self._operations)
-        self.entities = FakeEntityRepository(store, self._operations)
-        self.entity_mentions = FakeEntityMentionRepository(store)
-        self.relations = FakeRelationRepository(store, self._operations)
-        self.relation_evidence = FakeRelationEvidenceRepository(store)
-        self.graph_outbox = FakeGraphOutboxRepository(store, self._operations)
-        self.pipeline_runs = FakePipelineRunRepository(store)
-
-    async def __aenter__(self) -> FakeUnitOfWork:
-        return self
-
-    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        return None
-
-    async def commit(self) -> None:
-        self._store.committed_operations.append(list(self._operations))
-
-
-class FakeDrain:
-    def __init__(self, processed: int = 0, order: list[str] | None = None) -> None:
-        self.processed = processed
-        self.dataset_ids: list[UUID] = []
-        self.order = order
-
-    async def process_dataset(self, dataset_id: UUID) -> object:
-        self.dataset_ids.append(dataset_id)
-        if self.order is not None:
-            self.order.append("drain")
-        return type("DrainResult", (), {"processed": self.processed})()
-
-
-class FakeGraphReconciliation:
-    def __init__(
-        self,
-        result: GraphReconciliationResult | None = None,
-        failure: Exception | None = None,
-        order: list[str] | None = None,
-    ) -> None:
-        self.result = result or GraphReconciliationResult(
-            diff=GraphReconciliationDiff(),
-            rebuilt=False,
-        )
-        self.failure = failure
-        self.dataset_ids: list[UUID] = []
-        self.order = order
-
-    async def reconcile_dataset(self, dataset_id: UUID) -> GraphReconciliationResult:
-        self.dataset_ids.append(dataset_id)
-        if self.order is not None:
-            self.order.append("reconcile")
-        if self.failure is not None:
-            raise self.failure
-        return self.result
-
-
-class FakeGraphMaintenance:
-    def __init__(
-        self,
-        result: GraphMaintenanceCounts | None = None,
-        failure: Exception | None = None,
-        order: list[str] | None = None,
-    ) -> None:
-        self.result = result or GraphMaintenanceCounts(
-            relations_deactivated=0,
-            entities_importance_updated=0,
-            relations_importance_updated=0,
-            graph_events_enqueued=0,
-        )
-        self.failure = failure
-        self.calls: list[tuple[UUID, int]] = []
-        self.order = order
-
-    async def maintain_dataset(
-        self, dataset_id: UUID, *, generation: int
-    ) -> GraphMaintenanceCounts:
-        self.calls.append((dataset_id, generation))
-        if self.order is not None:
-            self.order.append("maintenance")
-        if self.failure is not None:
-            raise self.failure
-        return self.result
-
-
-class FakeSummaryRebuild:
-    def __init__(
-        self,
-        result: SummaryRebuildCounts | None = None,
-        failure: Exception | None = None,
-    ) -> None:
-        self.result = result or SummaryRebuildCounts(
-            document_summaries_rebuilt=0,
-            dataset_summaries_rebuilt=0,
-            summaries_deactivated=0,
-        )
-        self.failure = failure
-        self.calls: list[tuple[UUID, int]] = []
-
-    async def rebuild_dataset(self, dataset_id: UUID, *, generation: int) -> SummaryRebuildCounts:
-        self.calls.append((dataset_id, generation))
-        if self.failure is not None:
-            raise self.failure
-        return self.result
-
-
-class FakeEmbeddingClient:
-    def __init__(self, dimensions: int = 3072) -> None:
-        self.dimensions = dimensions
-        self.calls: list[list[str]] = []
-        self.responses: list[list[float]] | None = None
-        self.response_batches: list[list[list[float]]] = []
-        self.failure: Exception | None = None
-
-    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
-        self.calls.append(list(texts))
-        if self.failure is not None:
-            raise self.failure
-        if self.response_batches:
-            return self.response_batches.pop(0)
-        if self.responses is not None:
-            return self.responses
-        return [[0.25] * self.dimensions for _ in texts]
-
-
-def service_for(
-    tmp_path: Path,
-    store: FakeStore,
-    *,
-    drain: FakeDrain | None = None,
-    graph_reconciliation: FakeGraphReconciliation | None = None,
-    graph_maintenance: FakeGraphMaintenance | None = None,
-    summary_rebuild: FakeSummaryRebuild | None = None,
-) -> tuple[
-    ImproveService,
-    FakeEmbeddingClient,
-    FakeDrain,
-    FakeGraphReconciliation,
-    FakeGraphMaintenance,
-    FakeSummaryRebuild,
-]:
-    embedding_client = FakeEmbeddingClient()
-    resolved_drain = drain or FakeDrain()
-    resolved_graph_reconciliation = graph_reconciliation or FakeGraphReconciliation()
-    resolved_graph_maintenance = graph_maintenance or FakeGraphMaintenance()
-    resolved_summary_rebuild = summary_rebuild or FakeSummaryRebuild()
-
-    def create_uow() -> ImproveUnitOfWork:
-        return cast(ImproveUnitOfWork, FakeUnitOfWork(store))
-
-    return (
-        ImproveService(
-            make_settings(tmp_path),
-            embedding_client=embedding_client,
-            graph_projection_drain=resolved_drain,
-            graph_reconciliation=resolved_graph_reconciliation,
-            graph_maintenance=resolved_graph_maintenance,
-            summary_rebuild=resolved_summary_rebuild,
-            unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
-        ),
-        embedding_client,
-        resolved_drain,
-        resolved_graph_reconciliation,
-        resolved_graph_maintenance,
-        resolved_summary_rebuild,
-    )
-
-
-def seed_dataset(store: FakeStore, *, slug: str = "main", generation: int = 0) -> Dataset:
-    dataset = Dataset(
-        id=uuid4(),
-        name=slug,
-        slug=slug,
-        description=None,
-        status=DatasetStatus.ACTIVE,
-        active_generation=generation,
-    )
-    store.datasets.append(dataset)
-    return dataset
-
-
-def query_for(dataset_id: UUID, chunk_ids: Sequence[UUID]) -> Query:
-    return Query(
-        id=uuid4(),
-        query_text="What is relevant?",
-        dataset_ids=[dataset_id],
-        mode="rag",
-        answer="Answer.",
-        references={
-            "items": [
-                {
-                    "source_id": str(uuid4()),
-                    "document_id": str(uuid4()),
-                    "chunk_id": str(chunk_id),
-                    "chunk_ordinal": ordinal,
-                    "score": 0.03,
-                }
-                for ordinal, chunk_id in enumerate(chunk_ids)
-            ]
-        },
-        timings={"embedding": 1, "retrieval": 1, "graph": 0, "generation": 1, "total": 3},
-        model="gpt-test",
-        created_at=datetime(2026, 1, 1, tzinfo=UTC),
-    )
-
-
-def feedback_for(
-    query_id: UUID,
-    *,
-    target_type: str,
-    score: int,
-    target_id: UUID | None = None,
-) -> Feedback:
-    return Feedback(
-        id=uuid4(),
-        query_id=query_id,
-        target_type=target_type,
-        target_id=target_id,
-        score=score,
-        comment=None,
-        applied_at=None,
-        created_at=datetime(2026, 1, 1, tzinfo=UTC),
-    )
-
-
-def entity(dataset_id: UUID, *, generation: int, weight: float = 0.5) -> Entity:
+def entity(*, generation: int = 0, weight: float = 0.5) -> Entity:
+    dataset_id = uuid4()
     return Entity(
         id=uuid4(),
         dataset_id=dataset_id,
@@ -694,7 +71,7 @@ def relation(
     source_entity_id: UUID,
     target_entity_id: UUID,
     *,
-    generation: int,
+    generation: int = 0,
     weight: float = 0.5,
 ) -> Relation:
     return Relation(
@@ -713,923 +90,384 @@ def relation(
     )
 
 
-def cosine_similarity(first: list[float], second: list[float]) -> float:
-    dot_product = sum(left * right for left, right in zip(first, second, strict=True))
-    first_norm = sqrt(sum(value * value for value in first))
-    second_norm = sqrt(sum(value * value for value in second))
-    return dot_product / (first_norm * second_norm)
-
-
 def unit_embedding(cosine_to_first_axis: float) -> list[float]:
     return [cosine_to_first_axis, sqrt(1 - cosine_to_first_axis**2)] + [0.0] * 3070
+
+
+# ---------------------------------------------------------------------------
+# normalize_improve_stages / improve_run_input (SM-511 MAJOR 1: request
+# order is preserved, never reordered).
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_improve_stages_defaults_to_default_stages_in_declared_order() -> None:
+    assert normalize_improve_stages(None) == list(DEFAULT_IMPROVE_STAGES)
+
+
+def test_normalize_improve_stages_preserves_explicit_request_order() -> None:
+    assert normalize_improve_stages(["relation_embeddings", "feedback_weights"]) == [
+        "relation_embeddings",
+        "feedback_weights",
+    ]
+    assert normalize_improve_stages(["feedback_weights", "relation_embeddings"]) == [
+        "feedback_weights",
+        "relation_embeddings",
+    ]
+
+
+def test_normalize_improve_stages_dedupes_preserving_first_occurrence() -> None:
+    assert normalize_improve_stages(
+        ["relation_embeddings", "feedback_weights", "relation_embeddings"]
+    ) == ["relation_embeddings", "feedback_weights"]
+
+
+def test_normalize_improve_stages_none_and_explicit_default_order_are_identical() -> None:
+    assert normalize_improve_stages(None) == normalize_improve_stages(list(DEFAULT_IMPROVE_STAGES))
+
+
+def test_normalize_improve_stages_rejects_unsupported_stage() -> None:
+    with pytest.raises(SofiasMemoryError):
+        normalize_improve_stages(["not_a_real_stage"])
+
+
+def test_normalize_improve_stages_covers_every_supported_stage() -> None:
+    ordered = sorted(SUPPORTED_IMPROVE_STAGES)
+    assert normalize_improve_stages(ordered) == ordered
+
+
+def test_improve_run_input_excludes_wait_from_work_identity() -> None:
+    work_input = improve_run_input("main", ["feedback_weights"])
+    assert "wait" not in work_input
+    assert work_input == {"dataset": "main", "stages": ["feedback_weights"]}
+
+
+# ---------------------------------------------------------------------------
+# Feedback weight math (unchanged B4 algorithm)
+# ---------------------------------------------------------------------------
 
 
 def test_feedback_weight_normalization_and_streaming_formula() -> None:
     assert normalize_feedback_score(-1) == 0.0
     assert normalize_feedback_score(0) == 0.5
     assert normalize_feedback_score(1) == 1.0
-    assert stream_update_weight(1.0, 0.0) == 0.9
-    assert stream_update_weight(0.0, 1.0) == 0.1
-    assert stream_update_weight(0.333333, 0.5) == 0.35
+    with pytest.raises(ValueError):
+        normalize_feedback_score(2)
+
+    assert stream_update_weight(0.5, 1.0, alpha=0.1) == pytest.approx(0.55)
+    assert stream_update_weight(0.5, 0.0, alpha=0.1) == pytest.approx(0.45)
+    assert stream_update_weight(0.95, 1.0, alpha=0.5) == pytest.approx(0.975)
 
 
-def test_feedback_updates_feedback_component_when_importance_marker_exists() -> None:
-    without_marker_weight, without_marker_properties = apply_feedback_to_importance(
-        properties={"kept": True},
-        current_importance_weight=0.6,
-        normalized_score=1.0,
-    )
-    marker_properties = properties_with_importance_marker(
-        {"kept": True},
-        components=GraphMaintenanceImportanceComponents(
-            feedback_weight=0.6,
-            centrality_weight=1.0,
-        ),
-    )
-
-    with_marker_weight, with_marker_properties = apply_feedback_to_importance(
-        properties=marker_properties,
-        current_importance_weight=0.8,
-        normalized_score=1.0,
-    )
-
-    assert without_marker_weight == 0.64
-    assert without_marker_properties == {"kept": True}
-    assert with_marker_weight == 0.82
-    assert with_marker_properties["_sofias_memory_importance"] == {
-        "version": "degree-v1",
-        "feedback_weight": 0.64,
-        "centrality_weight": 1.0,
-    }
-
-
-@pytest.mark.parametrize(
-    "marker",
-    [
-        {"version": "degree-v1", "centrality_weight": 1.0},
-        {"version": "degree-v1", "feedback_weight": 0.6},
-        {"version": "degree-v0", "feedback_weight": 0.6, "centrality_weight": 1.0},
-        ["degree-v1"],
-        {"version": "degree-v1", "feedback_weight": "0.6", "centrality_weight": 1.0},
-        {"version": "degree-v1", "feedback_weight": False, "centrality_weight": 1.0},
-        {"version": "degree-v1", "feedback_weight": float("nan"), "centrality_weight": 1.0},
-        {"version": "degree-v1", "feedback_weight": float("-inf"), "centrality_weight": 1.0},
-        {"version": "degree-v1", "feedback_weight": 1.2, "centrality_weight": 1.0},
-    ],
-)
-def test_feedback_treats_invalid_importance_marker_as_legacy(marker: object) -> None:
-    properties = {IMPORTANCE_MARKER_KEY: marker, "kept": True}
-
+def test_apply_feedback_to_importance_without_marker_updates_weight_directly() -> None:
     next_weight, next_properties = apply_feedback_to_importance(
-        properties=properties,
-        current_importance_weight=0.8,
+        properties={}, current_importance_weight=0.5, normalized_score=1.0
+    )
+    assert next_weight == pytest.approx(0.55)
+    assert next_properties == {}
+
+
+def test_apply_feedback_to_importance_with_marker_updates_feedback_component_only() -> None:
+    properties = {
+        "_sofias_memory_importance": {
+            "version": "degree-v1",
+            "feedback_weight": 0.4,
+            "centrality_weight": 0.8,
+        }
+    }
+    next_weight, next_properties = apply_feedback_to_importance(
+        properties=properties, current_importance_weight=0.6, normalized_score=1.0
+    )
+    marker = next_properties["_sofias_memory_importance"]
+    assert marker["feedback_weight"] == pytest.approx(0.46)
+    assert marker["centrality_weight"] == pytest.approx(0.8)
+    assert next_weight == pytest.approx((0.46 + 0.8) / 2.0, abs=1e-4)
+
+
+@pytest.mark.parametrize("marker", [{"version": "unknown"}, "not-a-dict", 42])
+def test_apply_feedback_treats_invalid_importance_marker_as_legacy(marker: object) -> None:
+    next_weight, _ = apply_feedback_to_importance(
+        properties={"_sofias_memory_importance": marker},
+        current_importance_weight=0.5,
         normalized_score=1.0,
     )
+    assert next_weight == pytest.approx(0.55)
 
-    assert next_weight == 0.82
-    assert next_properties == properties
+
+def test_feedback_target_chunk_ids_resolves_reference_and_answer_targets() -> None:
+    reference_chunk = uuid4()
+    reference_feedback = UnappliedFeedback(
+        id=uuid4(),
+        query_id=uuid4(),
+        target_type=REFERENCE_TARGET_TYPE,
+        target_id=reference_chunk,
+        score=1,
+        references={},
+    )
+    assert feedback_target_chunk_ids(reference_feedback) == [reference_chunk]
+
+    chunk_a, chunk_b = sorted([uuid4(), uuid4()])
+    answer_feedback = UnappliedFeedback(
+        id=uuid4(),
+        query_id=uuid4(),
+        target_type=ANSWER_TARGET_TYPE,
+        target_id=None,
+        score=1,
+        references={"items": [{"chunk_id": str(chunk_a)}, {"chunk_id": str(chunk_b)}]},
+    )
+    assert feedback_target_chunk_ids(answer_feedback) == [chunk_a, chunk_b]
+
+
+# ---------------------------------------------------------------------------
+# Embedding text formatting / response validation
+# ---------------------------------------------------------------------------
 
 
 def test_relation_embedding_text_is_deterministic_and_omits_metadata() -> None:
     candidate = RelationEmbeddingCandidate(
         relation_id=uuid4(),
-        source_name=" PostgreSQL ",
-        target_name=" Sofias Memory ",
-        predicate="stores",
-        description=" Stores authoritative memory. ",
+        source_name="  Source  ",
+        target_name="  Target  ",
+        predicate="  relates_to  ",
+        description="  extra detail  ",
     )
-    predicate_only = RelationEmbeddingCandidate(
-        relation_id=uuid4(),
-        source_name="Chunk",
-        target_name="Document",
-        predicate="belongs_to",
-        description=" ",
-    )
-
-    assert (
-        relation_embedding_text(candidate)
-        == "PostgreSQL-›stores: Stores authoritative memory.-›Sofias Memory"
-    )
-    assert relation_embedding_text(predicate_only) == "Chunk-›belongs_to-›Document"
+    assert relation_embedding_text(candidate) == "Source-›relates_to: extra detail-›Target"
 
 
 def test_entity_embedding_text_is_stripped_name_only() -> None:
-    candidate = EntityEmbeddingCandidate(entity_id=uuid4(), name=" PostgreSQL ")
-
+    candidate = EntityEmbeddingCandidateStub(name="  PostgreSQL  ")
     assert entity_embedding_text(candidate) == "PostgreSQL"
 
 
-@pytest.mark.asyncio
-async def test_answer_and_reference_feedback_resolve_chunk_targets_and_enqueue_updated_weights(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    answer_chunk = uuid4()
-    reference_chunk = uuid4()
-    query = query_for(dataset.id, [answer_chunk, reference_chunk])
-    store.queries.append(query)
-    store.feedback.extend(
-        [
-            feedback_for(query.id, target_type="answer", score=1),
-            feedback_for(query.id, target_type="reference", target_id=reference_chunk, score=-1),
-        ]
+class EntityEmbeddingCandidateStub:
+    def __init__(self, *, name: str) -> None:
+        self.name = name
+
+
+def test_validate_embedding_response_rejects_count_and_dimension_mismatch() -> None:
+    with pytest.raises(DependencyUnavailableError):
+        validate_embedding_response(
+            [], expected_count=1, expected_dimensions=3072, subject="Entity"
+        )
+    with pytest.raises(DependencyUnavailableError):
+        validate_embedding_response(
+            [[0.1] * 10], expected_count=1, expected_dimensions=3072, subject="Entity"
+        )
+    validate_embedding_response(
+        [[0.1] * 3072], expected_count=1, expected_dimensions=3072, subject="Entity"
     )
-    first_entity = entity(dataset.id, generation=dataset.active_generation, weight=0.5)
-    second_entity = entity(dataset.id, generation=dataset.active_generation, weight=0.5)
-    first_relation = relation(
-        dataset.id,
-        first_entity.id,
-        second_entity.id,
-        generation=dataset.active_generation,
-        weight=0.5,
-    )
-    store.entities_by_chunk = {
-        answer_chunk: [first_entity],
-        reference_chunk: [second_entity],
-    }
-    store.relations_by_chunk = {reference_chunk: [first_relation]}
-    drain = FakeDrain(processed=3)
-
-    service, embedding_client, _, _, _, _ = service_for(tmp_path, store, drain=drain)
-    result = await service.improve(ImproveRequest())
-
-    assert embedding_client.calls == []
-    assert result.feedback_processed == 2
-    assert result.feedback_applied == 2
-    assert result.feedback_skipped == 0
-    assert result.entities_updated == 2
-    assert result.relations_updated == 1
-    assert result.graph_events_enqueued == 3
-    assert result.graph_events_processed == 3
-    assert first_entity.importance_weight == 0.55
-    assert second_entity.importance_weight == 0.495
-    assert first_relation.importance_weight == 0.495
-    assert all(feedback.applied_at is not None for feedback in store.feedback)
-    assert [command.aggregate_type for command in store.graph_commands] == [
-        "entity",
-        "entity",
-        "relation",
-    ]
-    relation_command = next(
-        command for command in store.graph_commands if command.aggregate_type == "relation"
-    )
-    assert relation_command.properties["importance_weight"] == 0.495
-    assert drain.dataset_ids == [dataset.id]
-    apply_commit = next(
-        operations
-        for operations in store.committed_operations
-        if any("outbox:" in item for item in operations)
-    )
-    assert any(":applied" in item for item in apply_commit)
-    assert any(item.startswith("outbox:entity") for item in apply_commit)
 
 
-@pytest.mark.asyncio
-async def test_relation_embeddings_select_active_current_null_candidates_and_persist_in_order(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store, generation=3)
-    source_entity = entity(dataset.id, generation=3)
-    source_entity.name = "PostgreSQL"
-    target_entity = entity(dataset.id, generation=3)
-    target_entity.name = "Sofias Memory"
-    stale_entity = entity(dataset.id, generation=2)
-    inactive_entity = entity(dataset.id, generation=3)
-    inactive_entity.is_active = False
-    store.entities.extend([source_entity, target_entity, stale_entity, inactive_entity])
-    selected_high_id = relation(dataset.id, source_entity.id, target_entity.id, generation=3)
-    selected_low_id = relation(dataset.id, source_entity.id, target_entity.id, generation=3)
-    selected_high_id.id = UUID("30000000-0000-0000-0000-000000000003")
-    selected_low_id.id = UUID("10000000-0000-0000-0000-000000000001")
-    selected_low_id.predicate = "stores"
-    selected_low_id.description = "Stores authoritative memory."
-    stale_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=2)
-    embedded_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=3)
-    embedded_relation.embedding = [0.9] * 3072
-    inactive_endpoint_relation = relation(
-        dataset.id,
-        inactive_entity.id,
-        target_entity.id,
-        generation=3,
-    )
-    store.relations.extend(
-        [
-            selected_high_id,
-            selected_low_id,
-            stale_relation,
-            embedded_relation,
-            inactive_endpoint_relation,
-        ]
-    )
-    service, embedding_client, drain, _, _, _ = service_for(tmp_path, store)
-    embedding_client.responses = [[0.1] * 3072, [0.2] * 3072]
-
-    result = await service.improve(ImproveRequest(stages=["relation_embeddings"]))
-
-    assert result.stages == ["relation_embeddings"]
-    assert result.feedback_processed == 0
-    assert result.feedback_applied == 0
-    assert result.feedback_skipped == 0
-    assert result.entities_updated == 0
-    assert result.relations_updated == 0
-    assert result.relations_embedded == 2
-    assert result.graph_events_enqueued == 0
-    assert result.graph_events_processed == 0
-    assert drain.dataset_ids == []
-    assert embedding_client.calls == [
-        [
-            "PostgreSQL-›stores: Stores authoritative memory.-›Sofias Memory",
-            "PostgreSQL-›uses: Uses projection.-›Sofias Memory",
-        ]
-    ]
-    assert selected_low_id.embedding == [0.1] * 3072
-    assert selected_high_id.embedding == [0.2] * 3072
-    assert stale_relation.embedding is None
-    assert embedded_relation.embedding == [0.9] * 3072
-    assert inactive_endpoint_relation.embedding is None
-
-    rerun = await service.improve(ImproveRequest(stages=["relation_embeddings"]))
-
-    assert rerun.relations_embedded == 0
-    assert len(embedding_client.calls) == 1
+# ---------------------------------------------------------------------------
+# Entity-merge planning (unchanged B4 algorithm)
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_entity_deduplication_embeds_active_current_null_entities_and_detects_pairs(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store, generation=2)
-    first = entity(dataset.id, generation=2)
+def test_plan_entity_merges_picks_earliest_survivor_and_ignores_transitive_pairs() -> None:
+    first = entity()
     first.id = UUID("10000000-0000-0000-0000-000000000001")
-    first.name = " PostgreSQL "
-    first.entity_type = "Database"
-    second = entity(dataset.id, generation=2)
-    second.id = UUID("20000000-0000-0000-0000-000000000002")
-    second.name = "Postgres"
-    second.entity_type = " database "
-    different_type = entity(dataset.id, generation=2)
-    different_type.id = UUID("30000000-0000-0000-0000-000000000003")
-    different_type.entity_type = "System"
-    stale = entity(dataset.id, generation=1)
-    inactive = entity(dataset.id, generation=2)
-    inactive.is_active = False
-    existing = entity(dataset.id, generation=2)
-    existing.embedding = [0.7] * 3072
-    store.entities.extend([second, existing, inactive, first, stale, different_type])
-    service, embedding_client, drain, _, _, _ = service_for(tmp_path, store)
-    embedding_client.responses = [
-        [1.0] + [0.0] * 3071,
-        [0.91, sqrt(1 - 0.91**2)] + [0.0] * 3070,
-        [0.0, 1.0] + [0.0] * 3070,
+    first.created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    bridge = entity()
+    bridge.id = UUID("20000000-0000-0000-0000-000000000002")
+    bridge.created_at = datetime(2026, 1, 2, tzinfo=UTC)
+    indirect = entity()
+    indirect.id = UUID("30000000-0000-0000-0000-000000000003")
+    indirect.created_at = datetime(2026, 1, 3, tzinfo=UTC)
+    entities_by_id = {first.id: first, bridge.id: bridge, indirect.id: indirect}
+    candidates = [
+        EntityDuplicateCandidate(
+            entity_id=first.id,
+            entity_name="a",
+            candidate_id=bridge.id,
+            candidate_name="b",
+            entity_type="concept",
+            similarity=0.97,
+        ),
+        EntityDuplicateCandidate(
+            entity_id=bridge.id,
+            entity_name="b",
+            candidate_id=indirect.id,
+            candidate_name="c",
+            entity_type="concept",
+            similarity=0.93,
+        ),
     ]
 
-    result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
+    merge_plan = plan_entity_merges(entities_by_id, candidates)
 
-    assert result.feedback_processed == 0
-    assert result.relations_embedded == 0
-    assert result.entities_embedded == 3
-    assert result.entity_duplicate_candidates == 1
-    assert result.entities_merged == 0
-    assert result.graph_events_enqueued == 0
-    assert result.graph_events_processed == 0
-    assert drain.dataset_ids == []
-    assert embedding_client.calls == [["PostgreSQL", "Postgres", different_type.name]]
-    assert first.embedding == [1.0] + [0.0] * 3071
-    assert second.embedding == [0.91, sqrt(1 - 0.91**2)] + [0.0] * 3070
-    assert different_type.embedding == [0.0, 1.0] + [0.0] * 3070
-    assert stale.embedding is None
-    assert inactive.embedding is None
-    assert existing.embedding == [0.7] * 3072
-    assert store.graph_commands == []
-
-    rerun = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
-
-    assert rerun.entities_embedded == 0
-    assert rerun.entity_duplicate_candidates == 1
-    assert len(embedding_client.calls) == 1
+    assert merge_plan == {bridge.id: first.id}
+    assert indirect.id not in merge_plan
 
 
-@pytest.mark.asyncio
-async def test_entity_deduplication_merges_safe_pair_rewrites_mentions_and_relations(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    survivor = entity(dataset.id, generation=0)
-    survivor.id = UUID("10000000-0000-0000-0000-000000000001")
+def test_merged_entity_aliases_dedupes_case_insensitively_and_drops_survivor_name() -> None:
+    survivor = entity()
     survivor.name = "PostgreSQL"
-    survivor.canonical_key = "database:postgresql"
     survivor.aliases = ["PG"]
-    survivor.embedding = [1.0] + [0.0] * 3071
-    survivor.created_at = datetime(2026, 1, 1, tzinfo=UTC)
-    duplicate = entity(dataset.id, generation=0)
-    duplicate.id = UUID("20000000-0000-0000-0000-000000000002")
+    duplicate = entity()
     duplicate.name = "Postgres"
     duplicate.aliases = ["pg", "", "PostgreSQL", "Postgres DB"]
-    duplicate.embedding = unit_embedding(0.98)
-    duplicate.created_at = datetime(2026, 1, 2, tzinfo=UTC)
-    target = entity(dataset.id, generation=0)
-    target.id = UUID("30000000-0000-0000-0000-000000000003")
-    target.name = "Sofias Memory"
-    target.embedding = [0.0, 1.0] + [0.0] * 3070
-    target.created_at = datetime(2026, 1, 3, tzinfo=UTC)
-    store.entities.extend([duplicate, target, survivor])
-    chunk_id = uuid4()
-    mention = EntityMention(
-        id=UUID("40000000-0000-0000-0000-000000000004"),
-        entity_id=duplicate.id,
-        chunk_id=chunk_id,
-        surface_text="Postgres",
-        start_char=10,
-        end_char=18,
+
+    aliases = merged_entity_aliases(survivor=survivor, duplicate=duplicate)
+
+    assert aliases == ["PG", "Postgres", "Postgres DB"]
+
+
+def test_reassign_entity_mentions_only_touches_mapped_entities() -> None:
+    survivor_id = uuid4()
+    duplicate_id = uuid4()
+    untouched_id = uuid4()
+    mapping = {duplicate_id: survivor_id}
+    dataset_id = uuid4()
+    mention_a = EntityMention(
+        id=uuid4(),
+        entity_id=duplicate_id,
+        chunk_id=uuid4(),
+        surface_text="x",
+        start_char=0,
+        end_char=1,
         confidence=0.9,
     )
-    store.entity_mentions.append(mention)
-    target_relation = relation(dataset.id, duplicate.id, target.id, generation=0)
-    target_relation.id = UUID("50000000-0000-0000-0000-000000000005")
-    target_relation.embedding = [0.2] * 3072
-    store.relations.append(target_relation)
-    drain = FakeDrain(processed=3)
-    service, embedding_client, _, _, _, _ = service_for(tmp_path, store, drain=drain)
+    mention_b = EntityMention(
+        id=uuid4(),
+        entity_id=untouched_id,
+        chunk_id=uuid4(),
+        surface_text="y",
+        start_char=0,
+        end_char=1,
+        confidence=0.9,
+    )
 
-    result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
+    commands = reassign_entity_mentions(
+        mentions=[mention_a, mention_b], entity_id_mapping=mapping, dataset_id=dataset_id
+    )
 
-    assert embedding_client.calls == []
-    assert result.entity_duplicate_candidates == 1
-    assert result.entities_merged == 1
-    assert result.entity_mentions_reassigned == 1
-    assert result.relations_rewired == 1
-    assert result.relations_deactivated == 0
-    assert result.graph_events_enqueued == 3
-    assert result.graph_events_processed == 3
-    assert duplicate.is_active is False
-    assert survivor.name == "PostgreSQL"
-    assert survivor.canonical_key == "database:postgresql"
-    assert survivor.aliases == ["PG", "Postgres", "Postgres DB"]
-    assert mention.entity_id == survivor.id
-    assert mention.surface_text == "Postgres"
-    assert target_relation.source_entity_id == survivor.id
-    assert target_relation.target_entity_id == target.id
-    assert target_relation.embedding is None
-    assert [command.operation for command in store.graph_commands] == ["delete", "upsert", "upsert"]
-    assert [command.aggregate_type for command in store.graph_commands] == [
-        "entity",
-        "entity_mention",
-        "relation",
-    ]
-
-    previous_command_count = len(store.graph_commands)
-    rerun = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
-
-    assert rerun.entities_merged == 0
-    assert rerun.entity_mentions_reassigned == 0
-    assert rerun.relations_rewired == 0
-    assert rerun.relations_deactivated == 0
-    assert rerun.graph_events_enqueued == 0
-    assert len(store.graph_commands) == previous_command_count
-    assert drain.dataset_ids == [dataset.id]
+    assert mention_a.entity_id == survivor_id
+    assert mention_b.entity_id == untouched_id
+    assert len(commands) == 1
+    assert commands[0].aggregate_id == str(mention_a.id)
 
 
-@pytest.mark.asyncio
-async def test_entity_deduplication_does_not_merge_transitively_without_direct_similarity(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    first = entity(dataset.id, generation=0)
-    first.id = UUID("10000000-0000-0000-0000-000000000001")
-    first.embedding = [1.0] + [0.0] * 3071
-    first.created_at = datetime(2026, 1, 1, tzinfo=UTC)
-    bridge = entity(dataset.id, generation=0)
-    bridge.id = UUID("20000000-0000-0000-0000-000000000002")
-    bridge.embedding = unit_embedding(0.98)
-    bridge.created_at = datetime(2026, 1, 2, tzinfo=UTC)
-    indirect = entity(dataset.id, generation=0)
-    indirect.id = UUID("30000000-0000-0000-0000-000000000003")
-    indirect.embedding = unit_embedding(0.92)
-    indirect.created_at = datetime(2026, 1, 3, tzinfo=UTC)
-    store.entities.extend([first, bridge, indirect])
-    service, _, drain, _, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=1))
-
-    result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
-
-    assert result.entity_duplicate_candidates == 3
-    assert result.entities_merged == 1
-    assert first.is_active is True
-    assert bridge.is_active is False
-    assert indirect.is_active is True
-    assert [command.aggregate_id for command in store.graph_commands] == [str(bridge.id)]
-    assert drain.dataset_ids == [dataset.id]
+# ---------------------------------------------------------------------------
+# Relation-merge planning + application (SM-511 pure/impure split)
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_entity_merge_handles_relation_self_loop_collision_and_evidence_copy(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    survivor = entity(dataset.id, generation=0)
-    survivor.id = UUID("10000000-0000-0000-0000-000000000001")
-    survivor.embedding = [1.0] + [0.0] * 3071
-    survivor.created_at = datetime(2026, 1, 1, tzinfo=UTC)
-    duplicate = entity(dataset.id, generation=0)
-    duplicate.id = UUID("20000000-0000-0000-0000-000000000002")
-    duplicate.embedding = unit_embedding(0.99)
-    duplicate.created_at = datetime(2026, 1, 2, tzinfo=UTC)
-    target = entity(dataset.id, generation=0)
-    target.id = UUID("30000000-0000-0000-0000-000000000003")
-    target.embedding = [0.0, 1.0] + [0.0] * 3070
-    store.entities.extend([survivor, duplicate, target])
-    canonical_relation = relation(dataset.id, survivor.id, target.id, generation=0, weight=0.4)
-    canonical_relation.id = UUID("40000000-0000-0000-0000-000000000004")
+def test_plan_relation_merges_rewires_survivor_and_deactivates_loser_with_evidence_copy() -> None:
+    dataset_id = uuid4()
+    survivor_entity = uuid4()
+    duplicate_entity = uuid4()
+    target_entity = uuid4()
+    canonical_relation = relation(dataset_id, survivor_entity, target_entity, weight=0.4)
     canonical_relation.confidence = 0.6
-    duplicate_relation = relation(dataset.id, duplicate.id, target.id, generation=0, weight=0.9)
-    duplicate_relation.id = UUID("50000000-0000-0000-0000-000000000005")
+    canonical_relation.created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    duplicate_relation = relation(dataset_id, duplicate_entity, target_entity, weight=0.9)
     duplicate_relation.confidence = 0.8
-    self_loop_relation = relation(dataset.id, duplicate.id, survivor.id, generation=0)
-    self_loop_relation.id = UUID("60000000-0000-0000-0000-000000000006")
-    store.relations.extend([canonical_relation, duplicate_relation, self_loop_relation])
+    duplicate_relation.created_at = datetime(2026, 1, 2, tzinfo=UTC)
     existing_chunk = uuid4()
     new_chunk = uuid4()
-    store.relation_evidence.extend(
-        [
-            RelationEvidence(
-                relation_id=canonical_relation.id,
-                chunk_id=existing_chunk,
-                quote="existing evidence",
-                confidence=0.7,
-            ),
-            RelationEvidence(
-                relation_id=duplicate_relation.id,
-                chunk_id=existing_chunk,
-                quote="do not overwrite",
-                confidence=0.9,
-            ),
-            RelationEvidence(
-                relation_id=duplicate_relation.id,
-                chunk_id=new_chunk,
-                quote="new evidence",
-                confidence=0.8,
-            ),
-        ]
-    )
-    service, _, _, _, _, _ = service_for(tmp_path, store, drain=FakeDrain(processed=2))
-
-    result = await service.improve(ImproveRequest(stages=["entity_deduplication"]))
-
-    assert result.entities_merged == 1
-    assert result.relations_rewired == 0
-    assert result.relations_deactivated == 2
-    assert result.relation_evidence_copied == 1
-    assert canonical_relation.is_active is True
-    assert canonical_relation.confidence == 0.8
-    assert canonical_relation.importance_weight == 0.9
-    assert duplicate_relation.is_active is False
-    assert self_loop_relation.is_active is False
-    copied = [
-        evidence
-        for evidence in store.relation_evidence
-        if evidence.relation_id == canonical_relation.id
-    ]
-    assert sorted(evidence.chunk_id for evidence in copied) == sorted([existing_chunk, new_chunk])
-    assert next(evidence for evidence in copied if evidence.chunk_id == existing_chunk).quote == (
-        "existing evidence"
-    )
-    relation_commands = [
-        command for command in store.graph_commands if command.aggregate_type == "relation"
-    ]
-    assert [command.aggregate_id for command in relation_commands] == [str(canonical_relation.id)]
-    assert relation_commands[0].properties["confidence"] == 0.8
-    assert relation_commands[0].properties["importance_weight"] == 0.9
-
-
-@pytest.mark.asyncio
-async def test_entity_embedding_provider_validation_and_failure_write_nothing(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    target = entity(dataset.id, generation=0)
-    store.entities.append(target)
-    service, embedding_client, _, _, _, _ = service_for(tmp_path, store)
-    embedding_client.responses = []
-
-    with pytest.raises(Exception, match="invalid response"):
-        await service.improve(ImproveRequest(stages=["entity_deduplication"]))
-
-    assert target.embedding is None
-
-    embedding_client.responses = [[0.1] * 2]
-    with pytest.raises(Exception, match="invalid response"):
-        await service.improve(ImproveRequest(stages=["entity_deduplication"]))
-
-    assert target.embedding is None
-
-    embedding_client.responses = None
-    embedding_client.failure = RuntimeError("secret provider failure")
-    with pytest.raises(Exception, match="unavailable"):
-        await service.improve(ImproveRequest(stages=["entity_deduplication"]))
-
-    assert target.embedding is None
-
-
-@pytest.mark.asyncio
-async def test_relation_embedding_provider_validation_and_failure_write_nothing(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    source_entity = entity(dataset.id, generation=0)
-    target_entity = entity(dataset.id, generation=0)
-    store.entities.extend([source_entity, target_entity])
-    target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
-    store.relations.append(target_relation)
-    service, embedding_client, _, _, _, _ = service_for(tmp_path, store)
-    embedding_client.responses = []
-
-    with pytest.raises(Exception, match="invalid response"):
-        await service.improve(ImproveRequest(stages=["relation_embeddings"]))
-
-    assert target_relation.embedding is None
-
-    embedding_client.responses = [[0.1] * 2]
-    with pytest.raises(Exception, match="invalid response"):
-        await service.improve(ImproveRequest(stages=["relation_embeddings"]))
-
-    assert target_relation.embedding is None
-
-    embedding_client.responses = None
-    embedding_client.failure = RuntimeError("secret provider failure")
-    with pytest.raises(Exception, match="unavailable"):
-        await service.improve(ImproveRequest(stages=["relation_embeddings"]))
-
-    assert target_relation.embedding is None
-
-
-@pytest.mark.asyncio
-async def test_omitted_stages_default_order_includes_deduplication_before_relation_embeddings(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    chunk_id = uuid4()
-    query = query_for(dataset.id, [chunk_id])
-    store.queries.append(query)
-    store.feedback.append(feedback_for(query.id, target_type="answer", score=1))
-    source_entity = entity(dataset.id, generation=0, weight=0.5)
-    source_entity.id = UUID("10000000-0000-0000-0000-000000000001")
-    source_entity.name = "A"
-    target_entity = entity(dataset.id, generation=0, weight=0.5)
-    target_entity.id = UUID("20000000-0000-0000-0000-000000000002")
-    target_entity.name = "B"
-    store.entities.extend([source_entity, target_entity])
-    store.entities_by_chunk[chunk_id] = [source_entity]
-    target_relation = relation(dataset.id, source_entity.id, target_entity.id, generation=0)
-    store.relations.append(target_relation)
-    drain = FakeDrain(processed=1)
-    service, embedding_client, _, _, _, _ = service_for(tmp_path, store, drain=drain)
-    embedding_client.response_batches = [
-        [[1.0] + [0.0] * 3071, [0.0, 1.0] + [0.0] * 3070],
-        [[0.3] * 3072],
-    ]
-
-    result = await service.improve(ImproveRequest())
-
-    assert result.stages == ["feedback_weights", "entity_deduplication", "relation_embeddings"]
-    assert result.feedback_processed == 1
-    assert result.entities_updated == 1
-    assert result.relations_embedded == 1
-    assert result.entities_embedded == 2
-    assert result.entity_duplicate_candidates == 0
-    assert drain.dataset_ids == [dataset.id]
-    assert embedding_client.calls == [["A", "B"], ["A-›uses: Uses projection.-›B"]]
-    assert store.run_current_steps_on_add == ["feedback_weights"]
-
-    relation_only_store = FakeStore()
-    seed_dataset(relation_only_store)
-    first_run_service, _, _, _, _, _ = service_for(tmp_path, relation_only_store)
-    await first_run_service.improve(ImproveRequest(stages=["relation_embeddings"]))
-
-    assert relation_only_store.run_current_steps_on_add == ["relation_embeddings"]
-
-
-@pytest.mark.asyncio
-async def test_graph_reconciliation_is_explicit_stage_and_not_default(
-    tmp_path: Path,
-) -> None:
-    default_store = FakeStore()
-    seed_dataset(default_store)
-    default_graph_reconciliation = FakeGraphReconciliation()
-    default_service, _, _, _, _, default_summary_rebuild = service_for(
-        tmp_path,
-        default_store,
-        graph_reconciliation=default_graph_reconciliation,
-    )
-
-    default_result = await default_service.improve(ImproveRequest())
-
-    assert default_result.stages == [
-        "feedback_weights",
-        "entity_deduplication",
-        "relation_embeddings",
-    ]
-    assert default_graph_reconciliation.dataset_ids == []
-    assert default_summary_rebuild.calls == []
-
-    explicit_store = FakeStore()
-    dataset = seed_dataset(explicit_store)
-    graph_reconciliation = FakeGraphReconciliation(
-        GraphReconciliationResult(
-            diff=GraphReconciliationDiff(
-                entities_missing=44,
-                chunks_extra=1,
-                entity_mentions_missing=2,
-                relations_extra=3,
-                next_missing=4,
-            ),
-            rebuilt=True,
-        )
-    )
-    order: list[str] = []
-    graph_reconciliation.order = order
-    drain = FakeDrain(processed=10, order=order)
-    graph_maintenance = FakeGraphMaintenance(order=order)
-    service, embedding_client, resolved_drain, _, graph_maintenance, _ = service_for(
-        tmp_path,
-        explicit_store,
-        drain=drain,
-        graph_reconciliation=graph_reconciliation,
-        graph_maintenance=graph_maintenance,
-    )
-
-    result = await service.improve(ImproveRequest(stages=["graph_reconciliation"]))
-
-    assert result.stages == ["graph_reconciliation"]
-    assert graph_maintenance.calls == [(dataset.id, 0)]
-    assert graph_reconciliation.dataset_ids == [dataset.id]
-    assert embedding_client.calls == []
-    assert resolved_drain.dataset_ids == [dataset.id]
-    assert result.graph_entities_missing == 44
-    assert result.graph_chunks_extra == 1
-    assert result.graph_entity_mentions_missing == 2
-    assert result.graph_relations_extra == 3
-    assert result.graph_next_missing == 4
-    assert result.graph_rebuilt is True
-    assert result.graph_events_enqueued == 0
-    assert result.graph_events_processed == 10
-    assert order == ["reconcile", "maintenance", "drain"]
-
-    metrics = explicit_store.pipeline_runs[-1].metrics["improve_result"]
-    assert metrics["graph_entities_missing"] == 44
-    assert metrics["graph_rebuilt"] is True
-
-
-@pytest.mark.asyncio
-async def test_summaries_is_explicit_stage_and_records_metrics(tmp_path: Path) -> None:
-    default_store = FakeStore()
-    seed_dataset(default_store)
-    default_summary_rebuild = FakeSummaryRebuild()
-    default_service, _, _, _, _, _ = service_for(
-        tmp_path,
-        default_store,
-        summary_rebuild=default_summary_rebuild,
-    )
-
-    default_result = await default_service.improve(ImproveRequest())
-
-    assert default_result.stages == [
-        "feedback_weights",
-        "entity_deduplication",
-        "relation_embeddings",
-    ]
-    assert default_summary_rebuild.calls == []
-
-    explicit_store = FakeStore()
-    dataset = seed_dataset(explicit_store, generation=2)
-    summary_rebuild = FakeSummaryRebuild(
-        SummaryRebuildCounts(
-            document_summaries_rebuilt=2,
-            dataset_summaries_rebuilt=1,
-            summaries_deactivated=3,
-        )
-    )
-    drain = FakeDrain(processed=10)
-    service, embedding_client, resolved_drain, _, _, _ = service_for(
-        tmp_path,
-        explicit_store,
-        drain=drain,
-        summary_rebuild=summary_rebuild,
-    )
-
-    result = await service.improve(ImproveRequest(stages=["summaries"]))
-
-    assert result.stages == ["summaries"]
-    assert summary_rebuild.calls == [(dataset.id, 2)]
-    assert embedding_client.calls == []
-    assert resolved_drain.dataset_ids == []
-    assert result.feedback_processed == 0
-    assert result.entities_updated == 0
-    assert result.relations_embedded == 0
-    assert result.document_summaries_rebuilt == 2
-    assert result.dataset_summaries_rebuilt == 1
-    assert result.summaries_deactivated == 3
-    assert result.graph_events_enqueued == 0
-    assert result.graph_events_processed == 0
-
-    metrics = explicit_store.pipeline_runs[-1].metrics["improve_result"]
-    assert metrics["document_summaries_rebuilt"] == 2
-    assert metrics["dataset_summaries_rebuilt"] == 1
-    assert metrics["summaries_deactivated"] == 3
-
-
-@pytest.mark.asyncio
-async def test_graph_reconciliation_failure_marks_run_failed(tmp_path: Path) -> None:
-    store = FakeStore()
-    seed_dataset(store)
-    service, _, _, _, _, _ = service_for(
-        tmp_path,
-        store,
-        graph_reconciliation=FakeGraphReconciliation(
-            failure=DependencyUnavailableError(message="Projection did not converge."),
+    evidence = [
+        RelationEvidence(
+            relation_id=canonical_relation.id,
+            chunk_id=existing_chunk,
+            quote="existing evidence",
+            confidence=0.7,
         ),
+        RelationEvidence(
+            relation_id=duplicate_relation.id,
+            chunk_id=existing_chunk,
+            quote="do not overwrite",
+            confidence=0.9,
+        ),
+        RelationEvidence(
+            relation_id=duplicate_relation.id,
+            chunk_id=new_chunk,
+            quote="new evidence",
+            confidence=0.8,
+        ),
+    ]
+
+    plan = plan_relation_merges(
+        relations=[canonical_relation, duplicate_relation],
+        relation_evidence=evidence,
+        entity_id_mapping={duplicate_entity: survivor_entity},
     )
 
-    with pytest.raises(DependencyUnavailableError, match="Projection"):
-        await service.improve(ImproveRequest(stages=["graph_reconciliation"]))
-
-    assert store.pipeline_runs[-1].status == PipelineRunStatus.FAILED
-    assert store.pipeline_runs[-1].error_code == "DependencyUnavailableError"
-    assert store.graph_commands == []
-
-
-@pytest.mark.asyncio
-async def test_improve_is_dataset_isolated_and_uses_only_current_active_knowledge(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store, generation=2)
-    other_dataset = seed_dataset(store, slug="other", generation=2)
-    target_chunk = uuid4()
-    query = query_for(dataset.id, [target_chunk])
-    other_query = query_for(other_dataset.id, [target_chunk])
-    store.queries.extend([query, other_query])
-    store.feedback.extend(
-        [
-            feedback_for(query.id, target_type="answer", score=1),
-            feedback_for(other_query.id, target_type="answer", score=1),
-        ]
-    )
-    active_entity = entity(dataset.id, generation=2, weight=0.2)
-    stale_entity = entity(dataset.id, generation=1, weight=0.2)
-    other_entity = entity(other_dataset.id, generation=2, weight=0.2)
-    inactive_relation = relation(
-        dataset.id,
-        active_entity.id,
-        stale_entity.id,
-        generation=2,
-        weight=0.2,
-    )
-    inactive_relation.is_active = False
-    store.entities_by_chunk[target_chunk] = [active_entity, stale_entity, other_entity]
-    store.relations_by_chunk[target_chunk] = [inactive_relation]
-
-    service, _, _, _, _, _ = service_for(tmp_path, store)
-    result = await service.improve(ImproveRequest(dataset="main", stages=["feedback_weights"]))
-
-    assert result.feedback_processed == 1
-    assert result.entities_updated == 1
-    assert result.relations_updated == 0
-    assert active_entity.importance_weight == 0.28
-    assert stale_entity.importance_weight == 0.2
-    assert other_entity.importance_weight == 0.2
-    assert store.feedback[0].applied_at is not None
-    assert store.feedback[1].applied_at is None
-    assert [command.aggregate_id for command in store.graph_commands] == [str(active_entity.id)]
+    assert len(plan.applies) == 1
+    apply = plan.applies[0]
+    assert apply.survivor_relation_id == canonical_relation.id
+    assert apply.loser_relation_ids == (duplicate_relation.id,)
+    assert apply.confidence == pytest.approx(0.8)
+    assert apply.importance_weight == pytest.approx(0.9)
+    assert len(plan.evidence_copies) == 1
+    assert plan.evidence_copies[0].chunk_id == new_chunk
+    assert plan.evidence_copies[0].quote == "new evidence"
 
 
-@pytest.mark.asyncio
-async def test_applied_feedback_is_not_reapplied_and_no_target_feedback_is_consumed(
-    tmp_path: Path,
-) -> None:
-    store = FakeStore()
-    dataset = seed_dataset(store)
-    target_chunk = uuid4()
-    query = query_for(dataset.id, [target_chunk])
-    store.queries.append(query)
-    already_applied = feedback_for(query.id, target_type="answer", score=1)
-    already_applied.applied_at = datetime(2026, 1, 2, tzinfo=UTC)
-    no_target = feedback_for(query.id, target_type="reference", target_id=target_chunk, score=-1)
-    store.feedback.extend([already_applied, no_target])
-
-    service, embedding_client, _, _, _, _ = service_for(tmp_path, store)
-    result = await service.improve(ImproveRequest(stages=["feedback_weights"]))
-
-    assert embedding_client.calls == []
-    assert result.feedback_processed == 1
-    assert result.feedback_applied == 0
-    assert result.feedback_skipped == 1
-    assert result.entities_updated == 0
-    assert result.relations_updated == 0
-    assert result.graph_events_enqueued == 0
-    assert no_target.applied_at is not None
-    assert store.graph_commands == []
-
-
-@pytest.mark.asyncio
-async def test_improve_route_returns_envelope_and_requires_api_key(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_plan_relation_merges_deactivates_self_loop_without_evidence_copy() -> None:
     dataset_id = uuid4()
-    run_id = uuid4()
+    survivor_entity = uuid4()
+    duplicate_entity = uuid4()
+    self_loop = relation(dataset_id, duplicate_entity, survivor_entity)
 
-    class FakeProjection:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-    class FakeOutboxProcessor:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-    class FakeBatchProcessor:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-    class FakeImproveService:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
-
-        async def improve(self, request: ImproveRequest) -> ImproveResult:
-            return ImproveResult(
-                run_id=run_id,
-                status=PipelineRunStatus.SUCCEEDED.value,
-                dataset_id=dataset_id,
-                generation=0,
-                stages=request.stages or ["feedback_weights"],
-                feedback_processed=1,
-                feedback_applied=1,
-                feedback_skipped=0,
-                entities_updated=1,
-                relations_updated=0,
-                relations_embedded=0,
-                entities_embedded=0,
-                entity_duplicate_candidates=0,
-                entities_merged=0,
-                entity_mentions_reassigned=0,
-                relations_rewired=0,
-                relations_deactivated=0,
-                relation_evidence_copied=0,
-                document_summaries_rebuilt=0,
-                dataset_summaries_rebuilt=0,
-                summaries_deactivated=0,
-                graph_relations_deactivated=0,
-                graph_entities_importance_updated=0,
-                graph_relations_importance_updated=0,
-                graph_entities_missing=0,
-                graph_entities_extra=0,
-                graph_chunks_missing=0,
-                graph_chunks_extra=0,
-                graph_entity_mentions_missing=0,
-                graph_entity_mentions_extra=0,
-                graph_relations_missing=0,
-                graph_relations_extra=0,
-                graph_next_missing=0,
-                graph_next_extra=0,
-                graph_rebuilt=False,
-                graph_events_enqueued=1,
-                graph_events_processed=1,
-            )
-
-    monkeypatch.setattr("sofias_memory.api.routes.improve.Neo4jProjection", FakeProjection)
-    monkeypatch.setattr(
-        "sofias_memory.api.routes.improve.GraphOutboxProcessor",
-        FakeOutboxProcessor,
+    plan = plan_relation_merges(
+        relations=[self_loop],
+        relation_evidence=[],
+        entity_id_mapping={duplicate_entity: survivor_entity},
     )
-    monkeypatch.setattr(
-        "sofias_memory.api.routes.improve.GraphOutboxBatchProcessor",
-        FakeBatchProcessor,
+
+    assert plan.self_loop_deactivate_ids == (self_loop.id,)
+    assert plan.applies == ()
+    assert plan.evidence_copies == ()
+
+
+@pytest.mark.asyncio
+async def test_apply_relation_merge_plan_mutates_only_planned_relations_once() -> None:
+    dataset_id = uuid4()
+    survivor_entity = uuid4()
+    duplicate_entity = uuid4()
+    target_entity = uuid4()
+    survivor = relation(dataset_id, survivor_entity, target_entity, weight=0.4)
+    survivor.confidence = 0.6
+    loser = relation(dataset_id, duplicate_entity, target_entity, weight=0.9)
+    loser.confidence = 0.8
+    self_loop = relation(dataset_id, duplicate_entity, survivor_entity)
+
+    plan = plan_relation_merges(
+        relations=[survivor, loser, self_loop],
+        relation_evidence=[],
+        entity_id_mapping={duplicate_entity: survivor_entity},
     )
-    monkeypatch.setattr("sofias_memory.api.routes.improve.ImproveService", FakeImproveService)
-    monkeypatch.setattr("sofias_memory.api.routes.improve.app_neo4j_resource", lambda app: object())
-    app = create_app(make_settings(tmp_path), enable_postgres_readiness=False, enable_neo4j=False)
-    transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        missing_key_response = await client.post("/api/v1/improve", json={})
-        response = await client.post(
-            "/api/v1/improve",
-            headers={API_KEY_HEADER: EXPECTED_API_KEY},
-            json={"dataset": "main", "stages": ["feedback_weights"], "wait": False},
-        )
+    class FakeRelationsRepo:
+        def __init__(self) -> None:
+            self._by_id = {r.id: r for r in (survivor, loser, self_loop)}
 
-    assert missing_key_response.status_code == 401
-    assert response.status_code == 200
-    body = response.json()
-    assert body["data"]["run_id"] == str(run_id)
-    assert body["data"]["dataset_id"] == str(dataset_id)
-    assert body["data"]["feedback_processed"] == 1
-    assert body["data"]["entities_updated"] == 1
-    assert body["meta"]["request_id"]
+        async def get_by_id(self, relation_id: UUID) -> Relation | None:
+            return self._by_id.get(relation_id)
+
+    class FakeEvidenceRepo:
+        def __init__(self) -> None:
+            self.added: list[RelationEvidence] = []
+
+        async def add(self, evidence: RelationEvidence) -> RelationEvidence:
+            self.added.append(evidence)
+            return evidence
+
+    relations_repo = FakeRelationsRepo()
+    evidence_repo = FakeEvidenceRepo()
+
+    counts, commands = await apply_relation_merge_plan(
+        relations_repo=relations_repo,
+        relation_evidence_repo=evidence_repo,
+        dataset_id=dataset_id,
+        plan=plan,
+    )
+
+    assert counts.rewired == 0
+    assert counts.deactivated == 2
+    assert loser.is_active is False
+    assert self_loop.is_active is False
+    assert survivor.is_active is True
+    assert survivor.confidence == pytest.approx(0.8)
+    assert survivor.importance_weight == pytest.approx(0.9)
+    assert len(commands) == 1
+    assert commands[0].aggregate_id == str(survivor.id)

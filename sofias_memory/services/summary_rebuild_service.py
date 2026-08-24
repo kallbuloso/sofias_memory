@@ -184,6 +184,24 @@ class SummaryRebuildService:
         )
 
     async def rebuild_dataset(self, dataset_id: UUID, *, generation: int) -> SummaryRebuildCounts:
+        """Convenience wrapper: prepare then apply in one owned transaction.
+        The B5 Improve pipeline step never calls this -- it calls
+        :meth:`prepare_dataset` from ``execute`` (external LLM/embedding
+        calls happen there) and :func:`apply_prepared_summaries` from
+        ``persist`` against the engine's own unit of work (ADR-0009 SS O),
+        so the mutation and the step's ``succeeded`` transition land in one
+        commit."""
+
+        prepared = await self.prepare_dataset(dataset_id, generation=generation)
+        return await self._persist_prepared(prepared)
+
+    async def prepare_dataset(self, dataset_id: UUID, *, generation: int) -> PreparedSummaryRebuild:
+        """External/computation phase only (ADR-0009 SS O ``execute``): reads
+        PostgreSQL and calls the LLM/embedding providers, but writes nothing.
+        The returned batch carries summary text and embeddings -- it must
+        stay in a step's private staged cache, never in ``StepResult``
+        (ADR-0009 SS 10 / SM-511 SS 35)."""
+
         dataset = SummaryRebuildDatasetSnapshot(id=dataset_id, generation=generation)
         document_plans = await self._load_document_plans(dataset)
         dataset_summary_current = await self._load_dataset_summary_current_text(dataset)
@@ -206,13 +224,12 @@ class SummaryRebuildService:
             prepared_dataset_summary = None
             deactivate_dataset_summary = not dataset_summary_inputs
 
-        prepared = PreparedSummaryRebuild(
+        return PreparedSummaryRebuild(
             dataset=dataset,
             documents=prepared_documents,
             dataset_summary=prepared_dataset_summary,
             deactivate_dataset_summary=deactivate_dataset_summary,
         )
-        return await self._persist_prepared(prepared)
 
     async def _load_document_plans(
         self,
@@ -322,106 +339,9 @@ class SummaryRebuildService:
 
     async def _persist_prepared(self, prepared: PreparedSummaryRebuild) -> SummaryRebuildCounts:
         async with self._unit_of_work_factory() as uow:
-            dataset = await uow.datasets.get_by_id(prepared.dataset.id)
-            if (
-                dataset is None
-                or dataset.status != DatasetStatus.ACTIVE
-                or dataset.active_generation != prepared.dataset.generation
-            ):
-                raise _summary_rebuild_state_changed_error()
-
-            summaries_deactivated = 0
-            document_summaries_rebuilt = 0
-            for document_summary in prepared.documents:
-                if not document_summary.rebuilt:
-                    continue
-                document = await uow.documents.get_active_for_summary_rebuild(
-                    dataset_id=prepared.dataset.id,
-                    generation=prepared.dataset.generation,
-                    document_id=document_summary.document_id,
-                )
-                if document is None:
-                    raise _summary_rebuild_state_changed_error()
-                summaries_deactivated += await uow.summaries.deactivate_active_for_target_except(
-                    dataset_id=prepared.dataset.id,
-                    generation=prepared.dataset.generation,
-                    target_type=SummaryTargetType.DOCUMENT,
-                    target_id=document.id,
-                    level=0,
-                    keep_summary_id=document_summary.summary_id,
-                )
-                summary = await uow.summaries.get_by_id(document_summary.summary_id)
-                if summary is None:
-                    summary = Summary(
-                        id=document_summary.summary_id,
-                        dataset_id=prepared.dataset.id,
-                        generation=prepared.dataset.generation,
-                        target_type=SummaryTargetType.DOCUMENT,
-                        target_id=document.id,
-                        level=0,
-                        text=document_summary.text,
-                        embedding=document_summary.embedding,
-                        is_active=True,
-                    )
-                    await uow.summaries.add(summary)
-                else:
-                    summary.text = document_summary.text
-                    summary.embedding = document_summary.embedding
-                    summary.is_active = True
-                document.metadata_ = document_summary_metadata(
-                    document.metadata_,
-                    summary_id=summary.id,
-                    llm_model=self._settings.llm_model,
-                    embedding_model=self._settings.embedding_model,
-                    config_fingerprint=self._settings.config_fingerprint(),
-                )
-                document_summaries_rebuilt += 1
-
-            dataset_summaries_rebuilt = 0
-            if prepared.dataset_summary is not None:
-                summaries_deactivated += await uow.summaries.deactivate_active_for_target_except(
-                    dataset_id=prepared.dataset.id,
-                    generation=prepared.dataset.generation,
-                    target_type=SummaryTargetType.DATASET,
-                    target_id=prepared.dataset.id,
-                    level=0,
-                    keep_summary_id=prepared.dataset_summary.summary_id,
-                )
-                summary = await uow.summaries.get_by_id(prepared.dataset_summary.summary_id)
-                if summary is None:
-                    summary = Summary(
-                        id=prepared.dataset_summary.summary_id,
-                        dataset_id=prepared.dataset.id,
-                        generation=prepared.dataset.generation,
-                        target_type=SummaryTargetType.DATASET,
-                        target_id=prepared.dataset.id,
-                        level=0,
-                        text=prepared.dataset_summary.text,
-                        embedding=prepared.dataset_summary.embedding,
-                        is_active=True,
-                    )
-                    await uow.summaries.add(summary)
-                else:
-                    summary.text = prepared.dataset_summary.text
-                    summary.embedding = prepared.dataset_summary.embedding
-                    summary.is_active = True
-                dataset_summaries_rebuilt = 1
-            elif prepared.deactivate_dataset_summary:
-                summaries_deactivated += await uow.summaries.deactivate_active_for_target_except(
-                    dataset_id=prepared.dataset.id,
-                    generation=prepared.dataset.generation,
-                    target_type=SummaryTargetType.DATASET,
-                    target_id=prepared.dataset.id,
-                    level=0,
-                    keep_summary_id=None,
-                )
-
+            counts = await apply_prepared_summaries(uow, prepared, settings=self._settings)
             await uow.commit()
-            return SummaryRebuildCounts(
-                document_summaries_rebuilt=document_summaries_rebuilt,
-                dataset_summaries_rebuilt=dataset_summaries_rebuilt,
-                summaries_deactivated=summaries_deactivated,
-            )
+            return counts
 
     async def _summarize_document(self, chunk_summaries: Sequence[str]) -> str:
         try:
@@ -452,6 +372,117 @@ class SummaryRebuildService:
             subject=subject,
         )
         return embeddings[0]
+
+
+async def apply_prepared_summaries(
+    uow: SummaryRebuildUnitOfWork,
+    prepared: PreparedSummaryRebuild,
+    *,
+    settings: Settings,
+) -> SummaryRebuildCounts:
+    """Impure application half (ADR-0009 SS O ``persist`` phase): applies an
+    already-``prepare_dataset``-computed batch using the caller's own
+    (engine-owned) unit of work. Never commits, never calls a provider."""
+
+    dataset = await uow.datasets.get_by_id(prepared.dataset.id)
+    if (
+        dataset is None
+        or dataset.status != DatasetStatus.ACTIVE
+        or dataset.active_generation != prepared.dataset.generation
+    ):
+        raise _summary_rebuild_state_changed_error()
+
+    summaries_deactivated = 0
+    document_summaries_rebuilt = 0
+    for document_summary in prepared.documents:
+        if not document_summary.rebuilt:
+            continue
+        document = await uow.documents.get_active_for_summary_rebuild(
+            dataset_id=prepared.dataset.id,
+            generation=prepared.dataset.generation,
+            document_id=document_summary.document_id,
+        )
+        if document is None:
+            raise _summary_rebuild_state_changed_error()
+        summaries_deactivated += await uow.summaries.deactivate_active_for_target_except(
+            dataset_id=prepared.dataset.id,
+            generation=prepared.dataset.generation,
+            target_type=SummaryTargetType.DOCUMENT,
+            target_id=document.id,
+            level=0,
+            keep_summary_id=document_summary.summary_id,
+        )
+        summary = await uow.summaries.get_by_id(document_summary.summary_id)
+        if summary is None:
+            summary = Summary(
+                id=document_summary.summary_id,
+                dataset_id=prepared.dataset.id,
+                generation=prepared.dataset.generation,
+                target_type=SummaryTargetType.DOCUMENT,
+                target_id=document.id,
+                level=0,
+                text=document_summary.text,
+                embedding=document_summary.embedding,
+                is_active=True,
+            )
+            await uow.summaries.add(summary)
+        else:
+            summary.text = document_summary.text
+            summary.embedding = document_summary.embedding
+            summary.is_active = True
+        document.metadata_ = document_summary_metadata(
+            document.metadata_,
+            summary_id=summary.id,
+            llm_model=settings.llm_model,
+            embedding_model=settings.embedding_model,
+            config_fingerprint=settings.config_fingerprint(),
+        )
+        document_summaries_rebuilt += 1
+
+    dataset_summaries_rebuilt = 0
+    if prepared.dataset_summary is not None:
+        summaries_deactivated += await uow.summaries.deactivate_active_for_target_except(
+            dataset_id=prepared.dataset.id,
+            generation=prepared.dataset.generation,
+            target_type=SummaryTargetType.DATASET,
+            target_id=prepared.dataset.id,
+            level=0,
+            keep_summary_id=prepared.dataset_summary.summary_id,
+        )
+        summary = await uow.summaries.get_by_id(prepared.dataset_summary.summary_id)
+        if summary is None:
+            summary = Summary(
+                id=prepared.dataset_summary.summary_id,
+                dataset_id=prepared.dataset.id,
+                generation=prepared.dataset.generation,
+                target_type=SummaryTargetType.DATASET,
+                target_id=prepared.dataset.id,
+                level=0,
+                text=prepared.dataset_summary.text,
+                embedding=prepared.dataset_summary.embedding,
+                is_active=True,
+            )
+            await uow.summaries.add(summary)
+        else:
+            summary.text = prepared.dataset_summary.text
+            summary.embedding = prepared.dataset_summary.embedding
+            summary.is_active = True
+        dataset_summaries_rebuilt = 1
+    elif prepared.deactivate_dataset_summary:
+        summaries_deactivated += await uow.summaries.deactivate_active_for_target_except(
+            dataset_id=prepared.dataset.id,
+            generation=prepared.dataset.generation,
+            target_type=SummaryTargetType.DATASET,
+            target_id=prepared.dataset.id,
+            level=0,
+            keep_summary_id=None,
+        )
+
+    return SummaryRebuildCounts(
+        document_summaries_rebuilt=document_summaries_rebuilt,
+        dataset_summaries_rebuilt=dataset_summaries_rebuilt,
+        summaries_deactivated=summaries_deactivated,
+    )
 
 
 def dataset_summary_id(dataset_id: UUID, *, generation: int) -> UUID:

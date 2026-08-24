@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from sofias_memory.domain import PipelineRunStatus
+
 ImproveStage = Literal[
     "feedback_weights",
     "entity_deduplication",
@@ -17,13 +19,20 @@ ImproveStage = Literal[
 
 
 class ImproveRequest(BaseModel):
-    """Explicit synchronous improve request."""
+    """Durable improve request (SM-511)."""
 
     model_config = ConfigDict(extra="forbid")
 
     dataset: str = Field(default="main", min_length=1)
     stages: list[ImproveStage] | None = Field(default=None, min_length=1)
-    wait: bool = Field(default=False)
+    wait: bool = Field(
+        default=False,
+        description=(
+            "Wait for the durable run to reach a terminal state before responding. "
+            "Not part of the work identity: the same request with wait=true and "
+            "wait=false under one Idempotency-Key resolves to the same run."
+        ),
+    )
 
     @field_validator("dataset")
     @classmethod
@@ -35,44 +44,51 @@ class ImproveRequest(BaseModel):
 
 
 class ImproveResult(BaseModel):
-    """Operational counts returned by Improve v1."""
+    """Durable state of one Improve run, as observed when responding.
+
+    Every field is reconstructed from the persisted ``PipelineRun`` -- never
+    from in-process memory. The business counters are populated only once the
+    run has actually succeeded (``status="succeeded"``); for an accepted run
+    that has not reached a terminal state yet, and for a cancelled one, only
+    ``run_id``/``status`` are known and the rest stay ``null``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     run_id: UUID
-    status: Literal["succeeded"]
-    dataset_id: UUID
-    generation: int
-    stages: list[str]
-    feedback_processed: int
-    feedback_applied: int
-    feedback_skipped: int
-    entities_updated: int
-    relations_updated: int
-    relations_embedded: int
-    entities_embedded: int
-    entity_duplicate_candidates: int
-    entities_merged: int
-    entity_mentions_reassigned: int
-    relations_rewired: int
-    relations_deactivated: int
-    relation_evidence_copied: int
-    document_summaries_rebuilt: int
-    dataset_summaries_rebuilt: int
-    summaries_deactivated: int
-    graph_relations_deactivated: int
-    graph_entities_importance_updated: int
-    graph_relations_importance_updated: int
-    graph_entities_missing: int
-    graph_entities_extra: int
-    graph_chunks_missing: int
-    graph_chunks_extra: int
-    graph_entity_mentions_missing: int
-    graph_entity_mentions_extra: int
-    graph_relations_missing: int
-    graph_relations_extra: int
-    graph_next_missing: int
-    graph_next_extra: int
-    graph_rebuilt: bool
-    graph_events_enqueued: int
-    graph_events_processed: int
+    status: PipelineRunStatus
+    dataset_id: UUID | None = None
+    generation: int | None = None
+    stages: list[str] | None = None
+    feedback_processed: int | None = None
+    feedback_applied: int | None = None
+    feedback_skipped: int | None = None
+    entities_updated: int | None = None
+    relations_updated: int | None = None
+    relations_embedded: int | None = None
+    entities_embedded: int | None = None
+    entity_duplicate_candidates: int | None = None
+    entities_merged: int | None = None
+    entity_mentions_reassigned: int | None = None
+    relations_rewired: int | None = None
+    relations_deactivated: int | None = None
+    relation_evidence_copied: int | None = None
+    document_summaries_rebuilt: int | None = None
+    dataset_summaries_rebuilt: int | None = None
+    summaries_deactivated: int | None = None
+    graph_relations_deactivated: int | None = None
+    graph_entities_importance_updated: int | None = None
+    graph_relations_importance_updated: int | None = None
+    graph_entities_missing: int | None = None
+    graph_entities_extra: int | None = None
+    graph_chunks_missing: int | None = None
+    graph_chunks_extra: int | None = None
+    graph_entity_mentions_missing: int | None = None
+    graph_entity_mentions_extra: int | None = None
+    graph_relations_missing: int | None = None
+    graph_relations_extra: int | None = None
+    graph_next_missing: int | None = None
+    graph_next_extra: int | None = None
+    graph_rebuilt: bool | None = None
+    graph_events_enqueued: int | None = None
+    graph_events_processed: int | None = None

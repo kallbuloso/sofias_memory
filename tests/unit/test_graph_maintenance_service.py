@@ -53,6 +53,10 @@ class FakeEntityRepository:
             and entity.is_active
         ]
 
+    async def get_active_current_by_id(self, *, dataset_id: UUID, entity_id: UUID) -> Entity | None:
+        matches = await self.list_active_current_for_dataset(dataset_id=dataset_id)
+        return next((entity for entity in matches if entity.id == entity_id), None)
+
 
 class FakeRelationRepository:
     def __init__(self, store: FakeStore) -> None:
@@ -81,6 +85,12 @@ class FakeRelationRepository:
                 continue
             relations.append(relation)
         return relations
+
+    async def get_active_current_by_id(
+        self, *, dataset_id: UUID, relation_id: UUID
+    ) -> Relation | None:
+        matches = await self.list_active_current_for_dataset(dataset_id=dataset_id)
+        return next((relation for relation in matches if relation.id == relation_id), None)
 
 
 class FakeRelationEvidenceRepository:

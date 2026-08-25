@@ -65,6 +65,7 @@ from sofias_memory.infrastructure.postgres.readiness import (
 from sofias_memory.lifespan import lifespan
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
 from sofias_memory.pipelines.steps.cognify import COGNIFY_SERVICE_RESOURCE
+from sofias_memory.pipelines.steps.forget import FORGET_RESOURCES_RESOURCE, ForgetPipelineResources
 from sofias_memory.pipelines.steps.improve import (
     IMPROVE_RESOURCES_RESOURCE,
     ImprovePipelineResources,
@@ -297,10 +298,23 @@ def build_pipeline_resources(
             graph_outbox_drain=graph_outbox_drain,
         )
 
+    def build_forget_resources() -> ForgetPipelineResources:
+        graph_outbox_drain: GraphOutboxBatchProcessor | None = None
+        if neo4j_resource is not None:
+            projection = Neo4jProjection(neo4j_resource)
+            graph_outbox_drain = GraphOutboxBatchProcessor(
+                session_factory=session_factory,
+                processor=GraphOutboxProcessor(
+                    session_factory=session_factory, projection=projection
+                ),
+            )
+        return ForgetPipelineResources(settings=settings, graph_outbox_drain=graph_outbox_drain)
+
     return _PipelineResources(
         {
             COGNIFY_SERVICE_RESOURCE: build_cognify_service,
             IMPROVE_RESOURCES_RESOURCE: build_improve_resources,
+            FORGET_RESOURCES_RESOURCE: build_forget_resources,
         }
     )
 

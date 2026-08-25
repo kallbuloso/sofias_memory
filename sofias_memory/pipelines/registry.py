@@ -322,11 +322,11 @@ class PipelineRegistry:
 
 
 def build_default_pipeline_registry() -> PipelineRegistry:
-    """The production registry (SM-505 SS 30/31, SM-510, SM-511).
+    """The production registry (SM-505 SS 30/31, SM-510, SM-511, SM-512).
 
-    Contains exactly two pipelines at this checkpoint: ``COGNIFY`` (SM-510)
-    and ``IMPROVE`` (SM-511). ``FORGET`` and ``REMEMBER`` are deliberately
-    absent until SM-512/SM-513 migrate them -- a partially-populated
+    Contains exactly three pipelines at this checkpoint: ``COGNIFY``
+    (SM-510), ``IMPROVE`` (SM-511), and ``FORGET`` (SM-512). ``REMEMBER`` is
+    deliberately absent until SM-513 migrates it -- a partially-populated
     registry is a normal, healthy production state, and submitting an
     unregistered ``PipelineType`` raises :class:`UnknownPipelineTypeError`
     before any PostgreSQL write rather than creating a run no worker could
@@ -338,10 +338,15 @@ def build_default_pipeline_registry() -> PipelineRegistry:
     """
 
     from sofias_memory.pipelines.steps.cognify import build_cognify_pipeline_definition
+    from sofias_memory.pipelines.steps.forget import build_forget_pipeline_definition
     from sofias_memory.pipelines.steps.improve import build_improve_pipeline_definition
 
     return PipelineRegistry(
-        [build_cognify_pipeline_definition(), build_improve_pipeline_definition()]
+        [
+            build_cognify_pipeline_definition(),
+            build_improve_pipeline_definition(),
+            build_forget_pipeline_definition(),
+        ]
     )
 
 

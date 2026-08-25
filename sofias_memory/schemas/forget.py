@@ -1,4 +1,4 @@
-"""Public schemas for explicit memory deletion."""
+"""Public schemas for explicit memory deletion (SM-512)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from sofias_memory.domain import SourceStatus
+from sofias_memory.domain import PipelineRunStatus
 
 
 class ForgetRequest(BaseModel):
-    """Explicit synchronous forget request for one of three scopes.
+    """Forget request for one of three scopes.
 
     Scope is not a request field. It is derived by the service from which
     fields were actually present in the payload (``source_id``, ``everything``,
@@ -26,7 +26,14 @@ class ForgetRequest(BaseModel):
     everything: bool = Field(default=False)
     confirm: str | None = Field(default=None)
     memory_only: bool = Field(default=False)
-    wait: bool = Field(default=True)
+    wait: bool = Field(
+        default=True,
+        description=(
+            "Wait for the durable run to reach a terminal state before responding. "
+            "Not part of the work identity: the same request with wait=true and "
+            "wait=false under one Idempotency-Key resolves to the same run."
+        ),
+    )
 
     @field_validator("dataset")
     @classmethod
@@ -38,27 +45,32 @@ class ForgetRequest(BaseModel):
 
 
 class ForgetSourceResult(BaseModel):
-    """Operational counts returned by synchronous source forget."""
+    """Durable state of one SOURCE-scope forget run, as observed when responding.
+
+    Every field is reconstructed from the persisted ``PipelineRun`` -- never
+    from in-process memory. Business counters are populated only once the
+    run has actually succeeded (``status="succeeded"``).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     scope: Literal["source"] = "source"
     run_id: UUID
-    status: Literal["succeeded"]
-    dataset_id: UUID
-    source_id: UUID
-    memory_only: bool
-    source_status: SourceStatus
-    documents_deactivated: int
-    chunks_deactivated: int
-    summaries_deactivated: int
-    entities_deactivated: int
-    relations_deactivated: int
-    entity_mentions_unprojected: int
-    relation_evidence_unprojected: int
-    graph_events_enqueued: int
-    graph_events_processed: int
-    storage_deleted: bool
+    status: PipelineRunStatus
+    dataset_id: UUID | None = None
+    source_id: UUID | None = None
+    memory_only: bool | None = None
+    source_status: str | None = None
+    documents_deactivated: int | None = None
+    chunks_deactivated: int | None = None
+    summaries_deactivated: int | None = None
+    entities_deactivated: int | None = None
+    relations_deactivated: int | None = None
+    entity_mentions_unprojected: int | None = None
+    relation_evidence_unprojected: int | None = None
+    graph_events_enqueued: int | None = None
+    graph_events_processed: int | None = None
+    storage_deleted: bool | None = None
 
 
 # Preserve the SM-422 name for backward compatibility with existing callers/tests.
@@ -66,54 +78,54 @@ ForgetResult = ForgetSourceResult
 
 
 class ForgetDatasetResult(BaseModel):
-    """Operational counts returned by synchronous dataset-scoped forget."""
+    """Durable state of one DATASET-scope forget run."""
 
     model_config = ConfigDict(extra="forbid")
 
     scope: Literal["dataset"] = "dataset"
     run_id: UUID
-    status: Literal["succeeded"]
-    dataset_id: UUID
-    memory_only: bool
-    sources_affected: int
-    sources_pending: int
-    sources_deleted: int
-    documents_deactivated: int
-    chunks_deactivated: int
-    summaries_deactivated: int
-    entities_deactivated: int
-    relations_deactivated: int
-    entity_mentions_unprojected: int
-    relation_evidence_unprojected: int
-    graph_events_enqueued: int
-    graph_events_processed: int
-    storage_deleted: int
-    storage_already_absent: int
+    status: PipelineRunStatus
+    dataset_id: UUID | None = None
+    memory_only: bool | None = None
+    sources_affected: int | None = None
+    sources_pending: int | None = None
+    sources_deleted: int | None = None
+    documents_deactivated: int | None = None
+    chunks_deactivated: int | None = None
+    summaries_deactivated: int | None = None
+    entities_deactivated: int | None = None
+    relations_deactivated: int | None = None
+    entity_mentions_unprojected: int | None = None
+    relation_evidence_unprojected: int | None = None
+    graph_events_enqueued: int | None = None
+    graph_events_processed: int | None = None
+    storage_deleted: int | None = None
+    storage_already_absent: int | None = None
 
 
 class ForgetEverythingResult(BaseModel):
-    """Operational counts returned by synchronous everything forget."""
+    """Durable state of one EVERYTHING-scope forget run."""
 
     model_config = ConfigDict(extra="forbid")
 
     scope: Literal["everything"] = "everything"
     run_id: UUID
-    status: Literal["succeeded"]
-    datasets_affected: int
-    sources_affected: int
-    sources_pending: int
-    sources_deleted: int
-    documents_deactivated: int
-    chunks_deactivated: int
-    summaries_deactivated: int
-    entities_deactivated: int
-    relations_deactivated: int
-    entity_mentions_unprojected: int
-    relation_evidence_unprojected: int
-    graph_events_enqueued: int
-    graph_events_processed: int
-    storage_deleted: int
-    storage_already_absent: int
+    status: PipelineRunStatus
+    datasets_affected: int | None = None
+    sources_affected: int | None = None
+    sources_pending: int | None = None
+    sources_deleted: int | None = None
+    documents_deactivated: int | None = None
+    chunks_deactivated: int | None = None
+    summaries_deactivated: int | None = None
+    entities_deactivated: int | None = None
+    relations_deactivated: int | None = None
+    entity_mentions_unprojected: int | None = None
+    relation_evidence_unprojected: int | None = None
+    graph_events_enqueued: int | None = None
+    graph_events_processed: int | None = None
+    storage_deleted: int | None = None
+    storage_already_absent: int | None = None
 
 
 type ForgetResponseData = ForgetSourceResult | ForgetDatasetResult | ForgetEverythingResult

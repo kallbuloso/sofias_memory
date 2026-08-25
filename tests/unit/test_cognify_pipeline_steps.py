@@ -64,20 +64,21 @@ RECOVERY_NOW = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 CONFIG_FINGERPRINT = "a" * 64
 
 
-# --- production registry (SM-510 Cognify scope; SM-511 added IMPROVE) -------
+# --- production registry (SM-510 Cognify; SM-511 added IMPROVE; SM-512 FORGET) -------
 
 
-def test_default_registry_contains_cognify_and_improve() -> None:
+def test_default_registry_contains_cognify_improve_and_forget() -> None:
     registry = build_default_pipeline_registry()
 
-    assert len(registry) == 2
+    assert len(registry) == 3
     assert registry.get(PipelineType.COGNIFY).pipeline_type == PipelineType.COGNIFY
     assert registry.get(PipelineType.IMPROVE).pipeline_type == PipelineType.IMPROVE
+    assert registry.get(PipelineType.FORGET).pipeline_type == PipelineType.FORGET
 
 
 @pytest.mark.parametrize(
     "pipeline_type",
-    [PipelineType.REMEMBER, PipelineType.FORGET],
+    [PipelineType.REMEMBER],
 )
 def test_default_registry_leaves_future_pipelines_unregistered(
     pipeline_type: PipelineType,

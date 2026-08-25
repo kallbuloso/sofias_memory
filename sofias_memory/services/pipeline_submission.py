@@ -191,6 +191,7 @@ class _RunSnapshot:
     source_id: UUID | None
     status: PipelineRunStatus
     payload_hash: str
+    input: Mapping[str, JSONValue]
 
 
 def _snapshot(run: PipelineRun) -> _RunSnapshot:
@@ -201,7 +202,21 @@ def _snapshot(run: PipelineRun) -> _RunSnapshot:
         source_id=run.source_id,
         status=run.status,
         payload_hash=run.payload_hash,
+        input=cast("Mapping[str, JSONValue]", run.input),
     )
+
+
+LegacyIntentEquivalent = Callable[[Mapping[str, JSONValue], Mapping[str, JSONValue]], bool]
+"""``(existing_run_input, new_work_input) -> bool``. An optional, narrow
+per-call extension to the idempotency-key resolution match (SM-513 SS 6):
+when a run's persisted ``payload_hash`` does not equal the new submission's
+hash, this callable gets one more chance to decide the two are still the
+SAME semantic work -- e.g. Remember's B4-legacy compatibility, where a
+historical B4 ``PipelineRun.input`` included ``wait`` (a field B5's own
+``payload_hash`` never covers). Never applied to the ``pipeline_type`` check
+-- a mismatched pipeline type is always a conflict, regardless of this
+callable. Every OTHER pipeline type passes ``None`` (the default), which
+keeps this codepath byte-for-byte identical to its pre-SM-513 behavior."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +299,8 @@ class PipelineSubmissionService:
         work_input: Mapping[str, JSONValue],
         idempotency_key: str | None,
         prepare: PreparationHook,
+        run_id: UUID | None = None,
+        legacy_intent_equivalent: LegacyIntentEquivalent | None = None,
     ) -> SubmissionOutcome:
         if idempotency_key is not None and idempotency_key.startswith(
             RESERVED_IDEMPOTENCY_KEY_PREFIX
@@ -300,7 +317,13 @@ class PipelineSubmissionService:
                 # lookup, no step plan, no prepare() -- none of that is
                 # needed to observe a run that already exists, in ANY of the
                 # six statuses, so none of it may ever block this path.
-                return self._resolve_existing(pipeline_type, existing, payload_hash=payload_hash)
+                return self._resolve_existing(
+                    pipeline_type,
+                    existing,
+                    payload_hash=payload_hash,
+                    work_input=work_input,
+                    legacy_intent_equivalent=legacy_intent_equivalent,
+                )
 
         # Only a genuinely new PipelineRun reaches this point -- everything
         # below is exclusive to creating new state.
@@ -320,6 +343,7 @@ class PipelineSubmissionService:
                 idempotency_key=idempotency_key,
                 prepare=prepare,
                 step_plan=step_plan,
+                run_id=run_id,
             )
         except IntegrityError as error:
             if idempotency_key is None or not _is_idempotency_key_unique_violation(error):
@@ -335,7 +359,13 @@ class PipelineSubmissionService:
                 # The failure was not this key racing with itself -- re-raise
                 # the original error rather than fabricating a conflict.
                 raise
-            return self._resolve_existing(pipeline_type, existing, payload_hash=payload_hash)
+            return self._resolve_existing(
+                pipeline_type,
+                existing,
+                payload_hash=payload_hash,
+                work_input=work_input,
+                legacy_intent_equivalent=legacy_intent_equivalent,
+            )
 
     def _resolve_existing(
         self,
@@ -343,6 +373,8 @@ class PipelineSubmissionService:
         existing: _RunSnapshot,
         *,
         payload_hash: str,
+        work_input: Mapping[str, JSONValue],
+        legacy_intent_equivalent: LegacyIntentEquivalent | None,
     ) -> SubmissionOutcome:
         # ADR-0009 SS S's mismatch guard is two-part, not one (SM-509 audit
         # Finding 1): `Idempotency-Key` is GLOBAL across pipeline_runs (the
@@ -352,7 +384,14 @@ class PipelineSubmissionService:
         # kind of accidental reuse this guard exists to catch. pipeline_type
         # is deliberately compared explicitly rather than folded into the
         # hash, to keep payload_hash byte-compatible with B4 (Finding 4).
-        if existing.pipeline_type != pipeline_type or existing.payload_hash != payload_hash:
+        # pipeline_type is never overridden by the legacy matcher -- only a
+        # payload_hash mismatch gets a second chance (SM-513 SS 6).
+        if existing.pipeline_type != pipeline_type:
+            raise idempotency_conflict_error()
+        if existing.payload_hash != payload_hash and (
+            legacy_intent_equivalent is None
+            or not legacy_intent_equivalent(existing.input, work_input)
+        ):
             raise idempotency_conflict_error()
 
         return SubmissionOutcome(
@@ -373,6 +412,7 @@ class PipelineSubmissionService:
         idempotency_key: str | None,
         prepare: PreparationHook,
         step_plan: list[StepPlan],
+        run_id: UUID | None,
     ) -> SubmissionOutcome:
         async with self._unit_of_work_factory() as uow:
             targets = await prepare(uow)
@@ -386,6 +426,7 @@ class PipelineSubmissionService:
                 input=dict(work_input),
                 config_fingerprint=self._config_fingerprint,
                 steps=step_plan,
+                run_id=run_id,
             )
             await uow.commit()
             new_run_id = run.id

@@ -461,25 +461,16 @@ def test_forget_service_module_no_longer_owns_run_lifecycle() -> None:
 # --- registry -----------------------------------------------------------------
 
 
-def test_default_registry_contains_cognify_improve_and_forget() -> None:
+def test_default_registry_contains_all_four_pipelines() -> None:
     from sofias_memory.pipelines.registry import build_default_pipeline_registry
 
     registry = build_default_pipeline_registry()
 
+    assert registry.get(PipelineType.REMEMBER) is not None
     assert registry.get(PipelineType.COGNIFY) is not None
     assert registry.get(PipelineType.IMPROVE) is not None
     assert registry.get(PipelineType.FORGET) is not None
-    assert len(registry) == 3
-
-
-def test_remember_is_still_unregistered() -> None:
-    from sofias_memory.pipelines.registry import (
-        UnknownPipelineTypeError,
-        build_default_pipeline_registry,
-    )
-
-    with pytest.raises(UnknownPipelineTypeError):
-        build_default_pipeline_registry().get(PipelineType.REMEMBER)
+    assert len(registry) == 4
 
 
 # --- OpenAPI surface ------------------------------------------------------

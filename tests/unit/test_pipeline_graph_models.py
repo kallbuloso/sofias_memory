@@ -120,6 +120,7 @@ def test_pipeline_runs_checks_and_indexes_are_exact() -> None:
         "uq_pipeline_runs_idempotency_key",
         "ix_pipeline_runs_status_next_attempt_at",
         "ix_pipeline_runs_retry_of_run_id",
+        "uq_pipeline_runs_dataset_id_operational",
     }
     assert index_columns(model_indexes["ix_pipeline_runs_status"]) == ["status"]
     assert index_columns(model_indexes["ix_pipeline_runs_dataset_id_status"]) == [
@@ -139,9 +140,14 @@ def test_pipeline_runs_checks_and_indexes_are_exact() -> None:
     ]
     assert index_columns(model_indexes["ix_pipeline_runs_retry_of_run_id"]) == ["retry_of_run_id"]
     # ADR-0009 SS D's UNIQUE(dataset_id) WHERE ... IN ('running', 'cancelling')
-    # operational backstop is deliberately NOT yet declared on the ORM model
-    # (see pipeline_run.py's __table_args__ comment and backlog SM-502/SM-513
-    # for the recorded deferred-cutover decision) -- it is not asserted here.
+    # operational backstop, activated by SM-513 now that Remember (the last
+    # direct-RUNNING B4 writer) has moved to the B5 runtime.
+    operational_index = model_indexes["uq_pipeline_runs_dataset_id_operational"]
+    assert operational_index.unique is True
+    assert index_columns(operational_index) == ["dataset_id"]
+    assert str(operational_index.dialect_options["postgresql"]["where"]) == (
+        "dataset_id IS NOT NULL AND status IN ('running', 'cancelling')"
+    )
 
 
 def test_pipeline_steps_columns_fks_checks_and_indexes_are_exact() -> None:

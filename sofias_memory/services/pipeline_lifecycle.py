@@ -47,6 +47,7 @@ async def create_run_with_steps(
     config_fingerprint: str,
     steps: Sequence[StepPlan],
     retry_of_run_id: UUID | None = None,
+    run_id: UUID | None = None,
 ) -> PipelineRun:
     """Materialize a ``queued`` PipelineRun and its ``queued`` PipelineSteps.
 
@@ -55,10 +56,18 @@ async def create_run_with_steps(
     materialization is not deferred to first claim. This function only adds
     the rows to the UnitOfWork's session (flush, not commit); the caller
     commits.
+
+    ``run_id`` defaults to a fresh ``uuid4()`` for every caller except
+    Remember (SM-513 SS 10): a route that must durably stage large ingress
+    bytes under a run-owned path *before* the run itself is committed needs
+    to know that identity up front, so it precomputes a candidate run id and
+    passes it through here -- the run this transaction creates then reuses
+    that exact id instead of generating an unrelated one, so the worker's
+    ingress lookup by ``context.run_id`` always finds what the route staged.
     """
 
     run = PipelineRun(
-        id=uuid4(),
+        id=run_id if run_id is not None else uuid4(),
         pipeline_type=pipeline_type,
         dataset_id=dataset_id,
         source_id=source_id,

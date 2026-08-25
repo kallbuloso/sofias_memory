@@ -1,491 +1,90 @@
-"""Synchronous remember text ingest service."""
+"""Remember pure/reusable primitives (SM-513, ADR-0009 SS O).
+
+Run lifecycle for Remember lives entirely in ``pipelines.steps.remember`` and
+the shared B5 submission/engine runtime -- this module holds only pure
+functions and PostgreSQL-free helpers reused by both the route (work
+identity, durable ingress staging) and the pipeline step (loader dispatch
+inputs, final storage helpers, B4-legacy semantic-intent compatibility).
+Nothing here owns a ``PipelineRun``/``PipelineStep`` transition.
+"""
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Mapping
+import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from http import HTTPStatus
 from pathlib import Path
-from typing import Protocol, cast
-from uuid import UUID, uuid4
+from typing import Any
+from uuid import UUID
 
 from sofias_memory.api.errors import SofiasMemoryError
-from sofias_memory.config import Settings
-from sofias_memory.domain import (
-    DatasetStatus,
-    PipelineRunStatus,
-    PipelineType,
-    SourceKind,
-    SourceStatus,
-)
-from sofias_memory.infrastructure.postgres.models import Dataset, Document, PipelineRun, Source
-from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
-from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
-from sofias_memory.loaders.text import PreparedText, PreparedTextFile, prepare_text_content
-from sofias_memory.schemas.common import ErrorCode, JSONValue, utc_now
-from sofias_memory.schemas.remember import (
-    RememberTextRequest,
-    RememberTextResult,
-    RememberUrlRequest,
-)
+from sofias_memory.schemas.common import ErrorCode, JSONValue
 
 DEFAULT_DATASET_SLUG = "main"
-INGEST_MODE = "ingest"
 REMEMBER_RESULT_METRIC_KEY = "remember_result"
+
+MODE_INGEST = "ingest"
+MODE_FULL = "full"
+SUPPORTED_MODES = frozenset({MODE_INGEST, MODE_FULL})
+
+SOURCE_KIND_TEXT = "text"
+SOURCE_KIND_FILE = "file"
+SOURCE_KIND_URL = "url"
+
 TEXT_MIME_TYPE = "text/plain"
 TEXT_STORAGE_EXTENSION = ".txt"
 UNTOKENIZED_SENTINEL = -1
 UNDETERMINED_LANGUAGE = "und"
 
+INGRESS_DIRECTORY_NAME = "_ingress"
+INGRESS_ORIGINAL_FILENAME = "original"
+INGRESS_FILENAME_METADATA_FILENAME = "filename.txt"
 
-class DatasetRepositoryForRemember(Protocol):
-    async def add(self, dataset: Dataset) -> Dataset: ...
-    async def get_by_slug(self, slug: str) -> Dataset | None: ...
-
-
-class SourceRepositoryForRemember(Protocol):
-    async def add(self, source: Source) -> Source: ...
-
-    async def get_latest_by_content_hash(
-        self,
-        *,
-        dataset_id: UUID,
-        content_sha256: str,
-    ) -> Source | None: ...
+UNSUPPORTED_MODE_ERROR_CODE = "REMEMBER_UNSUPPORTED_MODE"
 
 
-class DocumentRepositoryForRemember(Protocol):
-    async def add(self, document: Document) -> Document: ...
-    async def list_for_source(self, source_id: UUID) -> list[Document]: ...
+# ---------------------------------------------------------------------------
+# Mode validation (SM-513 SS 3): pure, syntactic, done at the route boundary.
+# ---------------------------------------------------------------------------
 
 
-class PipelineRunRepositoryForRemember(Protocol):
-    async def add(self, run: PipelineRun) -> PipelineRun: ...
-    async def get_by_id(self, run_id: UUID) -> PipelineRun | None: ...
-    async def get_by_idempotency_key(self, idempotency_key: str) -> PipelineRun | None: ...
-
-
-class RememberUnitOfWork(Protocol):
-    datasets: DatasetRepositoryForRemember
-    sources: SourceRepositoryForRemember
-    documents: DocumentRepositoryForRemember
-    pipeline_runs: PipelineRunRepositoryForRemember
-
-    async def __aenter__(self) -> RememberUnitOfWork: ...
-    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
-    async def commit(self) -> None: ...
-
-
-type UnitOfWorkFactory = Callable[[], RememberUnitOfWork]
-
-
-@dataclass(frozen=True)
-class RememberPreparedInput:
-    dataset: str
-    name: str | None
-    metadata: dict[str, JSONValue]
-    session_id: str | None
-    mode: str
-    wait: bool
-    force: bool
-    source_kind: SourceKind
-    mime_type: str
-    storage_extension: str
-    prepared_text: PreparedText
-    run_input: dict[str, JSONValue]
-    original_uri: str | None = None
-
-
-class RememberService:
-    """Text-only remember ingest adapted from Cognee's add/ingest core."""
-
-    def __init__(
-        self,
-        settings: Settings,
-        *,
-        session_factory: AsyncSessionFactory | None = None,
-        unit_of_work_factory: UnitOfWorkFactory | None = None,
-    ) -> None:
-        if unit_of_work_factory is None and session_factory is None:
-            raise ValueError("session_factory or unit_of_work_factory is required")
-        self._settings = settings
-        self._unit_of_work_factory = unit_of_work_factory or _postgres_unit_of_work_factory(
-            cast(AsyncSessionFactory, session_factory)
+def validate_remember_mode(mode: str) -> None:
+    if mode not in SUPPORTED_MODES:
+        supported: list[JSONValue] = list(sorted(SUPPORTED_MODES))
+        raise SofiasMemoryError(
+            code=ErrorCode.INVALID_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
+            message="Unsupported remember mode.",
+            details={"mode": mode, "supported": supported},
         )
 
-    async def remember_text(
-        self,
-        request: RememberTextRequest,
-        *,
-        idempotency_key: str | None = None,
-    ) -> RememberTextResult:
-        prepared_text = prepare_text_content(request.content)
-        prepared_input = RememberPreparedInput(
-            dataset=request.dataset,
-            name=request.name,
-            metadata=dict(request.metadata),
-            session_id=request.session_id,
-            mode=request.mode,
-            wait=request.wait,
-            force=request.force,
-            source_kind=SourceKind.TEXT,
-            mime_type=TEXT_MIME_TYPE,
-            storage_extension=TEXT_STORAGE_EXTENSION,
-            prepared_text=prepared_text,
-            run_input=remember_text_run_input(
-                request,
-                content_sha256=prepared_text.content_sha256,
-            ),
-        )
-        return await self._remember_prepared(prepared_input, idempotency_key=idempotency_key)
 
-    async def remember_file(
-        self,
-        *,
-        dataset: str,
-        prepared_file: PreparedTextFile,
-        metadata: dict[str, JSONValue],
-        session_id: str | None,
-        mode: str,
-        wait: bool,
-        force: bool,
-        idempotency_key: str | None = None,
-    ) -> RememberTextResult:
-        prepared_input = RememberPreparedInput(
-            dataset=dataset,
-            name=prepared_file.original_filename,
-            metadata=dict(metadata),
-            session_id=session_id,
-            mode=mode,
-            wait=wait,
-            force=force,
-            source_kind=SourceKind.FILE,
-            mime_type=prepared_file.mime_type,
-            storage_extension=prepared_file.storage_extension,
-            prepared_text=prepared_file.text,
-            run_input=remember_file_run_input(
-                dataset=dataset,
-                content_sha256=prepared_file.text.content_sha256,
-                filename=prepared_file.original_filename,
-                metadata=metadata,
-                session_id=session_id,
-                mode=mode,
-                wait=wait,
-                force=force,
-                mime_type=prepared_file.mime_type,
-            ),
-        )
-        return await self._remember_prepared(prepared_input, idempotency_key=idempotency_key)
-
-    async def remember_url(
-        self,
-        request: RememberUrlRequest,
-        *,
-        prepared_file: PreparedTextFile,
-        original_uri: str,
-        idempotency_key: str | None = None,
-    ) -> RememberTextResult:
-        prepared_input = RememberPreparedInput(
-            dataset=request.dataset,
-            name=prepared_file.original_filename,
-            metadata=dict(request.metadata),
-            session_id=request.session_id,
-            mode=request.mode,
-            wait=request.wait,
-            force=request.force,
-            source_kind=SourceKind.URL,
-            mime_type=prepared_file.mime_type,
-            storage_extension=prepared_file.storage_extension,
-            prepared_text=prepared_file.text,
-            run_input=remember_url_run_input(
-                request,
-                original_uri=original_uri,
-            ),
-            original_uri=original_uri,
-        )
-        return await self._remember_prepared(prepared_input, idempotency_key=idempotency_key)
-
-    async def _remember_prepared(
-        self,
-        prepared_input: RememberPreparedInput,
-        *,
-        idempotency_key: str | None,
-    ) -> RememberTextResult:
-        self._validate_supported_mode(prepared_input.mode, prepared_input.wait)
-        payload_hash = stable_payload_hash(prepared_input.run_input)
-
-        existing_result = await self._idempotent_existing_result(
-            idempotency_key=idempotency_key,
-            payload_hash=payload_hash,
-        )
-        if existing_result is not None:
-            return existing_result
-
-        run = await self._create_running_run(
-            idempotency_key=idempotency_key,
-            payload_hash=payload_hash,
-            run_input=prepared_input.run_input,
-        )
-        try:
-            return await self._ingest_prepared(run.id, prepared_input)
-        except Exception as exc:
-            await self._mark_run_failed(run.id, exc)
-            raise
-
-    def _validate_supported_mode(self, mode: str, wait: bool) -> None:
-        if mode != INGEST_MODE:
-            raise SofiasMemoryError(
-                code=ErrorCode.INVALID_REQUEST,
-                status_code=HTTPStatus.BAD_REQUEST,
-                message="Only remember mode=ingest is supported in this checkpoint.",
-                details={"mode": mode},
-            )
-        if wait is not True:
-            raise SofiasMemoryError(
-                code=ErrorCode.INVALID_REQUEST,
-                status_code=HTTPStatus.BAD_REQUEST,
-                message="Only wait=true is supported in this checkpoint.",
-                details={"wait": wait},
-            )
-
-    async def _idempotent_existing_result(
-        self,
-        *,
-        idempotency_key: str | None,
-        payload_hash: str,
-    ) -> RememberTextResult | None:
-        if idempotency_key is None:
-            return None
-
-        async with self._unit_of_work_factory() as uow:
-            existing = await uow.pipeline_runs.get_by_idempotency_key(idempotency_key)
-            if existing is None:
-                return None
-            if existing.payload_hash != payload_hash:
-                raise SofiasMemoryError(
-                    code=ErrorCode.INVALID_REQUEST,
-                    status_code=HTTPStatus.CONFLICT,
-                    message="Idempotency key was already used with a different payload.",
-                )
-            if existing.status != PipelineRunStatus.SUCCEEDED:
-                raise SofiasMemoryError(
-                    code=ErrorCode.INVALID_REQUEST,
-                    status_code=HTTPStatus.CONFLICT,
-                    message="Idempotency key is already associated with an unfinished run.",
-                )
-            return result_from_run(existing)
-
-    async def _create_running_run(
-        self,
-        *,
-        idempotency_key: str | None,
-        payload_hash: str,
-        run_input: dict[str, JSONValue],
-    ) -> PipelineRun:
-        now = utc_now()
-        run = PipelineRun(
-            id=uuid4(),
-            pipeline_type=PipelineType.REMEMBER,
-            dataset_id=None,
-            source_id=None,
-            status=PipelineRunStatus.RUNNING,
-            idempotency_key=idempotency_key,
-            payload_hash=payload_hash,
-            input=dict(run_input),
-            progress=0.0,
-            current_step="ingest",
-            attempt=1,
-            worker_id=None,
-            heartbeat_at=None,
-            config_fingerprint=self._settings.config_fingerprint(),
-            error_code=None,
-            error_message=None,
-            metrics={},
-            started_at=now,
-            finished_at=None,
-        )
-        async with self._unit_of_work_factory() as uow:
-            await uow.pipeline_runs.add(run)
-            await uow.commit()
-        return run
-
-    async def _ingest_prepared(
-        self,
-        run_id: UUID,
-        prepared_input: RememberPreparedInput,
-    ) -> RememberTextResult:
-        async with self._unit_of_work_factory() as uow:
-            run = await _require_run(uow, run_id)
-            dataset = await self._resolve_dataset(uow, prepared_input.dataset)
-            source = await uow.sources.get_latest_by_content_hash(
-                dataset_id=dataset.id,
-                content_sha256=prepared_input.prepared_text.content_sha256,
-            )
-            deduplicated = source is not None and not prepared_input.force
-
-            if deduplicated:
-                document = await _existing_document_for_source(uow, cast(Source, source))
-            else:
-                source = await self._create_source(
-                    uow,
-                    dataset=dataset,
-                    prepared_input=prepared_input,
-                    previous_source=source,
-                )
-                document = await self._create_document(
-                    uow,
-                    dataset=dataset,
-                    source=source,
-                    prepared_input=prepared_input,
-                )
-
-            result = RememberTextResult(
-                run_id=run.id,
-                status=PipelineRunStatus.SUCCEEDED.value,
-                dataset_id=dataset.id,
-                source_id=cast(Source, source).id,
-                document_id=document.id,
-                content_hash=prepared_input.prepared_text.content_sha256,
-                chunks=0,
-                entities=0,
-                relations=0,
-                deduplicated=deduplicated,
-            )
-            _mark_run_succeeded(
-                run,
-                result,
-                dataset_id=dataset.id,
-                source_id=cast(Source, source).id,
-            )
-            await uow.commit()
-            return result
-
-    async def _resolve_dataset(
-        self,
-        uow: RememberUnitOfWork,
-        dataset_slug: str,
-    ) -> Dataset:
-        dataset = await uow.datasets.get_by_slug(dataset_slug)
-        if dataset is not None:
-            if dataset.status != DatasetStatus.ACTIVE:
-                raise SofiasMemoryError(
-                    code=ErrorCode.INVALID_REQUEST,
-                    status_code=HTTPStatus.NOT_FOUND,
-                    message="Dataset does not exist.",
-                    details={"dataset": dataset_slug},
-                )
-            return dataset
-        if dataset_slug != DEFAULT_DATASET_SLUG:
-            raise SofiasMemoryError(
-                code=ErrorCode.INVALID_REQUEST,
-                status_code=HTTPStatus.NOT_FOUND,
-                message="Dataset does not exist.",
-                details={"dataset": dataset_slug},
-            )
-
-        dataset = Dataset(
-            id=uuid4(),
-            name=DEFAULT_DATASET_SLUG,
-            slug=DEFAULT_DATASET_SLUG,
-            description=None,
-            status=DatasetStatus.ACTIVE,
-            active_generation=0,
-        )
-        return await uow.datasets.add(dataset)
-
-    async def _create_source(
-        self,
-        uow: RememberUnitOfWork,
-        *,
-        dataset: Dataset,
-        prepared_input: RememberPreparedInput,
-        previous_source: Source | None,
-    ) -> Source:
-        source_id = uuid4()
-        storage_uri = write_original_bytes(
-            self._settings.data_directory,
-            dataset_id=dataset.id,
-            source_id=source_id,
-            storage_extension=prepared_input.storage_extension,
-            original_bytes=prepared_input.prepared_text.original_bytes,
-        )
-        source = Source(
-            id=source_id,
-            dataset_id=dataset.id,
-            kind=prepared_input.source_kind,
-            name=source_name(prepared_input),
-            mime_type=prepared_input.mime_type,
-            original_uri=prepared_input.original_uri,
-            storage_uri=storage_uri,
-            content_sha256=prepared_input.prepared_text.content_sha256,
-            normalized_sha256=prepared_input.prepared_text.normalized_sha256,
-            byte_size=prepared_input.prepared_text.byte_size,
-            metadata_=dict(prepared_input.metadata),
-            status=SourceStatus.PENDING,
-            version=1 if previous_source is None else previous_source.version + 1,
-        )
-        return await uow.sources.add(source)
-
-    async def _create_document(
-        self,
-        uow: RememberUnitOfWork,
-        *,
-        dataset: Dataset,
-        source: Source,
-        prepared_input: RememberPreparedInput,
-    ) -> Document:
-        document = Document(
-            id=uuid4(),
-            dataset_id=dataset.id,
-            source_id=source.id,
-            generation=dataset.active_generation,
-            title=source_name(prepared_input),
-            language=UNDETERMINED_LANGUAGE,
-            normalized_text=prepared_input.prepared_text.normalized_text,
-            text_sha256=prepared_input.prepared_text.normalized_sha256,
-            token_count=UNTOKENIZED_SENTINEL,
-            metadata_=document_metadata(prepared_input),
-            is_active=True,
-        )
-        return await uow.documents.add(document)
-
-    async def _mark_run_failed(self, run_id: UUID, exc: Exception) -> None:
-        async with self._unit_of_work_factory() as uow:
-            run = await uow.pipeline_runs.get_by_id(run_id)
-            if run is None:
-                return
-            now = utc_now()
-            run.status = PipelineRunStatus.FAILED
-            run.progress = 1.0
-            run.current_step = None
-            run.finished_at = now
-            run.error_code = type(exc).__name__
-            run.error_message = "Remember ingest failed."
-            await uow.commit()
-
-
-def _postgres_unit_of_work_factory(session_factory: AsyncSessionFactory) -> UnitOfWorkFactory:
-    def create_unit_of_work() -> RememberUnitOfWork:
-        return cast(RememberUnitOfWork, PostgresUnitOfWork(session_factory))
-
-    return create_unit_of_work
+# ---------------------------------------------------------------------------
+# Work identity (SM-513 SS 5): wait/confirm/request-id never participate.
+# ---------------------------------------------------------------------------
 
 
 def remember_text_run_input(
-    request: RememberTextRequest,
     *,
+    dataset: str,
     content_sha256: str,
+    name: str | None,
+    metadata: dict[str, JSONValue],
+    session_id: str | None,
+    mode: str,
+    force: bool,
 ) -> dict[str, JSONValue]:
     return {
-        "dataset": request.dataset,
+        "source_kind": SOURCE_KIND_TEXT,
+        "dataset": dataset,
         "content_sha256": content_sha256,
-        "name": request.name,
-        "metadata": request.metadata,
-        "session_id": request.session_id,
-        "mode": request.mode,
-        "force": request.force,
+        "name": name,
+        "metadata": metadata,
+        "session_id": session_id,
+        "mode": mode,
+        "force": force,
     }
 
 
@@ -497,47 +96,260 @@ def remember_file_run_input(
     metadata: dict[str, JSONValue],
     session_id: str | None,
     mode: str,
-    wait: bool,
     force: bool,
-    mime_type: str,
 ) -> dict[str, JSONValue]:
     return {
+        "source_kind": SOURCE_KIND_FILE,
         "dataset": dataset,
         "content_sha256": content_sha256,
         "filename": filename,
         "metadata": metadata,
         "session_id": session_id,
         "mode": mode,
-        "wait": wait,
         "force": force,
-        "source_kind": SourceKind.FILE.value,
-        "mime_type": mime_type,
     }
 
 
 def remember_url_run_input(
-    request: RememberUrlRequest,
     *,
-    original_uri: str,
+    dataset: str,
+    url: str,
+    metadata: dict[str, JSONValue],
+    session_id: str | None,
+    mode: str,
+    force: bool,
 ) -> dict[str, JSONValue]:
     return {
-        "dataset": request.dataset,
-        "url": original_uri,
-        "metadata": request.metadata,
-        "session_id": request.session_id,
-        "mode": request.mode,
-        "wait": request.wait,
-        "force": request.force,
-        "source_kind": SourceKind.URL.value,
+        "source_kind": SOURCE_KIND_URL,
+        "dataset": dataset,
+        "url": url,
+        "metadata": metadata,
+        "session_id": session_id,
+        "mode": mode,
+        "force": force,
     }
 
 
-def stable_payload_hash(payload: Mapping[str, JSONValue]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return sha256(encoded.encode("utf-8")).hexdigest()
+# ---------------------------------------------------------------------------
+# B4 -> B5 semantic intent compatibility (SM-513 SS 6).
+#
+# B4's own run_input shape included `wait` for FILE/URL (never for TEXT) and
+# had no `source_kind` key at all. B5 never includes `wait` and always
+# includes `source_kind`. Comparing raw payload_hash would therefore reject a
+# same-work retry against a historical B4 run even though nothing semantic
+# changed -- so, mirroring Forget's `same_forget_intent` (SM-512), identity
+# is compared as a normalized, tolerant intent, never as a raw hash.
+# ---------------------------------------------------------------------------
 
 
-def write_original_bytes(
+@dataclass(frozen=True, slots=True)
+class RememberSemanticIntent:
+    source_kind: str
+    dataset: str
+    content_identity: str
+    name: str | None
+    metadata: Mapping[str, JSONValue]
+    session_id: str | None
+    mode: str
+    force: bool
+
+
+def remember_semantic_intent_from_run_input(
+    run_input: Mapping[str, Any] | None,
+) -> RememberSemanticIntent | None:
+    """Best-effort, tolerant parse. Returns ``None`` for anything that does
+    not unambiguously describe a recognizable Remember work item -- callers
+    must never treat two ``None`` results as equal (see
+    :func:`same_remember_intent`)."""
+
+    if run_input is None:
+        return None
+    try:
+        dataset = str(run_input["dataset"])
+        metadata = run_input.get("metadata") or {}
+        if not isinstance(metadata, Mapping):
+            return None
+        session_id = run_input.get("session_id")
+        mode = str(run_input["mode"])
+        force = bool(run_input.get("force", False))
+
+        source_kind = run_input.get("source_kind")
+        if source_kind is None:
+            # Legacy B4 shape carried no `source_kind` key at all.
+            if "url" in run_input:
+                source_kind = SOURCE_KIND_URL
+            elif "filename" in run_input:
+                source_kind = SOURCE_KIND_FILE
+            elif "content_sha256" in run_input:
+                source_kind = SOURCE_KIND_TEXT
+            else:
+                return None
+
+        if source_kind == SOURCE_KIND_URL:
+            content_identity = str(run_input["url"])
+            name = None
+        elif source_kind == SOURCE_KIND_FILE:
+            content_identity = str(run_input["content_sha256"])
+            name = str(run_input["filename"])
+        elif source_kind == SOURCE_KIND_TEXT:
+            content_identity = str(run_input["content_sha256"])
+            raw_name = run_input.get("name")
+            name = str(raw_name) if raw_name is not None else None
+        else:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    return RememberSemanticIntent(
+        source_kind=str(source_kind),
+        dataset=dataset,
+        content_identity=content_identity,
+        name=name,
+        metadata=dict(metadata),
+        session_id=str(session_id) if session_id is not None else None,
+        mode=mode,
+        force=force,
+    )
+
+
+def same_remember_intent(
+    left: Mapping[str, Any] | None,
+    right: Mapping[str, Any] | None,
+) -> bool:
+    left_intent = remember_semantic_intent_from_run_input(left)
+    right_intent = remember_semantic_intent_from_run_input(right)
+    if left_intent is None or right_intent is None:
+        return False
+    return left_intent == right_intent
+
+
+# ---------------------------------------------------------------------------
+# Durable ingress staging (SM-513 SS 9/10).
+#
+# Path is keyed only by an application-generated run id (UUID) -- never by
+# any client-controlled string -- so no traversal/symlink-escape guard is
+# needed the way Source's *final* storage path requires (that one mixes in
+# dataset_id/source_id read back from a URI). Every artifact under this root
+# belongs to exactly one Remember run and is safe to delete unconditionally
+# once that run no longer needs it.
+# ---------------------------------------------------------------------------
+
+
+def ingress_directory(data_directory: Path, *, run_id: UUID) -> Path:
+    return data_directory / INGRESS_DIRECTORY_NAME / str(run_id)
+
+
+def ingress_artifact_path(data_directory: Path, *, run_id: UUID) -> Path:
+    return ingress_directory(data_directory, run_id=run_id) / INGRESS_ORIGINAL_FILENAME
+
+
+def _ingress_filename_path(data_directory: Path, *, run_id: UUID) -> Path:
+    return ingress_directory(data_directory, run_id=run_id) / INGRESS_FILENAME_METADATA_FILENAME
+
+
+def write_ingress_bytes(
+    data_directory: Path,
+    *,
+    run_id: UUID,
+    raw_bytes: bytes,
+    filename: str | None = None,
+) -> None:
+    """Atomically stage ``raw_bytes`` under this run's opaque ingress
+    directory, durable before the caller returns (SM-513 SS 9). Safe to call
+    more than once for the same ``run_id`` (a later call simply replaces the
+    artifact) -- callers that must not clobber an already-fetched artifact
+    check :func:`ingress_artifact_path` existence first."""
+
+    directory = ingress_directory(data_directory, run_id=run_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    target_path = directory / INGRESS_ORIGINAL_FILENAME
+    temporary_path = directory / f"{INGRESS_ORIGINAL_FILENAME}.tmp"
+    temporary_path.write_bytes(raw_bytes)
+    temporary_path.replace(target_path)
+
+    if filename is not None:
+        filename_path = _ingress_filename_path(data_directory, run_id=run_id)
+        filename_temporary_path = filename_path.with_suffix(".tmp")
+        filename_temporary_path.write_text(filename, encoding="utf-8")
+        filename_temporary_path.replace(filename_path)
+
+
+def read_ingress_bytes(data_directory: Path, *, run_id: UUID) -> bytes:
+    return ingress_artifact_path(data_directory, run_id=run_id).read_bytes()
+
+
+def read_ingress_filename(data_directory: Path, *, run_id: UUID) -> str | None:
+    filename_path = _ingress_filename_path(data_directory, run_id=run_id)
+    if not filename_path.exists():
+        return None
+    return filename_path.read_text(encoding="utf-8")
+
+
+def ingress_artifact_exists(data_directory: Path, *, run_id: UUID) -> bool:
+    return ingress_artifact_path(data_directory, run_id=run_id).exists()
+
+
+def delete_ingress_artifact(data_directory: Path, *, run_id: UUID) -> None:
+    """Best-effort recursive cleanup of this run's ingress directory.
+
+    Never raises: a leftover ingress directory is inert disk usage (never
+    referenced by anything but this one run id) rather than a correctness
+    hazard, so a failed delete here must never fail the caller (route
+    cleanup, worker post-storage-finalization cleanup)."""
+
+    directory = ingress_directory(data_directory, run_id=run_id)
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Final storage helpers (SM-513 SS 16/17): filesystem I/O only, never called
+# from a PipelineStep's persist().
+# ---------------------------------------------------------------------------
+
+
+def final_storage_directory(data_directory: Path, *, dataset_id: UUID, source_id: UUID) -> Path:
+    return data_directory / str(dataset_id) / str(source_id)
+
+
+def final_storage_path(
+    data_directory: Path,
+    *,
+    dataset_id: UUID,
+    source_id: UUID,
+    storage_extension: str,
+) -> Path:
+    return (
+        final_storage_directory(data_directory, dataset_id=dataset_id, source_id=source_id)
+        / f"original{storage_extension}"
+    )
+
+
+def final_storage_uri(
+    data_directory: Path,
+    *,
+    dataset_id: UUID,
+    source_id: UUID,
+    storage_extension: str,
+) -> str:
+    """Pure path computation, no filesystem access (safe to call from a
+    ``persist()`` phase, ADR-0009 SS O): the ``file://`` URI a source's final
+    storage path resolves to, assuming ``data_directory`` is already an
+    absolute, canonical root (true for ``Settings.data_directory``). Never
+    calls ``Path.resolve()`` -- that performs real syscalls (symlink
+    readback), which ``persist()`` may not do; ``dataset_id``/``source_id``
+    are trusted application-generated UUIDs here, not values parsed back
+    from an untrusted URI, so no symlink-escape re-check is needed the way
+    Forget's *read*-side ``source_storage_path`` requires."""
+
+    return final_storage_path(
+        data_directory,
+        dataset_id=dataset_id,
+        source_id=source_id,
+        storage_extension=storage_extension,
+    ).as_uri()
+
+
+def write_final_storage_bytes(
     data_directory: Path,
     *,
     dataset_id: UUID,
@@ -545,6 +357,12 @@ def write_original_bytes(
     storage_extension: str,
     original_bytes: bytes,
 ) -> str:
+    """Atomically write ``original_bytes`` to the source's final storage
+    path and return its ``file://`` URI. ``dataset_id``/``source_id`` are
+    always application-generated UUIDs at this call site (never parsed back
+    from client input), so the guard here only needs to prevent this
+    function's own output from ever escaping ``data_directory``."""
+
     storage_root = data_directory.resolve()
     target_directory = (storage_root / str(dataset_id) / str(source_id)).resolve()
     if not target_directory.is_relative_to(storage_root):
@@ -558,85 +376,85 @@ def write_original_bytes(
     temporary_path = target_directory / f"original{storage_extension}.tmp"
     temporary_path.write_bytes(original_bytes)
     temporary_path.replace(target_path)
-    return target_path.resolve().as_uri()
-
-
-def write_original_text(
-    data_directory: Path,
-    *,
-    dataset_id: UUID,
-    source_id: UUID,
-    original_bytes: bytes,
-) -> str:
-    return write_original_bytes(
+    return final_storage_uri(
         data_directory,
         dataset_id=dataset_id,
         source_id=source_id,
-        storage_extension=TEXT_STORAGE_EXTENSION,
-        original_bytes=original_bytes,
+        storage_extension=storage_extension,
     )
 
 
-def source_name(prepared_input: RememberPreparedInput) -> str:
-    return prepared_input.name or f"text-{prepared_input.prepared_text.content_sha256[:12]}"
+def final_storage_content_matches(path: Path, *, content_sha256: str) -> bool:
+    """Whether an already-existing final storage file's content hash matches
+    the expected content identity -- the idempotent-replay check that lets
+    :class:`~sofias_memory.pipelines.steps.remember.FinalizeStorageStep`
+    treat a file already present (a prior attempt's own write, or a crash
+    exactly after the copy but before the ``storage_uri`` commit) as safely
+    done rather than re-copying or failing."""
+
+    if not path.is_file():
+        return False
+    return sha256(path.read_bytes()).hexdigest() == content_sha256
 
 
-def document_metadata(prepared_input: RememberPreparedInput) -> dict[str, JSONValue]:
-    metadata = dict(prepared_input.metadata)
-    if prepared_input.session_id is not None:
-        metadata["session_id"] = prepared_input.session_id
-    return metadata
+def dataset_not_found_error(dataset_slug: str) -> SofiasMemoryError:
+    return SofiasMemoryError(
+        code=ErrorCode.INVALID_REQUEST,
+        status_code=HTTPStatus.NOT_FOUND,
+        message="Dataset does not exist.",
+        details={"dataset": dataset_slug},
+    )
 
 
-def result_from_run(run: PipelineRun) -> RememberTextResult:
-    result = run.metrics.get(REMEMBER_RESULT_METRIC_KEY)
-    if not isinstance(result, Mapping):
-        raise SofiasMemoryError(
-            code=ErrorCode.INTERNAL_ERROR,
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            message="Stored idempotent remember result is unavailable.",
-        )
-    return RememberTextResult.model_validate(result)
+def source_name(*, name: str | None, content_sha256: str) -> str:
+    return name or f"text-{content_sha256[:12]}"
 
 
-async def _require_run(uow: RememberUnitOfWork, run_id: UUID) -> PipelineRun:
-    run = await uow.pipeline_runs.get_by_id(run_id)
-    if run is None:
-        raise SofiasMemoryError(
-            code=ErrorCode.INTERNAL_ERROR,
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            message="Remember run could not be loaded.",
-        )
-    return run
-
-
-async def _existing_document_for_source(
-    uow: RememberUnitOfWork,
-    source: Source,
-) -> Document:
-    documents = await uow.documents.list_for_source(source.id)
-    if not documents:
-        raise SofiasMemoryError(
-            code=ErrorCode.INTERNAL_ERROR,
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            message="Stored source has no normalized document.",
-        )
-    return documents[-1]
-
-
-def _mark_run_succeeded(
-    run: PipelineRun,
-    result: RememberTextResult,
+def document_metadata(
     *,
-    dataset_id: UUID,
-    source_id: UUID,
-) -> None:
-    run.dataset_id = dataset_id
-    run.source_id = source_id
-    run.status = PipelineRunStatus.SUCCEEDED
-    run.progress = 1.0
-    run.current_step = None
-    run.error_code = None
-    run.error_message = None
-    run.finished_at = utc_now()
-    run.metrics = {REMEMBER_RESULT_METRIC_KEY: result.model_dump(mode="json")}
+    metadata: dict[str, JSONValue],
+    session_id: str | None,
+) -> dict[str, JSONValue]:
+    result = dict(metadata)
+    if session_id is not None:
+        result["session_id"] = session_id
+    return result
+
+
+__all__ = [
+    "DEFAULT_DATASET_SLUG",
+    "MODE_FULL",
+    "MODE_INGEST",
+    "REMEMBER_RESULT_METRIC_KEY",
+    "SOURCE_KIND_FILE",
+    "SOURCE_KIND_TEXT",
+    "SOURCE_KIND_URL",
+    "SUPPORTED_MODES",
+    "TEXT_MIME_TYPE",
+    "TEXT_STORAGE_EXTENSION",
+    "UNDETERMINED_LANGUAGE",
+    "UNSUPPORTED_MODE_ERROR_CODE",
+    "UNTOKENIZED_SENTINEL",
+    "RememberSemanticIntent",
+    "dataset_not_found_error",
+    "delete_ingress_artifact",
+    "document_metadata",
+    "final_storage_content_matches",
+    "final_storage_directory",
+    "final_storage_path",
+    "final_storage_uri",
+    "ingress_artifact_exists",
+    "ingress_artifact_path",
+    "ingress_directory",
+    "read_ingress_bytes",
+    "read_ingress_filename",
+    "remember_file_run_input",
+    "remember_semantic_intent_from_run_input",
+    "remember_text_run_input",
+    "remember_url_run_input",
+    "same_remember_intent",
+    "source_name",
+    "validate_remember_mode",
+    "write_final_storage_bytes",
+    "write_ingress_bytes",
+]

@@ -70,6 +70,10 @@ from sofias_memory.pipelines.steps.improve import (
     IMPROVE_RESOURCES_RESOURCE,
     ImprovePipelineResources,
 )
+from sofias_memory.pipelines.steps.remember import (
+    REMEMBER_RESOURCES_RESOURCE,
+    RememberPipelineResources,
+)
 from sofias_memory.services.cognify import CognifyService
 from sofias_memory.services.graph_maintenance_service import GraphMaintenanceService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
@@ -248,14 +252,23 @@ def build_pipeline_resources(
     pay even in a process that never claims a run.
     """
 
+    _cognify_service: CognifyService | None = None
+
     def build_cognify_service() -> CognifyService:
-        return CognifyService(
-            settings,
-            session_factory=session_factory,
-            embedding_client=OpenAIEmbeddingClient(settings),
-            knowledge_extraction_client=OpenAIKnowledgeExtractionClient(settings),
-            document_summary_client=OpenAIDocumentSummaryClient(settings),
-        )
+        # A single shared instance, built at most once regardless of which
+        # resource key triggers it first (SM-513 SS 59): Remember's `cognify`
+        # step reuses this exact object rather than constructing its own
+        # LLM/embedding/summary clients.
+        nonlocal _cognify_service
+        if _cognify_service is None:
+            _cognify_service = CognifyService(
+                settings,
+                session_factory=session_factory,
+                embedding_client=OpenAIEmbeddingClient(settings),
+                knowledge_extraction_client=OpenAIKnowledgeExtractionClient(settings),
+                document_summary_client=OpenAIDocumentSummaryClient(settings),
+            )
+        return _cognify_service
 
     def build_improve_resources() -> ImprovePipelineResources:
         # One shared embedding client, reused for entity/relation embedding
@@ -310,11 +323,15 @@ def build_pipeline_resources(
             )
         return ForgetPipelineResources(settings=settings, graph_outbox_drain=graph_outbox_drain)
 
+    def build_remember_resources() -> RememberPipelineResources:
+        return RememberPipelineResources(settings=settings, cognify_service=build_cognify_service())
+
     return _PipelineResources(
         {
             COGNIFY_SERVICE_RESOURCE: build_cognify_service,
             IMPROVE_RESOURCES_RESOURCE: build_improve_resources,
             FORGET_RESOURCES_RESOURCE: build_forget_resources,
+            REMEMBER_RESOURCES_RESOURCE: build_remember_resources,
         }
     )
 

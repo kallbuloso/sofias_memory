@@ -63,18 +63,21 @@ class PipelineRun(Base):
         Index("ix_pipeline_runs_created_at", "created_at"),
         Index("ix_pipeline_runs_status_next_attempt_at", "status", "next_attempt_at"),
         Index("ix_pipeline_runs_retry_of_run_id", "retry_of_run_id"),
-        # ADR-0009 SS D's partial unique operational-run backstop
-        # (UNIQUE(dataset_id) WHERE dataset_id IS NOT NULL AND status IN
-        # ('running', 'cancelling')) is intentionally NOT yet declared here.
-        # B4's still-synchronous public write pipelines create PipelineRun
-        # rows directly as RUNNING and rely on an application-level conflict
-        # check running after that insert; activating this constraint now
-        # would reject that insert before the app's own check runs. Physical
-        # activation is deferred to a follow-up migration once the last
-        # direct-RUNNING B4 writer is migrated to the B5 runtime (tracked in
-        # docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B5.md,
-        # SM-502/SM-513, verified at GATE-B5). This is a rollout-sequencing
-        # decision, not a change to ADR-0009's final invariant.
+        # ADR-0009 SS D's partial unique operational-run backstop, activated
+        # by SM-513 (migration 0010) now that Remember -- the last
+        # direct-RUNNING B4 writer -- has moved to the B5 runtime: every
+        # public write pipeline creates PipelineRun rows exclusively through
+        # the B5 claimer, which already serializes per-dataset execution, so
+        # this index is pure defense-in-depth, never the primary arbiter.
+        # dataset_id IS NULL (a true global run) stays outside the predicate.
+        Index(
+            "uq_pipeline_runs_dataset_id_operational",
+            "dataset_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "dataset_id IS NOT NULL AND status IN ('running', 'cancelling')"
+            ),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(

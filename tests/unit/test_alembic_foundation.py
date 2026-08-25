@@ -100,6 +100,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
         "0007_create_pipeline_and_graph_outbox.py",
         "0008_pipeline_run_retry_and_operational_constraints.py",
         "0009_graph_outbox_processing_lease.py",
+        "0010_pipeline_runs_operational_unique_constraint.py",
     ]
 
 

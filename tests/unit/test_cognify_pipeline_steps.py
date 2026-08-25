@@ -67,26 +67,14 @@ CONFIG_FINGERPRINT = "a" * 64
 # --- production registry (SM-510 Cognify; SM-511 added IMPROVE; SM-512 FORGET) -------
 
 
-def test_default_registry_contains_cognify_improve_and_forget() -> None:
+def test_default_registry_contains_all_four_pipelines() -> None:
     registry = build_default_pipeline_registry()
 
-    assert len(registry) == 3
+    assert len(registry) == 4
+    assert registry.get(PipelineType.REMEMBER).pipeline_type == PipelineType.REMEMBER
     assert registry.get(PipelineType.COGNIFY).pipeline_type == PipelineType.COGNIFY
     assert registry.get(PipelineType.IMPROVE).pipeline_type == PipelineType.IMPROVE
     assert registry.get(PipelineType.FORGET).pipeline_type == PipelineType.FORGET
-
-
-@pytest.mark.parametrize(
-    "pipeline_type",
-    [PipelineType.REMEMBER],
-)
-def test_default_registry_leaves_future_pipelines_unregistered(
-    pipeline_type: PipelineType,
-) -> None:
-    from sofias_memory.pipelines.registry import UnknownPipelineTypeError
-
-    with pytest.raises(UnknownPipelineTypeError):
-        build_default_pipeline_registry().get(pipeline_type)
 
 
 def test_cognify_definition_declares_the_two_expected_steps_in_order() -> None:

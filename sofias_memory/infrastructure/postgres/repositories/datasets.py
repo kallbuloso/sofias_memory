@@ -7,6 +7,7 @@ from typing import cast
 from uuid import UUID
 
 from sqlalchemy import Select, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -57,6 +58,39 @@ class DatasetRepository:
         statement = select(Dataset).where(Dataset.slug == slug)
         result = await self._session.scalar(statement)
         return cast(Dataset | None, result)
+
+    async def get_or_create_by_slug(self, candidate: Dataset) -> Dataset:
+        """Lazily resolve ``candidate.slug``, racing safely with a concurrent
+        first-ever caller (SM-513 SS 7: Remember's lazy ``main`` creation).
+
+        ``INSERT ... ON CONFLICT (slug) DO NOTHING`` + re-read (the
+        :data:`~sofias_memory.services.pipeline_submission.PreparationHook`
+        contract's documented pattern) rather than get-then-add: two
+        concurrent transactions racing to create the same slug for the
+        first time never see an uncaught ``IntegrityError`` from this call --
+        the loser's insert silently affects zero rows, and the immediate
+        re-read returns the winner's already-committed row. Never used to
+        update an existing dataset; a slug that already exists is returned
+        unchanged, even if ``candidate``'s other fields differ.
+        """
+
+        statement = (
+            pg_insert(Dataset)
+            .values(
+                id=candidate.id,
+                name=candidate.name,
+                slug=candidate.slug,
+                description=candidate.description,
+                status=candidate.status,
+                active_generation=candidate.active_generation,
+            )
+            .on_conflict_do_nothing(index_elements=["slug"])
+        )
+        await self._session.execute(statement)
+        await self._session.flush()
+        resolved = await self.get_by_slug(candidate.slug)
+        assert resolved is not None  # noqa: S101 - just inserted or already existed
+        return resolved
 
     async def get_by_slug_for_update(self, slug: str) -> Dataset | None:
         statement = select(Dataset).where(Dataset.slug == slug).with_for_update()

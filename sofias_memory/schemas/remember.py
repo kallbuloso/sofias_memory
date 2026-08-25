@@ -1,12 +1,12 @@
-"""Public schemas for remember text ingest."""
+"""Public schemas for remember ingest (SM-513)."""
 
 from __future__ import annotations
 
-from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from sofias_memory.domain import PipelineRunStatus
 from sofias_memory.schemas.common import JSONValue
 
 
@@ -60,17 +60,29 @@ class RememberUrlRequest(BaseModel):
 
 
 class RememberTextResult(BaseModel):
-    """Result returned after synchronous remember ingest."""
+    """Result of a remember run (text/file/url; ``mode=ingest``/``full``).
+
+    Business fields are optional/``None`` when the run has not yet reached
+    ``succeeded`` (SM-513, matching Cognify/Improve/Forget's B5 pattern) --
+    only ``run_id``/``status`` are guaranteed for ``queued``/``running``/
+    ``cancelling``/``cancelled``."""
 
     model_config = ConfigDict(extra="forbid")
 
     run_id: UUID
-    status: Literal["succeeded"]
-    dataset_id: UUID
-    source_id: UUID
-    document_id: UUID
-    content_hash: str = Field(min_length=64, max_length=64)
-    chunks: int
-    entities: int
-    relations: int
-    deduplicated: bool
+    status: PipelineRunStatus
+    dataset_id: UUID | None = None
+    source_id: UUID | None = None
+    document_id: UUID | None = None
+    content_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    chunks: int | None = None
+    entities: int | None = None
+    relations: int | None = None
+    deduplicated: bool | None = None
+
+
+__all__ = [
+    "RememberTextRequest",
+    "RememberTextResult",
+    "RememberUrlRequest",
+]

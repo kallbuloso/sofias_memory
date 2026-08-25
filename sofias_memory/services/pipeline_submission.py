@@ -192,6 +192,7 @@ class _RunSnapshot:
     status: PipelineRunStatus
     payload_hash: str
     input: Mapping[str, JSONValue]
+    retry_of_run_id: UUID | None
 
 
 def _snapshot(run: PipelineRun) -> _RunSnapshot:
@@ -203,6 +204,7 @@ def _snapshot(run: PipelineRun) -> _RunSnapshot:
         status=run.status,
         payload_hash=run.payload_hash,
         input=cast("Mapping[str, JSONValue]", run.input),
+        retry_of_run_id=run.retry_of_run_id,
     )
 
 
@@ -235,6 +237,9 @@ class SubmissionOutcome:
     """``True``: a brand-new ``PipelineRun`` was just committed. ``False``:
     an existing run was resolved via ``Idempotency-Key`` (any status,
     including terminal safe-replay)."""
+    retry_of_run_id: UUID | None = None
+    """Set when this run was created (or resolved) as a manual retry
+    (SM-514): the original run's id. ``None`` for a normal submission."""
 
     @property
     def terminal(self) -> bool:
@@ -302,11 +307,66 @@ class PipelineSubmissionService:
         run_id: UUID | None = None,
         legacy_intent_equivalent: LegacyIntentEquivalent | None = None,
     ) -> SubmissionOutcome:
+        """Public entry point: rejects a client-supplied ``sys:``-prefixed
+        key outright (ADR-0009 SS M). Every public write route calls this,
+        never :meth:`submit_trusted_internal`."""
+
         if idempotency_key is not None and idempotency_key.startswith(
             RESERVED_IDEMPOTENCY_KEY_PREFIX
         ):
             raise reserved_idempotency_key_namespace_error()
+        return await self._submit(
+            pipeline_type=pipeline_type,
+            work_input=work_input,
+            idempotency_key=idempotency_key,
+            prepare=prepare,
+            run_id=run_id,
+            legacy_intent_equivalent=legacy_intent_equivalent,
+            retry_of_run_id=None,
+        )
 
+    async def submit_trusted_internal(
+        self,
+        *,
+        pipeline_type: PipelineType,
+        work_input: Mapping[str, JSONValue],
+        idempotency_key: str,
+        prepare: PreparationHook,
+        run_id: UUID | None = None,
+        retry_of_run_id: UUID | None = None,
+    ) -> SubmissionOutcome:
+        """Internal-only entry point (SM-514 SS 21): the sole caller
+        permitted to submit under the reserved ``sys:`` idempotency-key
+        namespace -- currently manual retry
+        (``sys:retry:{original_run_id}``). Never reachable from a public
+        route; ``idempotency_key`` must already carry the reserved prefix
+        (enforced defensively, never relaxed to accept an arbitrary key)."""
+
+        if not idempotency_key.startswith(RESERVED_IDEMPOTENCY_KEY_PREFIX):
+            raise ValueError(
+                "submit_trusted_internal requires a reserved-namespace idempotency_key"
+            )
+        return await self._submit(
+            pipeline_type=pipeline_type,
+            work_input=work_input,
+            idempotency_key=idempotency_key,
+            prepare=prepare,
+            run_id=run_id,
+            legacy_intent_equivalent=None,
+            retry_of_run_id=retry_of_run_id,
+        )
+
+    async def _submit(
+        self,
+        *,
+        pipeline_type: PipelineType,
+        work_input: Mapping[str, JSONValue],
+        idempotency_key: str | None,
+        prepare: PreparationHook,
+        run_id: UUID | None,
+        legacy_intent_equivalent: LegacyIntentEquivalent | None,
+        retry_of_run_id: UUID | None,
+    ) -> SubmissionOutcome:
         payload_hash = canonical_work_payload_hash(work_input)
 
         if idempotency_key is not None:
@@ -344,6 +404,7 @@ class PipelineSubmissionService:
                 prepare=prepare,
                 step_plan=step_plan,
                 run_id=run_id,
+                retry_of_run_id=retry_of_run_id,
             )
         except IntegrityError as error:
             if idempotency_key is None or not _is_idempotency_key_unique_violation(error):
@@ -401,6 +462,7 @@ class PipelineSubmissionService:
             source_id=existing.source_id,
             status=existing.status,
             created=False,
+            retry_of_run_id=existing.retry_of_run_id,
         )
 
     async def _create_new_run(
@@ -413,6 +475,7 @@ class PipelineSubmissionService:
         prepare: PreparationHook,
         step_plan: list[StepPlan],
         run_id: UUID | None,
+        retry_of_run_id: UUID | None,
     ) -> SubmissionOutcome:
         async with self._unit_of_work_factory() as uow:
             targets = await prepare(uow)
@@ -427,6 +490,7 @@ class PipelineSubmissionService:
                 config_fingerprint=self._config_fingerprint,
                 steps=step_plan,
                 run_id=run_id,
+                retry_of_run_id=retry_of_run_id,
             )
             await uow.commit()
             new_run_id = run.id
@@ -445,6 +509,7 @@ class PipelineSubmissionService:
             source_id=current.source_id,
             status=current.status,
             created=True,
+            retry_of_run_id=current.retry_of_run_id,
         )
 
     async def _find_by_idempotency_key(self, idempotency_key: str) -> _RunSnapshot | None:

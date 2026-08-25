@@ -40,7 +40,7 @@ import httpx
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineType, SourceKind, SourceStatus
-from sofias_memory.infrastructure.postgres.models import Document, Source
+from sofias_memory.infrastructure.postgres.models import Document, PipelineRun, Source
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.loaders.text import PreparedText, TextFileLoadError, prepare_text_content
 from sofias_memory.loaders.text import prepare_text_file_content as _prepare_text_file_content
@@ -150,6 +150,37 @@ class _PreparedIngest:
     mime_type: str
     storage_extension: str
     text: PreparedText
+
+
+async def _retry_source_reuse(
+    uow: PostgresUnitOfWork,
+    *,
+    run: PipelineRun,
+    dataset_id: UUID,
+    content_sha256: str,
+) -> Source | None:
+    """SM-514 SS 39/40: if ``run`` is a manual retry (``retry_of_run_id`` set)
+    and the original run already committed a Source for this exact
+    dataset+content identity, that Source must be reused verbatim -- never
+    re-derived from ``force``/dedup logic, which would otherwise create a
+    duplicate version purely because a different ``PipelineRun.id`` is now
+    doing the work. Whitelisted revalidation only (never trusts the original
+    run's persisted output blindly): re-reads the Source fresh from
+    PostgreSQL and re-checks dataset/content identity match."""
+
+    if run.retry_of_run_id is None:
+        return None
+    original_run = await uow.pipeline_runs.get_by_id(run.retry_of_run_id)
+    if original_run is None or original_run.source_id is None:
+        return None
+    candidate = await uow.sources.get_by_id(original_run.source_id)
+    if (
+        candidate is not None
+        and candidate.dataset_id == dataset_id
+        and candidate.content_sha256 == content_sha256
+    ):
+        return candidate
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -312,12 +343,40 @@ class PrepareAndIngestStep:
                 REMEMBER_TARGET_MISSING_ERROR_CODE, REMEMBER_TARGET_MISSING_MESSAGE
             )
 
+        # Fetched early (rather than only at the end, where an earlier
+        # revision of this step used it purely to set run.source_id) so a
+        # manual-retry run (SM-514 SS 39/40) can be recognized BEFORE the
+        # dedup/force decision below: retry_of_run_id is never None for a
+        # run created by POST /runs/{id}/retry.
+        run = await uow.pipeline_runs.get_by_id_for_update(context.run_id)
+        if run is None:
+            raise PermanentPipelineStepError(
+                REMEMBER_TARGET_MISSING_ERROR_CODE, REMEMBER_TARGET_MISSING_MESSAGE
+            )
+
         force = bool(context.run_input.get("force", False))
         content_sha256 = prepared.text.content_sha256
         existing = await uow.sources.get_latest_by_content_hash(
             dataset_id=dataset.id, content_sha256=content_sha256
         )
-        deduplicated = existing is not None and not force
+
+        retry_source = await _retry_source_reuse(
+            uow, run=run, dataset_id=dataset.id, content_sha256=content_sha256
+        )
+        source: Source | None
+        if retry_source is not None:
+            # SM-514 SS 39: a manual retry redoes step 1 from scratch, but
+            # must never create ANOTHER Source version just because it is a
+            # different PipelineRun -- the original's own committed Source
+            # (proven, not guessed: same dataset, same content hash) is
+            # reused unconditionally, regardless of `force`. `force` governs
+            # "is this new content relative to what existed before THIS
+            # submission" -- a retry is not a new submission.
+            deduplicated = True
+            source = retry_source
+        else:
+            deduplicated = existing is not None and not force
+            source = existing if deduplicated else None
         source_kind = SourceKind(str(context.run_input.get("source_kind")))
         display_name = source_name(name=prepared.name, content_sha256=content_sha256)
         metadata = dict(context.run_input.get("metadata") or {})
@@ -325,8 +384,7 @@ class PrepareAndIngestStep:
         session_id = str(session_id_raw) if session_id_raw is not None else None
 
         if deduplicated:
-            assert existing is not None  # noqa: S101 - deduplicated implies existing
-            source = existing
+            assert source is not None  # noqa: S101 - deduplicated implies a target source
             documents = await uow.documents.list_for_source(source.id)
             if not documents:
                 raise PermanentPipelineStepError(
@@ -368,11 +426,6 @@ class PrepareAndIngestStep:
                 )
             )
 
-        run = await uow.pipeline_runs.get_by_id_for_update(context.run_id)
-        if run is None:
-            raise PermanentPipelineStepError(
-                REMEMBER_TARGET_MISSING_ERROR_CODE, REMEMBER_TARGET_MISSING_MESSAGE
-            )
         run.source_id = source.id
 
         result.output.update(

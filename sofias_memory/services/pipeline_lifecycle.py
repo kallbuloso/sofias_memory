@@ -155,6 +155,12 @@ def transition_run(
         PipelineRunStatus.CANCELLED,
     ):
         run.finished_at = now
+        # ADR-0009 SS A: next_attempt_at is only ever meaningful for a QUEUED
+        # run awaiting automatic retry (SM-514 SS 50). A terminal transition
+        # ends any such wait -- most commonly reachable today via a manual
+        # cancel of a QUEUED run that had one scheduled, but this belongs to
+        # the generic primitive, not any one caller.
+        run.next_attempt_at = None
         if target == PipelineRunStatus.FAILED:
             run.error_code = error_code
             run.error_message = error_message

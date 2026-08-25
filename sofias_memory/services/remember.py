@@ -1,11 +1,14 @@
 """Remember pure/reusable primitives (SM-513, ADR-0009 SS O).
 
 Run lifecycle for Remember lives entirely in ``pipelines.steps.remember`` and
-the shared B5 submission/engine runtime -- this module holds only pure
-functions and PostgreSQL-free helpers reused by both the route (work
-identity, durable ingress staging) and the pipeline step (loader dispatch
-inputs, final storage helpers, B4-legacy semantic-intent compatibility).
-Nothing here owns a ``PipelineRun``/``PipelineStep`` transition.
+the shared B5 submission/engine runtime -- this module holds mostly pure
+functions and filesystem/PostgreSQL-free helpers reused by both the route
+(work identity, durable ingress staging) and the pipeline step (loader
+dispatch inputs, final storage helpers, B4-legacy semantic-intent
+compatibility). The one exception is :func:`prepare_remember_retry_ingress`
+(SM-514), which needs a short, independent read of the authoritative Source
+to recover a manual retry's ingress bytes -- it never owns a
+``PipelineRun``/``PipelineStep`` transition itself.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ from typing import Any
 from uuid import UUID
 
 from sofias_memory.api.errors import SofiasMemoryError
+from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
+from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.schemas.common import ErrorCode, JSONValue
 
 DEFAULT_DATASET_SLUG = "main"
@@ -397,6 +402,90 @@ def final_storage_content_matches(path: Path, *, content_sha256: str) -> bool:
     return sha256(path.read_bytes()).hexdigest() == content_sha256
 
 
+async def prepare_remember_retry_ingress(
+    *,
+    session_factory: AsyncSessionFactory,
+    data_directory: Path,
+    original_run_id: UUID,
+    original_source_id: UUID | None,
+    candidate_run_id: UUID,
+    source_kind: str,
+) -> bool:
+    """SM-514 SS 34/35: recover durable bytes for a manual-retry child run's
+    own ``candidate_run_id``-keyed ingress artifact, using only what the
+    ORIGINAL run left behind. Never called inside a PostgreSQL transaction
+    that must stay short (SS 36) -- any read here is its own short,
+    independent unit of work.
+
+    Returns ``True`` when the retry can proceed: durable bytes were staged
+    for the candidate (TEXT/FILE, or URL content already acquired by the
+    original), or -- URL only, and only when nothing was ever acquired --
+    nothing needs staging because the worker will fetch fresh. Returns
+    ``False`` only when TEXT/FILE has nothing durable to redo step 1 with --
+    the caller must then fail the retry closed rather than create a child
+    doomed to `REMEMBER_INGRESS_MISSING`.
+    """
+
+    # Case 1 -- the original run's own ingress directory is still present
+    # (never reached/finalized, or the original failed before
+    # finalize_storage's cleanup ran). Applies to ALL source kinds
+    # (SM-514 SS 43): once a URL's bytes were durably acquired, a retry must
+    # reuse them rather than silently refetch and risk observing different
+    # content from a server whose response changed between attempts.
+    if ingress_artifact_exists(data_directory, run_id=original_run_id):
+        raw_bytes = read_ingress_bytes(data_directory, run_id=original_run_id)
+        # URL's own filename is derived from the fetch response, not from
+        # `run_input` -- it only lives in this ingress metadata, so it must
+        # be carried over too, or the retry's own loader dispatch would see
+        # no extension at all (TEXT/FILE never write this metadata; None is
+        # the correct no-op for them).
+        filename = read_ingress_filename(data_directory, run_id=original_run_id)
+        write_ingress_bytes(
+            data_directory, run_id=candidate_run_id, raw_bytes=raw_bytes, filename=filename
+        )
+        return True
+
+    if source_kind == SOURCE_KIND_URL and original_source_id is None:
+        # Never acquired (no ingress ever staged, and no Source was ever
+        # committed by prepare_and_ingest) -- no acquired-content identity
+        # exists anywhere to reuse, so a fresh fetch is the only option and
+        # is exactly what SM-514 SS 35 case 3 permits.
+        return True
+
+    # Case 2 -- original ingress is gone (finalize_storage already
+    # succeeded and cleaned it up): recover bytes from the authoritative
+    # Source's own final storage, validating path safety and content hash
+    # before trusting it (reuses Forget's already-audited safe-path guard,
+    # SM-512 -- never a second implementation of the same safety property).
+    if original_source_id is not None:
+        async with PostgresUnitOfWork(session_factory) as uow:
+            source = await uow.sources.get_by_id(original_source_id)
+            storage_uri = source.storage_uri if source is not None else None
+            dataset_id = source.dataset_id if source is not None else None
+            content_sha256 = source.content_sha256 if source is not None else None
+        if storage_uri is not None and dataset_id is not None:
+            from sofias_memory.services.forget import source_storage_path
+
+            path = source_storage_path(
+                data_directory,
+                dataset_id=dataset_id,
+                source_id=original_source_id,
+                storage_uri=storage_uri,
+            )
+            if path is not None:
+                raw_bytes = path.read_bytes()
+                if sha256(raw_bytes).hexdigest() == content_sha256:
+                    write_ingress_bytes(
+                        data_directory, run_id=candidate_run_id, raw_bytes=raw_bytes
+                    )
+                    return True
+
+    # Case 4 -- TEXT/FILE with neither a live ingress artifact nor
+    # recoverable final storage: no durable bytes exist anywhere to redo
+    # step 1 with. Fail closed rather than create a doomed child run.
+    return False
+
+
 def dataset_not_found_error(dataset_slug: str) -> SofiasMemoryError:
     return SofiasMemoryError(
         code=ErrorCode.INVALID_REQUEST,
@@ -446,6 +535,7 @@ __all__ = [
     "ingress_artifact_exists",
     "ingress_artifact_path",
     "ingress_directory",
+    "prepare_remember_retry_ingress",
     "read_ingress_bytes",
     "read_ingress_filename",
     "remember_file_run_input",

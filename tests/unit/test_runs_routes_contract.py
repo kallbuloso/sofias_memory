@@ -1,4 +1,5 @@
-"""OpenAPI-surface contract checks for the SM-508 Runs read API."""
+"""OpenAPI-surface contract checks for the Runs API (SM-508 read, SM-514
+cancel/retry control)."""
 
 from __future__ import annotations
 
@@ -15,11 +16,8 @@ LLM_API_KEY = "sk-fake-test-key"
 EXPECTED_RUNS_PATHS = {
     "/api/v1/runs",
     "/api/v1/runs/{run_id}",
-}
-
-FORBIDDEN_RUNS_PATHS = {
-    "/api/v1/runs/{run_id}/retry",
     "/api/v1/runs/{run_id}/cancel",
+    "/api/v1/runs/{run_id}/retry",
 }
 
 
@@ -45,7 +43,7 @@ def openapi_schemas() -> dict[str, dict[str, object]]:
     return cast(dict[str, dict[str, object]], app.openapi()["components"]["schemas"])
 
 
-def test_both_sm_508_run_routes_exist() -> None:
+def test_all_expected_run_routes_exist() -> None:
     paths = openapi_paths()
     assert EXPECTED_RUNS_PATHS.issubset(paths)
 
@@ -56,16 +54,22 @@ def test_no_extra_run_routes_exist_this_story() -> None:
     assert runs_paths == EXPECTED_RUNS_PATHS
 
 
-def test_sm_514_retry_and_cancel_routes_are_not_registered() -> None:
+def test_run_read_routes_only_expose_get() -> None:
     paths = openapi_paths()
-    assert FORBIDDEN_RUNS_PATHS.isdisjoint(paths)
+    for path in ("/api/v1/runs", "/api/v1/runs/{run_id}"):
+        assert set(paths[path].keys()) <= {"get"}, f"non-read method on {path}: {paths[path]}"
 
 
-def test_run_routes_only_expose_get() -> None:
+def test_run_control_routes_only_expose_post() -> None:
     paths = openapi_paths()
-    for path, operations in paths.items():
-        if path.startswith("/api/v1/runs"):
-            assert set(operations.keys()) <= {"get"}, f"non-read method on {path}: {operations}"
+    for path in ("/api/v1/runs/{run_id}/cancel", "/api/v1/runs/{run_id}/retry"):
+        assert set(paths[path].keys()) == {"post"}, f"unexpected method on {path}: {paths[path]}"
+
+
+def test_run_control_routes_declare_no_request_body() -> None:
+    paths = openapi_paths()
+    for path in ("/api/v1/runs/{run_id}/cancel", "/api/v1/runs/{run_id}/retry"):
+        assert "requestBody" not in paths[path]["post"]
 
 
 def test_run_list_route_declares_expected_filters() -> None:

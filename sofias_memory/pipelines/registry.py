@@ -323,11 +323,12 @@ class PipelineRegistry:
 
 def build_default_pipeline_registry() -> PipelineRegistry:
     """The production registry (SM-505 SS 30/31, SM-510, SM-511, SM-512,
-    SM-513).
+    SM-513, SM-515).
 
-    Contains exactly four pipelines: ``COGNIFY`` (SM-510), ``IMPROVE``
-    (SM-511), ``FORGET`` (SM-512), and ``REMEMBER`` (SM-513) -- every public
-    write pipeline B5 defines, cutover complete.
+    Contains exactly five pipelines: ``COGNIFY`` (SM-510), ``IMPROVE``
+    (SM-511), ``FORGET`` (SM-512), ``REMEMBER`` (SM-513), and
+    ``DATASET_DELETE`` (SM-515, ADR-0010) -- every public write pipeline B5
+    defines, cutover complete.
 
     The step-definition imports are deferred to call time purely to keep
     this module free of a cycle: concrete steps import the contracts defined
@@ -335,6 +336,9 @@ def build_default_pipeline_registry() -> PipelineRegistry:
     """
 
     from sofias_memory.pipelines.steps.cognify import build_cognify_pipeline_definition
+    from sofias_memory.pipelines.steps.dataset_delete import (
+        build_dataset_delete_pipeline_definition,
+    )
     from sofias_memory.pipelines.steps.forget import build_forget_pipeline_definition
     from sofias_memory.pipelines.steps.improve import build_improve_pipeline_definition
     from sofias_memory.pipelines.steps.remember import build_remember_pipeline_definition
@@ -345,6 +349,7 @@ def build_default_pipeline_registry() -> PipelineRegistry:
             build_cognify_pipeline_definition(),
             build_improve_pipeline_definition(),
             build_forget_pipeline_definition(),
+            build_dataset_delete_pipeline_definition(),
         ]
     )
 

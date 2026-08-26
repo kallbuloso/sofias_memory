@@ -5,21 +5,28 @@ from __future__ import annotations
 from http import HTTPStatus
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
 
 from sofias_memory.api.errors import current_request_id
-from sofias_memory.lifespan import app_postgres_session_factory
+from sofias_memory.lifespan import (
+    app_pipeline_registry,
+    app_pipeline_worker,
+    app_postgres_session_factory,
+    app_settings,
+)
 from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
 from sofias_memory.schemas.datasets import (
     DATASET_PAGE_DEFAULT_LIMIT,
     DATASET_PAGE_MAX_LIMIT,
     DatasetCreateRequest,
+    DatasetDeleteResult,
     DatasetListResult,
     DatasetRenameRequest,
     DatasetResult,
     DatasetSourcesResult,
     DatasetStatsResult,
 )
+from sofias_memory.services.dataset_delete import DatasetDeleteService
 from sofias_memory.services.datasets import DatasetService
 
 router = APIRouter(tags=["datasets"])
@@ -107,5 +114,42 @@ async def get_dataset_stats(
     result = await service.get_stats(dataset_id)
     return SuccessEnvelope[DatasetStatsResult](
         data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.delete(
+    "/datasets/{dataset_id}",
+    response_model=SuccessEnvelope[DatasetDeleteResult],
+    responses={
+        HTTPStatus.ACCEPTED: {
+            "description": (
+                "A new (or already-existing, still non-terminal) administrative "
+                "delete run was accepted. Poll GET /api/v1/runs/{run_id} for the "
+                "terminal state."
+            )
+        }
+    },
+)
+async def delete_dataset(
+    dataset_id: UUID,
+    request: Request,
+    response: Response,
+) -> SuccessEnvelope[DatasetDeleteResult]:
+    """Administrative Dataset deletion (SM-515, ADR-0010). Not an alias of
+    ``POST /api/v1/forget``: this permanently retires the Dataset namespace
+    (tombstone, ``name``/``slug`` reserved forever) rather than clearing its
+    content while leaving it usable."""
+
+    service = DatasetDeleteService(
+        registry=app_pipeline_registry(request.app),
+        worker=app_pipeline_worker(request.app),
+        settings=app_settings(request.app),
+        session_factory=app_postgres_session_factory(request.app),
+    )
+    control = await service.request_delete(dataset_id)
+    response.status_code = control.http_status
+    return SuccessEnvelope[DatasetDeleteResult](
+        data=control.result,
         meta=ResponseMeta(request_id=current_request_id()),
     )

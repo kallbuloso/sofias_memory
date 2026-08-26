@@ -473,6 +473,15 @@ class DatasetMutationPart:
     entity_mentions_unprojected: int
     relation_evidence_unprojected: int
     graph_events_enqueued: int
+    graph_outbox_ids: tuple[int, ...] = ()
+    """The exact ``graph_outbox`` row ids this mutation enqueued (SM-515,
+    ADR-0010 Finding 2). Empty for Forget's own callers, which converge via
+    dataset-wide draining without needing exact-row proof of convergence;
+    populated for DATASET_DELETE, which must prove -- before
+    ``finalize_tombstone`` runs -- that these exact rows reached ``DONE``,
+    not merely that PostgreSQL's outbox has nothing left it considers
+    "processable" (a permanently FAILED-at-ceiling row is invisible to that
+    query, which would otherwise let convergence be falsely declared)."""
 
 
 @dataclass(frozen=True)
@@ -746,8 +755,16 @@ async def apply_dataset_forget_mutation(
         relations=relations,
         entities=entities,
     )
+    graph_outbox_ids: list[int] = []
     for command in commands:
-        await uow.graph_outbox.add_projection_command(command)
+        event = await uow.graph_outbox.add_projection_command(command)
+        # Defensive against Forget's own unit-test doubles, which return a
+        # bare ``object()`` with no ``id`` (SM-515, ADR-0010 Finding 2) --
+        # only the real PostgreSQL-backed repository's row id is ever
+        # actually used, by DATASET_DELETE's own convergence proof.
+        event_id = getattr(event, "id", None)
+        if isinstance(event_id, int):
+            graph_outbox_ids.append(event_id)
 
     return DatasetMutationPart(
         dataset_id=dataset.id,
@@ -760,6 +777,7 @@ async def apply_dataset_forget_mutation(
         relations_deactivated=len(relations),
         entity_mentions_unprojected=len(mentions),
         relation_evidence_unprojected=len(evidence),
+        graph_outbox_ids=tuple(graph_outbox_ids),
         graph_events_enqueued=len(commands),
     )
 

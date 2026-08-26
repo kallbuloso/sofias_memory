@@ -352,7 +352,7 @@ async def test_stats_are_stable_postgresql_counters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dataset_route_returns_envelope_requires_api_key_and_has_no_delete(
+async def test_dataset_route_returns_envelope_and_requires_api_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,10 +443,6 @@ async def test_dataset_route_returns_envelope_requires_api_key_and_has_no_delete
             f"/api/v1/datasets/{dataset_id}/stats",
             headers={API_KEY_HEADER: EXPECTED_API_KEY},
         )
-        delete_response = await client.delete(
-            f"/api/v1/datasets/{dataset_id}",
-            headers={API_KEY_HEADER: EXPECTED_API_KEY},
-        )
 
     assert missing_key.status_code == 401
     assert created.status_code == 201
@@ -459,7 +455,6 @@ async def test_dataset_route_returns_envelope_requires_api_key_and_has_no_delete
     assert renamed.json()["data"]["name"] == "Renamed"
     assert sources.json()["data"] == {"items": [], "limit": 50, "offset": 0, "total": 0}
     assert stats.json()["data"]["sources"] == {"total": 0, "active": 0}
-    assert delete_response.status_code == 405
 
 
 def dataset_result(dataset_id: UUID, name: str, slug: str) -> DatasetResult:

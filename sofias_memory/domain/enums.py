@@ -57,6 +57,7 @@ class PipelineType(StrEnum):
     COGNIFY = "cognify"
     IMPROVE = "improve"
     FORGET = "forget"
+    DATASET_DELETE = "dataset_delete"
 
 
 class PipelineRunStatus(StrEnum):

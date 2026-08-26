@@ -106,6 +106,27 @@ class GraphOutboxRepository:
         result = await self._session.scalar(statement)
         return cast(GraphOutbox | None, result)
 
+    async def list_status_by_ids(self, ids: list[int]) -> dict[int, tuple[GraphOutboxStatus, int]]:
+        """Exact, by-row-id ``(status, attempt)`` snapshot for a specific set
+        of outbox rows (SM-515, ADR-0010 Finding 2).
+
+        Unlike :meth:`list_claimable_ids`/the drain-eligibility predicate --
+        which deliberately excludes a row permanently ``FAILED`` at the
+        attempt ceiling because it is no longer *processable* -- this method
+        answers a different question: "what did these EXACT rows end up as,
+        including a dead-ended one?" A caller that needs to prove
+        convergence (not merely drain what remains claimable) must use this,
+        never infer non-membership-in-claimable as proof of ``DONE``.
+        """
+
+        if not ids:
+            return {}
+        statement = select(GraphOutbox.id, GraphOutbox.status, GraphOutbox.attempt).where(
+            GraphOutbox.id.in_(ids)
+        )
+        result = await self._session.execute(statement)
+        return {row.id: (row.status, row.attempt) for row in result}
+
     async def get_database_now(self) -> datetime:
         """PostgreSQL's own ``now()`` -- the sole time authority for
         ``processing_started_at``/``processed_at`` (ADR-0009 SS 14)."""

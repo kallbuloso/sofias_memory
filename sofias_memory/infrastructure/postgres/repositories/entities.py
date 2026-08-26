@@ -223,12 +223,27 @@ class EntityRepository:
         *,
         dataset_id: UUID,
     ) -> list[Entity]:
+        """All authoritative current-generation entities for a dataset-wide
+        mutation (Forget dataset/everything scope, ADR-0010 DATASET_DELETE).
+
+        Accepts ``DELETING`` as well as ``ACTIVE``: Forget's own dataset-scope
+        mutation observes this query with an in-memory ``DELETING`` write
+        still unflushed (so the committed value it reads is always
+        ``ACTIVE``); DATASET_DELETE's ``deactivate_authoritative`` step runs
+        in a separate, later transaction where ``DELETING`` is already
+        durably committed by the prior ``begin_delete`` step (ADR-0010 D9) --
+        excluding it here would silently skip every entity, never
+        deactivating or projecting a DELETE for them. Excluding ``DELETED``
+        is still correct: nothing legitimately mutates a dataset that has
+        already reached its administrative tombstone.
+        """
+
         statement = (
             select(Entity)
             .join(Dataset, Entity.dataset_id == Dataset.id)
             .where(
                 Entity.dataset_id == dataset_id,
-                Dataset.status == DatasetStatus.ACTIVE,
+                Dataset.status.in_((DatasetStatus.ACTIVE, DatasetStatus.DELETING)),
                 Entity.generation == Dataset.active_generation,
                 Entity.is_active.is_(True),
             )

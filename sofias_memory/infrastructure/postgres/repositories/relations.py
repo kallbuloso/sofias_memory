@@ -162,6 +162,13 @@ class RelationRepository:
         *,
         dataset_id: UUID,
     ) -> list[Relation]:
+        """All authoritative current-generation relations for a dataset-wide
+        mutation. Accepts ``DELETING`` as well as ``ACTIVE`` -- see
+        ``EntityRepository.list_active_current_for_dataset`` for why
+        (ADR-0010 DATASET_DELETE's ``deactivate_authoritative`` step observes
+        an already-durably-committed ``DELETING`` Dataset from a prior,
+        separate transaction)."""
+
         source_entity = aliased(Entity)
         target_entity = aliased(Entity)
         statement = (
@@ -171,7 +178,7 @@ class RelationRepository:
             .join(target_entity, Relation.target_entity_id == target_entity.id)
             .where(
                 Relation.dataset_id == dataset_id,
-                Dataset.status == DatasetStatus.ACTIVE,
+                Dataset.status.in_((DatasetStatus.ACTIVE, DatasetStatus.DELETING)),
                 Relation.generation == Dataset.active_generation,
                 Relation.is_active.is_(True),
                 source_entity.dataset_id == Dataset.id,

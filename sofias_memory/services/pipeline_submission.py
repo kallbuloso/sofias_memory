@@ -33,6 +33,7 @@ from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWor
 from sofias_memory.pipelines.hashing import canonical_work_payload_hash
 from sofias_memory.pipelines.registry import PipelineRegistry, StepPlan
 from sofias_memory.schemas.common import ErrorCode, JSONValue
+from sofias_memory.services.dataset_delete_barrier import raise_if_dataset_administratively_blocked
 from sofias_memory.services.pipeline_lifecycle import create_run_with_steps
 
 
@@ -479,6 +480,18 @@ class PipelineSubmissionService:
     ) -> SubmissionOutcome:
         async with self._unit_of_work_factory() as uow:
             targets = await prepare(uow)
+            if pipeline_type != PipelineType.DATASET_DELETE:
+                # ADR-0010 D12/D16: the delete-intent barrier applies to
+                # every OTHER dataset-scoped pipeline type's new-run
+                # creation -- including a manual retry's own
+                # submit_trusted_internal call, which reaches this same
+                # code path. DATASET_DELETE's own submission never goes
+                # through this generic service at all (see
+                # services.dataset_delete), so it is never blocked by its
+                # own barrier.
+                await raise_if_dataset_administratively_blocked(
+                    cast(PostgresUnitOfWork, uow), targets.dataset_id
+                )
             run = await create_run_with_steps(
                 cast(PostgresUnitOfWork, uow),
                 pipeline_type=pipeline_type,

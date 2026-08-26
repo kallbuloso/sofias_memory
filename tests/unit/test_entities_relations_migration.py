@@ -107,6 +107,7 @@ def test_entities_relations_revision_is_current_head() -> None:
         "0008_pipeline_run_retry_and_operational_constraints.py",
         "0009_graph_outbox_processing_lease.py",
         "0010_pipeline_runs_operational_unique_constraint.py",
+        "0011_add_dataset_delete_pipeline_type.py",
     ]
 
 

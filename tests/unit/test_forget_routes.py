@@ -461,7 +461,7 @@ def test_forget_service_module_no_longer_owns_run_lifecycle() -> None:
 # --- registry -----------------------------------------------------------------
 
 
-def test_default_registry_contains_all_four_pipelines() -> None:
+def test_default_registry_contains_all_five_pipelines() -> None:
     from sofias_memory.pipelines.registry import build_default_pipeline_registry
 
     registry = build_default_pipeline_registry()
@@ -470,7 +470,8 @@ def test_default_registry_contains_all_four_pipelines() -> None:
     assert registry.get(PipelineType.COGNIFY) is not None
     assert registry.get(PipelineType.IMPROVE) is not None
     assert registry.get(PipelineType.FORGET) is not None
-    assert len(registry) == 4
+    assert registry.get(PipelineType.DATASET_DELETE) is not None
+    assert len(registry) == 5
 
 
 # --- OpenAPI surface ------------------------------------------------------

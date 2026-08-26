@@ -594,7 +594,15 @@ async def _finalize_dataset_target(
             sources_deleted += 1
         else:
             sources_pending += 1
-    if dataset.status == DatasetStatus.DELETING:
+    # ADR-0010 D28/D42 defense-in-depth: re-evaluate administrative ownership
+    # immediately before writing ACTIVE, even though target enumeration
+    # (list_ids_for_everything_forget) already excludes an
+    # administratively-owned DELETING dataset -- this guards the race
+    # between that enumeration and this finalize step within the same run.
+    # Forget must never resurrect an administrative tombstone.
+    if dataset.status == DatasetStatus.DELETING and not (
+        await uow.pipeline_runs.exists_administrative_delete_ownership(dataset.id)
+    ):
         dataset.status = DatasetStatus.ACTIVE
     return {
         "dataset_id": str(dataset_id),

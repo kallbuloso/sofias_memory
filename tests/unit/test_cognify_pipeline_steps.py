@@ -67,14 +67,15 @@ CONFIG_FINGERPRINT = "a" * 64
 # --- production registry (SM-510 Cognify; SM-511 added IMPROVE; SM-512 FORGET) -------
 
 
-def test_default_registry_contains_all_four_pipelines() -> None:
+def test_default_registry_contains_all_five_pipelines() -> None:
     registry = build_default_pipeline_registry()
 
-    assert len(registry) == 4
+    assert len(registry) == 5
     assert registry.get(PipelineType.REMEMBER).pipeline_type == PipelineType.REMEMBER
     assert registry.get(PipelineType.COGNIFY).pipeline_type == PipelineType.COGNIFY
     assert registry.get(PipelineType.IMPROVE).pipeline_type == PipelineType.IMPROVE
     assert registry.get(PipelineType.FORGET).pipeline_type == PipelineType.FORGET
+    assert registry.get(PipelineType.DATASET_DELETE).pipeline_type == PipelineType.DATASET_DELETE
 
 
 def test_cognify_definition_declares_the_two_expected_steps_in_order() -> None:

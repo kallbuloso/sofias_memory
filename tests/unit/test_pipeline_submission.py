@@ -135,11 +135,23 @@ class FakePipelineStepRepository:
         return steps
 
 
+class FakeDatasetRepository:
+    """Always "no Dataset row found" -- this suite never exercises the
+    ADR-0010 D12 delete-intent barrier's Dataset-found branches; those are
+    covered against real PostgreSQL in
+    tests/integration/test_dataset_delete_postgres_integration.py."""
+
+    async def get_by_id(self, dataset_id: UUID) -> None:
+        del dataset_id
+        return None
+
+
 class FakeUnitOfWork:
     def __init__(self, store: FakeStore) -> None:
         self._store = store
         self.pipeline_runs = FakePipelineRunRepository(store)
         self.pipeline_steps = FakePipelineStepRepository(store)
+        self.datasets = FakeDatasetRepository()
 
     async def __aenter__(self) -> FakeUnitOfWork:
         return self

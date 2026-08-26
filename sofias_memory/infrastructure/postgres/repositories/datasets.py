@@ -6,17 +6,19 @@ from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, exists, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from sofias_memory.domain import DatasetStatus, SourceStatus
+from sofias_memory.domain import DatasetStatus, PipelineStepStatus, PipelineType, SourceStatus
 from sofias_memory.infrastructure.postgres.models import (
     Chunk,
     Dataset,
     Document,
     Entity,
+    PipelineRun,
+    PipelineStep,
     Relation,
     Source,
     Summary,
@@ -103,11 +105,31 @@ class DatasetRepository:
         return cast(Dataset | None, result)
 
     async def list_ids_for_everything_forget(self) -> list[UUID]:
-        """Enumerate authoritative forget targets: active datasets and recoverable retries."""
+        """Enumerate authoritative forget targets: active datasets and
+        Forget-owned recoverable-DELETING datasets.
 
+        ADR-0010 D28: a dataset whose ``DELETING`` status is administratively
+        owned (at least one ``DATASET_DELETE`` run for it has a persisted
+        ``begin_delete`` step that reached ``SUCCEEDED``) is excluded --
+        Forget Everything must never resume/finalize it back to ``ACTIVE``.
+        An ordinary Forget-owned ``DELETING`` dataset (no such administrative
+        lineage ever crossed ``begin_delete``) remains correctly eligible,
+        exactly as before this exclusion existed.
+        """
+
+        administratively_owned = exists().where(
+            PipelineRun.dataset_id == Dataset.id,
+            PipelineRun.pipeline_type == PipelineType.DATASET_DELETE,
+            PipelineStep.run_id == PipelineRun.id,
+            PipelineStep.name == "begin_delete",
+            PipelineStep.status == PipelineStepStatus.SUCCEEDED,
+        )
         statement = (
             select(Dataset.id)
-            .where(Dataset.status.in_((DatasetStatus.ACTIVE, DatasetStatus.DELETING)))
+            .where(
+                Dataset.status.in_((DatasetStatus.ACTIVE, DatasetStatus.DELETING)),
+                ~administratively_owned,
+            )
             .order_by(Dataset.id)
         )
         result = await self._session.scalars(statement)

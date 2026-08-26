@@ -499,4 +499,4 @@ def test_default_registry_contains_remember() -> None:
 
     registry = build_default_pipeline_registry()
     assert registry.get(PipelineType.REMEMBER) is not None
-    assert len(registry) == 4
+    assert len(registry) == 5

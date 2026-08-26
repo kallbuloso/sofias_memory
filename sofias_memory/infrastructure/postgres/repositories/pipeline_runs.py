@@ -11,8 +11,8 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from sofias_memory.domain import PipelineRunStatus, PipelineType
-from sofias_memory.infrastructure.postgres.models import PipelineRun
+from sofias_memory.domain import PipelineRunStatus, PipelineStepStatus, PipelineType
+from sofias_memory.infrastructure.postgres.models import PipelineRun, PipelineStep
 
 type _SelectAny = Select[Any]
 
@@ -563,3 +563,125 @@ class PipelineRunRepository:
         statement = select(PipelineRun).where(PipelineRun.idempotency_key == idempotency_key)
         result = await self._session.scalar(statement)
         return cast(PipelineRun | None, result)
+
+    # -- SM-515 dataset administrative delete primitives (ADR-0010) ---------
+
+    async def find_nonterminal_dataset_delete_for_dataset(
+        self, dataset_id: UUID
+    ) -> PipelineRun | None:
+        """The one currently QUEUED/RUNNING/CANCELLING ``DATASET_DELETE`` run
+        for this dataset, if any (ADR-0010 D12/D21 delete-intent barrier and
+        repeated-DELETE convergence)."""
+
+        statement = (
+            select(PipelineRun)
+            .where(
+                PipelineRun.dataset_id == dataset_id,
+                PipelineRun.pipeline_type == PipelineType.DATASET_DELETE,
+                PipelineRun.status.in_(
+                    (
+                        PipelineRunStatus.QUEUED,
+                        PipelineRunStatus.RUNNING,
+                        PipelineRunStatus.CANCELLING,
+                    )
+                ),
+            )
+            .order_by(PipelineRun.created_at.desc(), PipelineRun.id.desc())
+            .limit(1)
+        )
+        result = await self._session.scalar(statement)
+        return cast(PipelineRun | None, result)
+
+    async def find_nonterminal_dataset_delete_for_dataset_for_update(
+        self, dataset_id: UUID
+    ) -> PipelineRun | None:
+        """Row-locked variant of :meth:`find_nonterminal_dataset_delete_for_dataset`,
+        used while already holding the Dataset row lock inside the same
+        transaction that may create a brand-new ``DATASET_DELETE`` run
+        (ADR-0010 D8/D21 -- TOCTOU-safe convergence)."""
+
+        statement = (
+            select(PipelineRun)
+            .where(
+                PipelineRun.dataset_id == dataset_id,
+                PipelineRun.pipeline_type == PipelineType.DATASET_DELETE,
+                PipelineRun.status.in_(
+                    (
+                        PipelineRunStatus.QUEUED,
+                        PipelineRunStatus.RUNNING,
+                        PipelineRunStatus.CANCELLING,
+                    )
+                ),
+            )
+            .order_by(PipelineRun.created_at.desc(), PipelineRun.id.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        result = await self._session.scalar(statement)
+        return cast(PipelineRun | None, result)
+
+    async def find_latest_dataset_delete_for_dataset(self, dataset_id: UUID) -> PipelineRun | None:
+        """Most recent ``DATASET_DELETE`` run (any status) for this dataset --
+        used to surface a public-safe ``run_id`` when a repeated ``DELETE``
+        finds a terminal FAILED/CANCELLED lineage awaiting manual retry
+        (ADR-0010 D21/D23)."""
+
+        statement = (
+            select(PipelineRun)
+            .where(
+                PipelineRun.dataset_id == dataset_id,
+                PipelineRun.pipeline_type == PipelineType.DATASET_DELETE,
+            )
+            .order_by(PipelineRun.created_at.desc(), PipelineRun.id.desc())
+            .limit(1)
+        )
+        result = await self._session.scalar(statement)
+        return cast(PipelineRun | None, result)
+
+    async def exists_administrative_delete_ownership(self, dataset_id: UUID) -> bool:
+        """ADR-0010 D28's frozen ``administratively_deleting`` predicate,
+        minus the ``Dataset.status == DELETING`` half (the caller already
+        holds/observes the Dataset row): whether *any* ``DATASET_DELETE`` run
+        for this dataset has a persisted ``begin_delete`` step that reached
+        ``SUCCEEDED``. Mere run existence is deliberately NOT sufficient --
+        see ADR-0010 D28's counterexample (a `DATASET_DELETE` cancelled while
+        still QUEUED must never poison a later, unrelated Forget-owned
+        ``DELETING`` cycle on the same dataset)."""
+
+        statement = select(
+            exists().where(
+                PipelineRun.dataset_id == dataset_id,
+                PipelineRun.pipeline_type == PipelineType.DATASET_DELETE,
+                PipelineStep.run_id == PipelineRun.id,
+                PipelineStep.name == "begin_delete",
+                PipelineStep.status == PipelineStepStatus.SUCCEEDED,
+            )
+        )
+        result = await self._session.scalar(statement)
+        return bool(result)
+
+    async def list_incompatible_queued_for_dataset_for_update(
+        self, *, dataset_id: UUID, exclude_run_id: UUID
+    ) -> list[PipelineRun]:
+        """Every still-``QUEUED`` run on this dataset that is NOT itself a
+        ``DATASET_DELETE`` run, row-locked -- what ``begin_delete``
+        administratively cancels (ADR-0010 D14/D16). Never includes another
+        ``DATASET_DELETE`` run: the create-time Dataset-row-locked
+        resolve-or-create sequence (ADR-0010 D21) already guarantees at most
+        one nonterminal ``DATASET_DELETE`` exists per dataset, and this run's
+        own id is excluded defensively regardless (ADR-0010 D16 "never
+        cancel the executing DATASET_DELETE run itself")."""
+
+        statement = (
+            select(PipelineRun)
+            .where(
+                PipelineRun.dataset_id == dataset_id,
+                PipelineRun.status == PipelineRunStatus.QUEUED,
+                PipelineRun.pipeline_type != PipelineType.DATASET_DELETE,
+                PipelineRun.id != exclude_run_id,
+            )
+            .order_by(PipelineRun.created_at, PipelineRun.id)
+            .with_for_update()
+        )
+        result = await self._session.scalars(statement)
+        return list(result)

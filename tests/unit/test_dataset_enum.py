@@ -92,12 +92,13 @@ def test_sm210_enums_have_no_aliases() -> None:
     assert len(MemoryEntryType) == len({entry_type.value for entry_type in MemoryEntryType})
 
 
-def test_pipeline_type_values_are_exact_from_adr_0007() -> None:
+def test_pipeline_type_values_are_exact_from_adr_0007_and_adr_0010() -> None:
     assert [pipeline_type.value for pipeline_type in PipelineType] == [
         "remember",
         "cognify",
         "improve",
         "forget",
+        "dataset_delete",
     ]
 
 

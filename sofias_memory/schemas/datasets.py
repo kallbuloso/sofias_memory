@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from sofias_memory.domain import DatasetStatus, SourceKind, SourceStatus
+from sofias_memory.domain import DatasetStatus, PipelineRunStatus, SourceKind, SourceStatus
 from sofias_memory.schemas.common import JSONValue
 
 DATASET_PAGE_DEFAULT_LIMIT = 50
@@ -65,6 +65,36 @@ class DatasetResult(BaseModel):
     active_generation: int
     created_at: datetime
     updated_at: datetime
+
+
+class DatasetDeleteCounters(BaseModel):
+    """Terminal, PostgreSQL-derived counters for a succeeded administrative
+    Dataset delete (ADR-0010 D24) -- never reconstructed from Neo4j or the
+    filesystem."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sources_deleted: int
+    documents_deactivated: int
+    chunks_deactivated: int
+    entities_deactivated: int
+    relations_deactivated: int
+    summaries_deactivated: int
+    storage_deleted: int
+    storage_already_absent: int
+    graph_events_processed: int
+
+
+class DatasetDeleteResult(BaseModel):
+    """Public projection of an administrative Dataset delete request/observation
+    (SM-515, ADR-0010 D23/D24)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: UUID
+    dataset_id: UUID
+    status: PipelineRunStatus
+    counters: DatasetDeleteCounters | None = None
 
 
 class DatasetListResult(BaseModel):

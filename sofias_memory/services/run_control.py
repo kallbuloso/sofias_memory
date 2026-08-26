@@ -32,6 +32,7 @@ from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWor
 from sofias_memory.pipelines.registry import PipelineRegistry
 from sofias_memory.schemas.common import ErrorCode, JSONValue
 from sofias_memory.schemas.runs import RunDetailResult
+from sofias_memory.services.dataset_delete_barrier import raise_if_dataset_administratively_blocked
 from sofias_memory.services.pipeline_lifecycle import transition_run, transition_step
 from sofias_memory.services.pipeline_submission import (
     PipelineSubmissionService,
@@ -178,6 +179,16 @@ class RunControlService:
         )
         if existing_id is not None:
             return await self._respond(existing_id)
+
+        if original.pipeline_type != PipelineType.DATASET_DELETE:
+            # ADR-0010 D16: revalidate the target dataset before doing any
+            # work toward a NEW retry child -- in particular before Remember
+            # ever stages ingress bytes for a candidate that would just be
+            # discarded. submit_trusted_internal below re-checks this same
+            # barrier as defense-in-depth (SM-515), but this early check
+            # avoids that wasted filesystem I/O specifically.
+            async with PostgresUnitOfWork(self._session_factory) as uow:
+                await raise_if_dataset_administratively_blocked(uow, original.dataset_id)
 
         candidate_run_id = uuid4()
         if original.pipeline_type == PipelineType.REMEMBER:

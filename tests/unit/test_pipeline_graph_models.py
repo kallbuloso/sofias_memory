@@ -70,7 +70,13 @@ def test_pipeline_runs_columns_types_nullability_and_fks_are_exact() -> None:
     assert columns.id.primary_key is True
     assert isinstance(columns.pipeline_type.type, ENUM)
     assert columns.pipeline_type.type.name == "pipeline_type"
-    assert columns.pipeline_type.type.enums == ["remember", "cognify", "improve", "forget"]
+    assert columns.pipeline_type.type.enums == [
+        "remember",
+        "cognify",
+        "improve",
+        "forget",
+        "dataset_delete",
+    ]
     assert isinstance(columns.status.type, ENUM)
     assert columns.status.type.name == "pipeline_run_status"
     assert "stale" not in columns.status.type.enums

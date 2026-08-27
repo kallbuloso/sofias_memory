@@ -188,7 +188,7 @@ def make_test_registry() -> PipelineRegistry:
 @dataclass
 class StaticWorker:
     enabled: bool = True
-    is_running: bool = True
+    is_operational: bool = True
 
 
 async def dataset_row_count(engine: AsyncEngine, dataset_id: UUID) -> int:
@@ -672,7 +672,7 @@ async def test_existing_queued_run_resolves_with_worker_disabled_and_empty_regis
         unavailable_service = PipelineSubmissionService(
             session_factory=create_session_factory(postgres_engine),
             registry=PipelineRegistry([]),
-            worker=StaticWorker(enabled=False, is_running=False),
+            worker=StaticWorker(enabled=False, is_operational=False),
             config_fingerprint=CONFIG_FINGERPRINT,
         )
 
@@ -828,7 +828,7 @@ async def test_worker_unavailable_creates_no_pipeline_run_row(
     ids = SubmissionIds()
     await insert_dataset(postgres_engine, ids)
     service = service_for(
-        postgres_engine, ids, worker=StaticWorker(enabled=False, is_running=False)
+        postgres_engine, ids, worker=StaticWorker(enabled=False, is_operational=False)
     )
 
     with pytest.raises(SofiasMemoryError) as error:

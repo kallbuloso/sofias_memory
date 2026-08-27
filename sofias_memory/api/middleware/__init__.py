@@ -18,6 +18,7 @@ from sofias_memory.api.middleware.request_id import (
     RequestIdMiddleware,
     resolve_request_id,
 )
+from sofias_memory.api.middleware.request_metrics import RequestMetricsMiddleware
 
 __all__ = [
     "API_KEY_HEADER",
@@ -28,6 +29,7 @@ __all__ = [
     "REQUEST_ID_HEADER",
     "RequestBodyLimitMiddleware",
     "RequestIdMiddleware",
+    "RequestMetricsMiddleware",
     "RequestTooLargeError",
     "is_valid_api_key",
     "max_body_bytes_from_mebibytes",

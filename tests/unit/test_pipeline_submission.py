@@ -90,7 +90,7 @@ def make_test_registry(pipeline_type: PipelineType = PipelineType.REMEMBER) -> P
 @dataclass
 class FakeWorker:
     enabled: bool = True
-    is_running: bool = True
+    is_operational: bool = True
 
 
 class FakeStore:
@@ -604,7 +604,7 @@ async def test_existing_terminal_match_never_calls_build_step_plan() -> None:
 @pytest.mark.asyncio
 async def test_worker_disabled_rejects_new_submission_with_503_and_zero_state() -> None:
     store = FakeStore()
-    service = service_for(store, worker=FakeWorker(enabled=False, is_running=False))
+    service = service_for(store, worker=FakeWorker(enabled=False, is_operational=False))
 
     with pytest.raises(SofiasMemoryError) as error:
         await service.submit(
@@ -624,7 +624,7 @@ async def test_worker_disabled_rejects_new_submission_with_503_and_zero_state() 
 @pytest.mark.asyncio
 async def test_worker_unready_not_running_rejects_new_submission_with_503() -> None:
     store = FakeStore()
-    service = service_for(store, worker=FakeWorker(enabled=True, is_running=False))
+    service = service_for(store, worker=FakeWorker(enabled=True, is_operational=False))
 
     with pytest.raises(SofiasMemoryError) as error:
         await service.submit(
@@ -641,7 +641,7 @@ async def test_worker_unready_not_running_rejects_new_submission_with_503() -> N
 @pytest.mark.asyncio
 async def test_worker_disabled_never_falls_back_to_synchronous_execution() -> None:
     store = FakeStore()
-    service = service_for(store, worker=FakeWorker(enabled=False, is_running=False))
+    service = service_for(store, worker=FakeWorker(enabled=False, is_operational=False))
 
     async def failing_prepare(uow: Any) -> SubmissionTargets:
         del uow
@@ -669,7 +669,7 @@ async def test_worker_unavailable_still_replays_existing_terminal_run() -> None:
         status=PipelineRunStatus.SUCCEEDED,
     )
     store.add_run(run)
-    service = service_for(store, worker=FakeWorker(enabled=False, is_running=False))
+    service = service_for(store, worker=FakeWorker(enabled=False, is_operational=False))
 
     outcome = await service.submit(
         pipeline_type=PipelineType.REMEMBER,
@@ -709,7 +709,7 @@ async def test_worker_unavailable_still_resolves_any_existing_matching_run_statu
     payload_hash = canonical_work_payload_hash({"seed": "any-status"})
     run = existing_run(idempotency_key="any-status-key", payload_hash=payload_hash, status=status)
     store.add_run(run)
-    service = service_for(store, worker=FakeWorker(enabled=False, is_running=False))
+    service = service_for(store, worker=FakeWorker(enabled=False, is_operational=False))
 
     outcome = await service.submit(
         pipeline_type=PipelineType.REMEMBER,

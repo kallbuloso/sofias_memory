@@ -10,6 +10,7 @@ from pydantic import SecretStr
 from sofias_memory.observability.logging import (
     REDACTED,
     bind_log_context,
+    bound_log_context,
     clear_log_context,
     configure_logging,
     get_logger,
@@ -92,6 +93,17 @@ def test_bind_source_document_and_step(log_stream: StringIO) -> None:
     assert record["step"] == "chunk"
 
 
+def test_bind_worker_pipeline_type_and_attempt(log_stream: StringIO) -> None:
+    bind_log_context(worker_id="wk-1", pipeline_type="cognify", attempt=2)
+
+    get_logger("sofias_memory.tests").info("worker_run_bound")
+
+    [record] = read_log_records(log_stream)
+    assert record["worker_id"] == "wk-1"
+    assert record["pipeline_type"] == "cognify"
+    assert record["attempt"] == 2
+
+
 def test_unbind_log_context_removes_selected_field(log_stream: StringIO) -> None:
     bind_log_context(request_id="request-1", run_id="run-1")
     unbind_log_context("run_id")
@@ -125,6 +137,39 @@ async def test_contextvars_do_not_leak_between_tasks(log_stream: StringIO) -> No
 
     records = read_log_records(log_stream)
     assert {record["request_id"] for record in records} == {"request-a", "request-b"}
+
+
+@pytest.mark.asyncio
+async def test_worker_run_context_does_not_leak_between_concurrent_runs(
+    log_stream: StringIO,
+) -> None:
+    """SM-516 SS 14/52: two concurrently executing worker runs (each binding
+    its own run/step-scoped context, mirroring ``PipelineEngine.execute``'s
+    ``bound_log_context`` usage) must never see each other's fields, and a
+    run's context must never survive into an unrelated later worker log."""
+
+    async def run_with_context(run_id: str, step: str) -> None:
+        with bound_log_context(run_id=run_id, worker_id="wk-shared", attempt=1):
+            await asyncio.sleep(0)
+            with bound_log_context(step=step):
+                await asyncio.sleep(0)
+                get_logger("sofias_memory.tests").info("pipeline_step_event")
+
+    await asyncio.gather(
+        run_with_context("run-a", "extract"),
+        run_with_context("run-b", "summarize"),
+    )
+
+    records = {record["run_id"]: record for record in read_log_records(log_stream)}
+    assert records["run-a"]["step"] == "extract"
+    assert records["run-b"]["step"] == "summarize"
+    assert records["run-a"]["worker_id"] == "wk-shared"
+    assert records["run-b"]["worker_id"] == "wk-shared"
+
+    get_logger("sofias_memory.tests").info("worker_idle_after_runs")
+    idle_record = read_log_records(log_stream)[-1]
+    assert "run_id" not in idle_record
+    assert "step" not in idle_record
 
 
 @pytest.mark.parametrize(

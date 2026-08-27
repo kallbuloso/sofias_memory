@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
@@ -52,6 +54,22 @@ DEFAULT_GRAPH_OUTBOX_BATCH_SIZE = 50
 outbox consumer (ADR-0009 SS V, backlog SS 12). Each iteration claims,
 applies, and finalizes exactly one row (short lease, no batch of rows left
 PROCESSING at once) -- not a single query claiming many rows up front."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerHealthSnapshot:
+    """Internal-only runtime health signal (SM-516 SS 7). Not exposed on any
+    public schema -- readiness collapses this into a plain ``ready`` boolean
+    with a safe generic detail (SS 37)."""
+
+    enabled: bool
+    started: bool
+    stopped: bool
+    poll_task_alive: bool
+    outbox_task_expected: bool
+    outbox_task_alive: bool
+    active_run_count: int
+    operational: bool
 
 
 def heartbeat_interval_seconds(stale_after_seconds: int) -> float:
@@ -123,6 +141,8 @@ class PipelineWorkerCoordinator:
         self._stopped = False
 
         self._outbox_task: asyncio.Task[None] | None = None
+        self._poll_task_failed = False
+        self._outbox_task_failed = False
 
     @property
     def enabled(self) -> bool:
@@ -130,26 +150,100 @@ class PipelineWorkerCoordinator:
 
     @property
     def is_running(self) -> bool:
-        """Minimal worker readiness signal (ADR-0009 SS U, SM-505 SS 37):
-        ``True`` only once :meth:`start` has completed and :meth:`stop` has
-        not (yet) been called. Never inspects run/task internals -- that is
-        SM-516 observability, not this story's readiness contract."""
+        """Minimal started/not-stopped lifecycle signal (ADR-0009 SS U,
+        SM-505 SS 37). No longer the "is the worker available for new
+        work" contract as of the SM-516 staging fix below -- that is
+        :attr:`is_operational` now, the single signal both readiness and
+        new-work gating share. ``is_running`` stays as a plain lifecycle
+        flag for internal coordinator tests/introspection only."""
 
         return self._started and not self._stopped
 
+    @property
+    def is_operational(self) -> bool:
+        """SM-516 staging fix (worker-availability split-brain): the single
+        "worker available for NEW work" signal, backed by the exact same
+        predicate readiness uses (:meth:`health_snapshot`.``operational``).
+        A dead poll/outbox task now correctly blocks new-run creation, not
+        just readiness -- ``is_running`` alone could stay ``True`` after an
+        unexpected background-task death, silently accepting writes a dead
+        worker could never claim."""
+
+        return self.health_snapshot().operational
+
+    def health_snapshot(self) -> WorkerHealthSnapshot:
+        """SM-516 SS 6-7: a worker is not operational merely because it was
+        started -- it must also still have a live poll loop, and a live
+        outbox loop when one is expected. A single ``PipelineRun``'s
+        engine-level failure never flips this (SS 6): only the coordinator's
+        own background tasks dying unexpectedly does."""
+
+        poll_alive = self._started and not self._stopped and not self._poll_task_failed
+        outbox_expected = self._graph_outbox_processor is not None
+        outbox_alive = not outbox_expected or (
+            self._started and not self._stopped and not self._outbox_task_failed
+        )
+        return WorkerHealthSnapshot(
+            enabled=self._enabled,
+            started=self._started,
+            stopped=self._stopped,
+            poll_task_alive=poll_alive,
+            outbox_task_expected=outbox_expected,
+            outbox_task_alive=outbox_alive,
+            active_run_count=len(self._active_tasks),
+            operational=self._enabled and poll_alive and outbox_alive,
+        )
+
     async def start(self) -> None:
         """No-op when disabled (ADR-0009 SS U) or already started -- calling
-        ``start()`` twice never creates a second poll task."""
+        ``start()`` twice never creates a second poll task. Task creation
+        failures are logged and re-raised (SM-516 SS 9) rather than left as a
+        silently half-started coordinator -- including a *partial* failure,
+        where the poll task was already created successfully and only the
+        graph outbox task's own creation raises: that already-live poll task
+        must never be left running as an orphan (SM-516 staging fix,
+        Scenario B)."""
 
         if not self._enabled or self._started:
             return
-        self._started = True
-        self._stop_event.clear()
-        self._poll_task = asyncio.create_task(self._poll_loop(), name="pipeline-worker-poll")
-        if self._graph_outbox_processor is not None:
-            self._outbox_task = asyncio.create_task(
-                self._outbox_loop(), name="pipeline-worker-graph-outbox"
+        logger.info("worker_starting", worker_id=self.worker_id)
+        try:
+            self._started = True
+            self._stop_event.clear()
+            self._poll_task_failed = False
+            self._outbox_task_failed = False
+            self._poll_task = asyncio.create_task(self._poll_loop(), name="pipeline-worker-poll")
+            self._poll_task.add_done_callback(self._on_poll_task_done)
+            if self._graph_outbox_processor is not None:
+                self._outbox_task = asyncio.create_task(
+                    self._outbox_loop(), name="pipeline-worker-graph-outbox"
+                )
+                self._outbox_task.add_done_callback(self._on_outbox_task_done)
+        except Exception as exc:
+            await self._cleanup_partial_start()
+            logger.error(
+                "worker_start_failed",
+                worker_id=self.worker_id,
+                exception_type=type(exc).__name__,
             )
+            raise
+        logger.info("worker_started", worker_id=self.worker_id)
+
+    async def _cleanup_partial_start(self) -> None:
+        """Cancel and await whatever task(s) a failed :meth:`start` already
+        created before the failure, then reset to a fully-stopped state.
+        Never leaves an earlier successfully-created task running just
+        because a later one failed."""
+
+        self._started = False
+        self._stop_event.set()
+        partial_tasks = [task for task in (self._poll_task, self._outbox_task) if task is not None]
+        for task in partial_tasks:
+            task.cancel()
+        if partial_tasks:
+            await asyncio.gather(*partial_tasks, return_exceptions=True)
+        self._poll_task = None
+        self._outbox_task = None
 
     async def stop(self) -> None:
         """No-op when disabled or never started. Otherwise: stop issuing new
@@ -160,12 +254,23 @@ class PipelineWorkerCoordinator:
 
         if not self._enabled or not self._started or self._stopped:
             return
+        shutdown_start = time.monotonic()
+        active_runs_at_shutdown = len(self._active_tasks)
+        logger.info(
+            "worker_stopping",
+            worker_id=self.worker_id,
+            active_runs=active_runs_at_shutdown,
+        )
         self._stopped = True
         self._stop_event.set()
 
         poll_task = self._poll_task
         if poll_task is not None:
-            await poll_task
+            # SM-516 SS 8: the poll task may already have died unexpectedly
+            # (``_on_poll_task_done`` already observed/logged that). Awaiting
+            # a task that completed with an exception re-raises it -- shut
+            # down must stay deterministic even for an already-dead task.
+            await asyncio.gather(poll_task, return_exceptions=True)
             self._poll_task = None
 
         outbox_task = self._outbox_task
@@ -190,6 +295,63 @@ class PipelineWorkerCoordinator:
             self._active_claims.clear()
 
         await self._final_heartbeat_sweep(claims_snapshot)
+        duration_ms = (time.monotonic() - shutdown_start) * 1000
+        logger.info(
+            "worker_stopped",
+            worker_id=self.worker_id,
+            active_runs=active_runs_at_shutdown,
+            duration_ms=round(duration_ms, 2),
+        )
+
+    # -- background task death observability ------------------------------
+
+    def _on_poll_task_done(self, task: asyncio.Task[None]) -> None:
+        """SM-516 SS 8: the poll loop is designed to run until
+        ``_stop_event`` is set, swallowing per-tick failures internally
+        (``_poll_loop``). If it ends any other way -- an exception escaped
+        its own structure, or it returned before shutdown was requested --
+        that is the coordinator's own failure, not a business run failure."""
+
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._poll_task_failed = True
+            logger.error(
+                "worker_background_task_failed",
+                worker_id=self.worker_id,
+                task_name="pipeline-worker-poll",
+                exception_type=type(exc).__name__,
+            )
+        elif not self._stop_event.is_set():
+            self._poll_task_failed = True
+            logger.error(
+                "worker_background_task_failed",
+                worker_id=self.worker_id,
+                task_name="pipeline-worker-poll",
+                exception_type="UnexpectedExit",
+            )
+
+    def _on_outbox_task_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._outbox_task_failed = True
+            logger.error(
+                "worker_background_task_failed",
+                worker_id=self.worker_id,
+                task_name="pipeline-worker-graph-outbox",
+                exception_type=type(exc).__name__,
+            )
+        elif not self._stop_event.is_set():
+            self._outbox_task_failed = True
+            logger.error(
+                "worker_background_task_failed",
+                worker_id=self.worker_id,
+                task_name="pipeline-worker-graph-outbox",
+                exception_type="UnexpectedExit",
+            )
 
     # -- poll loop ------------------------------------------------------
 
@@ -356,5 +518,6 @@ __all__ = [
     "MAX_HEARTBEAT_INTERVAL_SECONDS",
     "MIN_HEARTBEAT_INTERVAL_SECONDS",
     "PipelineWorkerCoordinator",
+    "WorkerHealthSnapshot",
     "heartbeat_interval_seconds",
 ]

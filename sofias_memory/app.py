@@ -5,6 +5,7 @@ from typing import Any, cast
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ExceptionHandler
 
@@ -16,10 +17,12 @@ from sofias_memory.api.errors import (
 )
 from sofias_memory.api.middleware import (
     API_KEY_HEADER,
+    PUBLIC_PATHS,
     REQUEST_ID_HEADER,
     ApiKeyMiddleware,
     RequestBodyLimitMiddleware,
     RequestIdMiddleware,
+    RequestMetricsMiddleware,
     max_body_bytes_from_mebibytes,
 )
 from sofias_memory.api.routes.cognify import router as cognify_router
@@ -84,6 +87,10 @@ from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatch
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.graph_rebuild_service import GraphRebuildService
 from sofias_memory.services.graph_reconciliation_service import GraphReconciliationService
+from sofias_memory.services.operational_metrics import (
+    OperationalMetricsReporter,
+    OperationalMetricsService,
+)
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.summary_rebuild_service import SummaryRebuildService
@@ -196,6 +203,17 @@ def create_app(
         )
     application.state.readiness_checks = validate_readiness_checks(resolved_readiness_checks)
 
+    # SM-516 SS 19-20: local operational visibility, deliberately independent
+    # of worker enablement -- built unconditionally so it stays available
+    # even in a disabled/read-only degraded deployment (never authoritative,
+    # never touches readiness).
+    application.state.operational_metrics_reporter = OperationalMetricsReporter(
+        OperationalMetricsService(
+            application.state.postgres_session_factory,
+            stale_after_seconds=float(resolved_settings.worker_stale_after_seconds),
+        )
+    )
+
     application.add_exception_handler(
         SofiasMemoryError,
         cast(ExceptionHandler, sofias_memory_error_handler),
@@ -233,6 +251,9 @@ def create_app(
             allow_credentials=False,
         )
     application.add_middleware(RequestIdMiddleware)
+    application.add_middleware(RequestMetricsMiddleware)
+
+    application.openapi = _custom_openapi(application)  # type: ignore[method-assign]
 
     return application
 
@@ -407,19 +428,64 @@ def _neo4j_readiness_check(
 def _worker_readiness_check(
     coordinator: PipelineWorkerCoordinator,
 ) -> Callable[[], Awaitable[ReadinessCheckResult]]:
-    """ADR-0009 SS U, SM-505 SS 37: ``WORKER_ENABLED=false`` is always
+    """ADR-0009 SS U, SM-516 SS 6-7: ``WORKER_ENABLED=false`` is always
     ``not ready`` (no synchronous fallback exists); ``WORKER_ENABLED=true``
-    is ready only once the coordinator has started and not (yet) stopped.
-    Deliberately minimal -- no queue/heartbeat diagnostics here, that is
-    SM-516."""
+    is ready only once the coordinator has started, has not (yet) stopped,
+    and its background tasks (poll loop, and the graph outbox loop when one
+    is expected) are still alive. A single ``PipelineRun``'s own failure
+    never flips this -- only the coordinator's own background tasks dying
+    unexpectedly does. Reads :attr:`PipelineWorkerCoordinator.is_operational`
+    -- the same single signal new-work gating (``pipeline_submission``,
+    ``dataset_delete``) reads, so readiness and write-acceptance can never
+    disagree (SM-516 staging fix)."""
 
     async def check() -> ReadinessCheckResult:
         if not coordinator.enabled:
             return ReadinessCheckResult(ready=False, detail=WORKER_NOT_READY_DETAIL)
-        ready = coordinator.is_running
+        ready = coordinator.is_operational
         return ReadinessCheckResult(
             ready=ready,
             detail=None if ready else WORKER_NOT_READY_DETAIL,
         )
 
     return check
+
+
+API_KEY_SECURITY_SCHEME_NAME = "ApiKeyAuth"
+"""SM-516 SS 46: ``X-API-Key`` is enforced by :class:`ApiKeyMiddleware`, an
+ASGI middleware outside FastAPI's per-route dependency system -- so nothing
+about it appears in the generated OpenAPI document unless added explicitly.
+This documents the real runtime requirement (every private route needs the
+header); it changes no runtime behavior, since the middleware already
+enforces it regardless of what the schema says."""
+
+
+def _custom_openapi(application: FastAPI) -> Callable[[], dict[str, Any]]:
+    def openapi() -> dict[str, Any]:
+        if application.openapi_schema:
+            return application.openapi_schema
+
+        schema = get_openapi(
+            title=application.title,
+            version=application.version,
+            routes=application.routes,
+        )
+        schema.setdefault("components", {})["securitySchemes"] = {
+            API_KEY_SECURITY_SCHEME_NAME: {
+                "type": "apiKey",
+                "in": "header",
+                "name": API_KEY_HEADER,
+            }
+        }
+        exempt_paths = {path.rstrip("/") for path in PUBLIC_PATHS}
+        for path, operations in schema.get("paths", {}).items():
+            if path.rstrip("/") in exempt_paths:
+                continue
+            for operation in operations.values():
+                if isinstance(operation, dict):
+                    operation["security"] = [{API_KEY_SECURITY_SCHEME_NAME: []}]
+
+        application.openapi_schema = schema
+        return application.openapi_schema
+
+    return openapi

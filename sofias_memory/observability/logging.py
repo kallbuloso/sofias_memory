@@ -23,6 +23,9 @@ LOG_CONTEXT_FIELDS = frozenset(
         "source_id",
         "document_id",
         "step",
+        "worker_id",
+        "pipeline_type",
+        "attempt",
     }
 )
 

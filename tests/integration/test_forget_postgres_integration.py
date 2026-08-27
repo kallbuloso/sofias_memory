@@ -14,8 +14,11 @@ own gate.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from collections.abc import AsyncIterator, Mapping
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -46,6 +49,7 @@ from sofias_memory.infrastructure.postgres.models import (
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.observability.logging import clear_log_context, configure_logging
 from sofias_memory.pipelines.context import PipelineContext
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
 from sofias_memory.pipelines.steps.forget import (
@@ -947,3 +951,127 @@ async def test_source_forget_removes_neo4j_projection_and_preserves_external_nod
                 "MATCH (n) WHERE n.dataset_id = $ds DETACH DELETE n", ds=str(dataset.id)
             )
         await neo4j_resource.driver.close()
+
+
+# === SM-516 staging fix Finding 2: storage-path sentinel security regression ===
+
+
+def read_log_records(stream: StringIO) -> list[dict[str, object]]:
+    return [json.loads(line) for line in stream.getvalue().splitlines() if line]
+
+
+STORAGE_PATH_SECRET_SENTINEL = "STORAGE_PATH_SECRET_SENTINEL"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_storage_deletion_failure_never_leaks_path_through_logs_or_public_response(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """SM-516 staging fix Finding 2: a real storage-path-safety rejection
+    (traversal outside the sandboxed ``data_directory``) exercised end to
+    end through the real Forget pipeline/worker/HTTP surface -- not just
+    ``redact_sensitive_data()`` in isolation. The rejected absolute target
+    embeds a unique sentinel; it must never appear in any captured JSON log
+    line, in the persisted ``PipelineStep``/``PipelineRun`` error, or in the
+    public ``GET /api/v1/runs/{run_id}`` response body. Only safe values
+    (exception type, stable error_code, generic message) may survive.
+    """
+
+    log_stream = StringIO()
+    httpx_logger = logging.getLogger("httpx")
+    previous_httpx_level = httpx_logger.level
+    httpx_logger.setLevel(logging.WARNING)
+    clear_log_context()
+    configure_logging("INFO", stream=log_stream)
+
+    try:
+        app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+        dataset = await seed_dataset(session_factory, slug=f"forget-storage-leak-{uuid4()}")
+        source, _entity = await seed_source_with_content(
+            session_factory, tmp_path, dataset_id=dataset.id
+        )
+
+        # A real file genuinely exists OUTSIDE the sandboxed data_directory,
+        # embedding the sentinel -- proving this is a real traversal
+        # rejection (SS 25 path-safety guard), not just a "file missing"
+        # no-op that never reaches the unsafe branch.
+        escape_dir = tmp_path.parent / STORAGE_PATH_SECRET_SENTINEL
+        escape_dir.mkdir(parents=True, exist_ok=True)
+        escape_target = escape_dir / "escaped_source.txt"
+        escape_target.write_text("outside the sandbox")
+        traversal_path = (
+            tmp_path
+            / str(dataset.id)
+            / str(source.id)
+            / ".."
+            / ".."
+            / ".."
+            / STORAGE_PATH_SECRET_SENTINEL
+            / "escaped_source.txt"
+        )
+        malicious_uri = traversal_path.as_uri()
+        assert STORAGE_PATH_SECRET_SENTINEL in malicious_uri
+
+        async with PostgresUnitOfWork(session_factory) as uow:
+            row = await uow.sources.get_by_id_for_update(source.id)
+            assert row is not None
+            row.storage_uri = malicious_uri
+            await uow.commit()
+
+        coordinator = app.state.pipeline_worker
+        await coordinator.start()
+        try:
+            response = await post_forget(
+                app, {"dataset": dataset.slug, "source_id": str(source.id), "wait": True}
+            )
+        finally:
+            await coordinator.stop()
+
+        # wait=true on a run that reaches FAILED surfaces as a generic 500
+        # (forget.py's own _failed_run_error) -- never the path.
+        assert response.status_code == 500
+        error_body = response.json()
+        run_id = UUID(error_body["error"]["details"]["run_id"])
+
+        async with build_client(app) as client:
+            run_response = await client.get(
+                f"/api/v1/runs/{run_id}", headers={API_KEY_HEADER: EXPECTED_API_KEY}
+            )
+        assert run_response.status_code == 200
+        run_body = run_response.json()
+
+        public_surfaces = {
+            "forget_error_response": error_body,
+            "run_detail_response": run_body,
+        }
+        for surface_name, surface in public_surfaces.items():
+            serialized = json.dumps(surface)
+            assert STORAGE_PATH_SECRET_SENTINEL not in serialized, (
+                f"path sentinel leaked into {surface_name}: {serialized}"
+            )
+            assert str(escape_target) not in serialized
+            assert malicious_uri not in serialized
+
+        captured_records = read_log_records(log_stream)
+        assert captured_records, "expected at least one captured log line"
+        for record in captured_records:
+            serialized_record = json.dumps(record)
+            assert STORAGE_PATH_SECRET_SENTINEL not in serialized_record, (
+                f"path sentinel leaked into a log line: {serialized_record}"
+            )
+            assert str(escape_target) not in serialized_record
+            assert malicious_uri not in serialized_record
+
+        # The run/step DID fail because of this rejection (not some
+        # unrelated error) -- confirms the test actually exercised the
+        # path-safety guard, and only ever a safe, stable error_code
+        # survived publicly.
+        run_data = run_body["data"]
+        assert run_data["status"] == "failed"
+        assert run_data["error_code"] is not None
+        step_errors = [step["error"] for step in run_data["steps"] if step["error"] is not None]
+        assert step_errors, "expected at least one failed step with a safe error"
+    finally:
+        clear_log_context()
+        httpx_logger.setLevel(previous_httpx_level)

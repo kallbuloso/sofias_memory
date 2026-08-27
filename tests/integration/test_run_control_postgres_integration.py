@@ -49,6 +49,7 @@ from sofias_memory.pipelines.steps.remember import (
     RememberPipelineResources,
 )
 from sofias_memory.services.cognify import CognifyService
+from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.remember import ingress_artifact_exists, write_ingress_bytes
 
@@ -183,12 +184,23 @@ def make_settings(tmp_path: Path, **overrides: object) -> Settings:
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]
 
 
+class _NullProjection:
+    """Minimal ``GraphProjectionPort`` stub (SM-516 staging fix Finding 1
+    tests): the dedicated test database's ``graph_outbox`` table stays
+    empty for these scenarios, so ``apply()`` is never actually invoked --
+    this only exists so the coordinator has a real outbox task to kill."""
+
+    async def apply(self, command: Any) -> None:
+        raise AssertionError("apply() must never run -- graph_outbox stays empty in these tests")
+
+
 def build_harness(
     engine: AsyncEngine,
     tmp_path: Path,
     *,
     worker_enabled: bool = True,
     worker_claims: bool = True,
+    with_outbox_processor: bool = False,
 ) -> tuple[Any, AsyncSessionFactory, PipelineRegistry, dict[str, Any]]:
     """``worker_claims=False`` gives the coordinator an empty registry: it is
     genuinely started/enabled/running (so the submission gate passes, and
@@ -196,7 +208,13 @@ def build_harness(
     truly-not-executing run), but never claims anything -- a run stays
     durably QUEUED until the test itself decides what happens to it. This
     mirrors the same pattern already established for Cognify's own test
-    harness (``test_cognify_async_postgres_integration.py``)."""
+    harness (``test_cognify_async_postgres_integration.py``).
+
+    ``with_outbox_processor=True`` wires a real ``GraphOutboxProcessor``
+    (against a ``_NullProjection`` stub, never Neo4j) so the coordinator
+    spawns its autonomous outbox task -- needed only for the SM-516 staging
+    fix's "required graph_outbox task dies" scenario.
+    """
 
     settings = make_settings(tmp_path)
     session_factory = create_session_factory(engine)
@@ -214,6 +232,11 @@ def build_harness(
     }
     registry = build_default_pipeline_registry()
     worker_registry = registry if worker_claims else PipelineRegistry([])
+    graph_outbox_processor = (
+        GraphOutboxProcessor(session_factory=session_factory, projection=_NullProjection())
+        if with_outbox_processor
+        else None
+    )
     coordinator = PipelineWorkerCoordinator(
         session_factory,
         worker_registry,
@@ -221,7 +244,7 @@ def build_harness(
         poll_interval_ms=POLL_INTERVAL_MS,
         stale_after_seconds=settings.worker_stale_after_seconds,
         max_concurrent_datasets=settings.worker_max_concurrent_datasets,
-        graph_outbox_processor=None,
+        graph_outbox_processor=graph_outbox_processor,
         resources=resources,
     )
     app = create_app(
@@ -1610,3 +1633,422 @@ async def get_source_status(session_factory: AsyncSessionFactory, source_id: UUI
         source = await uow.sources.get_by_id(source_id)
         assert source is not None
         return source.status
+
+
+# === SM-516 staging fix Finding 1: worker-availability split-brain =========
+#
+# ``is_running`` (started/not-stopped) and readiness's real operational
+# signal used to disagree once a background task died unexpectedly: readiness
+# would flip NOT_READY while ``is_running`` stayed True, silently letting new
+# writes through to a worker that could never actually claim them.
+# ``PipelineSubmissionService``/``DatasetDeleteService`` now gate on
+# ``worker.is_operational`` -- the exact same predicate readiness uses
+# (``PipelineWorkerCoordinator.health_snapshot().operational``) -- so the two
+# can never disagree again. These tests prove that against the real
+# coordinator, real Postgres, real HTTP surface.
+
+
+async def pipeline_run_count(engine: AsyncEngine, *, dataset_id: UUID | None = None) -> int:
+    async with engine.connect() as connection:
+        if dataset_id is None:
+            count = await connection.scalar(text("SELECT count(*) FROM pipeline_runs"))
+        else:
+            count = await connection.scalar(
+                text("SELECT count(*) FROM pipeline_runs WHERE dataset_id = :id"),
+                {"id": str(dataset_id)},
+            )
+        return int(count or 0)
+
+
+async def get_readiness(app: Any) -> httpx.Response:
+    async with build_client(app) as client:
+        return await client.get("/health/ready")
+
+
+async def kill_poll_task_unexpectedly(coordinator: PipelineWorkerCoordinator) -> None:
+    """Simulates the poll loop dying from a real, uncaught fault escaping
+    its unprotected wait-for-next-poll call (ADR-0009/SM-516 SS 8) -- never
+    a cooperative ``stop()`` (a graceful ``task.cancel()`` from ``stop()``
+    is deliberately NOT treated as a failure by
+    ``PipelineWorkerCoordinator._on_poll_task_done``, so simulating a real
+    death requires an actual exception escaping the loop, not a cancel)."""
+
+    original = coordinator._wait_for_next_poll_or_stop  # noqa: SLF001
+    failed_once = False
+
+    async def _fail_once() -> None:
+        nonlocal failed_once
+        current = asyncio.current_task()
+        if not failed_once and current is not None and current.get_name() == "pipeline-worker-poll":
+            failed_once = True
+            raise RuntimeError("simulated fatal poll-loop fault")
+        await original()
+
+    coordinator._wait_for_next_poll_or_stop = _fail_once  # type: ignore[method-assign] # noqa: SLF001, E501
+
+    for _ in range(150):
+        await asyncio.sleep(0.02)
+        if coordinator.health_snapshot().poll_task_alive is False:
+            return
+    raise AssertionError("poll task did not die within timeout")
+
+
+async def kill_outbox_task_unexpectedly(coordinator: PipelineWorkerCoordinator) -> None:
+    original = coordinator._wait_for_next_poll_or_stop  # noqa: SLF001
+    failed_once = False
+
+    async def _fail_once() -> None:
+        nonlocal failed_once
+        current = asyncio.current_task()
+        if (
+            not failed_once
+            and current is not None
+            and current.get_name() == "pipeline-worker-graph-outbox"
+        ):
+            failed_once = True
+            raise RuntimeError("simulated fatal outbox-loop fault")
+        await original()
+
+    coordinator._wait_for_next_poll_or_stop = _fail_once  # type: ignore[method-assign] # noqa: SLF001, E501
+
+    for _ in range(150):
+        await asyncio.sleep(0.02)
+        if coordinator.health_snapshot().outbox_task_alive is False:
+            return
+    raise AssertionError("outbox task did not die within timeout")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_worker_operational_new_remember_submission_accepted(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 1: worker healthy -- new Remember submission accepted."""
+
+    app, _, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        assert coordinator.is_operational is True
+        response = await post_remember(app, {"dataset": "main", "content": "hello", "wait": False})
+        assert response.status_code == 202
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_poll_task_death_blocks_readiness_and_new_submission(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 2: poll task dies unexpectedly -- readiness false, a new
+    ordinary B5 submission is rejected with 503 WORKER_DISABLED, and zero
+    new ``PipelineRun`` rows are created."""
+
+    app, _, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        await kill_poll_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        ready_response = await get_readiness(app)
+        assert ready_response.status_code == 503
+        ready_body = ready_response.json()
+        assert ready_body["status"] == "not_ready"
+        assert ready_body["checks"]["worker"]["ready"] is False
+
+        before = await pipeline_run_count(postgres_engine)
+        response = await post_remember(app, {"dataset": "main", "content": "x", "wait": False})
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "WORKER_DISABLED"
+        after = await pipeline_run_count(postgres_engine)
+        assert after == before
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outbox_task_death_blocks_readiness_and_new_submission(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 3: the required graph_outbox task dies unexpectedly --
+    readiness false, a new ordinary B5 submission is rejected with 503, and
+    zero new ``PipelineRun`` rows are created."""
+
+    app, _, _, _ = build_harness(
+        postgres_engine, tmp_path, worker_claims=False, with_outbox_processor=True
+    )
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        assert coordinator.health_snapshot().outbox_task_expected is True
+        await kill_outbox_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        ready_response = await get_readiness(app)
+        assert ready_response.status_code == 503
+        assert ready_response.json()["checks"]["worker"]["ready"] is False
+
+        before = await pipeline_run_count(postgres_engine)
+        response = await post_remember(app, {"dataset": "main", "content": "x", "wait": False})
+        assert response.status_code == 503
+        after = await pipeline_run_count(postgres_engine)
+        assert after == before
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_delete_new_run_blocked_after_poll_task_death(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 4: Dataset DELETE requiring a NEW run after worker death --
+    503, zero new DATASET_DELETE run."""
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    dataset_id = await seed_dataset(session_factory, slug=f"delete-blocked-{uuid4()}")
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        await kill_poll_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        before = await pipeline_run_count(postgres_engine, dataset_id=dataset_id)
+        async with build_client(app) as client:
+            response = await client.delete(
+                f"/api/v1/datasets/{dataset_id}", headers={API_KEY_HEADER: EXPECTED_API_KEY}
+            )
+        assert response.status_code == 503
+        after = await pipeline_run_count(postgres_engine, dataset_id=dataset_id)
+        assert after == before == 0
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_existing_idempotent_run_still_observable_after_poll_task_death(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 5: an existing idempotent ``PipelineRun`` is still
+    observable/resolved via replay after the worker dies -- no 503 just for
+    observing already-existing state."""
+
+    app, _, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    idempotency_key = f"idem-replay-{uuid4()}"
+    try:
+        first = await post_remember(
+            app,
+            {"dataset": "main", "content": "replay me", "wait": False},
+            idempotency_key=idempotency_key,
+        )
+        assert first.status_code == 202
+        original_run_id = first.json()["data"]["run_id"]
+
+        await kill_poll_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        replay = await post_remember(
+            app,
+            {"dataset": "main", "content": "replay me", "wait": False},
+            idempotency_key=idempotency_key,
+        )
+        assert replay.status_code == 202
+        assert replay.json()["data"]["run_id"] == original_run_id
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_delete_nonterminal_observation_after_poll_task_death(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 6: an existing nonterminal DATASET_DELETE run is still
+    observable after the worker dies -- ADR-0010 D23 returns the same run,
+    never 503."""
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    dataset_id = await seed_dataset(session_factory, slug=f"delete-nonterm-{uuid4()}")
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        async with build_client(app) as client:
+            first = await client.delete(
+                f"/api/v1/datasets/{dataset_id}", headers={API_KEY_HEADER: EXPECTED_API_KEY}
+            )
+        assert first.status_code == 202
+        original_run_id = first.json()["data"]["run_id"]
+
+        await kill_poll_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        async with build_client(app) as client:
+            second = await client.delete(
+                f"/api/v1/datasets/{dataset_id}", headers={API_KEY_HEADER: EXPECTED_API_KEY}
+            )
+        assert second.status_code == 202
+        assert second.json()["data"]["run_id"] == original_run_id
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cancel_available_after_poll_task_death(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 7: cancellation intent does not require worker availability
+    -- remains available after the worker dies."""
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_remember(app, {"dataset": "main", "content": "x", "wait": False})
+        assert response.status_code == 202
+        run_id = UUID(response.json()["data"]["run_id"])
+
+        await kill_poll_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        cancel_response = await post_cancel(app, run_id)
+        assert cancel_response.status_code == 200
+        assert cancel_response.json()["data"]["status"] == "cancelled"
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_manual_retry_new_child_blocked_after_poll_task_death(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 8: manual retry requiring a NEW child after worker death --
+    503, zero child created."""
+
+    from sofias_memory.services.pipeline_lifecycle import transition_run
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_remember(app, {"dataset": "main", "content": "x", "wait": False})
+        assert response.status_code == 202
+        original_id = UUID(response.json()["data"]["run_id"])
+        async with PostgresUnitOfWork(session_factory) as uow:
+            run = await uow.pipeline_runs.get_by_id_for_update(original_id)
+            assert run is not None
+            now = await uow.pipeline_runs.get_database_now()
+            transition_run(run, PipelineRunStatus.RUNNING, now=now, worker_id="w1")
+            transition_run(
+                run, PipelineRunStatus.FAILED, now=now, error_code="X", error_message="e"
+            )
+            await uow.commit()
+
+        await kill_poll_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        retry_response = await post_retry(app, original_id)
+        assert retry_response.status_code == 503
+
+        async with postgres_engine.connect() as connection:
+            child_count = await connection.scalar(
+                text("SELECT count(*) FROM pipeline_runs WHERE retry_of_run_id = :id"),
+                {"id": str(original_id)},
+            )
+        assert child_count == 0
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_manual_retry_existing_child_still_observable_after_poll_task_death(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Scenario 9: an existing manual-retry child is still observable via
+    replay after the worker dies -- no 503 just for observing it."""
+
+    from sofias_memory.services.pipeline_lifecycle import transition_run
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_remember(app, {"dataset": "main", "content": "x", "wait": False})
+        assert response.status_code == 202
+        original_id = UUID(response.json()["data"]["run_id"])
+        async with PostgresUnitOfWork(session_factory) as uow:
+            run = await uow.pipeline_runs.get_by_id_for_update(original_id)
+            assert run is not None
+            now = await uow.pipeline_runs.get_database_now()
+            transition_run(run, PipelineRunStatus.RUNNING, now=now, worker_id="w1")
+            transition_run(
+                run, PipelineRunStatus.FAILED, now=now, error_code="X", error_message="e"
+            )
+            await uow.commit()
+
+        # First retry: worker still operational -- creates the child. Stays
+        # QUEUED/nonterminal (worker_claims=False), so 202, not 200.
+        first_retry = await post_retry(app, original_id)
+        assert first_retry.status_code == 202
+        child_run_id = first_retry.json()["data"]["run_id"]
+
+        await kill_poll_task_unexpectedly(coordinator)
+        assert coordinator.is_operational is False
+
+        # Second retry of the same original: pure replay of the
+        # already-created child -- must never need the worker.
+        second_retry = await post_retry(app, original_id)
+        assert second_retry.status_code == 202
+        assert second_retry.json()["data"]["run_id"] == child_run_id
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_single_run_failure_worker_stays_operational_new_submission_accepted(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """One business ``PipelineRun`` FAILED while the coordinator's poll/
+    outbox infrastructure remains alive: the worker stays operational and
+    new submissions remain accepted -- a business failure is never confused
+    with a coordinator/infrastructure failure."""
+
+    from sofias_memory.services.pipeline_lifecycle import transition_run
+
+    app, session_factory, _, _ = build_harness(
+        postgres_engine, tmp_path, worker_claims=False, with_outbox_processor=True
+    )
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_remember(app, {"dataset": "main", "content": "x", "wait": False})
+        assert response.status_code == 202
+        failed_run_id = UUID(response.json()["data"]["run_id"])
+        async with PostgresUnitOfWork(session_factory) as uow:
+            run = await uow.pipeline_runs.get_by_id_for_update(failed_run_id)
+            assert run is not None
+            now = await uow.pipeline_runs.get_database_now()
+            transition_run(run, PipelineRunStatus.RUNNING, now=now, worker_id="w1")
+            transition_run(
+                run, PipelineRunStatus.FAILED, now=now, error_code="X", error_message="e"
+            )
+            await uow.commit()
+
+        assert coordinator.is_operational is True
+        ready_response = await get_readiness(app)
+        assert ready_response.status_code == 200
+        assert ready_response.json()["checks"]["worker"]["ready"] is True
+
+        second = await post_remember(app, {"dataset": "main", "content": "y", "wait": False})
+        assert second.status_code == 202
+    finally:
+        await coordinator.stop()

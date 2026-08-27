@@ -47,6 +47,7 @@ from sofias_memory.pipelines.registry import (
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_lifecycle import StepPlan, create_run_with_steps
 from sofias_memory.services.pipeline_queue_claimer import PipelineRunClaimer
+from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 
 WORKER_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_PIPELINE_WORKER_POSTGRES_TESTS"
@@ -1521,3 +1522,137 @@ async def test_u_grace_expiry_cancels_apply_without_marking_terminal(
         assert status == GraphOutboxStatus.PROCESSING
     finally:
         await cleanup_outbox_event(session_factory, outbox_id)
+
+
+# === Z. real restart: instance A crash -> instance B recovery (SM-516 SS 12/50/56) ===
+
+
+async def backdate_run_heartbeat(engine: AsyncEngine, run_id: UUID, *, seconds: float) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE pipeline_runs SET heartbeat_at = now() - make_interval(secs => :seconds) "
+                "WHERE id = :id"
+            ),
+            {"id": run_id, "seconds": seconds},
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_z_real_restart_instance_a_crash_instance_b_recovers(
+    postgres_engine: AsyncEngine,
+) -> None:
+    """Two independent coordinator "process instances" against the same real
+    PostgreSQL database. Instance A claims a run and starts its one step,
+    then is abandoned without a clean shutdown handshake (no cooperative
+    ``stop()``, no final heartbeat sweep) -- the closest an in-process test
+    can get to a real crash. Instance B is a brand-new coordinator (new
+    ``worker_id``) whose startup sequence runs real startup stale recovery
+    before its own poll loop ever claims anything (ADR-0009 SS I), proving:
+    no essential state was memory-only, B carries a different worker_id,
+    the run converges via B without being claimed twice concurrently, B's
+    own readiness is false before ``start()`` and true after, and nothing
+    from A survives as an orphan task.
+    """
+
+    ids = WorkerTestIds()
+    session_factory = create_session_factory(postgres_engine)
+    coordinator_a: PipelineWorkerCoordinator | None = None
+    coordinator_b: PipelineWorkerCoordinator | None = None
+    try:
+        dataset_id = await insert_dataset(session_factory, ids)
+
+        blocking_step = NeverFinishesStep(name="blocking")
+        registry_a = PipelineRegistry(
+            [
+                PipelineDefinition(
+                    pipeline_type=PipelineType.COGNIFY,
+                    steps=(step_definition("blocking", blocking_step),),
+                )
+            ]
+        )
+        run_id = await submit_run(session_factory, ids, registry=registry_a, dataset_id=dataset_id)
+
+        coordinator_a = make_coordinator(session_factory, registry_a, stale_after_seconds=1)
+        await asyncio.wait_for(coordinator_a.start(), timeout=TEST_TIMEOUT)
+        await asyncio.wait_for(blocking_step.entered.wait(), timeout=TEST_TIMEOUT)
+
+        run_mid_flight = await read_run(session_factory, run_id)
+        assert run_mid_flight.status == PipelineRunStatus.RUNNING
+        worker_a_id = run_mid_flight.worker_id
+        assert worker_a_id is not None
+
+        # Simulate a crash: forcibly cancel everything instance A owns --
+        # never a cooperative stop(), no final heartbeat sweep -- then let
+        # PostgreSQL's own clock age the row past the stale threshold, the
+        # same way a real dead process's last heartbeat would.
+        crashed_tasks = list(coordinator_a._active_tasks)  # noqa: SLF001
+        if coordinator_a._poll_task is not None:  # noqa: SLF001
+            crashed_tasks.append(coordinator_a._poll_task)  # noqa: SLF001
+        for task in crashed_tasks:
+            task.cancel()
+        await asyncio.gather(*crashed_tasks, return_exceptions=True)
+        await backdate_run_heartbeat(postgres_engine, run_id, seconds=5.0)
+
+        # Instance B: a brand-new coordinator/worker_id. Its real recovery
+        # pass must run and complete before its own start() -- exactly the
+        # ordering ADR-0009 SS I / lifespan.py enforce.
+        recovery_b = PipelineRecoveryService(
+            session_factory,
+            registry_a,
+            stale_after_seconds=1,
+            config_fingerprint="b" * 64,  # matches submit_run()'s config_fingerprint
+        )
+        recovered_count = await recovery_b.recover_startup()
+        assert recovered_count == 1
+
+        run_after_recovery = await read_run(session_factory, run_id)
+        assert run_after_recovery.status == PipelineRunStatus.QUEUED
+        assert run_after_recovery.worker_id == worker_a_id  # not yet reclaimed by anyone
+
+        # A fresh, deterministic step this time -- NeverFinishesStep would
+        # hang B forever too. Same step name/definition_id, so the engine's
+        # plan-drift check still matches the persisted plan.
+        finishing_step = RecordingStep(name="blocking")
+        registry_b = PipelineRegistry(
+            [
+                PipelineDefinition(
+                    pipeline_type=PipelineType.COGNIFY,
+                    steps=(step_definition("blocking", finishing_step),),
+                )
+            ]
+        )
+        coordinator_b = make_coordinator(session_factory, registry_b, stale_after_seconds=1)
+        assert coordinator_b.worker_id != worker_a_id
+        assert coordinator_b.health_snapshot().operational is False  # not started yet
+
+        await asyncio.wait_for(coordinator_b.start(), timeout=TEST_TIMEOUT)
+        assert coordinator_b.health_snapshot().operational is True
+
+        async def run_succeeded() -> bool:
+            run = await read_run(session_factory, run_id)
+            return run.status == PipelineRunStatus.SUCCEEDED
+
+        await wait_until(run_succeeded)
+
+        final_run = await read_run(session_factory, run_id)
+        assert final_run.status == PipelineRunStatus.SUCCEEDED
+        assert final_run.worker_id == coordinator_b.worker_id
+        assert final_run.worker_id != worker_a_id
+        assert finishing_step.calls == 1  # claimed and executed exactly once via B
+
+        await asyncio.wait_for(coordinator_b.stop(), timeout=TEST_TIMEOUT)
+        assert coordinator_b.health_snapshot().operational is False
+
+        # No orphan task from either instance survives this test.
+        leftover_names = {
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        }
+        assert not any(name.startswith("pipeline-worker-") for name in leftover_names), (
+            leftover_names
+        )
+    finally:
+        await cleanup_worker_fixture(postgres_engine, ids)

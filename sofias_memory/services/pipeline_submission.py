@@ -159,16 +159,22 @@ above fits the target it owns.
 
 
 class WorkerAvailability(Protocol):
-    """The minimal worker-readiness signal SM-509 needs (ADR-0009 SS U):
+    """The minimal worker-availability signal SM-509 needs (ADR-0009 SS U):
     already implemented by ``PipelineWorkerCoordinator`` -- this Protocol
     exists only to decouple the submission service from that concrete class,
-    not to introduce a second readiness framework."""
+    not to introduce a second readiness framework.
+
+    ``is_operational`` (SM-516 staging fix) is the single source of truth
+    for "may this worker be handed NEW work" -- the same predicate
+    ``/health/ready`` uses, so a dead poll/outbox task blocks new-run
+    creation exactly as it blocks readiness. Never re-derive that predicate
+    here; read the one signal."""
 
     @property
     def enabled(self) -> bool: ...
 
     @property
-    def is_running(self) -> bool: ...
+    def is_operational(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,7 +542,7 @@ class PipelineSubmissionService:
             return _snapshot(run) if run is not None else None
 
     def _require_worker_available(self) -> None:
-        if not (self._worker.enabled and self._worker.is_running):
+        if not (self._worker.enabled and self._worker.is_operational):
             raise worker_disabled_error()
 
 

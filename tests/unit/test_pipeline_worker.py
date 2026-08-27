@@ -11,7 +11,7 @@ disposition semantics; that is
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -530,3 +530,236 @@ async def test_shutdown_awaits_in_flight_outbox_task_within_grace() -> None:
 
     assert coordinator._outbox_task is None  # noqa: SLF001 - internal state check
     assert processor.calls >= 1
+
+
+# --- SM-516 SS 6-9, 41-42: WorkerHealthSnapshot / operational readiness ----------
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_operational_matrix_enabled_before_start() -> None:
+    coordinator, _, _ = make_coordinator()
+    snapshot = coordinator.health_snapshot()
+    assert snapshot.operational is False
+    assert snapshot.started is False
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_operational_true_once_started_no_outbox() -> None:
+    coordinator, _, _ = make_coordinator()
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    snapshot = coordinator.health_snapshot()
+    assert snapshot.operational is True
+    assert snapshot.poll_task_alive is True
+    assert snapshot.outbox_task_expected is False
+    assert snapshot.outbox_task_alive is True
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_operational_true_once_started_with_outbox() -> None:
+    processor = FakeGraphOutboxProcessor()
+    coordinator, _, _ = make_coordinator(graph_outbox_processor=processor)
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    snapshot = coordinator.health_snapshot()
+    assert snapshot.operational is True
+    assert snapshot.outbox_task_expected is True
+    assert snapshot.outbox_task_alive is True
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_operational_false_when_disabled() -> None:
+    coordinator, _, _ = make_coordinator(enabled=False)
+    await coordinator.start()
+    assert coordinator.health_snapshot().operational is False
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_operational_false_after_stop() -> None:
+    coordinator, _, _ = make_coordinator()
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+    assert coordinator.health_snapshot().operational is False
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_true_when_single_run_fails_but_infra_alive() -> None:
+    """A single ``PipelineRun``'s engine failure is a business/operational run
+    failure, never a worker/coordinator failure (SM-516 SS 6)."""
+
+    engine = FakeEngine(raise_error=True)
+    claimer = FakeClaimer(queued=[make_claimed_run()])
+    coordinator, _, _ = make_coordinator(claimer=claimer, engine=engine)
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.sleep(0.05)
+    assert coordinator.health_snapshot().operational is True
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_active_run_count_reflects_saturation() -> None:
+    engine = FakeEngine(hang_forever=True)
+    claimer = FakeClaimer(queued=[make_claimed_run()])
+    coordinator, _, _ = make_coordinator(claimer=claimer, engine=engine, max_concurrent_datasets=1)
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.sleep(0.05)
+    snapshot = coordinator.health_snapshot()
+    assert snapshot.active_run_count == 1
+    assert snapshot.operational is True
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_health_snapshot_empty_queue_stays_operational() -> None:
+    coordinator, claimer, _ = make_coordinator()
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+    await asyncio.sleep(0.05)
+    assert claimer.calls >= 1
+    assert coordinator.health_snapshot().operational is True
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_poll_task_unexpected_death_flips_operational_false(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fault escaping ``_wait_for_next_poll_or_stop`` (outside the
+    per-tick try/except in ``_poll_loop``) is a real way the poll task can
+    die without the stop signal ever being set."""
+
+    coordinator, _, _ = make_coordinator()
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+
+    failed_once = False
+    original = coordinator._wait_for_next_poll_or_stop  # noqa: SLF001
+
+    async def _fail_once() -> None:
+        nonlocal failed_once
+        current = asyncio.current_task()
+        if not failed_once and current is not None and current.get_name() == "pipeline-worker-poll":
+            failed_once = True
+            raise RuntimeError("simulated fatal poll-loop fault")
+        await original()
+
+    coordinator._wait_for_next_poll_or_stop = _fail_once  # type: ignore[method-assign] # noqa: SLF001
+
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if coordinator.health_snapshot().poll_task_alive is False:
+            break
+
+    snapshot = coordinator.health_snapshot()
+    assert snapshot.poll_task_alive is False
+    assert snapshot.operational is False
+    # stop() must remain safe even though the poll task already died with an
+    # exception (it must not be re-raised out of shutdown).
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_outbox_task_unexpected_death_flips_operational_false() -> None:
+    processor = FakeGraphOutboxProcessor()
+    coordinator, _, _ = make_coordinator(graph_outbox_processor=processor)
+    await asyncio.wait_for(coordinator.start(), timeout=TEST_TIMEOUT)
+
+    failed_once = False
+    original = coordinator._wait_for_next_poll_or_stop  # noqa: SLF001
+
+    async def _fail_once() -> None:
+        nonlocal failed_once
+        current = asyncio.current_task()
+        expected_name = "pipeline-worker-graph-outbox"
+        if not failed_once and current is not None and current.get_name() == expected_name:
+            failed_once = True
+            raise RuntimeError("simulated fatal outbox-loop fault")
+        await original()
+
+    coordinator._wait_for_next_poll_or_stop = _fail_once  # type: ignore[method-assign] # noqa: SLF001
+
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if coordinator.health_snapshot().outbox_task_alive is False:
+            break
+
+    snapshot = coordinator.health_snapshot()
+    assert snapshot.outbox_task_alive is False
+    assert snapshot.operational is False
+    # The poll loop is still alive and using the patched method (which no
+    # longer raises after the first call) -- stop() must still cleanly join
+    # both the live poll task and the already-dead outbox task.
+    await asyncio.wait_for(coordinator.stop(), timeout=TEST_TIMEOUT)
+
+
+def _leftover_worker_task_names() -> set[str]:
+    return {
+        task.get_name()
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and not task.done()
+        and task.get_name().startswith("pipeline-worker-")
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_start_failure_scenario_a_first_task_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SM-516 staging fix Scenario A: the very first ``create_task`` call
+    (the poll task) raises -- nothing was ever created, so cleanup has
+    nothing to do, but ``start()`` must still raise/observe/leave the
+    coordinator non-operational with zero orphan tasks."""
+
+    coordinator, _, _ = make_coordinator()
+
+    def _boom(coro: Coroutine[object, object, object], **kwargs: object) -> object:
+        coro.close()  # avoid an unawaited-coroutine warning
+        raise RuntimeError("simulated task-creation failure")
+
+    monkeypatch.setattr(asyncio, "create_task", _boom)
+    with pytest.raises(RuntimeError, match="simulated task-creation failure"):
+        await coordinator.start()
+    assert coordinator.is_running is False
+    assert coordinator.health_snapshot().operational is False
+    assert _leftover_worker_task_names() == set()
+
+
+@pytest.mark.asyncio
+async def test_worker_start_failure_scenario_b_second_task_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SM-516 staging fix Scenario B: the poll task is created successfully,
+    then the graph outbox task's own ``create_task`` call raises. The
+    already-live poll task must be cancelled/awaited, never left running as
+    an orphan, and no "Task exception was never retrieved" warning must
+    escape (``pytest.ini``'s ``-W error::RuntimeWarning`` would fail this
+    test if one did)."""
+
+    processor = FakeGraphOutboxProcessor()
+    coordinator, _, _ = make_coordinator(graph_outbox_processor=processor)
+
+    real_create_task = asyncio.create_task
+    call_count = 0
+
+    def _fail_on_second_call(
+        coro: Coroutine[object, object, object], **kwargs: object
+    ) -> asyncio.Task[object]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return real_create_task(coro, **kwargs)  # type: ignore[arg-type]
+        coro.close()  # avoid an unawaited-coroutine warning
+        raise RuntimeError("simulated outbox task-creation failure")
+
+    monkeypatch.setattr(asyncio, "create_task", _fail_on_second_call)
+    with pytest.raises(RuntimeError, match="simulated outbox task-creation failure"):
+        await coordinator.start()
+
+    assert coordinator.is_running is False
+    assert coordinator.health_snapshot().operational is False
+    assert coordinator._poll_task is None  # noqa: SLF001 - cleaned up, not orphaned
+    assert coordinator._outbox_task is None  # noqa: SLF001
+
+    # Give the cancelled poll task's own teardown a tick to fully settle,
+    # then prove nothing named "pipeline-worker-*" survives.
+    await asyncio.sleep(0.05)
+    assert _leftover_worker_task_names() == set()

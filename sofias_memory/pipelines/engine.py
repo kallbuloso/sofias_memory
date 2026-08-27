@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -31,6 +32,7 @@ from sofias_memory.domain import PipelineRunStatus, PipelineStepStatus
 from sofias_memory.infrastructure.postgres.models import PipelineStep
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.observability.logging import bound_log_context, get_logger
 from sofias_memory.pipelines.context import PipelineContext
 from sofias_memory.pipelines.errors import (
     STEP_INPUT_DRIFT_ERROR_CODE,
@@ -51,6 +53,24 @@ from sofias_memory.services.pipeline_queue_claimer import ClaimedRun
 STEP_INPUT_DRIFT_MESSAGE = "The persisted step plan no longer matches the registered pipeline."
 STEP_INPUT_UNRESOLVABLE_MESSAGE = "A pipeline step's input could not be resolved."
 UNEXPECTED_STEP_ERROR_MESSAGE = "An unexpected internal error occurred while executing this step."
+
+logger = get_logger(__name__)
+
+
+def _log_run_transition(status: PipelineRunStatus, *, error_code: str | None = None) -> None:
+    """SM-516 SS 15: one authoritative event per meaningful run transition,
+    emitted from inside the run-level (and, when applicable, step-level) log
+    context :meth:`PipelineEngine.execute` already bound. Never logs
+    input/payload/error message content -- only the stable ``error_code``."""
+
+    if status == PipelineRunStatus.SUCCEEDED:
+        logger.info("pipeline_run_succeeded")
+    elif status == PipelineRunStatus.FAILED:
+        logger.warning("pipeline_run_failed", error_code=error_code)
+    elif status == PipelineRunStatus.CANCELLED:
+        logger.info("pipeline_run_cancelled")
+    elif status == PipelineRunStatus.QUEUED:
+        logger.info("pipeline_run_retry_scheduled")
 
 
 async def _run_transactional_phase[T](coro: Coroutine[Any, Any, T]) -> T:
@@ -232,6 +252,25 @@ class PipelineEngine:
         default), behavior is identical to before this parameter existed.
         """
 
+        with bound_log_context(
+            run_id=str(claimed_run.run_id),
+            pipeline_type=claimed_run.pipeline_type.value,
+            dataset_id=str(claimed_run.dataset_id),
+            worker_id=claimed_run.worker_id,
+            attempt=claimed_run.attempt,
+        ):
+            return await self._execute_locked(claimed_run, stop_requested=stop_requested)
+
+    async def _execute_locked(
+        self,
+        claimed_run: ClaimedRun,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> PipelineExecutionResult:
+        """SM-516 SS 13-15: the actual engine body, run under the run-level
+        log context :meth:`execute` binds (``run_id``/``pipeline_type``/
+        ``dataset_id``/``worker_id``/``attempt``)."""
+
         definition = self._registry.get(claimed_run.pipeline_type)
 
         prepared = await _run_transactional_phase(self._prepare(claimed_run, definition))
@@ -241,6 +280,8 @@ class PipelineEngine:
             return PipelineExecutionResult(
                 run_id=claimed_run.run_id, status=prepared.terminal_status
             )
+
+        logger.info("pipeline_run_started")
 
         assert prepared.run_input is not None  # noqa: S101 - set whenever not abandoned/terminal
         assert prepared.step_outputs is not None  # noqa: S101
@@ -255,64 +296,83 @@ class PipelineEngine:
         for step_row in prepared.pending_steps:
             step_def = steps_by_name[step_row.name]
 
-            checkpoint = await _run_transactional_phase(
-                self._checkpoint_before_step(
-                    claimed_run,
-                    step_row,
-                    step_def,
+            with bound_log_context(step=step_def.name):
+                checkpoint = await _run_transactional_phase(
+                    self._checkpoint_before_step(
+                        claimed_run,
+                        step_row,
+                        step_def,
+                        run_input=run_input,
+                        step_outputs=step_outputs,
+                        stop_requested=stop_requested,
+                    )
+                )
+                if checkpoint.abandoned:
+                    return PipelineExecutionResult(
+                        run_id=claimed_run.run_id, status=None, abandoned=True
+                    )
+                if checkpoint.paused_for_shutdown:
+                    return PipelineExecutionResult(
+                        run_id=claimed_run.run_id, status=None, paused_for_shutdown=True
+                    )
+                if checkpoint.terminal_status is not None:
+                    return PipelineExecutionResult(
+                        run_id=claimed_run.run_id, status=checkpoint.terminal_status
+                    )
+                assert (  # noqa: S101 - set on the executing branch
+                    checkpoint.step_attempt is not None
+                )
+
+                context = PipelineContext(
+                    run_id=claimed_run.run_id,
+                    pipeline_type=claimed_run.pipeline_type,
+                    dataset_id=claimed_run.dataset_id,
+                    source_id=prepared.source_id,
                     run_input=run_input,
-                    step_outputs=step_outputs,
-                    stop_requested=stop_requested,
-                )
-            )
-            if checkpoint.abandoned:
-                return PipelineExecutionResult(
-                    run_id=claimed_run.run_id, status=None, abandoned=True
-                )
-            if checkpoint.paused_for_shutdown:
-                return PipelineExecutionResult(
-                    run_id=claimed_run.run_id, status=None, paused_for_shutdown=True
-                )
-            if checkpoint.terminal_status is not None:
-                return PipelineExecutionResult(
-                    run_id=claimed_run.run_id, status=checkpoint.terminal_status
-                )
-            assert checkpoint.step_attempt is not None  # noqa: S101 - set on the executing branch
-
-            context = PipelineContext(
-                run_id=claimed_run.run_id,
-                pipeline_type=claimed_run.pipeline_type,
-                dataset_id=claimed_run.dataset_id,
-                source_id=prepared.source_id,
-                run_input=run_input,
-                step_outputs=dict(step_outputs),
-                session_factory=self._session_factory,
-                resources=self._resources,
-            )
-
-            outcome = await self._run_step(step_def, context)
-
-            persisted = await self._persist_step_outcome(
-                claimed_run=claimed_run,
-                step_id=step_row.id,
-                expected_step_attempt=checkpoint.step_attempt,
-                outcome=outcome,
-                succeeded_count=succeeded_count,
-                total_steps=total_steps,
-                step_def=step_def,
-                context=context,
-            )
-            if persisted.abandoned:
-                return PipelineExecutionResult(
-                    run_id=claimed_run.run_id, status=None, abandoned=True
-                )
-            if persisted.terminal_status is not None:
-                return PipelineExecutionResult(
-                    run_id=claimed_run.run_id, status=persisted.terminal_status
+                    step_outputs=dict(step_outputs),
+                    session_factory=self._session_factory,
+                    resources=self._resources,
                 )
 
-            succeeded_count += 1
-            step_outputs[step_row.name] = persisted.output or {}
+                logger.info("pipeline_step_started", step_attempt=checkpoint.step_attempt)
+                step_started_at = time.monotonic()
+                outcome = await self._run_step(step_def, context)
+                step_duration_ms = round((time.monotonic() - step_started_at) * 1000, 2)
+                if outcome.kind == "success":
+                    logger.info(
+                        "pipeline_step_succeeded",
+                        step_attempt=checkpoint.step_attempt,
+                        duration_ms=step_duration_ms,
+                    )
+                else:
+                    logger.warning(
+                        "pipeline_step_failed",
+                        step_attempt=checkpoint.step_attempt,
+                        duration_ms=step_duration_ms,
+                        error_code=outcome.code,
+                    )
+
+                persisted = await self._persist_step_outcome(
+                    claimed_run=claimed_run,
+                    step_id=step_row.id,
+                    expected_step_attempt=checkpoint.step_attempt,
+                    outcome=outcome,
+                    succeeded_count=succeeded_count,
+                    total_steps=total_steps,
+                    step_def=step_def,
+                    context=context,
+                )
+                if persisted.abandoned:
+                    return PipelineExecutionResult(
+                        run_id=claimed_run.run_id, status=None, abandoned=True
+                    )
+                if persisted.terminal_status is not None:
+                    return PipelineExecutionResult(
+                        run_id=claimed_run.run_id, status=persisted.terminal_status
+                    )
+
+                succeeded_count += 1
+                step_outputs[step_row.name] = persisted.output or {}
 
         raise PipelineEngineInvariantError(
             f"Run {claimed_run.run_id} exhausted its pending steps without reaching a "
@@ -364,6 +424,7 @@ class PipelineEngine:
                     error_message=issue[1],
                 )
                 await uow.commit()
+                _log_run_transition(PipelineRunStatus.FAILED, error_code=issue[0])
                 return _PrepareOutcome(terminal_status=PipelineRunStatus.FAILED)
 
             # ADR-0009 SS A/SS N: CANCELLING may only converge to CANCELLED
@@ -381,6 +442,7 @@ class PipelineEngine:
                     apply_run_progress(run, 1.0)
                 transition_run(run, PipelineRunStatus.CANCELLED, now=db_now)
                 await uow.commit()
+                _log_run_transition(PipelineRunStatus.CANCELLED)
                 return _PrepareOutcome(terminal_status=PipelineRunStatus.CANCELLED)
 
             if first_pending_index is None:
@@ -392,6 +454,7 @@ class PipelineEngine:
                 apply_run_progress(run, 1.0)
                 transition_run(run, PipelineRunStatus.SUCCEEDED, now=db_now)
                 await uow.commit()
+                _log_run_transition(PipelineRunStatus.SUCCEEDED)
                 return _PrepareOutcome(terminal_status=PipelineRunStatus.SUCCEEDED)
 
             if run_status != PipelineRunStatus.RUNNING:
@@ -510,6 +573,7 @@ class PipelineEngine:
                 self._cancel_queued(all_steps, now=db_now)
                 transition_run(run, PipelineRunStatus.CANCELLED, now=db_now)
                 await uow.commit()
+                _log_run_transition(PipelineRunStatus.CANCELLED)
                 return _CheckpointOutcome(terminal_status=PipelineRunStatus.CANCELLED)
 
             if run.status != PipelineRunStatus.RUNNING:
@@ -539,6 +603,9 @@ class PipelineEngine:
                     error_message=STEP_INPUT_UNRESOLVABLE_MESSAGE,
                 )
                 await uow.commit()
+                _log_run_transition(
+                    PipelineRunStatus.FAILED, error_code=STEP_INPUT_UNRESOLVABLE_ERROR_CODE
+                )
                 return _CheckpointOutcome(terminal_status=PipelineRunStatus.FAILED)
 
             if step.input_hash is not None and step.input_hash != expected_hash:
@@ -550,6 +617,9 @@ class PipelineEngine:
                     error_message=STEP_INPUT_DRIFT_MESSAGE,
                 )
                 await uow.commit()
+                _log_run_transition(
+                    PipelineRunStatus.FAILED, error_code=STEP_INPUT_DRIFT_ERROR_CODE
+                )
                 return _CheckpointOutcome(terminal_status=PipelineRunStatus.FAILED)
             if step.input_hash is None:
                 step.input_hash = expected_hash
@@ -729,11 +799,13 @@ class PipelineEngine:
                 self._cancel_queued(other_steps, now=fenced.now)
                 transition_run(fenced.run, PipelineRunStatus.CANCELLED, now=fenced.now)
                 await uow.commit()
+                _log_run_transition(PipelineRunStatus.CANCELLED)
                 return _PersistOutcome(terminal_status=PipelineRunStatus.CANCELLED)
 
             if new_succeeded_count == total_steps:
                 transition_run(fenced.run, PipelineRunStatus.SUCCEEDED, now=fenced.now)
                 await uow.commit()
+                _log_run_transition(PipelineRunStatus.SUCCEEDED)
                 return _PersistOutcome(terminal_status=PipelineRunStatus.SUCCEEDED)
 
             await uow.commit()
@@ -778,6 +850,7 @@ class PipelineEngine:
                     next_attempt_at=fenced.now + timedelta(seconds=delay),
                 )
                 await uow.commit()
+                _log_run_transition(PipelineRunStatus.QUEUED)
                 return _PersistOutcome(terminal_status=PipelineRunStatus.QUEUED)
 
             # Permanent, or retryable with the run's attempt ceiling
@@ -792,6 +865,7 @@ class PipelineEngine:
                 error_message=outcome.message,
             )
             await uow.commit()
+            _log_run_transition(PipelineRunStatus.FAILED, error_code=outcome.code)
             return _PersistOutcome(terminal_status=PipelineRunStatus.FAILED)
 
     async def _persist_failure_while_cancelling(
@@ -816,6 +890,7 @@ class PipelineEngine:
                 error_message=outcome.message,
             )
             await uow.commit()
+            _log_run_transition(PipelineRunStatus.FAILED, error_code=outcome.code)
             return _PersistOutcome(terminal_status=PipelineRunStatus.FAILED)
 
         # ADR-0009 SS 34: cancellation intent must never be lost. Route the
@@ -830,6 +905,7 @@ class PipelineEngine:
         self._cancel_queued(other_steps, now=now)
         transition_run(run, PipelineRunStatus.CANCELLED, now=now)
         await uow.commit()
+        _log_run_transition(PipelineRunStatus.CANCELLED)
         return _PersistOutcome(terminal_status=PipelineRunStatus.CANCELLED)
 
 

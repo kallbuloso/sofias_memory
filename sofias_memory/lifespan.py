@@ -13,6 +13,7 @@ from sofias_memory.infrastructure.neo4j import Neo4jResource, ensure_neo4j_schem
 from sofias_memory.infrastructure.postgres import AsyncSessionFactory, dispose_async_engine
 from sofias_memory.observability.logging import configure_logging, get_logger
 from sofias_memory.pipelines.registry import PipelineRegistry
+from sofias_memory.services.operational_metrics import OperationalMetricsReporter
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 
@@ -80,6 +81,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 logger.error("neo4j_startup_failed", exception_type=type(exc).__name__)
                 raise
 
+        # SM-516 SS 19-20: local operational visibility, independent of
+        # worker enablement -- started here regardless of whether the worker
+        # itself is allowed to start below. A collection failure is
+        # self-contained (SS 53) and never aborts startup.
+        reporter = cast(
+            OperationalMetricsReporter | None,
+            getattr(app.state, "operational_metrics_reporter", None),
+        )
+        if reporter is not None:
+            await reporter.start()
+
         worker = cast(PipelineWorkerCoordinator | None, getattr(app.state, "pipeline_worker", None))
         if worker is not None and worker.enabled:
             # ADR-0009 SS T / PRD 21.1: the worker only starts once PostgreSQL
@@ -126,6 +138,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # would turn a graceful shutdown into a broken-connection crash.
             # No-op internally if the worker was never started (disabled).
             await worker.stop()
+        reporter = cast(
+            OperationalMetricsReporter | None,
+            getattr(app.state, "operational_metrics_reporter", None),
+        )
+        if reporter is not None:
+            await reporter.stop()
         neo4j_resource = getattr(app.state, "neo4j_resource", None)
         if neo4j_resource is not None:
             await neo4j_resource.close()

@@ -189,12 +189,14 @@ class PipelineRecoveryService:
                 self._recover_running(run, steps, now=db_now)
 
             await uow.commit()
-            logger.info(
-                "pipeline_recovery_run_reconciled",
-                run_id=str(run.id),
-                pipeline_type=str(run.pipeline_type),
-                final_status=str(run.status),
-            )
+            reconciled_fields: dict[str, object] = {
+                "run_id": str(run.id),
+                "pipeline_type": str(run.pipeline_type),
+                "final_status": str(run.status),
+            }
+            if run.error_code is not None:
+                reconciled_fields["error_code"] = run.error_code
+            logger.info("pipeline_recovery_run_reconciled", **reconciled_fields)
             return True
 
     # -- RUNNING (ADR-0009 SS I "RUNNING stale") -----------------------------

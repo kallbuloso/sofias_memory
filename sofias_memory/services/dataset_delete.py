@@ -175,7 +175,7 @@ class DatasetDeleteService:
             # lineage is required. Only a NEW run needs the worker
             # (ADR-0010 D23); every branch above observes existing/terminal
             # state and works without one.
-            if not (self._worker.enabled and self._worker.is_running):
+            if not (self._worker.enabled and self._worker.is_operational):
                 raise worker_disabled_error()
 
             work_input = {"dataset_id": str(dataset_id)}

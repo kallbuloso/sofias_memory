@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Sequence
 
 from openai import AsyncOpenAI
 
 from sofias_memory.config import Settings
+from sofias_memory.infrastructure.provider_metrics import (
+    log_embedding_request_completed,
+    log_provider_request_failed,
+)
 
 
 class OpenAIEmbeddingClient:
@@ -36,13 +41,29 @@ class OpenAIEmbeddingClient:
         semaphore = asyncio.Semaphore(self._max_concurrency)
 
         async def embed_batch(start_index: int, batch: list[str]) -> tuple[int, list[list[float]]]:
-            async with semaphore:
-                response = await self._client.embeddings.create(
-                    model=self._model,
-                    input=batch,
-                    encoding_format="float",
+            started_at = time.monotonic()
+            try:
+                async with semaphore:
+                    response = await self._client.embeddings.create(
+                        model=self._model,
+                        input=batch,
+                        encoding_format="float",
+                    )
+            except Exception as exc:
+                log_provider_request_failed(
+                    operation="embedding",
+                    exception=exc,
+                    duration_ms=round((time.monotonic() - started_at) * 1000, 2),
                 )
+                raise
             ordered_data = sorted(response.data, key=lambda item: item.index)
+            log_embedding_request_completed(
+                model=self._model,
+                input_count=len(batch),
+                embedding_count=len(ordered_data),
+                duration_ms=round((time.monotonic() - started_at) * 1000, 2),
+                usage=getattr(response, "usage", None),
+            )
             return start_index, [list(item.embedding) for item in ordered_data]
 
         results = await asyncio.gather(

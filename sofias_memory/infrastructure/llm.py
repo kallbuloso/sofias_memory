@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from openai.types.shared_params import ResponseFormatJSONSchema
 from pydantic import ValidationError
 
 from sofias_memory.config import Settings
+from sofias_memory.infrastructure.provider_metrics import (
+    log_llm_request_completed,
+    log_provider_request_failed,
+)
 from sofias_memory.schemas.knowledge import (
     ChunkKnowledgeExtraction,
     KnowledgeExtractionValidationError,
@@ -31,6 +36,10 @@ DATASET_SUMMARY_PROMPT_PATH = (
 )
 RECALL_RAG_PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "recall_rag.v1.md"
 STRUCTURED_OUTPUT_REPAIR_ATTEMPTS = 1
+
+
+def _duration_ms(started_at: float) -> float:
+    return round((time.monotonic() - started_at) * 1000, 2)
 
 
 class KnowledgeExtractionOutputError(RuntimeError):
@@ -104,12 +113,27 @@ class OpenAIKnowledgeExtractionClient:
                 "strict": True,
             },
         }
-        async with self._semaphore:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                response_format=response_format,
+        started_at = time.monotonic()
+        try:
+            async with self._semaphore:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    response_format=response_format,
+                )
+        except Exception as exc:
+            log_provider_request_failed(
+                operation="knowledge_extraction",
+                exception=exc,
+                duration_ms=_duration_ms(started_at),
             )
+            raise
+        log_llm_request_completed(
+            operation="knowledge_extraction",
+            model=self._model,
+            duration_ms=_duration_ms(started_at),
+            usage=getattr(response, "usage", None),
+        )
         content = response.choices[0].message.content if response.choices else None
         if not isinstance(content, str):
             raise TypeError("structured response content is missing")
@@ -179,12 +203,27 @@ class OpenAIDocumentSummaryClient:
                 "strict": True,
             },
         }
-        async with self._semaphore:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                response_format=response_format,
+        started_at = time.monotonic()
+        try:
+            async with self._semaphore:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    response_format=response_format,
+                )
+        except Exception as exc:
+            log_provider_request_failed(
+                operation="document_summary",
+                exception=exc,
+                duration_ms=_duration_ms(started_at),
             )
+            raise
+        log_llm_request_completed(
+            operation="document_summary",
+            model=self._model,
+            duration_ms=_duration_ms(started_at),
+            usage=getattr(response, "usage", None),
+        )
         content = response.choices[0].message.content if response.choices else None
         if not isinstance(content, str):
             raise TypeError("structured response content is missing")
@@ -256,12 +295,27 @@ class OpenAIDatasetSummaryClient:
                 "strict": True,
             },
         }
-        async with self._semaphore:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                response_format=response_format,
+        started_at = time.monotonic()
+        try:
+            async with self._semaphore:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    response_format=response_format,
+                )
+        except Exception as exc:
+            log_provider_request_failed(
+                operation="dataset_summary",
+                exception=exc,
+                duration_ms=_duration_ms(started_at),
             )
+            raise
+        log_llm_request_completed(
+            operation="dataset_summary",
+            model=self._model,
+            duration_ms=_duration_ms(started_at),
+            usage=getattr(response, "usage", None),
+        )
         content = response.choices[0].message.content if response.choices else None
         if not isinstance(content, str):
             raise TypeError("structured response content is missing")
@@ -292,11 +346,26 @@ class OpenAIRagAnswerClient:
                 ),
             },
         ]
-        async with self._semaphore:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
+        started_at = time.monotonic()
+        try:
+            async with self._semaphore:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                )
+        except Exception as exc:
+            log_provider_request_failed(
+                operation="rag_answer",
+                exception=exc,
+                duration_ms=_duration_ms(started_at),
             )
+            raise
+        log_llm_request_completed(
+            operation="rag_answer",
+            model=self._model,
+            duration_ms=_duration_ms(started_at),
+            usage=getattr(response, "usage", None),
+        )
         content = response.choices[0].message.content if response.choices else None
         if not isinstance(content, str) or not content.strip():
             raise TypeError("RAG response content is missing")

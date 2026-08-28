@@ -62,14 +62,26 @@ specification in `docs/product/Sofias_Memory_PRD_SPECS.md` for the full rational
 
 ## Quick start
 
-The release image now contains its own Alembic migration assets and operational
-scripts (no source checkout required to run `alembic upgrade head` or
-`scripts/rebuild_graph.py` from inside it) — but the finalized, image-based
-first-start/upgrade/backup procedure is still being written; see
-`docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` (REL-003) for
-what remains before the v0.1.0 tag. The flow below reflects what is documented
-and verified today, running the application from a source checkout against
-PostgreSQL and Neo4j reachable from the host.
+The release image contains its own Alembic migration assets and operational
+scripts, so a full first start needs no source checkout at all. See
+[`docs/operations.md`](docs/operations.md) for the complete, verified
+first-start/migration/upgrade/rollback/backup/restore contract — every command
+there was run for real against disposable infrastructure, including a
+complete non-empty backup, destroy, restore, and Neo4j-rebuild drill.
+
+Minimal Compose-based flow (see `docs/operations.md` §2 for the full version):
+
+```bash
+cp .env.example .env   # set API_KEY, DB_PASSWORD, DB_NEO4J_PASSWORD, LLM_API_KEY
+docker compose up -d postgres neo4j
+docker compose run --rm sofias-memory alembic upgrade head
+docker compose up -d sofias-memory
+curl http://127.0.0.1:8000/health/ready
+```
+
+Prefer running from a source checkout (e.g. for development)? See
+[`docs/development.md`](docs/development.md). That flow still works and looks
+like this:
 
 ```bash
 # 1. Start PostgreSQL + pgvector and Neo4j, reachable from the host.
@@ -102,16 +114,9 @@ uv run uvicorn sofias_memory.app:create_app --factory --host 127.0.0.1 --port 80
 curl http://127.0.0.1:8000/health/ready
 ```
 
-`compose.yaml` is the canonical, portable stack definition
-(`sofias-memory` + `postgres` + `neo4j`, application-only published by default,
-hardened with `read_only`/`cap_drop: ALL`/`no-new-privileges`) and is what
-Portainer/EasyPanel consume directly — see [Development](docs/development.md) for
-more on its internal-network layout. The application image can already run its
-own migration and operational scripts standalone (verified against a real,
-disposable PostgreSQL and Neo4j, with no source bind-mounted in); documenting
-the exact end-to-end first-start/upgrade sequence built entirely on top of
-`compose.yaml` is REL-003's remaining work before the v0.1.0 tag — until then,
-the source-checkout flow above is the documented quick start.
+`compose.yaml` (`sofias-memory` + `postgres` + `neo4j`, application-only
+published by default) is what Portainer/EasyPanel consume directly — see
+[Development](docs/development.md) for more on its internal-network layout.
 
 ## Configuration
 
@@ -198,15 +203,14 @@ Three named volumes back the canonical `compose.yaml` stack:
 PostgreSQL data, Neo4j data, and original source files. PostgreSQL and the source
 volume are authoritative; Neo4j is always reconstructible from PostgreSQL.
 
-## Backup and restore (overview)
+## Backup and restore
 
 **Must be backed up:** PostgreSQL and the source files volume — both are
 irreplaceable. **Reconstructible:** Neo4j — it can always be rebuilt from
-PostgreSQL via `scripts/rebuild_graph.py --all` (now packaged in the release
-image itself, no source checkout needed), so backing it up is a convenience,
-not a requirement. A concrete, step-by-step backup/restore procedure is being
-finalized as release work — see
-`docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` (REL-003).
+PostgreSQL via `scripts/rebuild_graph.py --all`, so backing it up is a
+convenience, not a requirement. The full, verified backup/restore procedure —
+including a real, non-empty backup → destroy → restore → Neo4j-rebuild drill —
+is in [`docs/operations.md`](docs/operations.md#6-backup).
 
 ## Upgrade and migrations
 
@@ -214,12 +218,11 @@ Alembic is the sole authority for schema evolution; migrations are applied
 **explicitly**, never automatically at application startup. `/health/ready`
 detects a schema that doesn't match the application's expected revision and
 reports `not_ready` rather than guessing. Downgrades are not guaranteed in
-general — migration `0011`, for example, adds a native PostgreSQL enum value and
-has no safe destructive downgrade (`ALTER TYPE ... DROP VALUE` does not exist in
-PostgreSQL). The release image now contains its own migration assets
-(`alembic upgrade head` runs from inside it, no source checkout needed); the
-finalized, documented upgrade procedure built on top of that is release work in
-progress (REL-003).
+general — migration `0011`, for example, adds a native PostgreSQL enum value
+and has no safe destructive downgrade (`ALTER TYPE ... DROP VALUE` does not
+exist in PostgreSQL). The full migration/upgrade/rollback procedure,
+including that limitation's exact operational consequence, is in
+[`docs/operations.md`](docs/operations.md#3-migration-policy).
 
 ## Security notes
 

@@ -11,8 +11,8 @@ features de produto e NÃO é SM-517/B6.
 | Task | Status | Commit/baseline |
 |---|---|---|
 | REL-001 — Documentação canônica | DONE | `b621dcb` — `docs: add canonical v0.1.0 user and API guides` |
-| REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE (fechamento desta task) | baseline `b621dcb` |
-| REL-003 — Contrato operacional de migração/upgrade/backup | TODO | — |
+| REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE | `762a153` — `build: harden v0.1.0 release packaging`; `34658cc` — `build: complete v0.1.0 version packaging` |
+| REL-003 — Contrato operacional de migração/upgrade/backup | DONE (commit pendente de publicação) | baseline `34658cc` |
 | REL-004 — CI mínima de qualidade e integração | TODO | — |
 | REL-005 — Automação de release / publicação GHCR | TODO | — |
 | REL-006 — Guias de deployment + smoke de produção | TODO | — |

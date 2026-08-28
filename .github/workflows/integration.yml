@@ -1,0 +1,243 @@
+name: Integration (real PostgreSQL + Neo4j)
+
+# Never runs on pull_request: it mutates/destroys data in disposable
+# databases it fully owns, takes much longer than the PR guardrail, and
+# needs no code-review-time signal beyond what ci.yml already gives every
+# PR. Manual dispatch for on-demand validation; a low-collision nightly
+# schedule for unattended regression coverage.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:17 UTC daily -- outside common US/EU/APAC working hours, and a
+    # non-round minute to avoid GitHub's documented top-of-hour scheduling
+    # congestion for cron jobs.
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: integration-${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Real PostgreSQL + Neo4j integration suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.1-pg17
+        env:
+          POSTGRES_DB: sofias_memory
+          POSTGRES_USER: sofias_memory
+          POSTGRES_PASSWORD: ci-disposable-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sofias_memory -d sofias_memory"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/ci-disposable-password
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p ci-disposable-password 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 15
+
+    env:
+      # Disposable, CI-only credentials -- never real secrets, and never a
+      # GitHub Actions secret (this workflow needs none).
+      API_KEY: sf-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      LLM_API_KEY: sk-ci-disposable
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ci-disposable-password
+      NEO4J_DATABASE: neo4j
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: sofias_memory
+      PGPASSWORD: ci-disposable-password
+      PGDATABASE: sofias_memory
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      # The exact regression this job exists to prevent (REL-002 found and
+      # fixed it): the release image must be able to migrate a PostgreSQL
+      # database entirely on its own, with no source checkout mounted in.
+      - name: Build release image
+        run: |
+          docker build \
+            --build-arg APP_VERSION=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            -t sofias-memory:ci \
+            .
+
+      # Every dedicated database this suite's exact-name gates require
+      # (tests/integration/*.py each declare their own `*_DATABASE_NAME`),
+      # plus the default `sofias_memory` database used by modules that read
+      # DATABASE_URL/NEO4J_URI via the standard Settings loader, plus one
+      # for the real-OS-process-kill recovery test. All are created here,
+      # disposable, and never reused across runs (the service container
+      # itself is destroyed when the job ends).
+      - name: Create dedicated databases
+        run: |
+          set -e
+          for db in \
+            sofias_memory_cognify_async_test \
+            sofias_memory_dataset_delete_test \
+            sofias_memory_forget_test \
+            sofias_memory_graph_maintenance_test \
+            sofias_memory_graph_outbox_worker_test \
+            sofias_memory_graph_provenance_test \
+            sofias_memory_improve_async_test \
+            sofias_memory_pipeline_claiming_test \
+            sofias_memory_pipeline_engine_test \
+            sofias_memory_pipeline_lifecycle_test \
+            sofias_memory_pipeline_recovery_test \
+            sofias_memory_pipeline_worker_test \
+            sofias_memory_remember_test \
+            sofias_memory_run_control_test \
+            sofias_memory_runs_test \
+            sofias_memory_submission_test \
+            sofias_memory_process_kill_test \
+          ; do
+            psql -c "CREATE DATABASE ${db}"
+          done
+
+      # Proves migration works FROM THE IMAGE, against the real PostgreSQL
+      # service container, for every database this job just created -- no
+      # `sofias_memory/`, `migrations/`, `alembic.ini`, or `scripts/`
+      # bind-mounted from the checkout. `--network host` is required
+      # because this is a separate `docker run`, not a step running
+      # directly on the runner -- it cannot resolve the service container
+      # by its service name the way the runner's own steps can.
+      - name: Migrate every database from the built image (0001 -> 0011)
+        run: |
+          set -e
+          for db in \
+            sofias_memory \
+            sofias_memory_cognify_async_test \
+            sofias_memory_dataset_delete_test \
+            sofias_memory_forget_test \
+            sofias_memory_graph_maintenance_test \
+            sofias_memory_graph_outbox_worker_test \
+            sofias_memory_graph_provenance_test \
+            sofias_memory_improve_async_test \
+            sofias_memory_pipeline_claiming_test \
+            sofias_memory_pipeline_engine_test \
+            sofias_memory_pipeline_lifecycle_test \
+            sofias_memory_pipeline_recovery_test \
+            sofias_memory_pipeline_worker_test \
+            sofias_memory_remember_test \
+            sofias_memory_run_control_test \
+            sofias_memory_runs_test \
+            sofias_memory_submission_test \
+            sofias_memory_process_kill_test \
+          ; do
+            docker run --rm --network host \
+              -e DATABASE_URL="postgresql+asyncpg://sofias_memory:ci-disposable-password@127.0.0.1:5432/${db}" \
+              -e API_KEY="$API_KEY" \
+              -e NEO4J_PASSWORD="$NEO4J_PASSWORD" \
+              -e LLM_API_KEY="$LLM_API_KEY" \
+              --entrypoint uv \
+              sofias-memory:ci run --no-sync alembic upgrade head
+          done
+
+      - name: Confirm alembic current == 0011 on the main database
+        run: |
+          set -e
+          CURRENT=$(psql -tAc "SELECT version_num FROM alembic_version")
+          echo "alembic current: $CURRENT"
+          test "$CURRENT" = "0011"
+
+      # CI-compatible integration modules only -- see docs/development.md
+      # and the REL-004 report for the full per-module inventory and the
+      # rationale for every exclusion. Notably excluded:
+      #   - test_b3_neo4j_gate.py: testcontainers-only by its own existing
+      #     contract; this workflow deliberately uses GitHub-native service
+      #     containers instead and does not reconfigure that gate.
+      #   - Nothing here calls a real LLM/embedding provider: every
+      #     included module uses in-process fake LLM/embedding clients.
+      - name: Run CI-compatible integration suite
+        timeout-minutes: 45
+        run: uv run pytest tests/integration -q --deselect tests/integration/test_b3_neo4j_gate.py
+        env:
+          DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory
+          SOFIAS_MEMORY_RUN_COGNIFY_ASYNC_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_COGNIFY_ASYNC_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_cognify_async_test
+          SOFIAS_MEMORY_RUN_DATASET_DELETE_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_DATASET_DELETE_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_dataset_delete_test
+          SOFIAS_MEMORY_RUN_DATASET_DELETE_NEO4J_TESTS: "1"
+          SOFIAS_MEMORY_RUN_FORGET_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_FORGET_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_forget_test
+          SOFIAS_MEMORY_RUN_FORGET_NEO4J_TESTS: "1"
+          SOFIAS_MEMORY_RUN_GRAPH_MAINTENANCE_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_GRAPH_MAINTENANCE_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_graph_maintenance_test
+          SOFIAS_MEMORY_RUN_GRAPH_OUTBOX_PROCESSOR_TESTS: "1"
+          SOFIAS_MEMORY_RUN_GRAPH_OUTBOX_WORKER_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_GRAPH_OUTBOX_WORKER_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_graph_outbox_worker_test
+          SOFIAS_MEMORY_RUN_GRAPH_PROVENANCE_TESTS: "1"
+          SOFIAS_MEMORY_GRAPH_PROVENANCE_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_graph_provenance_test
+          SOFIAS_MEMORY_RUN_GRAPH_REBUILD_TESTS: "1"
+          SOFIAS_MEMORY_RUN_GRAPH_RECONCILIATION_ORDER_NEO4J_TESTS: "1"
+          SOFIAS_MEMORY_RUN_IMPROVE_ASYNC_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_IMPROVE_ASYNC_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_improve_async_test
+          SOFIAS_MEMORY_RUN_IMPROVE_ASYNC_NEO4J_TESTS: "1"
+          SOFIAS_MEMORY_RUN_NEO4J_PROJECTION_TESTS: "1"
+          SOFIAS_MEMORY_RUN_NEO4J_READINESS_TESTS: "1"
+          SOFIAS_MEMORY_RUN_NEO4J_SCHEMA_TESTS: "1"
+          SOFIAS_MEMORY_RUN_OPERATIONAL_METRICS_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_PIPELINE_CLAIMING_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_PIPELINE_CLAIMING_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_pipeline_claiming_test
+          SOFIAS_MEMORY_RUN_PIPELINE_ENGINE_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_PIPELINE_ENGINE_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_pipeline_engine_test
+          SOFIAS_MEMORY_RUN_PIPELINE_LIFECYCLE_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_PIPELINE_LIFECYCLE_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_pipeline_lifecycle_test
+          SOFIAS_MEMORY_RUN_POSTGRES_MIGRATION_GATE: "1"
+          SOFIAS_MEMORY_POSTGRES_GATE_BACKEND: local
+          SOFIAS_MEMORY_RUN_POSTGRES_READINESS_TESTS: "1"
+          SOFIAS_MEMORY_RUN_POSTGRES_SCHEMA_GUARD: "1"
+          SOFIAS_MEMORY_RUN_POSTGRES_UOW_TESTS: "1"
+          SOFIAS_MEMORY_RUN_PIPELINE_RECOVERY_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_PIPELINE_RECOVERY_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_pipeline_recovery_test
+          SOFIAS_MEMORY_RUN_REMEMBER_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_REMEMBER_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_remember_test
+          SOFIAS_MEMORY_RUN_REMEMBER_NEO4J_TESTS: "1"
+          SOFIAS_MEMORY_RUN_RUNS_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUNS_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_runs_test
+          SOFIAS_MEMORY_RUN_RUN_CONTROL_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_CONTROL_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_run_control_test
+          SOFIAS_MEMORY_RUN_SUBMISSION_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_SUBMISSION_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_submission_test
+          SOFIAS_MEMORY_RUN_PIPELINE_WORKER_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_PIPELINE_WORKER_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_pipeline_worker_test
+          SOFIAS_MEMORY_RUN_PROCESS_KILL_RECOVERY_TESTS: "1"
+          SOFIAS_MEMORY_PROCESS_KILL_RECOVERY_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_process_kill_test
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker ps
+          docker inspect --format '{{json .State.Health}}' $(docker ps -q --filter ancestor=pgvector/pgvector:0.8.1-pg17) || true
+          docker inspect --format '{{json .State.Health}}' $(docker ps -q --filter ancestor=neo4j:5.26-community) || true
+          psql -c "SELECT version_num FROM alembic_version" || true

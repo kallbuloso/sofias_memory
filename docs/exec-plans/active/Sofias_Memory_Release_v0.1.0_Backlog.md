@@ -12,8 +12,8 @@ features de produto e NÃO é SM-517/B6.
 |---|---|---|
 | REL-001 — Documentação canônica | DONE | `b621dcb` — `docs: add canonical v0.1.0 user and API guides` |
 | REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE | `762a153` — `build: harden v0.1.0 release packaging`; `34658cc` — `build: complete v0.1.0 version packaging` |
-| REL-003 — Contrato operacional de migração/upgrade/backup | DONE (commit pendente de publicação) | baseline `34658cc` |
-| REL-004 — CI mínima de qualidade e integração | TODO | — |
+| REL-003 — Contrato operacional de migração/upgrade/backup | DONE | `3c071c5` — `docs: define v0.1.0 operational recovery contract` |
+| REL-004 — CI mínima de qualidade e integração | IN PROGRESS / validation pending publication | baseline `3c071c5`; workflows implementados e validados localmente, aguardando push + primeira execução real no GitHub (`ci.yml` automático + `integration.yml` manual) antes de DONE |
 | REL-005 — Automação de release / publicação GHCR | TODO | — |
 | REL-006 — Guias de deployment + smoke de produção | TODO | — |
 | GATE-R1 — Sofias Memory v0.1.0 Release | TODO | — |

@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Disposable, non-secret values -- never real credentials. Used only to
+  # satisfy Settings validation for jobs that never make a real network
+  # call to Postgres/Neo4j/an LLM provider.
+  CI_API_KEY: sf-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  CI_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory
+  CI_NEO4J_PASSWORD: ci-disposable-password
+  CI_LLM_API_KEY: sk-ci-disposable
+
+jobs:
+  quality:
+    name: Lint, type check, unit/contract/security tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: uv lock --check
+        run: uv lock --check
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy
+        run: uv run mypy sofias_memory scripts
+
+      # Only tests with no external I/O: no real PostgreSQL/Neo4j/provider
+      # call happens in this job. Security tests (SSRF regression, API-key
+      # contracts, storage-path guards) are required on every PR, not
+      # deferred to the nightly integration workflow.
+      - name: pytest (unit + contract + security)
+        run: uv run pytest tests/unit tests/contract tests/security
+        env:
+          API_KEY: ${{ env.CI_API_KEY }}
+          DATABASE_URL: ${{ env.CI_DATABASE_URL }}
+          NEO4J_PASSWORD: ${{ env.CI_NEO4J_PASSWORD }}
+          LLM_API_KEY: ${{ env.CI_LLM_API_KEY }}
+
+      - name: Export runtime dependencies (for pip-audit)
+        run: uv export --frozen --no-dev --no-hashes -o runtime-requirements.txt
+
+      # Audits only the RUNTIME dependency tree actually shipped in the
+      # release image -- not the dev tooling group. A dev-only advisory
+      # (e.g. a pytest CVE) must never fail this gate; a runtime advisory
+      # must always fail it.
+      - name: pip-audit (runtime dependencies only)
+        run: uv run pip-audit -r runtime-requirements.txt
+
+      - name: bandit (full scan, informational)
+        run: uv run bandit -r sofias_memory -q
+        continue-on-error: true
+
+      # The actual gate: fails the job on any HIGH-severity finding. The
+      # one pre-existing Medium (0.0.0.0 bind, intentional for a
+      # containerized single-process service) and the Low `assert`
+      # findings (each already documented with `# noqa: S101`) are
+      # accepted and must not make this job permanently red.
+      - name: bandit (blocking gate, HIGH severity only)
+        run: uv run bandit -r sofias_memory -q --severity-level high
+
+      - name: Settings / .env.example / Compose parity + version consistency
+        run: uv run python scripts/ci_release_consistency_check.py
+        env:
+          API_KEY: ${{ env.CI_API_KEY }}
+          DB_PASSWORD: ci-disposable-password
+          DB_NEO4J_PASSWORD: ci-disposable-password
+          LLM_API_KEY: ${{ env.CI_LLM_API_KEY }}
+
+  docker-build:
+    name: Docker image build + OCI label check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Build only -- never pushed, never authenticated against any
+      # registry. APP_VERSION/VCS_REF are non-secret release metadata.
+      - name: Build release image
+        run: |
+          docker build \
+            --build-arg APP_VERSION=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            -t sofias-memory:ci \
+            .
+
+      - name: Verify OCI labels
+        run: |
+          set -e
+          EXPECTED_VERSION=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          ACTUAL_VERSION=$(docker inspect sofias-memory:ci --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+          ACTUAL_REVISION=$(docker inspect sofias-memory:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          echo "expected version=$EXPECTED_VERSION actual version=$ACTUAL_VERSION"
+          echo "expected revision=${{ github.sha }} actual revision=$ACTUAL_REVISION"
+          test "$ACTUAL_VERSION" = "$EXPECTED_VERSION"
+          test "$ACTUAL_REVISION" = "${{ github.sha }}"

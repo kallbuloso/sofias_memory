@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from sofias_memory.config import (
     API_KEY_PREFIX,
+    CANONICAL_APP_VERSION,
     FINGERPRINT_SCHEMA_VERSION,
     Settings,
     build_config_fingerprint,
@@ -453,6 +454,24 @@ def test_app_version_change_does_not_change_fingerprint() -> None:
     changed = make_settings(app_version="0.1.1")
 
     assert changed.config_fingerprint() == baseline.config_fingerprint()
+
+
+def test_canonical_app_version_matches_pyproject_toml() -> None:
+    pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    pyproject_text = pyproject_path.read_text(encoding="utf-8")
+    match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject_text)
+    assert match is not None
+    assert match.group(1) == CANONICAL_APP_VERSION
+
+
+def test_settings_without_app_version_override_uses_canonical_version() -> None:
+    assert make_settings().app_version == CANONICAL_APP_VERSION
+
+
+def test_settings_app_version_can_still_be_explicitly_overridden() -> None:
+    assert make_settings(app_version="9.9.9-deployment-metadata").app_version == (
+        "9.9.9-deployment-metadata"
+    )
 
 
 @pytest.mark.parametrize(

@@ -4,10 +4,19 @@
 **Escopo:** Determinar o que falta entre o MVP funcional aprovado (GATE-B5) e uma
 release v0.1.0 reproduzível, documentada e suportável. Este documento NÃO implementa
 features de produto e NÃO é SM-517/B6.
-**Status:** DISCOVERY CONCLUÍDO — backlog pronto para execução, nenhuma REL-task iniciada.
-**Baseline:** `01d6b1b2e0d40439e82657dee51dff4d62062c17` — `docs: close B5 operational
-async runtime milestone`. Working tree limpo, `alembic heads` = `0011`, nenhuma
-mudança de código de produção feita durante este discovery.
+**Status:** EM EXECUÇÃO — ver tabela de status abaixo.
+**Baseline original do discovery:** `01d6b1b2e0d40439e82657dee51dff4d62062c17` —
+`docs: close B5 operational async runtime milestone`.
+
+| Task | Status | Commit/baseline |
+|---|---|---|
+| REL-001 — Documentação canônica | DONE | `b621dcb` — `docs: add canonical v0.1.0 user and API guides` |
+| REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE (fechamento desta task) | baseline `b621dcb` |
+| REL-003 — Contrato operacional de migração/upgrade/backup | TODO | — |
+| REL-004 — CI mínima de qualidade e integração | TODO | — |
+| REL-005 — Automação de release / publicação GHCR | TODO | — |
+| REL-006 — Guias de deployment + smoke de produção | TODO | — |
+| GATE-R1 — Sofias Memory v0.1.0 Release | TODO | — |
 
 ---
 

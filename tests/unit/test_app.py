@@ -189,6 +189,12 @@ def test_version_uses_app_version() -> None:
     assert app.version == "1.2.3"
 
 
+def test_openapi_schema_reports_app_version() -> None:
+    app = create_app(make_settings(app_version="1.2.3"))
+
+    assert app.openapi()["info"]["version"] == "1.2.3"
+
+
 def test_request_id_middleware_is_registered() -> None:
     app = create_app(make_settings())
 

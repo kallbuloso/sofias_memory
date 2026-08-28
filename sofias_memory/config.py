@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Self
@@ -22,6 +23,35 @@ DEFAULT_PROMPT_VERSIONS: Mapping[str, str] = {
     "graph_extraction": "v1",
 }
 ConfigFingerprintPayload = dict[str, object]
+
+
+def _load_canonical_app_version() -> str:
+    """Read the project's canonical version from ``pyproject.toml``.
+
+    ``pyproject.toml`` is not installed as package metadata (there is no
+    ``[build-system]`` in this project, and the release image runs
+    ``uv sync --no-install-project``), so ``importlib.metadata.version()``
+    cannot resolve it. Instead this reads the same file directly from a
+    location relative to this module -- one directory above the
+    ``sofias_memory`` package -- which resolves identically in a source
+    checkout and inside the release image (the Dockerfile copies
+    ``pyproject.toml`` next to the ``sofias_memory`` package, at that same
+    relative position), with no dependency on process working directory.
+    """
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        data = tomllib.load(handle)
+    return str(data["project"]["version"])
+
+
+CANONICAL_APP_VERSION = _load_canonical_app_version()
+"""The project's single source of truth for its own version, read once at
+import time directly from ``pyproject.toml``. ``Settings.app_version``
+defaults to this value; set ``APP_VERSION`` explicitly only to intentionally
+report different deployment metadata than the code actually running (e.g. a
+CI-injected build identifier) -- it is not a second place to declare the
+project's version."""
 
 
 def _secret_is_blank(value: SecretStr) -> bool:
@@ -58,7 +88,7 @@ class Settings(BaseSettings):
 
     app_name: str = Field(default="Sofias Memory", alias="APP_NAME")
     app_env: str = Field(default="production", alias="APP_ENV")
-    app_version: str = Field(default="0.1.0", alias="APP_VERSION")
+    app_version: str = Field(default=CANONICAL_APP_VERSION, alias="APP_VERSION")
     api_key: SecretStr = Field(alias="API_KEY")
     http_host: str = Field(default="0.0.0.0", alias="HTTP_HOST")
     http_port: int = Field(default=8000, gt=0, le=65535, alias="HTTP_PORT")

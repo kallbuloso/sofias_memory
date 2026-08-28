@@ -1,12 +1,29 @@
 FROM ghcr.io/astral-sh/uv:0.8.17 AS uv
 
-FROM python:3.12-slim AS runtime
+# Explicit Python patch version + explicit Debian variant, pinned additionally
+# by digest: python:3.12-slim (and even python:3.12-slim-bookworm alone) are
+# floating tags that move without notice, which the PRD's release-image
+# reproducibility requirement forbids. Bumping the Python version means
+# updating both the tag and the digest together -- no more work than bumping
+# the tag alone, and it removes any ambiguity about which image was actually
+# built.
+FROM python:3.12.14-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579 AS runtime
+
+ARG APP_VERSION=0.1.0
+ARG VCS_REF=local
+
+LABEL org.opencontainers.image.title="Sofias Memory" \
+    org.opencontainers.image.version="${APP_VERSION}" \
+    org.opencontainers.image.revision="${VCS_REF}" \
+    org.opencontainers.image.source="https://github.com/kallbuloso/sofias_memory" \
+    org.opencontainers.image.licenses="Apache-2.0"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PATH="/app/.venv/bin:${PATH}"
+    PATH="/app/.venv/bin:${PATH}" \
+    PYTHONPATH="/app"
 
 WORKDIR /app
 
@@ -16,6 +33,9 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY sofias_memory ./sofias_memory
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
+COPY scripts ./scripts
 
 RUN groupadd --system sofias-memory \
     && useradd --system --gid sofias-memory --home-dir /app sofias-memory \

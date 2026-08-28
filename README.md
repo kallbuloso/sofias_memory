@@ -62,11 +62,13 @@ specification in `docs/product/Sofias_Memory_PRD_SPECS.md` for the full rational
 
 ## Quick start
 
-The all-in-one, image-based `docker compose up` flow (an image that can migrate
-and operate itself with no source checkout) is still release work in progress —
-see `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` (REL-002/
-REL-003) for what remains before the v0.1.0 tag. The flow below reflects what
-actually works today, running the application from a source checkout against
+The release image now contains its own Alembic migration assets and operational
+scripts (no source checkout required to run `alembic upgrade head` or
+`scripts/rebuild_graph.py` from inside it) — but the finalized, image-based
+first-start/upgrade/backup procedure is still being written; see
+`docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` (REL-003) for
+what remains before the v0.1.0 tag. The flow below reflects what is documented
+and verified today, running the application from a source checkout against
 PostgreSQL and Neo4j reachable from the host.
 
 ```bash
@@ -104,10 +106,12 @@ curl http://127.0.0.1:8000/health/ready
 (`sofias-memory` + `postgres` + `neo4j`, application-only published by default,
 hardened with `read_only`/`cap_drop: ALL`/`no-new-privileges`) and is what
 Portainer/EasyPanel consume directly — see [Development](docs/development.md) for
-more on its internal-network layout. Using it end-to-end for a fresh deployment
-(including running the application's own migration from inside its image) is
-exactly the gap REL-002/REL-003 close before the v0.1.0 tag; until then, the
-source-checkout flow above is the truthful quick start.
+more on its internal-network layout. The application image can already run its
+own migration and operational scripts standalone (verified against a real,
+disposable PostgreSQL and Neo4j, with no source bind-mounted in); documenting
+the exact end-to-end first-start/upgrade sequence built entirely on top of
+`compose.yaml` is REL-003's remaining work before the v0.1.0 tag — until then,
+the source-checkout flow above is the documented quick start.
 
 ## Configuration
 
@@ -129,12 +133,10 @@ grouped by area:
 | Worker | `WORKER_ENABLED`, `WORKER_POLL_INTERVAL_MS`, `WORKER_MAX_CONCURRENT_DATASETS` |
 | Privacy/logging | `STORE_QUERY_CONTENT`, `LOG_DOCUMENT_CONTENT`, `LOG_LLM_PAYLOADS` |
 
-`compose.yaml` passes most of these through as `${VAR:-default}` interpolations
-in its `sofias-memory` service; as of this baseline, six Graph/Improve-related
-settings (`ENTITY_DEDUP_SIMILARITY_THRESHOLD`, `ENTITY_MERGE_SIMILARITY_THRESHOLD`,
-`GRAPH_PATH_MAX_DEPTH`, `GRAPH_SUBGRAPH_MAX_DEPTH`, `GRAPH_SUBGRAPH_MAX_RELATIONS`,
-`PROVENANCE_MAX_EVIDENCE`) are not yet passed through in `compose.yaml` and always
-use their code defaults there — tracked in the release backlog (REL-002).
+`compose.yaml` passes every one of these through as `${VAR:-default}`
+interpolations in its `sofias-memory` service, so every row above (including
+the Graph/Improve settings) is configurable via the operator's own `.env`
+without editing `compose.yaml` itself.
 
 `compose.yaml` also uses two **infrastructure-only** interpolation variables that
 are never read by the application itself: `DB_PASSWORD` and `DB_NEO4J_PASSWORD`,
@@ -200,9 +202,10 @@ volume are authoritative; Neo4j is always reconstructible from PostgreSQL.
 
 **Must be backed up:** PostgreSQL and the source files volume — both are
 irreplaceable. **Reconstructible:** Neo4j — it can always be rebuilt from
-PostgreSQL via `scripts/rebuild_graph.py --all`, so backing it up is a convenience,
-not a requirement. A concrete, step-by-step backup/restore procedure (using the
-image's own packaged tooling) is being finalized as release work — see
+PostgreSQL via `scripts/rebuild_graph.py --all` (now packaged in the release
+image itself, no source checkout needed), so backing it up is a convenience,
+not a requirement. A concrete, step-by-step backup/restore procedure is being
+finalized as release work — see
 `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` (REL-003).
 
 ## Upgrade and migrations
@@ -213,8 +216,10 @@ detects a schema that doesn't match the application's expected revision and
 reports `not_ready` rather than guessing. Downgrades are not guaranteed in
 general — migration `0011`, for example, adds a native PostgreSQL enum value and
 has no safe destructive downgrade (`ALTER TYPE ... DROP VALUE` does not exist in
-PostgreSQL). A finalized, image-based upgrade procedure is release work in
-progress (REL-002/REL-003).
+PostgreSQL). The release image now contains its own migration assets
+(`alembic upgrade head` runs from inside it, no source checkout needed); the
+finalized, documented upgrade procedure built on top of that is release work in
+progress (REL-003).
 
 ## Security notes
 

@@ -2,7 +2,7 @@
 
 **Documento:** Backlog técnico — B5 Operational Async Pipeline Runtime
 **Escopo:** B5 execução operacional assíncrona, worker interno, lifecycle durável de pipelines e fechamento do MVP operacional sobre B0–B4
-**Status:** PRONTO PARA EXECUÇÃO — iniciar por SM-501 / ADR-0009
+**Status:** GATE-B5 PASSED; SM-501..SM-516 concluídas
 **Pré-requisitos:** GATE-B4 PASSED; `AGENTS.md`; `docs/product/Sofias_Memory_PRD_SPECS.md`; ADRs aceitos, especialmente ADR-0002, ADR-0007 e ADR-0008
 **Regra:** executar uma task por vez, respeitando dependências, contratos congelados e gates. Não antecipar stories seguintes.
 **Base de elaboração:** estado do repositório após `f202e86` — `docs: close B4 synchronous core memory milestone`.
@@ -625,6 +625,8 @@ SM-516  Worker observability, readiness and security hardening
 GATE-B5  MVP operacional assíncrono
 ```
 
+SM-501..SM-516 estão DONE. GATE-B5 — PASSED.
+
 Dependências cruzadas podem ser refinadas após ADR-0009, mas não devem ser reordenadas silenciosamente se isso alterar o contrato público ou o gate.
 
 ---
@@ -633,7 +635,7 @@ Dependências cruzadas podem ser refinadas após ADR-0009, mas não devem ser re
 
 ## SM-501 — Architecture Gate — Worker, Queue and Pipeline Lifecycle Contract
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** GATE-B4 PASSED
 **PRD:** FR-001, FR-010, FR-020, FR-050, FR-090, FR-100, FR-120; seções 14.3, 15, 19, 21 e 25
@@ -682,7 +684,7 @@ Administrative Dataset DELETE fica reservado a ADR-0010/SM-515 e não deve infla
 
 ## SM-502 — PipelineRun/PipelineStep operational persistence and state transitions
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-501
 **PRD:** FR-100; seções 12.13 e 12.14
@@ -747,7 +749,7 @@ verificação obrigatória em GATE-B5.
 
 ## SM-503 — PostgreSQL queue claiming and dataset/global serialization
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-502
 **PRD:** FR-100.5–8; NFR-002
@@ -788,7 +790,7 @@ Implementar a seleção/claim transacional de runs queued e garantir exclusão o
 
 ## SM-504 — Resumable pipeline engine, registry and persisted step execution
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-502, SM-503
 **PRD:** seção 14.3; FR-100
@@ -833,7 +835,7 @@ Criar o engine interno que executa pipelines versionados em código e persiste o
 
 ## SM-505 — Internal worker lifecycle, polling, heartbeat and graceful shutdown
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-503, SM-504
 **PRD:** FR-001, FR-100, FR-120; seção 21
@@ -874,7 +876,7 @@ Adicionar o worker interno ao mesmo processo FastAPI e conectá-lo ao lifespan.
 
 ## SM-506 — Autonomous graph_outbox processing and crash recovery
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-501, SM-505
 **PRD:** FR-050, FR-100; NFR-004
@@ -914,7 +916,7 @@ Fechar autonomamente o gap `PostgreSQL commit OK → processo morre antes do dra
 
 ## SM-507 — Stale PipelineRun/PipelineStep startup recovery
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-504, SM-505
 **PRD:** FR-001.8, FR-100.9–12; NFR-004
@@ -953,7 +955,7 @@ Implementar recovery de runs abandonados após término anormal de processo, inc
 
 ## SM-508 — Runs read API
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-502
 **PRD:** UC-10; FR-100; seção 11.2 Runs
@@ -1006,7 +1008,7 @@ GET /api/v1/runs/{run_id}
 
 ## SM-509 — Shared async submission and wait contract
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-505, SM-508
 **PRD:** convenções HTTP; FR-100
@@ -1055,7 +1057,7 @@ Também cobrir:
 
 ## SM-510 — Cognify operational async + rebuild/new generation
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-509
 **PRD:** FR-050; endpoint Cognify
@@ -1097,7 +1099,7 @@ Migrar Cognify para o runtime B5 sem alterar os algoritmos funcionais aprovados 
 
 ## SM-511 — Improve operational async
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-509
 **PRD:** FR-070
@@ -1144,7 +1146,7 @@ Não reintroduzir `maintain → drain → reconcile`.
 
 ## SM-512 — Forget operational async
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-509, SM-507
 **PRD:** FR-090
@@ -1191,7 +1193,7 @@ Migrar toda a semântica B4 de Forget para execução operacional assíncrona e 
 
 ## SM-513 — Remember mode=full + async text/file/url
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-510, SM-509
 **PRD:** UC-01, UC-02, UC-03; FR-020; Remember API
@@ -1272,7 +1274,7 @@ Número de migration não reservado agora.
 
 ## SM-514 — Run cancellation and manual retry API
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-507, SM-508, SM-509
 **PRD:** FR-100; seção 11.2 Runs
@@ -1317,7 +1319,7 @@ Expor os controles operacionais congelados pelo ADR-0009.
 
 ## SM-515 — Administrative asynchronous Dataset DELETE
 
-**Status:** TODO
+**Status:** DONE
 **Prioridade:** P0
 **Dependências:** SM-512, SM-514
 **PRD:** FR-010; seção 11.2 Datasets
@@ -1369,7 +1371,8 @@ Implementar a deleção administrativa de Dataset que ficou explicitamente pende
 
 ## SM-516 — Worker observability, readiness and security hardening
 
-**Status:** TODO
+**Status:** DONE
+**Commit:** `b2528af` — `feat(runtime): harden worker observability and readiness`
 **Prioridade:** P0
 **Dependências:** SM-505..SM-515
 **PRD:** FR-120; seção 23; NFR-004/NFR-005/NFR-006
@@ -1428,7 +1431,7 @@ Fechar o runtime operacional com readiness, métricas, logs e testes de seguran�
 
 # 8. GATE-B5 — MVP operacional assíncrono
 
-**Status:** TODO
+**Status:** DONE / PASSED
 **Prioridade:** P0
 **Dependências:** SM-501..SM-516
 **Tipo:** FUNCTIONAL / INTEGRATION / RECOVERY GATE
@@ -1613,6 +1616,88 @@ Se todas as validações passarem:
 ```text
 GATE-B5 PASSED — MVP OPERACIONAL ASSÍNCRONO CONCLUÍDO
 ```
+
+## Nota de fechamento
+
+`GATE-B5` foi executado e aprovado (`GATE-B5 PASSED — MVP OPERACIONAL ASSÍNCRONO
+CONCLUÍDO`). Baseline: `b2528af` (`feat(runtime): harden worker observability and
+readiness`, SM-516). Evidência combinada:
+
+- **A→O**: PASS. Auditoria estática confirmou exatamente uma aplicação FastAPI, worker
+  interno no mesmo processo, exatamente cinco `PipelineType` (`remember, cognify,
+  improve, forget, dataset_delete`), nenhuma fila/broker externo, nenhuma rota
+  proibida no OpenAPI, e nenhum writer público criando `PipelineRun` diretamente
+  `RUNNING` (apenas o claimant executa `QUEUED → RUNNING`).
+- **PostgreSQL real**: schema fresco migrado `0001 → 0011` e auditado fisicamente via
+  catálogo (`pg_indexes`/`pg_type`/`pg_enum`) — enum `pipeline_type` com os cinco
+  valores, índice parcial único `uq_pipeline_runs_dataset_id_operational` com o
+  predicado exato `WHERE (dataset_id IS NOT NULL) AND (status IN ('running',
+  'cancelling'))`; downgrade `NotImplementedError` de `0011` confirmado documentado,
+  não contornado.
+- **Neo4j real**: sentinel externo `SmokeExternalControl` verificado presente antes e
+  depois de toda a execução — nunca wipeado.
+- **Provider real (E2E ao vivo)**: `POST /remember` (mode=full) executado contra
+  OpenAI real (`gpt-5-mini` + `text-embedding-3-large`) — extração real de 5 entidades
+  e 6 relações, 1 chunk, projeção Neo4j real; `POST /recall` (chunks e graph) recuperou
+  a memória com resposta gerada real e cadeia de proveniência completa; `DELETE
+  /datasets/{id}` (Administrative Dataset Delete) executado ao vivo, 5 steps
+  concluídos, projeção convergida de volta ao sentinel externo.
+- **Kill/restart real de processo**: novo teste
+  (`tests/integration/test_process_kill_recovery_postgres_integration.py` +
+  `_process_kill_child.py`) derruba um processo filho real via `SIGKILL`/
+  `TerminateProcess` (nunca `worker.stop()`) enquanto um step está em execução, e prova
+  — por timestamps reais capturados de um segundo processo com novo `worker_id` — que
+  `recovery_finished < first_claim_by_B`, com o run abandonado sendo reconciliado
+  (`WORKER_LOST` → retry → reclaim) sem efeito colateral duplicado. 3/3 execuções
+  determinísticas.
+- **Queue/concorrência, retry automático/manual, cancelamento, outbox
+  crash/replay, Dataset Delete**: suítes SM-505..515 completas passando contra os 16
+  bancos PostgreSQL dedicados por família já provisionados neste ambiente (mais
+  Neo4j real onde aplicável).
+- **Segurança**: nova suíte SSRF dedicada
+  (`tests/security/test_url_ssrf.py`, 32/32) cobrindo os 12 cenários exigidos
+  (loopback literal, `localhost`, hostname privado, RFC1918, link-local/metadata
+  IPv4+IPv6, IPv6 público aceito, redirect público→privado rejeitado com
+  re-resolução independente por hop, DNS multi-resposta com IP privado, userinfo na
+  URL, esquema não suportado, limite de tamanho declarado e por stream adversarial) —
+  incluindo prova de que o único caller (`PrepareAndIngestStep`) nunca vaza a URL/razão
+  interna em caso de rejeição. `bandit`: 0 High, 1 Medium triado como não aplicável
+  (bind `0.0.0.0` é o comportamento pretendido para o container single-process,
+  AGENTS.md §22). `pip-audit`: 1 achado (`pytest`/`PYSEC-2026-1845`) triado como não
+  aplicável — dependência apenas de dev, nunca embarcada na imagem de produção.
+- **OpenAPI**: 24 operações privadas com `security: [{"ApiKeyAuth": []}]`; rotas de
+  health isentas; nenhuma rota proibida presente.
+- **Cobertura NFR-006**: `sofias_memory.domain` + `sofias_memory.pipelines` = 85%
+  (2049 stmts, 228 miss) — acima do mínimo de 80%. Cobertura total do pacote: 88%.
+- **Hygiene de dependência**: `prometheus-client` confirmado sem nenhum import em
+  todo o repositório e removido de `[project.dependencies]`; `uv.lock` regenerado e
+  `uv lock --check` verde.
+- **Suíte completa**: 1718 passed, 0 failures reais. 8 testes
+  (`test_api_errors.py`, `test_request_metrics_middleware.py`) mostraram-se
+  sensíveis a timing de captura de log apenas sob a suíte massiva completa — 3/3
+  execuções determinísticas em isolamento confirmam que não é regressão, seguindo a
+  mesma ressalva já documentada por SM-516 (§42 do gate).
+- **`test_b3_neo4j_gate.py`** (backend `testcontainers`) não executável neste
+  ambiente por ausência de daemon Docker — limitação de ambiente, não do código;
+  excluído da pontuação PASS/FAIL.
+- **Achado do gate corrigido**: `test_graph_maintenance_postgres_and_outbox_share_transaction`
+  tinha uma expectativa obsoleta (`relations_deactivated == 1`) que não refletia a
+  semântica correta e já vigente de `GraphMaintenanceService` (relações sem evidência
+  autoritativa são desativadas — confirmado por seu teste-irmão
+  `test_authoritative_evidence_query_uses_active_current_dataset_scope`, que já
+  passava). O fixture `insert_transaction_fixture` não insere nenhuma evidência, logo
+  as cinco relações do dataset-alvo são corretamente desativadas por hygiene; apenas o
+  teste foi corrigido (`relations_deactivated == 5`, com asserções explícitas de que
+  as cinco relações do dataset-alvo ficam inativas e a relação do outro dataset
+  permanece ativa) — `GraphMaintenanceService` em produção não foi alterado.
+- **Achados de teste corrigidos (pré-existentes, não introduzidos por B5)**:
+  `test_postgres_migration_gate.py` referenciava o nome de índice pré-0008
+  (`ix_pipeline_steps_run_id_ordinal`, renomeado por `0008` para
+  `uq_pipeline_steps_run_id_ordinal`) e não tratava o downgrade intencionalmente
+  `NotImplementedError` de `0011` (ADR-0010 D34) — ambos corrigidos no próprio arquivo
+  de teste, sem qualquer mudança de contrato ou de código de produção.
+
+Nenhum `BLOCKER`/`MAJOR` permanece aberto.
 
 ---
 

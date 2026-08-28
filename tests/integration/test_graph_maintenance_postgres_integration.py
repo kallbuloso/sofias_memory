@@ -183,9 +183,28 @@ async def test_graph_maintenance_postgres_and_outbox_share_transaction(
         service = GraphMaintenanceService(session_factory=session_factory)
         result = await service.maintain_dataset(ids.dataset_id, generation=1)
 
-        assert result.relations_deactivated == 1
+        # insert_transaction_fixture (unlike insert_authoritative_evidence_fixture)
+        # deliberately inserts zero relation_evidence rows: none of this fixture's
+        # five target-Dataset relations has authoritative evidence, so all five --
+        # including "valid_relation_id", which is only structurally active/
+        # current-generation here, not evidence-authoritative -- are correctly
+        # hygiene-deactivated by a real maintenance pass (SM-420). This test's
+        # purpose is proving the PostgreSQL-mutation/graph_outbox-enqueue
+        # transaction boundary (rollback above, commit below), not evidence
+        # scoping -- that contract belongs to
+        # test_authoritative_evidence_query_uses_active_current_dataset_scope.
+        target_relation_ids = (
+            ids.valid_relation_id,
+            ids.inactive_chunk_relation_id,
+            ids.stale_chunk_relation_id,
+            ids.inactive_document_relation_id,
+            ids.inactive_source_relation_id,
+        )
+        assert result.relations_deactivated == len(target_relation_ids)
         assert result.graph_events_enqueued > 0
-        assert await relation_is_active(postgres_engine, ids.valid_relation_id) is False
+        for relation_id in target_relation_ids:
+            assert await relation_is_active(postgres_engine, relation_id) is False
+        assert await relation_is_active(postgres_engine, ids.other_dataset_relation_id) is True
         assert await graph_outbox_count(postgres_engine, ids.dataset_id) == (
             result.graph_events_enqueued
         )

@@ -101,7 +101,7 @@ EXPECTED_INDEXES = frozenset(
         "uq_pipeline_runs_idempotency_key",
         "ix_pipeline_runs_created_at",
         "ix_pipeline_steps_run_id",
-        "ix_pipeline_steps_run_id_ordinal",
+        "uq_pipeline_steps_run_id_ordinal",
         "ix_pipeline_steps_status",
         "ix_graph_outbox_status",
         "ix_graph_outbox_status_created_at",
@@ -372,7 +372,17 @@ def test_postgres_migration_gate_from_empty_database(
     asyncio.run(assert_complete_b2_schema(disposable_postgres_url, expected_revision=head))
     asyncio.run(exercise_minimal_b2_schema(disposable_postgres_url))
 
-    command.downgrade(config, "-1")
+    try:
+        command.downgrade(config, "-1")
+    except NotImplementedError:
+        # Head (0011) documents that PostgreSQL cannot drop a single native
+        # enum value, so downgrading past it is intentionally unsupported
+        # (ADR-0010 D34) -- this is the documented restriction holding, not
+        # a migration defect. The database is untouched (still at head), so
+        # there is nothing further to round-trip.
+        asyncio.run(assert_complete_b2_schema(disposable_postgres_url, expected_revision=head))
+        return
+
     asyncio.run(
         assert_last_migration_downgraded(
             disposable_postgres_url,

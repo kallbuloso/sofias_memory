@@ -28,7 +28,6 @@ dependencies = [
     "beautifulsoup4>=4.13,<5",
     "lxml>=5,<7",
     "charset-normalizer>=3.4,<4",
-    "prometheus-client>=0.22,<1",
 ]
 
 [dependency-groups]

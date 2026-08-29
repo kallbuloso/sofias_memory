@@ -14,7 +14,7 @@ features de produto e NÃO é SM-517/B6.
 | REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE | `762a153` — `build: harden v0.1.0 release packaging`; `34658cc` — `build: complete v0.1.0 version packaging` |
 | REL-003 — Contrato operacional de migração/upgrade/backup | DONE | `3c071c5` — `docs: define v0.1.0 operational recovery contract` |
 | REL-004 — CI mínima de qualidade e integração | DONE | `f24c673` — `ci: add v0.1.0 quality and integration gates`; CI `33220003273` PASS; Integration `33222166381` PASS |
-| REL-005 — Automação de release / publicação GHCR | IN PROGRESS / workflow implementation | baseline `997c34a`; `release.yml` + `CHANGELOG.md` implementados e validados localmente (build/labels/tag-matching), aguardando push + `v0.1.0-rc.1` real para RC PASS |
+| REL-005 — Automação de release / publicação GHCR | IMPLEMENTED / RC PASS / final v0.1.0 publication pending REL-006 + GATE-R1 | `607fb8d` — release workflow + CHANGELOG; CI `33227939187` PASS; Release RC run `33228177783` PASS; `v0.1.0-rc.1` public GHCR digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` |
 | REL-006 — Guias de deployment + smoke de produção | TODO | — |
 | GATE-R1 — Sofias Memory v0.1.0 Release | TODO | — |
 

@@ -11,10 +11,12 @@ The MVP operational async runtime passed its functional/integration/recovery gat
 (`GATE-B5`, see `docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B5.md`).
 Remember, Cognify, Recall, Improve, Forget, Dataset lifecycle, and Run
 retry/cancel are all implemented and durable, running through a single internal
-worker with PostgreSQL as the queue and source of truth. **v0.1.0 is currently in
-release preparation** (release-candidate quality; not yet tagged/published) — see
-`docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for exactly what
-remains before the tag.
+worker with PostgreSQL as the queue and source of truth. **v0.1.0** was the
+first stable MVP release; **v0.1.1** improves Swagger/OpenAPI documentation
+and developer UX (see `CHANGELOG.md`) with no business API, pipeline, or
+storage contract change — see
+`docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
+original release discovery/backlog.
 
 ## Principal capabilities
 

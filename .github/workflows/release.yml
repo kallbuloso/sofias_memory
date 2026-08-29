@@ -151,8 +151,8 @@ jobs:
       - name: Checkout tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # linux/amd64 only for v0.1.0 -- the release image's supported
-      # architecture; no multi-arch manifest is produced. Built under a
+      # linux/amd64 is the currently supported release architecture; no
+      # multi-arch manifest is produced. Built under a
       # local-only reference (not the real GHCR tag) so the subsequent
       # existence check below can `docker pull` the real tag without
       # clobbering this freshly-built candidate.
@@ -224,11 +224,10 @@ jobs:
           fi
           echo "existing published image matches this exact commit/version/source -- treating as idempotent recovery from a partial prior publish; image layers will not be re-pushed, only the remaining steps (GitHub Release) will proceed."
 
-      # No `latest` tag is published for v0.1.0 (see release backlog REL-005
-      # §16/§18): the backlog treats it as optional, the PRD favors
-      # reproducibility over a floating convenience tag, and no
-      # documentation depends on it. Only the immutable, exact version tag
-      # is pushed -- and only if it is not already published.
+      # No floating `latest` tag is published; exact version tags are used
+      # for reproducibility (see release backlog REL-005 §16/§18) and no
+      # documentation depends on `latest`. Only the immutable, exact version
+      # tag is pushed -- and only if it is not already published.
       - name: Push image to GHCR
         if: steps.existing.outputs.exists == 'false'
         run: |

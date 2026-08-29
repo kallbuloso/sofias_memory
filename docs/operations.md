@@ -1,6 +1,6 @@
 # Operations Guide
 
-This is the canonical operational contract for Sofias Memory v0.1.0: first
+This is the canonical operational contract for Sofias Memory: first
 start, migration, upgrade, rollback, backup, and restore. Every command below
 was executed literally against a real, disposable PostgreSQL + Neo4j pair
 (via `docker compose`, using the release image built from this repository's
@@ -111,7 +111,7 @@ yet; do not run these commands against an artifact that doesn't exist. Once
 published, the same eight steps apply with `image: <target-image>:<version>`
 substituted for the local build in `compose.yaml`, and no local rebuild step.
 
-v0.1.0 does **not** promise zero-downtime upgrades. The model above requires
+Sofias Memory does **not** promise zero-downtime upgrades. The model above requires
 a maintenance window (the app is quiesced for the duration of the migration).
 For a single-user MVP, this trade-off is intentional: it favors a simple,
 recoverable procedure over rolling-migration complexity that nothing in the
@@ -157,7 +157,7 @@ is unsupported, destructive, and out of scope for this document.
 
 ## 6. Backup
 
-For v0.1.0 the supported backup is a **maintenance-window, quiesced backup**
+The supported backup model is a **maintenance-window, quiesced backup**
 — not a sophisticated hot-backup mechanism. This is a deliberate,
 conservative choice: it removes any race between PostgreSQL and the source
 volume, at the cost of a short window where the application is stopped.
@@ -261,7 +261,7 @@ docker compose run --rm sofias-memory alembic current
 docker run --rm --network <compose-network> \
   -e DATABASE_URL=... -e NEO4J_URI=... -e NEO4J_PASSWORD=... \
   -e API_KEY=... -e LLM_API_KEY=... \
-  sofias-memory:0.1.0 uv run --no-sync python scripts/rebuild_graph.py \
+  sofias-memory:0.1.1 uv run --no-sync python scripts/rebuild_graph.py \
   --all --confirm-all
 
 # 8. Start the application.
@@ -397,17 +397,17 @@ procedure — only how the image gets onto the host differs.
 ### B. First production start
 
 Follow §2 (First start) exactly, substituting the target image (built or
-pulled per §A) for `sofias-memory:0.1.0`. Do not skip the migration step
+pulled per §A) for `sofias-memory:0.1.1`. Do not skip the migration step
 (§3) or the readiness check — a deployment is not "up" until
 `/health/ready` reports `ready` and a production smoke run (§H) has passed.
 
 ### C. Published GHCR image
 
-Once a stable `v0.1.0` tag is published (REL-005's release workflow), the
-image is available at:
+Stable releases (REL-005's release workflow) are published to GHCR at the
+exact version tag. The current stable image is available at:
 
 ```text
-ghcr.io/kallbuloso/sofias-memory:0.1.0
+ghcr.io/kallbuloso/sofias-memory:0.1.1
 ```
 
 **For a release candidate** (used only to validate this very procedure, never
@@ -427,9 +427,9 @@ run there is always executed from a source checkout on the *host*, as a
 standalone HTTP client against the deployed API; it never needs to run
 *inside* the target container, so it works identically regardless of what
 that image's `/app/scripts` contains. Any image built from the REL-006
-commit onward (including the eventual stable `v0.1.0`) contains
-`production_smoke.py` automatically, since `Dockerfile` already does
-`COPY scripts ./scripts`.
+commit onward (including the published `v0.1.0` and every later release)
+contains `production_smoke.py` automatically, since `Dockerfile` already
+does `COPY scripts ./scripts`.
 
 To run the published image via the canonical `compose.yaml` without a local
 build, override the `image` value for the `sofias-memory` service at deploy
@@ -445,7 +445,7 @@ externally rather than the repository maintaining a second Compose file.
 Production deployments must reference an exact, immutable identity — never a
 floating tag:
 
-- Prefer an exact version tag: `ghcr.io/kallbuloso/sofias-memory:0.1.0`.
+- Prefer an exact version tag: `ghcr.io/kallbuloso/sofias-memory:0.1.1`.
 - For maximum reproducibility (e.g. verifying exactly what was validated
   before a rollout), pin by digest instead:
   `ghcr.io/kallbuloso/sofias-memory@sha256:...`.

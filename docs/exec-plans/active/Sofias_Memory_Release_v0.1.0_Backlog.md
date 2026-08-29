@@ -14,9 +14,9 @@ features de produto e NÃO é SM-517/B6.
 | REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE | `762a153` — `build: harden v0.1.0 release packaging`; `34658cc` — `build: complete v0.1.0 version packaging` |
 | REL-003 — Contrato operacional de migração/upgrade/backup | DONE | `3c071c5` — `docs: define v0.1.0 operational recovery contract` |
 | REL-004 — CI mínima de qualidade e integração | DONE | `f24c673` — `ci: add v0.1.0 quality and integration gates`; CI `33220003273` PASS; Integration `33222166381` PASS |
-| REL-005 — Automação de release / publicação GHCR | IMPLEMENTED / RC PASS / final v0.1.0 publication pending GATE-R1 final phase | `607fb8d` — release workflow + CHANGELOG; CI `33227939187` PASS; Release RC run `33228177783` PASS; `v0.1.0-rc.1` public GHCR digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` |
+| REL-005 — Automação de release / publicação GHCR | DONE | `607fb8d` — release workflow + CHANGELOG; CI `33227939187` PASS; Release RC run `33228177783` PASS; `v0.1.0-rc.1` public GHCR digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43`; stable Release run `33232163643` PASS at `e6c54d3` |
 | REL-006 — Guias de deployment + smoke de produção | DONE | `0848731` — `docs: add production deployment and smoke validation`; CI `33230847900` PASS; RC production smoke PASS against published RC digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` |
-| GATE-R1 — Sofias Memory v0.1.0 Release | PRE-PUBLICATION PASS / final artifact verification pending | (uncommitted, local audit) — FASE A: critérios 1–10, 12, 13 = PASS; critério 11 = PENDING FINAL PUBLICATION (esperado); baseline `0848731`, CI `33230847900` PASS |
+| GATE-R1 — Sofias Memory v0.1.0 Release | PASSED | FASE A: critérios 1–10, 12, 13 = PASS (baseline `0848731`, CI `33230847900`); FASE B: tag `v0.1.0` publicada em `e6c54d3`, Release workflow run `33232163643` PASS, GHCR `ghcr.io/kallbuloso/sofias-memory:0.1.0` e GitHub Release `v0.1.0` (stable, não-prerelease) confirmados publicados — critério 11 satisfeito |
 
 ## Nota de sequenciamento de execução (REL-005)
 

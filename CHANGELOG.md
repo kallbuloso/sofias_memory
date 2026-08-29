@@ -2,6 +2,36 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.1.1]
+
+### API documentation and Swagger
+
+- Swagger UI (`/docs`) is now available only when `APP_ENV=dev` or
+  `development`; production and every other environment continue to have no
+  documentation surface at all (`404`, not an auth error) for `/docs`,
+  `/openapi.json`, and `/redoc` (`/redoc` is never available in any
+  environment).
+- Every API operation now has a meaningful summary and description, request
+  fields have clear descriptions, and destructive operations (Forget,
+  administrative Dataset delete) are explicitly called out as such.
+- `401`, `403`, `422`, and route-specific error responses (for example
+  dataset-not-found, idempotency conflicts, worker-unavailable) are now
+  documented accurately against the real `ErrorEnvelope` shape this API
+  actually returns, replacing FastAPI's generic default validation-error
+  documentation.
+- The `X-API-Key` Authorize flow in Swagger UI is unchanged and documented.
+- The human-facing Swagger UI now omits the `Idempotency-Key` header input
+  for readability; the canonical `/openapi.json` schema continues to fully
+  document `Idempotency-Key` on every operation that accepts it.
+
+### Compatibility
+
+- No business API paths were removed or renamed.
+- No request or response business contract was intentionally changed.
+- `Idempotency-Key` runtime support and semantics are unchanged.
+- Pipeline, storage, and database behavior are unchanged.
+- No database migration is required to upgrade to 0.1.1.
+
 ## [0.1.0]
 
 Sofias Memory is a focused, single-user semantic memory and knowledge graph
@@ -18,9 +48,9 @@ original source.
 - Process pending or explicitly selected sources into semantic memory
   (Cognify), including full dataset rebuilds onto a new generation without
   ever exposing a partially-rebuilt state to readers.
-- Retrieve context via six modes: vector chunks, lexical, summaries, graph
-  traversal, hybrid rank fusion, and graph-grounded RAG with a generated,
-  provenance-backed answer.
+- Retrieve context via six modes: vector chunks, summaries, graph traversal,
+  authoritative entity/relation triplets, hybrid rank fusion, and
+  graph-grounded RAG with a generated, provenance-backed answer.
 - Background hygiene (Improve): feedback-weighted ranking, entity
   deduplication, relation embedding refresh, summary maintenance, and graph
   reconciliation — always explicit, never triggered implicitly.

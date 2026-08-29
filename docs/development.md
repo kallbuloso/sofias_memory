@@ -120,7 +120,7 @@ neo4j:7687
 These scripts run from a source checkout via `uv run python scripts/...` as
 shown below. They are also packaged inside the release image itself (see
 `docs/operations.md`), so the same scripts run there too, with no source
-checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.1.0
+checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.1.1
 run --no-sync python scripts/rebuild_graph.py --all --confirm-all`.
 
 ```bash

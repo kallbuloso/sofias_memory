@@ -9,6 +9,7 @@ from uuid import UUID
 
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from sofias_memory.domain import GraphOutboxOperation, GraphOutboxStatus
 from sofias_memory.infrastructure.postgres.models import GraphOutbox
@@ -136,6 +137,48 @@ class GraphOutboxRepository:
         return cast(datetime, result)
 
     @staticmethod
+    def _blocking_upsert_status_predicate(column_owner: Any, *, max_attempts: int) -> Any:
+        """Statuses that make an UPSERT row still "relevant" for the
+        cross-row fence below -- the same three statuses
+        ``_drain_snapshot_predicate`` treats as not-yet-terminal. A row
+        ``FAILED`` at the attempt ceiling is excluded: it has no autonomous
+        resurrection path (nothing resets its attempt counter, and no new
+        pipeline work can target a DELETING/DELETED dataset), so it can
+        never recreate a projection later -- safe to ignore here."""
+
+        return or_(
+            column_owner.status == GraphOutboxStatus.PENDING,
+            column_owner.status == GraphOutboxStatus.PROCESSING,
+            and_(
+                column_owner.status == GraphOutboxStatus.FAILED,
+                column_owner.attempt < max_attempts,
+            ),
+        )
+
+    def _blocking_upsert_exists_for_dataset(self, dataset_id: Any, *, max_attempts: int) -> Any:
+        """Correlated ``EXISTS`` proving "this dataset still has a relevant
+        UPSERT" -- the durable, PostgreSQL-authoritative cross-row fence
+        (backlog review round 2, BLOCKER): row-level claim-or-observe only
+        prevents two workers from claiming the *same* row; it does nothing
+        to stop an autonomous worker from independently claiming a DELETE
+        row for dataset X while a *different* row -- an older UPSERT for
+        the same dataset -- is still PENDING/PROCESSING/retryable-FAILED
+        under a live or separate lease. Evaluated fresh at claim time (never
+        cached, never backed by an in-memory mutex), so discovery and claim
+        can never together violate the invariant."""
+
+        blocking = aliased(GraphOutbox)
+        return (
+            select(blocking.id)
+            .where(
+                blocking.dataset_id == dataset_id,
+                blocking.operation == GraphOutboxOperation.UPSERT,
+                self._blocking_upsert_status_predicate(blocking, max_attempts=max_attempts),
+            )
+            .exists()
+        )
+
+    @staticmethod
     def _claim_eligibility_predicate(*, stale_after_seconds: float, max_attempts: int) -> Any:
         """ADR-0009 SS V eligibility: pending, stale-processing (including a
         legacy row with a NULL lease predating this migration, backlog SS 6),
@@ -169,6 +212,12 @@ class GraphOutboxRepository:
         Ordered by ``id`` ascending: insertion order already respects the
         dependency order producers emit commands in within one authoritative
         transaction (Entity -> Chunk -> MENTIONED_IN -> RELATES_TO -> NEXT).
+
+        A DELETE row is excluded from discovery while its own dataset still
+        has a relevant UPSERT outstanding (backlog review round 2, BLOCKER)
+        -- the same cross-row fence :meth:`claim_one` re-checks atomically
+        at claim time, since a row excluded here could otherwise still be
+        raced onto another candidate list between this scan and the claim.
         """
 
         statement = (
@@ -176,7 +225,13 @@ class GraphOutboxRepository:
             .where(
                 self._claim_eligibility_predicate(
                     stale_after_seconds=stale_after_seconds, max_attempts=max_attempts
-                )
+                ),
+                or_(
+                    GraphOutbox.operation != GraphOutboxOperation.DELETE,
+                    ~self._blocking_upsert_exists_for_dataset(
+                        GraphOutbox.dataset_id, max_attempts=max_attempts
+                    ),
+                ),
             )
             .order_by(GraphOutbox.id.asc())
             .limit(limit)
@@ -221,6 +276,19 @@ class GraphOutboxRepository:
         ):
             return None
 
+        if event.operation == GraphOutboxOperation.DELETE and await self._has_blocking_upsert(
+            event.dataset_id, max_attempts=max_attempts
+        ):
+            # Cross-row fence (backlog review round 2, BLOCKER): re-evaluated
+            # here, inside the same transaction that is about to claim this
+            # row, so discovery (list_claimable_ids) racing a concurrent
+            # claim elsewhere can never together let a DELETE win while a
+            # relevant UPSERT for the same dataset is still outstanding.
+            # This only reads committed state -- it never locks the blocking
+            # UPSERT row(s), so it never holds a PostgreSQL lock across the
+            # Neo4j I/O that happens after this claim commits.
+            return None
+
         event.status = GraphOutboxStatus.PROCESSING
         event.processing_started_at = db_now
         event.worker_id = worker_id
@@ -228,6 +296,23 @@ class GraphOutboxRepository:
         event.processed_at = None
         await self._session.flush()
         return ClaimedGraphOutbox.from_model(event)
+
+    async def _has_blocking_upsert(self, dataset_id: UUID, *, max_attempts: int) -> bool:
+        """Non-correlated form of :meth:`_blocking_upsert_exists_for_dataset`
+        for a single, already-known ``dataset_id`` -- used by
+        :meth:`claim_one`'s atomic re-check."""
+
+        statement = (
+            select(GraphOutbox.id)
+            .where(
+                GraphOutbox.dataset_id == dataset_id,
+                GraphOutbox.operation == GraphOutboxOperation.UPSERT,
+                self._blocking_upsert_status_predicate(GraphOutbox, max_attempts=max_attempts),
+            )
+            .limit(1)
+        )
+        result = await self._session.scalar(statement)
+        return result is not None
 
     async def _finalize_if_owned(
         self,
@@ -337,9 +422,41 @@ class GraphOutboxRepository:
         :class:`GraphOutboxProcessor`'s claim-or-observe semantics rather
         than skip. A row already ``DONE``, or ``FAILED`` at the attempt
         ceiling, is correctly absent -- nothing left to observe for either.
+
+        Ordering is two-phase, by ``(operation, aggregate_type)`` -- never
+        ``aggregate_type`` alone (a production incident traced to exactly
+        that gap: a mixed snapshot of stale UPSERTs left over from an
+        earlier, still-converging pipeline run alongside a fresh
+        administrative Dataset delete's DELETEs let ``entity``/``chunk``
+        DELETEs run before older ``entity_mention``/``relation`` UPSERTs,
+        which then failed with a missing-endpoint error because their
+        Entity/Chunk anchor node was already gone):
+
+        1. Every UPSERT first, in dependency order (Entity/Chunk before
+           EntityMention/Relation/ChunkNext) -- this is what lets a stale
+           UPSERT left over from a still-converging or since-abandoned
+           pipeline run safely finish (or fail out under its own retry
+           budget) before anything in this dataset is torn down, instead of
+           racing a DELETE that removes its endpoint out from under it.
+        2. Every DELETE second, in the *reverse* order (EntityMention/
+           Relation/ChunkNext before Chunk/Entity) -- edges/dependents are
+           removed before the nodes they point at, mirroring how UPSERTs
+           build the graph up.
+
+        Because one drain call processes this whole ordered snapshot to
+        completion before returning (claim-or-observe, never skip), every
+        UPSERT already enqueued for this dataset is guaranteed to reach a
+        terminal outcome before any DELETE in the same snapshot begins --
+        so a Dataset can never end up torn down with a dangling stale
+        UPSERT still able to recreate part of its projection afterward.
         """
 
-        aggregate_order = case(
+        operation_order = case(
+            (GraphOutbox.operation == GraphOutboxOperation.UPSERT, 0),
+            (GraphOutbox.operation == GraphOutboxOperation.DELETE, 1),
+            else_=2,
+        )
+        upsert_aggregate_order = case(
             (GraphOutbox.aggregate_type == "entity", 0),
             (GraphOutbox.aggregate_type == "chunk", 1),
             (GraphOutbox.aggregate_type == "entity_mention", 2),
@@ -347,13 +464,25 @@ class GraphOutboxRepository:
             (GraphOutbox.aggregate_type == "chunk_next", 4),
             else_=5,
         )
+        delete_aggregate_order = case(
+            (GraphOutbox.aggregate_type == "chunk_next", 0),
+            (GraphOutbox.aggregate_type == "relation", 1),
+            (GraphOutbox.aggregate_type == "entity_mention", 2),
+            (GraphOutbox.aggregate_type == "chunk", 3),
+            (GraphOutbox.aggregate_type == "entity", 4),
+            else_=5,
+        )
+        aggregate_order = case(
+            (GraphOutbox.operation == GraphOutboxOperation.DELETE, delete_aggregate_order),
+            else_=upsert_aggregate_order,
+        )
         statement = (
             select(GraphOutbox.id)
             .where(
                 GraphOutbox.dataset_id == dataset_id,
                 self._drain_snapshot_predicate(max_attempts=max_attempts),
             )
-            .order_by(aggregate_order, GraphOutbox.id)
+            .order_by(operation_order, aggregate_order, GraphOutbox.id)
         )
         result = await self._session.scalars(statement)
         return list(result)

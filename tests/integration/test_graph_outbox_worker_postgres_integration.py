@@ -160,6 +160,60 @@ async def insert_event(
         return event.id
 
 
+async def insert_dataset_scoped_event(
+    session_factory: AsyncSessionFactory,
+    *,
+    dataset_id: object,
+    aggregate_type: str,
+    operation: GraphOutboxOperation,
+    status: GraphOutboxStatus = GraphOutboxStatus.PENDING,
+    attempt: int = 0,
+) -> int:
+    """Insert one minimal, schema-valid outbox row for a specific dataset,
+    aggregate type and operation -- used to reproduce a mixed dataset-wide
+    snapshot (stale UPSERTs alongside a fresh administrative delete's
+    DELETEs) without requiring the full producer pipelines that normally
+    create such rows."""
+
+    aggregate_id = uuid4()
+    if aggregate_type in ("entity", "chunk"):
+        identity: dict[str, object] = {"id": str(aggregate_id)}
+        endpoints: dict[str, object] = {}
+    elif aggregate_type == "relation":
+        identity = {"relation_id": str(aggregate_id)}
+        endpoints = {"source_entity_id": str(uuid4()), "target_entity_id": str(uuid4())}
+    elif aggregate_type == "entity_mention":
+        identity = {"mention_id": str(aggregate_id)}
+        endpoints = {"entity_id": str(uuid4()), "chunk_id": str(uuid4())}
+    else:
+        raise ValueError(f"unsupported aggregate_type for this helper: {aggregate_type}")
+
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "aggregate_type": aggregate_type,
+        "operation": operation.value,
+        "dataset_id": str(dataset_id),
+        "aggregate_id": str(aggregate_id),
+        "identity": identity,
+        "endpoints": endpoints,
+        "properties": {},
+    }
+    async with PostgresUnitOfWork(session_factory) as uow:
+        event = GraphOutbox(
+            dataset_id=dataset_id,
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            operation=operation,
+            payload=payload,
+            status=status,
+            attempt=attempt,
+            processed_at=None,
+        )
+        await uow.graph_outbox.add(event)
+        await uow.commit()
+        return event.id
+
+
 async def backdate_processing_started_at(
     session_factory: AsyncSessionFactory, outbox_id: int, *, seconds_ago: float
 ) -> None:
@@ -572,6 +626,366 @@ async def test_k_claim_commit_is_visible_to_other_sessions_before_finalize(
             assert other_dataset.scalar() == 1
     finally:
         await cleanup_event(session_factory, outbox_id)
+
+
+# -- M: dataset-wide drain snapshot orders UPSERTs before DELETEs --------------
+#
+# Regression for a real Easypanel production incident: a Dataset delete's
+# fresh entity/chunk DELETEs were scheduled ahead of an earlier, still-
+# unconverged Cognify run's entity_mention/relation UPSERTs (ordering was by
+# aggregate_type alone), so the UPSERTs failed with
+# ProjectionEndpointMissingError once their Entity/Chunk endpoint had
+# already been deleted. See ``list_processable_ids_for_dataset``'s docstring
+# for the fix (two-phase ``(operation, aggregate_type)`` ordering).
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_m_dataset_snapshot_orders_every_upsert_before_any_delete(
+    postgres_engine: AsyncEngine,
+) -> None:
+    session_factory = create_session_factory(postgres_engine)
+    dataset_id = uuid4()
+    outbox_ids: dict[str, int] = {}
+    try:
+        # Stale upserts left over from an earlier, still-converging pipeline
+        # run -- inserted in a deliberately scrambled order so a passing
+        # test cannot be an artifact of insertion order.
+        outbox_ids["relation_upsert"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="relation",
+            operation=GraphOutboxOperation.UPSERT,
+            status=GraphOutboxStatus.FAILED,
+            attempt=DEFAULT_GRAPH_OUTBOX_MAX_ATTEMPTS - 1,
+        )
+        outbox_ids["chunk_upsert"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="chunk",
+            operation=GraphOutboxOperation.UPSERT,
+        )
+        outbox_ids["entity_mention_upsert"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="entity_mention",
+            operation=GraphOutboxOperation.UPSERT,
+        )
+        outbox_ids["entity_upsert"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="entity",
+            operation=GraphOutboxOperation.UPSERT,
+        )
+
+        # A fresh administrative Dataset delete's own DELETEs, enqueued
+        # after the stale upserts above.
+        outbox_ids["entity_delete"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="entity",
+            operation=GraphOutboxOperation.DELETE,
+        )
+        outbox_ids["entity_mention_delete"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="entity_mention",
+            operation=GraphOutboxOperation.DELETE,
+        )
+        outbox_ids["chunk_delete"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="chunk",
+            operation=GraphOutboxOperation.DELETE,
+        )
+        outbox_ids["relation_delete"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="relation",
+            operation=GraphOutboxOperation.DELETE,
+        )
+
+        async with PostgresUnitOfWork(session_factory) as uow:
+            ordered_ids = await uow.graph_outbox.list_processable_ids_for_dataset(
+                dataset_id, max_attempts=DEFAULT_GRAPH_OUTBOX_MAX_ATTEMPTS
+            )
+            await uow.commit()
+
+        expected_order = [
+            outbox_ids["entity_upsert"],
+            outbox_ids["chunk_upsert"],
+            outbox_ids["entity_mention_upsert"],
+            outbox_ids["relation_upsert"],
+            outbox_ids["relation_delete"],
+            outbox_ids["entity_mention_delete"],
+            outbox_ids["chunk_delete"],
+            outbox_ids["entity_delete"],
+        ]
+        assert ordered_ids == expected_order
+
+        upsert_ids = set(expected_order[:4])
+        delete_ids = set(expected_order[4:])
+        last_upsert_position = max(ordered_ids.index(i) for i in upsert_ids)
+        first_delete_position = min(ordered_ids.index(i) for i in delete_ids)
+        assert last_upsert_position < first_delete_position
+    finally:
+        for outbox_id in outbox_ids.values():
+            await cleanup_event(session_factory, outbox_id)
+
+
+# -- N: cross-row fence -- DELETE unclaimable while a sibling UPSERT is live ----
+#
+# Regression for backlog review round 2's BLOCKER: round 1's ordering fix
+# (test M above) only orders one dataset-wide snapshot processed by ONE
+# sequential drain call. Row-level claim-or-observe only stops two workers
+# from claiming the SAME row. Neither stops an autonomous worker from
+# independently discovering and claiming a DELETE row for dataset X while a
+# DIFFERENT, older UPSERT row for the same dataset is still PENDING,
+# PROCESSING under a live lease (owned by any worker, autonomous or
+# explicit), or FAILED-but-retryable -- list_claimable_ids' global scan has
+# no per-dataset ordering at all. This proves the durable, PostgreSQL-
+# authoritative cross-row fence added to list_claimable_ids/claim_one closes
+# that gap without any in-memory mutex and without holding a lock on the
+# blocking row.
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_n_delete_is_unclaimable_while_dataset_has_a_live_upsert(
+    postgres_engine: AsyncEngine,
+) -> None:
+    session_factory = create_session_factory(postgres_engine)
+    dataset_id = uuid4()
+    outbox_ids: dict[str, int] = {}
+    try:
+        # Step 2 (spec): a stale relation UPSERT, claimed and PROCESSING
+        # under a live (non-stale) lease -- standing in for "worker A
+        # claimed it and paused before its projection apply completed."
+        outbox_ids["relation_upsert"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="relation",
+            operation=GraphOutboxOperation.UPSERT,
+            status=GraphOutboxStatus.PROCESSING,
+            attempt=1,
+        )
+        async with PostgresUnitOfWork(session_factory) as uow:
+            live_lease_now = await uow.graph_outbox.get_database_now()
+            event = await uow.graph_outbox.get_by_id(outbox_ids["relation_upsert"])
+            assert event is not None
+            event.worker_id = "wk-a"
+            event.processing_started_at = live_lease_now
+            await uow.commit()
+
+        # Step 4 (spec): DATASET_DELETE's own DELETE rows, PENDING.
+        outbox_ids["entity_delete"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="entity",
+            operation=GraphOutboxOperation.DELETE,
+        )
+        outbox_ids["relation_delete"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="relation",
+            operation=GraphOutboxOperation.DELETE,
+        )
+
+        # Step 5 (spec): worker B's autonomous discovery must not even
+        # surface either DELETE row as a candidate while the UPSERT is live.
+        async with PostgresUnitOfWork(session_factory) as uow:
+            claimable = await uow.graph_outbox.list_claimable_ids(**CLAIM_KWARGS, limit=100)
+            await uow.commit()
+        assert outbox_ids["entity_delete"] not in claimable
+        assert outbox_ids["relation_delete"] not in claimable
+
+        # Step 6 (spec): even a direct claim-by-id (the atomic re-check,
+        # closing the discovery/claim TOCTOU window) must refuse both
+        # DELETE rows while the UPSERT remains unresolved.
+        async with PostgresUnitOfWork(session_factory) as uow:
+            blocked_entity_delete = await uow.graph_outbox.claim_one(
+                outbox_ids["entity_delete"], worker_id="wk-b", **CLAIM_KWARGS
+            )
+            blocked_relation_delete = await uow.graph_outbox.claim_one(
+                outbox_ids["relation_delete"], worker_id="wk-b", **CLAIM_KWARGS
+            )
+            await uow.commit()
+        assert blocked_entity_delete is None
+        assert blocked_relation_delete is None
+
+        persisted_deletes_still_pending = await load_event(
+            session_factory, outbox_ids["entity_delete"]
+        )
+        assert persisted_deletes_still_pending is not None
+        assert persisted_deletes_still_pending.status == GraphOutboxStatus.PENDING
+
+        # Step 7 (spec): release A -- the UPSERT reaches DONE.
+        async with PostgresUnitOfWork(session_factory) as uow:
+            resolved = await uow.graph_outbox.mark_done_if_owned(
+                outbox_ids["relation_upsert"], worker_id="wk-a", attempt=1
+            )
+            await uow.commit()
+        assert resolved is True
+
+        # Steps 8-9 (spec): the DELETEs are now claimable and processable.
+        async with PostgresUnitOfWork(session_factory) as uow:
+            claimable_after = await uow.graph_outbox.list_claimable_ids(**CLAIM_KWARGS, limit=100)
+            await uow.commit()
+        assert outbox_ids["entity_delete"] in claimable_after
+        assert outbox_ids["relation_delete"] in claimable_after
+
+        async with PostgresUnitOfWork(session_factory) as uow:
+            claimed_entity_delete = await uow.graph_outbox.claim_one(
+                outbox_ids["entity_delete"], worker_id="wk-b", **CLAIM_KWARGS
+            )
+            await uow.commit()
+        assert claimed_entity_delete is not None
+    finally:
+        for outbox_id in outbox_ids.values():
+            await cleanup_event(session_factory, outbox_id)
+
+
+# -- O: claim_one is the authoritative fence, independent of discovery ---------
+#
+# Freezes the invariant behind the round-2 fence: list_claimable_ids is only
+# an optimization (it may skip candidates it already knows are blocked), but
+# claim_one is what actually enforces the safety property. These tests never
+# call list_claimable_ids at all -- they exercise claim_one directly against
+# a DELETE row, parametrized over each state _blocking_upsert_status_predicate
+# treats as "still relevant" for a sibling UPSERT in the same dataset.
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocking_state",
+    ["pending", "processing_live", "failed_retryable"],
+)
+async def test_o_claim_one_is_the_authoritative_fence_independent_of_discovery(
+    postgres_engine: AsyncEngine, blocking_state: str
+) -> None:
+    session_factory = create_session_factory(postgres_engine)
+    dataset_id = uuid4()
+    outbox_ids: dict[str, int] = {}
+    try:
+        # A: an UPSERT for dataset X in the blocking state under test.
+        if blocking_state == "pending":
+            outbox_ids["upsert"] = await insert_dataset_scoped_event(
+                session_factory,
+                dataset_id=dataset_id,
+                aggregate_type="entity",
+                operation=GraphOutboxOperation.UPSERT,
+                status=GraphOutboxStatus.PENDING,
+            )
+        elif blocking_state == "processing_live":
+            outbox_ids["upsert"] = await insert_dataset_scoped_event(
+                session_factory,
+                dataset_id=dataset_id,
+                aggregate_type="entity",
+                operation=GraphOutboxOperation.UPSERT,
+                status=GraphOutboxStatus.PROCESSING,
+                attempt=1,
+            )
+            async with PostgresUnitOfWork(session_factory) as uow:
+                live_lease_now = await uow.graph_outbox.get_database_now()
+                event = await uow.graph_outbox.get_by_id(outbox_ids["upsert"])
+                assert event is not None
+                event.worker_id = "wk-blocking"
+                event.processing_started_at = live_lease_now
+                await uow.commit()
+        else:
+            assert blocking_state == "failed_retryable"
+            outbox_ids["upsert"] = await insert_dataset_scoped_event(
+                session_factory,
+                dataset_id=dataset_id,
+                aggregate_type="entity",
+                operation=GraphOutboxOperation.UPSERT,
+                status=GraphOutboxStatus.FAILED,
+                attempt=DEFAULT_GRAPH_OUTBOX_MAX_ATTEMPTS - 1,
+            )
+
+        # B: a DELETE row for the same dataset X.
+        outbox_ids["delete"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_id,
+            aggregate_type="entity",
+            operation=GraphOutboxOperation.DELETE,
+        )
+
+        # C/D: claim_one called directly -- list_claimable_ids is never
+        # invoked in this test at all.
+        async with PostgresUnitOfWork(session_factory) as uow:
+            blocked = await uow.graph_outbox.claim_one(
+                outbox_ids["delete"], worker_id="wk-b", **CLAIM_KWARGS
+            )
+            await uow.commit()
+        assert blocked is None
+
+        # E: the DELETE row is untouched -- still PENDING, not PROCESSING.
+        delete_after_block = await load_event(session_factory, outbox_ids["delete"])
+        assert delete_after_block is not None
+        assert delete_after_block.status == GraphOutboxStatus.PENDING
+
+        # F: resolve the blocking UPSERT -- DONE for pending/live-processing,
+        # FAILED-at-ceiling (terminal, no resurrection path) for the failed case.
+        async with PostgresUnitOfWork(session_factory) as uow:
+            upsert_event = await uow.graph_outbox.get_by_id(outbox_ids["upsert"])
+            assert upsert_event is not None
+            if blocking_state == "failed_retryable":
+                upsert_event.status = GraphOutboxStatus.FAILED
+                upsert_event.attempt = DEFAULT_GRAPH_OUTBOX_MAX_ATTEMPTS
+            else:
+                upsert_event.status = GraphOutboxStatus.DONE
+                upsert_event.processed_at = await uow.graph_outbox.get_database_now()
+            await uow.commit()
+
+        # G/H: claim_one now succeeds.
+        async with PostgresUnitOfWork(session_factory) as uow:
+            claimed = await uow.graph_outbox.claim_one(
+                outbox_ids["delete"], worker_id="wk-b", **CLAIM_KWARGS
+            )
+            await uow.commit()
+        assert claimed is not None
+        assert claimed.outbox_id == outbox_ids["delete"]
+    finally:
+        for outbox_id in outbox_ids.values():
+            await cleanup_event(session_factory, outbox_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_o_blocking_upsert_in_dataset_x_does_not_block_delete_in_dataset_y(
+    postgres_engine: AsyncEngine,
+) -> None:
+    session_factory = create_session_factory(postgres_engine)
+    dataset_x = uuid4()
+    dataset_y = uuid4()
+    outbox_ids: dict[str, int] = {}
+    try:
+        outbox_ids["upsert_x"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_x,
+            aggregate_type="entity",
+            operation=GraphOutboxOperation.UPSERT,
+            status=GraphOutboxStatus.PENDING,
+        )
+        outbox_ids["delete_y"] = await insert_dataset_scoped_event(
+            session_factory,
+            dataset_id=dataset_y,
+            aggregate_type="entity",
+            operation=GraphOutboxOperation.DELETE,
+        )
+
+        async with PostgresUnitOfWork(session_factory) as uow:
+            claimed = await uow.graph_outbox.claim_one(
+                outbox_ids["delete_y"], worker_id="wk-b", **CLAIM_KWARGS
+            )
+            await uow.commit()
+        assert claimed is not None
+        assert claimed.outbox_id == outbox_ids["delete_y"]
+    finally:
+        for outbox_id in outbox_ids.values():
+            await cleanup_event(session_factory, outbox_id)
 
 
 # -- L: a failure does not busy-spin the attempt budget in one tick -------------

@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from typing import Any, cast
 from uuid import UUID
 
+from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
+
 from sofias_memory.domain import (
     DatasetStatus,
     GraphOutboxStatus,
@@ -51,7 +53,10 @@ from sofias_memory.pipelines.registry import (
 )
 from sofias_memory.services.forget import apply_dataset_forget_mutation, delete_source_storage
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
-from sofias_memory.services.graph_outbox_processor import DEFAULT_GRAPH_OUTBOX_MAX_ATTEMPTS
+from sofias_memory.services.graph_outbox_processor import (
+    DEFAULT_GRAPH_OUTBOX_MAX_ATTEMPTS,
+    GraphOutboxAttemptsExhaustedError,
+)
 from sofias_memory.services.pipeline_lifecycle import transition_run, transition_step
 
 DATASET_DELETE_RESOURCES_RESOURCE = "dataset_delete_resources"
@@ -260,7 +265,32 @@ class ConvergeProjectionStep:
             raise RetryablePipelineStepError(
                 DATASET_DELETE_DEPENDENCY_ERROR_CODE, DATASET_DELETE_DEPENDENCY_ERROR_MESSAGE
             )
-        await resources.graph_outbox_drain.process_dataset(dataset_id)
+        try:
+            await resources.graph_outbox_drain.process_dataset(dataset_id)
+        except GraphOutboxAttemptsExhaustedError:
+            # A relevant row -- not necessarily one of this run's own
+            # tracked outbox_ids -- settled FAILED at its attempt ceiling
+            # while this call was observing another owner's live lease.
+            # This is a real, deterministic outcome, not a dependency
+            # outage: the exact row-id check below (ADR-0010 Finding 2) is
+            # what actually decides pass/fail for *this run's* tracked ids,
+            # so let it run instead of masking this as retryable.
+            pass
+        except (ServiceUnavailable, SessionExpired, TransientError) as exc:
+            # Genuine transient Neo4j/transport failures. No durable
+            # graph_outbox bookkeeping needs to change for these to be
+            # worth retrying -- the whole step is safe to retry as-is.
+            raise RetryablePipelineStepError(
+                DATASET_DELETE_DEPENDENCY_ERROR_CODE, DATASET_DELETE_DEPENDENCY_ERROR_MESSAGE
+            ) from exc
+        # Anything else -- GraphOutboxPayloadMismatchError, a Neo4j
+        # ProjectionValidationError/ProjectionEndpointMissingError (which
+        # the dependency-ordering fix and the cross-row claim fence should
+        # together make structurally impossible here), or any other
+        # unexpected exception -- is a real defect, not a dependency
+        # outage. It must never be relabeled as retryable: that would hide
+        # the defect behind infinite retries instead of surfacing it.
+        # Deliberately left unclassified/propagating.
 
         async with PostgresUnitOfWork(context.session_factory) as uow:
             statuses = await uow.graph_outbox.list_status_by_ids(outbox_ids)

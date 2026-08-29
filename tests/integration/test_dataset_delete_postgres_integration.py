@@ -1538,3 +1538,208 @@ async def test_real_neo4j_dataset_delete_removes_only_owned_projection(
                 b=str(dataset_b),
             )
         await neo4j_resource.driver.close()
+
+
+# --- production incident regression: stale UPSERTs vs a fresh DELETE ----------
+#
+# Reproduces a real Easypanel production failure: a Dataset delete's own
+# fresh entity/relation DELETEs raced a still-unconverged Cognify run's
+# stale relation UPSERT for the same dataset. Before the fix,
+# list_processable_ids_for_dataset ordered purely by aggregate_type, so the
+# entity DELETEs could run before the older relation UPSERT, which then
+# failed with ProjectionEndpointMissingError once its Entity endpoint was
+# already gone -- surfacing as converge_projection's generic
+# STEP_UNEXPECTED_ERROR. The fix orders every UPSERT (dependency-ordered)
+# before every DELETE (reverse-dependency-ordered) within one dataset-wide
+# drain snapshot.
+
+
+class _EndpointCheckingProjection:
+    """Deterministic stand-in for a real ``GraphProjectionPort`` that
+    reproduces the exact production failure mode: a relation UPSERT whose
+    Entity endpoints are not both present raises
+    ``ProjectionEndpointMissingError``, mirroring ``Neo4jProjection``'s real
+    behavior when its Cypher MATCH for a relationship endpoint finds no
+    node."""
+
+    def __init__(self) -> None:
+        self.present_entities: set[str] = set()
+        self.applied: list[tuple[str, str, str]] = []
+
+    async def apply(self, command: Any) -> None:
+        self.applied.append((command.operation, command.aggregate_type, command.aggregate_id))
+        if command.aggregate_type == "entity":
+            if command.operation == "upsert":
+                self.present_entities.add(command.aggregate_id)
+            else:
+                self.present_entities.discard(command.aggregate_id)
+        elif command.aggregate_type == "relation" and command.operation == "upsert":
+            from sofias_memory.infrastructure.neo4j.projection import (
+                ProjectionEndpointMissingError,
+            )
+
+            missing = {
+                endpoint_id
+                for endpoint_id in command.endpoints.values()
+                if endpoint_id not in self.present_entities
+            }
+            if missing:
+                raise ProjectionEndpointMissingError(
+                    f"relation {command.aggregate_id} missing endpoints {missing}"
+                )
+
+
+async def seed_active_entity_with_key(
+    session_factory: AsyncSessionFactory, *, dataset_id: UUID, canonical_key: str
+) -> UUID:
+    """Like ``seed_active_entity``, but with a caller-chosen ``canonical_key``
+    -- needed to seed more than one active Entity for the same dataset,
+    since ``uq_entities_dataset_id_canonical_key_active`` rejects a second
+    row with the same (dataset_id, canonical_key)."""
+
+    from sofias_memory.infrastructure.postgres.models import Entity
+
+    entity_id = uuid4()
+    async with PostgresUnitOfWork(session_factory) as uow:
+        await uow.entities.add(
+            Entity(
+                id=entity_id,
+                dataset_id=dataset_id,
+                generation=0,
+                canonical_key=canonical_key,
+                name=canonical_key,
+                entity_type="Concept",
+                description="d",
+                aliases=[],
+                properties={},
+                confidence=0.9,
+                importance_weight=1.0,
+                embedding=None,
+                is_active=True,
+            )
+        )
+        await uow.commit()
+    return entity_id
+
+
+async def seed_stale_relation_upsert(
+    session_factory: AsyncSessionFactory,
+    *,
+    dataset_id: UUID,
+    source_entity_id: UUID,
+    target_entity_id: UUID,
+) -> int:
+    """Enqueue one PENDING relation UPSERT directly -- simulating a Cognify
+    run's projection command that never converged before an administrative
+    Dataset delete started."""
+
+    from sofias_memory.ports import relation_upsert_command
+
+    command = relation_upsert_command(
+        relation_id=uuid4(),
+        dataset_id=dataset_id,
+        source_entity_id=source_entity_id,
+        target_entity_id=target_entity_id,
+        predicate="relates_to",
+        description="stale unconverged relation",
+        confidence=0.9,
+        importance_weight=1.0,
+        generation=0,
+    )
+    async with PostgresUnitOfWork(session_factory) as uow:
+        event = await uow.graph_outbox.add_projection_command(command)
+        outbox_id = event.id
+        await uow.commit()
+    return outbox_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_end_to_end_dataset_delete_converges_with_stale_relation_upsert_pending(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Regression for the Easypanel production incident: a stale, still-
+    PENDING relation UPSERT left over from an earlier pipeline run must be
+    applied to completion *before* the Dataset delete's own entity/relation
+    DELETEs run, so the pipeline converges to SUCCEEDED/DELETED instead of
+    failing with ProjectionEndpointMissingError, and no graph_outbox row is
+    left behind capable of resurrecting the dataset's projection."""
+
+    projection = _EndpointCheckingProjection()
+    session_factory_for_drain = create_session_factory(postgres_engine)
+    from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
+
+    drain = GraphOutboxBatchProcessor(
+        session_factory=session_factory_for_drain,
+        processor=GraphOutboxProcessor(
+            session_factory=session_factory_for_drain, projection=projection
+        ),
+    )
+    app, session_factory, _ = build_harness(postgres_engine, tmp_path, dataset_delete_drain=drain)
+    await app.state.pipeline_worker.start()
+    try:
+        dataset_id = await seed_dataset(session_factory, slug="stale-relation-upsert-e2e")
+        entity_a = await seed_active_entity_with_key(
+            session_factory, dataset_id=dataset_id, canonical_key="stale-relation-entity-a"
+        )
+        entity_b = await seed_active_entity_with_key(
+            session_factory, dataset_id=dataset_id, canonical_key="stale-relation-entity-b"
+        )
+        # Mirrors the real incident: both entities' own UPSERTs already
+        # converged in an earlier drain, well before this run starts -- only
+        # the relation UPSERT below is still stuck. (Their DELETE, enqueued
+        # by this run's own deactivate_authoritative step, is what must not
+        # jump ahead of that stale relation UPSERT.)
+        projection.present_entities.update({str(entity_a), str(entity_b)})
+
+        # Pre-existing stale work: a relation UPSERT that never converged,
+        # referencing both active entities as its endpoints -- this must be
+        # applied before either entity's DELETE, or it fails.
+        stale_outbox_id = await seed_stale_relation_upsert(
+            session_factory,
+            dataset_id=dataset_id,
+            source_entity_id=entity_a,
+            target_entity_id=entity_b,
+        )
+
+        response = await delete_dataset(app, dataset_id)
+        assert response.status_code == 202
+        run_id = UUID(response.json()["data"]["run_id"])
+        run_status = await wait_for_status(
+            session_factory, run_id, {PipelineRunStatus.SUCCEEDED, PipelineRunStatus.FAILED}
+        )
+        assert run_status == PipelineRunStatus.SUCCEEDED
+        dataset_status = await wait_for_dataset_status(
+            session_factory, dataset_id, {DatasetStatus.DELETED}
+        )
+        assert dataset_status == DatasetStatus.DELETED
+
+        # The stale relation UPSERT must have been applied (and succeeded)
+        # strictly before either entity's DELETE -- proving the ordering fix,
+        # not merely that the pipeline happened to succeed.
+        upsert_index = next(
+            index
+            for index, (operation, aggregate_type, _id) in enumerate(projection.applied)
+            if operation == "upsert" and aggregate_type == "relation"
+        )
+        first_delete_index = next(
+            index
+            for index, (operation, _type, _id) in enumerate(projection.applied)
+            if operation == "delete"
+        )
+        assert upsert_index < first_delete_index
+
+        # No entity remains projected, and no outbox row for this dataset can
+        # later resurrect any part of its projection.
+        assert projection.present_entities == set()
+        async with PostgresUnitOfWork(session_factory) as uow:
+            steps = await uow.pipeline_steps.list_for_run(run_id)
+            deactivate_step = next(
+                step for step in steps if step.name == "deactivate_authoritative"
+            )
+            relevant_outbox_ids = [stale_outbox_id, *deactivate_step.output["graph_outbox_ids"]]
+            statuses = await uow.graph_outbox.list_status_by_ids(relevant_outbox_ids)
+        assert len(statuses) == len(relevant_outbox_ids)
+        assert all(status == GraphOutboxStatus.DONE for status, _attempt in statuses.values())
+    finally:
+        await app.state.pipeline_worker.stop()

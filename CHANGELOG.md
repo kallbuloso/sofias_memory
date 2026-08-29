@@ -2,6 +2,44 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.1.2]
+
+Patch release for a production defect found by the EASYPANEL-001 production
+smoke's Dataset-delete cleanup phase.
+
+### Fixes
+
+- Fixed a `graph_outbox` drain ordering defect where a mixed snapshot of
+  entity/chunk UPSERT and DELETE commands for the same Dataset could apply
+  DELETEs before older, still-unconverged UPSERTs, causing an administrative
+  Dataset delete's `converge_projection` step to fail once a relationship
+  UPSERT's endpoint node had already been removed.
+- Added a PostgreSQL-authoritative fence so a DELETE `graph_outbox` row for a
+  Dataset cannot be claimed -- by either the autonomous consumer or an
+  explicit dataset drain -- while that Dataset still has an UPSERT row
+  PENDING, PROCESSING under a live lease, or FAILED with retries remaining.
+  This closes a cross-row race that ordering alone did not: two different
+  outbox rows can no longer be applied out of dependency order by two
+  different workers, which previously risked stale projection work
+  resurrecting or otherwise breaking Neo4j graph state for a Dataset already
+  (or concurrently) being deleted.
+- Improved `DATASET_DELETE` error classification for its projection
+  convergence step: genuine transient Neo4j/transport failures are still
+  reported as a retryable dependency outage, but an unexpected or
+  programming-defect failure is no longer relabeled as retryable and masked
+  behind indefinite retries.
+
+### Compatibility
+
+- No public API contract change.
+- No request or response shape change.
+- No database schema migration.
+- No storage format change.
+
+This release candidate (`v0.1.2-rc.1`) has not yet been validated against a
+real Easypanel deployment; EASYPANEL-001 validation for this fix is still
+pending and is not claimed complete by this entry.
+
 ## [0.1.1]
 
 ### API documentation and Swagger

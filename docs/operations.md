@@ -261,7 +261,7 @@ docker compose run --rm sofias-memory alembic current
 docker run --rm --network <compose-network> \
   -e DATABASE_URL=... -e NEO4J_URI=... -e NEO4J_PASSWORD=... \
   -e API_KEY=... -e LLM_API_KEY=... \
-  sofias-memory:0.1.1 uv run --no-sync python scripts/rebuild_graph.py \
+  sofias-memory:0.1.2 uv run --no-sync python scripts/rebuild_graph.py \
   --all --confirm-all
 
 # 8. Start the application.
@@ -397,7 +397,7 @@ procedure — only how the image gets onto the host differs.
 ### B. First production start
 
 Follow §2 (First start) exactly, substituting the target image (built or
-pulled per §A) for `sofias-memory:0.1.1`. Do not skip the migration step
+pulled per §A) for `sofias-memory:0.1.2`. Do not skip the migration step
 (§3) or the readiness check — a deployment is not "up" until
 `/health/ready` reports `ready` and a production smoke run (§H) has passed.
 

@@ -12,9 +12,11 @@ The MVP operational async runtime passed its functional/integration/recovery gat
 Remember, Cognify, Recall, Improve, Forget, Dataset lifecycle, and Run
 retry/cancel are all implemented and durable, running through a single internal
 worker with PostgreSQL as the queue and source of truth. **v0.1.0** was the
-first stable MVP release; **v0.1.1** improves Swagger/OpenAPI documentation
-and developer UX (see `CHANGELOG.md`) with no business API, pipeline, or
-storage contract change — see
+first stable MVP release; **v0.1.1** improved Swagger/OpenAPI documentation
+and developer UX; **v0.1.2** is a patch release fixing a `graph_outbox`
+UPSERT/DELETE ordering and cross-row claim-race defect found during
+administrative Dataset deletion (see `CHANGELOG.md`), with no business API,
+pipeline, or storage contract change — see
 `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.
 

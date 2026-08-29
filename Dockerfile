@@ -9,7 +9,7 @@ FROM ghcr.io/astral-sh/uv:0.8.17 AS uv
 # built.
 FROM python:3.12.14-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579 AS runtime
 
-ARG APP_VERSION=0.1.1
+ARG APP_VERSION=0.1.2
 ARG VCS_REF=local
 
 LABEL org.opencontainers.image.title="Sofias Memory" \

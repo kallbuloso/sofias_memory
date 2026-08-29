@@ -24,6 +24,12 @@ from fastapi import APIRouter, File, Form, Header, Request, Response, UploadFile
 from pydantic import TypeAdapter, ValidationError
 
 from sofias_memory.api.errors import SofiasMemoryError, current_request_id
+from sofias_memory.api.openapi_responses import (
+    DATASET_NOT_FOUND_404,
+    IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+    RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
+    WORKER_DISABLED_503,
+)
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.models import Dataset
@@ -70,6 +76,22 @@ from sofias_memory.services.remember import (
 )
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_KEY_DESCRIPTION = (
+    "Optional retry-safety key for this write. Reusing the same key with the "
+    "same logical request returns the original PipelineRun instead of creating "
+    "duplicate work; reusing it for different work returns an idempotency "
+    "conflict. Keys starting with 'sys:' are reserved. Leave blank for ordinary "
+    "manual testing."
+)
+RETRY_SAFETY_DESCRIPTION = (
+    "\n\n**Retry safety:** clients may optionally send an `Idempotency-Key` "
+    "header (see the canonical /openapi.json for its full parameter "
+    "documentation -- it is omitted from this human-facing page for "
+    "readability). Reusing the same key for the same logical request returns "
+    "the original run instead of creating duplicate work; reusing it for "
+    "different work returns a conflict. Ordinary manual testing does not "
+    "require it."
+)
 UPLOAD_READ_CHUNK_SIZE_BYTES = 1024 * 1024
 METADATA_ADAPTER = TypeAdapter(dict[str, JSONValue])
 
@@ -79,20 +101,36 @@ router = APIRouter(tags=["remember"])
 @router.post(
     "/remember",
     response_model=SuccessEnvelope[RememberTextResult],
+    summary="Remember text content",
+    description=(
+        "Store raw text as a new source in a dataset. With `mode=ingest` (default) "
+        "the content is stored as-is for a later Cognify run -- no LLM cost. With "
+        "`mode=full` it is also chunked, embedded, and processed into entities and "
+        "relations immediately. Creates a durable PipelineRun; use `wait=false` for "
+        "an immediate `202` or `wait=true` to wait for the terminal result."
+        + RETRY_SAFETY_DESCRIPTION
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "The run was accepted durably and has not reached a terminal state "
                 "(wait=false, or wait=true timed out). Poll GET /api/v1/runs/{run_id}."
             )
-        }
+        },
+        HTTPStatus.BAD_REQUEST: RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
+        HTTPStatus.NOT_FOUND: DATASET_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: WORKER_DISABLED_503,
     },
 )
 async def remember_text(
     payload: RememberTextRequest,
     request: Request,
     response: Response,
-    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
 ) -> SuccessEnvelope[RememberTextResult]:
     validate_remember_mode(payload.mode)
     settings = app_settings(request.app)
@@ -138,20 +176,35 @@ async def remember_text(
 @router.post(
     "/remember/url",
     response_model=SuccessEnvelope[RememberTextResult],
+    summary="Remember an HTTPS URL",
+    description=(
+        "Fetch a single HTTPS URL and store its content as a new source in a "
+        "dataset. The fetch happens asynchronously in the worker, not during this "
+        "request; SSRF guards (loopback/link-local/private-network/cloud-metadata) "
+        "apply to the actual fetch. Same `mode`/`wait` semantics as text Remember."
+        + RETRY_SAFETY_DESCRIPTION
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "The run was accepted durably and has not reached a terminal state "
                 "(wait=false, or wait=true timed out). Poll GET /api/v1/runs/{run_id}."
             )
-        }
+        },
+        HTTPStatus.BAD_REQUEST: RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
+        HTTPStatus.NOT_FOUND: DATASET_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: WORKER_DISABLED_503,
     },
 )
 async def remember_url(
     payload: RememberUrlRequest,
     request: Request,
     response: Response,
-    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
 ) -> SuccessEnvelope[RememberTextResult]:
     validate_remember_mode(payload.mode)
     settings = app_settings(request.app)
@@ -196,26 +249,78 @@ async def remember_url(
 @router.post(
     "/remember/file",
     response_model=SuccessEnvelope[RememberTextResult],
+    summary="Upload a file to memory",
+    description=(
+        "Upload a supported text-bearing file (multipart/form-data) as a new "
+        "source in a dataset. Same `mode`/`wait` semantics as text Remember. "
+        "`metadata` is a JSON object encoded as a string form field, not native "
+        "JSON, because multipart form fields are always strings." + RETRY_SAFETY_DESCRIPTION
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "The run was accepted durably and has not reached a terminal state "
                 "(wait=false, or wait=true timed out). Poll GET /api/v1/runs/{run_id}."
             )
-        }
+        },
+        HTTPStatus.BAD_REQUEST: RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
+        HTTPStatus.NOT_FOUND: DATASET_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: WORKER_DISABLED_503,
     },
 )
 async def remember_file(
     request: Request,
     response: Response,
-    file: Annotated[UploadFile, File()],
-    dataset: Annotated[str, Form()] = "main",
-    metadata: Annotated[str | None, Form()] = None,
-    session_id: Annotated[str | None, Form()] = None,
-    mode: Annotated[str, Form()] = "ingest",
-    wait: Annotated[bool, Form()] = True,
-    force: Annotated[bool, Form()] = False,
-    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
+    file: Annotated[UploadFile, File(description="The file to remember.")],
+    dataset: Annotated[
+        str,
+        Form(description="Target dataset slug. Created automatically only if it is 'main'."),
+    ] = "main",
+    metadata: Annotated[
+        str | None,
+        Form(
+            description=(
+                'Optional metadata as a JSON object encoded as a string, e.g. \'{"k":"v"}\'.'
+            )
+        ),
+    ] = None,
+    session_id: Annotated[
+        str | None,
+        Form(
+            description="Optional caller-supplied session identifier, stored for correlation only."
+        ),
+    ] = None,
+    mode: Annotated[
+        str,
+        Form(
+            description=(
+                "'ingest' stores the file as-is for a later Cognify run. 'full' also "
+                "chunks, embeds, and extracts entities/relations immediately."
+            )
+        ),
+    ] = "ingest",
+    wait: Annotated[
+        bool,
+        Form(
+            description=(
+                "If true, wait for this run to reach a terminal state before responding. "
+                "If false, return as soon as the run is durably queued."
+            )
+        ),
+    ] = True,
+    force: Annotated[
+        bool,
+        Form(
+            description=(
+                "Re-process even if identical content was already remembered for this dataset."
+            )
+        ),
+    ] = False,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
 ) -> SuccessEnvelope[RememberTextResult]:
     validate_remember_mode(mode)
     settings = app_settings(request.app)

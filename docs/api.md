@@ -49,9 +49,11 @@ X-API-Key: sf-...
 ```
 
 compared against the configured key in constant time. `GET /health/live` and
-`GET /health/ready` are the only routes that do not require it. A missing key
-returns `401 MISSING_API_KEY`; a wrong key returns `401 INVALID_API_KEY`. The key
-is never accepted as a query string parameter.
+`GET /health/ready` are the only routes that do not require it (`/docs` and
+`/openapi.json` are also exempt, but only exist at all when `APP_ENV=dev` or
+`development`). A missing key returns `401 MISSING_API_KEY`; a wrong key
+returns `403 INVALID_API_KEY`. The key is never accepted as a query string
+parameter.
 
 ```bash
 curl -sS "$SOFIAS_MEMORY_URL/health/live"
@@ -120,15 +122,16 @@ curl -sS -o /dev/null -w "%{http_code}\n" "$SOFIAS_MEMORY_URL/api/v1/info"
 # 401, body: {"error":{"code":"MISSING_API_KEY", ...}}
 ```
 
-Example — validation error (HTTP `422`, using FastAPI's standard
-`HTTPValidationError` shape rather than the envelope above — this is the one
-place the response shape differs, since it comes from request parsing itself):
+Example — validation error (HTTP `422`, same `ErrorEnvelope` shape as every
+other error, with `error.code=INVALID_REQUEST` and each field-level problem
+listed in `error.details.errors`):
 
 ```bash
 curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/remember" \
   -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
   -d '{}'
-# 422, body: {"detail":[{"loc":["body","content"],"msg":"Field required", ...}]}
+# 422, body: {"error":{"code":"INVALID_REQUEST","message":"Invalid request.",
+#   "details":{"errors":[{"loc":["body","content"],"msg":"Field required", ...}]}, ...}}
 ```
 
 ## 4. `Idempotency-Key`

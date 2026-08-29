@@ -37,14 +37,46 @@ class RecallRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(min_length=1, max_length=4000)
-    datasets: list[str] = Field(default_factory=lambda: ["main"], min_length=1)
-    mode: RecallMode = "rag"
-    top_k: int | None = Field(default=None, ge=1)
-    only_context: bool = False
-    include_references: bool = True
-    session_id: str | None = Field(default=None, max_length=255)
-    filters: RecallFilters = Field(default_factory=RecallFilters)
+    query: str = Field(
+        min_length=1,
+        max_length=4000,
+        description="The question or search text to retrieve context for.",
+        examples=["What component does Project Aurora use?"],
+    )
+    datasets: list[str] = Field(
+        default_factory=lambda: ["main"],
+        min_length=1,
+        description="Dataset slugs to search. Results are combined across all listed datasets.",
+    )
+    mode: RecallMode = Field(
+        default="rag",
+        description=(
+            "'chunks': ranked vector-search chunks. 'summaries': document summaries. "
+            "'graph': entity/relation subgraph traversal seeded from the query. "
+            "'triplets': authoritative entity/relation triplets. 'hybrid': "
+            "rank-fused vector+graph retrieval. 'rag': hybrid retrieval plus a "
+            "generated, provenance-backed answer (the only mode that calls the LLM)."
+        ),
+    )
+    top_k: int | None = Field(
+        default=None, ge=1, description="Maximum number of context items to return."
+    )
+    only_context: bool = Field(
+        default=False,
+        description="If true, skip answer generation even in mode=rag and return only context.",
+    )
+    include_references: bool = Field(
+        default=True, description="Include provenance references alongside the context."
+    )
+    session_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Optional caller-supplied session identifier, stored for correlation only.",
+    )
+    filters: RecallFilters = Field(
+        default_factory=RecallFilters,
+        description="Optional fixed filters applied to chunk retrieval.",
+    )
 
     @field_validator("query")
     @classmethod
@@ -153,11 +185,25 @@ class RecallResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    query_id: UUID
-    mode: str
-    answer: str | None
-    context: list[RecallContextItem | RecallSummaryContextItem]
-    references: list[RecallReference]
-    entities: list[RecallEntity] = Field(default_factory=list)
-    relations: list[RecallRelation] = Field(default_factory=list)
-    timings_ms: dict[str, int]
+    query_id: UUID = Field(
+        description="Durable identifier for this query, used for provenance/feedback."
+    )
+    mode: str = Field(description="The recall mode that was actually executed.")
+    answer: str | None = Field(
+        description=(
+            "LLM-generated answer (mode=rag only, unless only_context=true). Null otherwise."
+        )
+    )
+    context: list[RecallContextItem | RecallSummaryContextItem] = Field(
+        description="Ranked retrieved context items backing the answer, if any."
+    )
+    references: list[RecallReference] = Field(
+        description="Deterministic provenance references for each retrieved chunk."
+    )
+    entities: list[RecallEntity] = Field(
+        default_factory=list, description="Entities returned by graph/triplets/hybrid modes."
+    )
+    relations: list[RecallRelation] = Field(
+        default_factory=list, description="Relations returned by graph/triplets/hybrid modes."
+    )
+    timings_ms: dict[str, int] = Field(description="Per-stage timing breakdown in milliseconds.")

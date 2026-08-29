@@ -16,6 +16,11 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Request, Response
 
 from sofias_memory.api.errors import current_request_id
+from sofias_memory.api.openapi_responses import (
+    RUN_NOT_FOUND_404,
+    RUN_RETRY_CONFLICT_409,
+    WORKER_DISABLED_503,
+)
 from sofias_memory.domain import PipelineRunStatus, PipelineType
 from sofias_memory.lifespan import (
     app_pipeline_registry,
@@ -36,7 +41,14 @@ from sofias_memory.services.runs import RunService
 router = APIRouter(tags=["runs"])
 
 
-@router.get("/runs", response_model=SuccessEnvelope[RunListResult])
+@router.get(
+    "/runs",
+    response_model=SuccessEnvelope[RunListResult],
+    summary="List pipeline runs",
+    description=(
+        "List durable PipelineRuns, paginated, optionally filtered by status, type, or dataset."
+    ),
+)
 async def list_runs(
     request: Request,
     limit: int = Query(default=RUN_PAGE_DEFAULT_LIMIT, ge=1, le=RUN_PAGE_MAX_LIMIT),
@@ -59,7 +71,16 @@ async def list_runs(
     )
 
 
-@router.get("/runs/{run_id}", response_model=SuccessEnvelope[RunDetailResult])
+@router.get(
+    "/runs/{run_id}",
+    response_model=SuccessEnvelope[RunDetailResult],
+    summary="Get pipeline run details",
+    description=(
+        "Get one PipelineRun's full status, progress, and per-step plan. Use "
+        "this to poll a run created with wait=false to a terminal state."
+    ),
+    responses={HTTPStatus.NOT_FOUND: RUN_NOT_FOUND_404},
+)
 async def get_run(
     run_id: UUID,
     request: Request,
@@ -84,13 +105,22 @@ def _control_service(request: Request) -> RunControlService:
 @router.post(
     "/runs/{run_id}/cancel",
     response_model=SuccessEnvelope[RunDetailResult],
+    summary="Cancel a pipeline run",
+    description=(
+        "Request cooperative cancellation of a run. This never forcibly interrupts "
+        "an in-flight external call (e.g. an LLM request already in progress) -- "
+        "the run transitions to CANCELLING and finishes its current step before "
+        "reaching the terminal CANCELLED state. Only a QUEUED or RUNNING run can "
+        "be cancelled."
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "Cancellation was accepted (RUNNING -> CANCELLING, or already "
                 "CANCELLING). Poll GET /api/v1/runs/{run_id} for the terminal state."
             )
-        }
+        },
+        HTTPStatus.NOT_FOUND: RUN_NOT_FOUND_404,
     },
 )
 async def cancel_run(
@@ -110,13 +140,23 @@ async def cancel_run(
 @router.post(
     "/runs/{run_id}/retry",
     response_model=SuccessEnvelope[RunDetailResult],
+    summary="Retry a pipeline run",
+    description=(
+        "Create a new run that re-attempts the same work as a failed or cancelled "
+        "run. The new run is a separate, immutable child (its `run_id` differs and "
+        "its `attempt` is incremented) -- the original run's history is never "
+        "mutated. Only a terminal, non-succeeded run can be retried."
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "A new (or already-existing, still non-terminal) retry run was "
                 "accepted. Poll GET /api/v1/runs/{run_id} for the terminal state."
             )
-        }
+        },
+        HTTPStatus.NOT_FOUND: RUN_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: RUN_RETRY_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: WORKER_DISABLED_503,
     },
 )
 async def retry_run(

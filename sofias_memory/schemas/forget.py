@@ -11,21 +11,39 @@ from sofias_memory.domain import PipelineRunStatus
 
 
 class ForgetRequest(BaseModel):
-    """Forget request for one of three scopes.
+    """Forget request for one of three scopes: SOURCE, DATASET, or EVERYTHING.
 
-    Scope is not a request field. It is derived by the service from which
-    fields were actually present in the payload (``source_id``, ``everything``,
-    or an explicit ``dataset``), so the wire-compatible SOURCE contract from
-    SM-422 keeps working unchanged.
+    Scope is not a request field. It is derived from which fields are
+    actually present in the payload (``source_id``, ``everything``, or an
+    explicit ``dataset`` alone).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    dataset: str = Field(default="main", min_length=1)
-    source_id: UUID | None = Field(default=None)
-    everything: bool = Field(default=False)
-    confirm: str | None = Field(default=None)
-    memory_only: bool = Field(default=False)
+    dataset: str = Field(
+        default="main", min_length=1, description="Dataset slug (SOURCE/DATASET scope)."
+    )
+    source_id: UUID | None = Field(
+        default=None,
+        description="Present to scope this Forget to a single source within the dataset.",
+    )
+    everything: bool = Field(
+        default=False,
+        description=(
+            'Destructive: forget every dataset\'s memory. Requires confirm="DELETE EVERYTHING".'
+        ),
+    )
+    confirm: str | None = Field(
+        default=None,
+        description='Required, exact confirmation phrase for everything=true: "DELETE EVERYTHING".',
+    )
+    memory_only: bool = Field(
+        default=False,
+        description=(
+            "Clear derived memory (chunks/entities/relations/summaries/graph) but "
+            "keep the original source stored, so it can be re-cognified later."
+        ),
+    )
     wait: bool = Field(
         default=True,
         description=(
@@ -55,8 +73,10 @@ class ForgetSourceResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope: Literal["source"] = "source"
-    run_id: UUID
-    status: PipelineRunStatus
+    run_id: UUID = Field(
+        description="Durable PipelineRun identifier. Poll GET /api/v1/runs/{run_id}."
+    )
+    status: PipelineRunStatus = Field(description="Current status of the underlying PipelineRun.")
     dataset_id: UUID | None = None
     source_id: UUID | None = None
     memory_only: bool | None = None
@@ -83,8 +103,10 @@ class ForgetDatasetResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope: Literal["dataset"] = "dataset"
-    run_id: UUID
-    status: PipelineRunStatus
+    run_id: UUID = Field(
+        description="Durable PipelineRun identifier. Poll GET /api/v1/runs/{run_id}."
+    )
+    status: PipelineRunStatus = Field(description="Current status of the underlying PipelineRun.")
     dataset_id: UUID | None = None
     memory_only: bool | None = None
     sources_affected: int | None = None
@@ -109,8 +131,10 @@ class ForgetEverythingResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope: Literal["everything"] = "everything"
-    run_id: UUID
-    status: PipelineRunStatus
+    run_id: UUID = Field(
+        description="Durable PipelineRun identifier. Poll GET /api/v1/runs/{run_id}."
+    )
+    status: PipelineRunStatus = Field(description="Current status of the underlying PipelineRun.")
     datasets_affected: int | None = None
     sources_affected: int | None = None
     sources_pending: int | None = None

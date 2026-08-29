@@ -21,9 +21,16 @@ class DatasetCreateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=DATASET_NAME_MAX_LENGTH)
-    description: str | None = Field(default=None)
-    slug: str | None = Field(default=None, min_length=1, max_length=DATASET_SLUG_MAX_LENGTH)
+    name: str = Field(
+        min_length=1, max_length=DATASET_NAME_MAX_LENGTH, description="Human-readable dataset name."
+    )
+    description: str | None = Field(default=None, description="Optional free-text description.")
+    slug: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=DATASET_SLUG_MAX_LENGTH,
+        description="URL-safe identifier. Derived from name if omitted.",
+    )
 
     @field_validator("name", "description", "slug")
     @classmethod
@@ -41,7 +48,9 @@ class DatasetRenameRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=DATASET_NAME_MAX_LENGTH)
+    name: str = Field(
+        min_length=1, max_length=DATASET_NAME_MAX_LENGTH, description="New human-readable name."
+    )
 
     @field_validator("name")
     @classmethod
@@ -69,8 +78,7 @@ class DatasetResult(BaseModel):
 
 class DatasetDeleteCounters(BaseModel):
     """Terminal, PostgreSQL-derived counters for a succeeded administrative
-    Dataset delete (ADR-0010 D24) -- never reconstructed from Neo4j or the
-    filesystem."""
+    Dataset delete -- never reconstructed from Neo4j or the filesystem."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -86,15 +94,18 @@ class DatasetDeleteCounters(BaseModel):
 
 
 class DatasetDeleteResult(BaseModel):
-    """Public projection of an administrative Dataset delete request/observation
-    (SM-515, ADR-0010 D23/D24)."""
+    """Public projection of an administrative Dataset delete request/observation."""
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: UUID
-    dataset_id: UUID
-    status: PipelineRunStatus
-    counters: DatasetDeleteCounters | None = None
+    run_id: UUID = Field(
+        description="Durable PipelineRun identifier. Poll GET /api/v1/runs/{run_id}."
+    )
+    dataset_id: UUID = Field(description="Dataset being administratively deleted.")
+    status: PipelineRunStatus = Field(description="Current status of the underlying PipelineRun.")
+    counters: DatasetDeleteCounters | None = Field(
+        default=None, description="Populated only once the delete run has succeeded."
+    )
 
 
 class DatasetListResult(BaseModel):

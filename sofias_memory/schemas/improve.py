@@ -19,12 +19,20 @@ ImproveStage = Literal[
 
 
 class ImproveRequest(BaseModel):
-    """Durable improve request (SM-511)."""
+    """Durable improve request."""
 
     model_config = ConfigDict(extra="forbid")
 
-    dataset: str = Field(default="main", min_length=1)
-    stages: list[ImproveStage] | None = Field(default=None, min_length=1)
+    dataset: str = Field(default="main", min_length=1, description="Dataset slug to improve.")
+    stages: list[ImproveStage] | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Which maintenance stages to run: feedback_weights, "
+            "entity_deduplication, relation_embeddings, summaries, "
+            "graph_reconciliation. Omit to run all stages."
+        ),
+    )
     wait: bool = Field(
         default=False,
         description=(
@@ -55,11 +63,15 @@ class ImproveResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: UUID
-    status: PipelineRunStatus
-    dataset_id: UUID | None = None
-    generation: int | None = None
-    stages: list[str] | None = None
+    run_id: UUID = Field(
+        description="Durable PipelineRun identifier. Poll GET /api/v1/runs/{run_id}."
+    )
+    status: PipelineRunStatus = Field(description="Current status of the underlying PipelineRun.")
+    dataset_id: UUID | None = Field(default=None, description="Dataset this run improved.")
+    generation: int | None = Field(
+        default=None, description="Dataset generation this run acted on."
+    )
+    stages: list[str] | None = Field(default=None, description="Stages actually executed.")
     feedback_processed: int | None = None
     feedback_applied: int | None = None
     feedback_skipped: int | None = None

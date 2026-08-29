@@ -14,9 +14,21 @@ class CognifyRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    dataset: str = Field(default="main", min_length=1)
-    source_ids: list[UUID] | None = Field(default=None)
-    rebuild: bool = Field(default=False)
+    dataset: str = Field(default="main", min_length=1, description="Dataset slug to process.")
+    source_ids: list[UUID] | None = Field(
+        default=None,
+        description=(
+            "Process only these specific source ids. Omit to process all pending "
+            "sources in the dataset. Mutually exclusive with rebuild=true."
+        ),
+    )
+    rebuild: bool = Field(
+        default=False,
+        description=(
+            "Reprocess the whole dataset onto a new generation instead of only "
+            "pending sources. Always covers the whole dataset; rejects source_ids."
+        ),
+    )
     wait: bool = Field(
         default=True,
         description=(
@@ -47,11 +59,18 @@ class CognifyResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: UUID
-    status: PipelineRunStatus
-    dataset_id: UUID | None = None
-    generation: int | None = None
-    sources_processed: int | None = None
-    chunks: int | None = None
-    entities: int | None = None
-    relations: int | None = None
+    run_id: UUID = Field(
+        description="Durable PipelineRun identifier. Poll GET /api/v1/runs/{run_id}."
+    )
+    status: PipelineRunStatus = Field(description="Current status of the underlying PipelineRun.")
+    dataset_id: UUID | None = Field(default=None, description="Dataset this run processed.")
+    generation: int | None = Field(
+        default=None,
+        description="Dataset generation activated by this run (only set after rebuild=true).",
+    )
+    sources_processed: int | None = Field(
+        default=None, description="Number of sources processed by this run."
+    )
+    chunks: int | None = Field(default=None, description="Number of chunks created.")
+    entities: int | None = Field(default=None, description="Number of entities extracted.")
+    relations: int | None = Field(default=None, description="Number of relations extracted.")

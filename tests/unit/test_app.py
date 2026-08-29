@@ -276,11 +276,10 @@ async def test_openapi_enabled_in_development(log_stream: StringIO) -> None:
 
     assert response.status_code == 200
     schema = response.json()
-    assert schema["components"]["securitySchemes"]["ApiKeyAuth"] == {
-        "type": "apiKey",
-        "in": "header",
-        "name": "X-API-Key",
-    }
+    scheme = schema["components"]["securitySchemes"]["ApiKeyAuth"]
+    assert scheme["type"] == "apiKey"
+    assert scheme["in"] == "header"
+    assert scheme["name"] == "X-API-Key"
 
 
 @pytest.mark.asyncio

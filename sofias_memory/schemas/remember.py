@@ -15,14 +15,47 @@ class RememberTextRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    dataset: str = Field(default="main", min_length=1)
-    content: str = Field(min_length=1)
-    name: str | None = Field(default=None, min_length=1)
-    metadata: dict[str, JSONValue] = Field(default_factory=dict)
-    session_id: str | None = Field(default=None, min_length=1)
-    mode: str = Field(default="ingest")
-    wait: bool = Field(default=True)
-    force: bool = Field(default=False)
+    dataset: str = Field(
+        default="main",
+        min_length=1,
+        description="Target dataset slug. Created automatically only if it is 'main'.",
+    )
+    content: str = Field(
+        min_length=1,
+        description="Raw text content to store.",
+        examples=["Project Aurora uses component Nimbus."],
+    )
+    name: str | None = Field(
+        default=None, min_length=1, description="Optional human-readable name for this source."
+    )
+    metadata: dict[str, JSONValue] = Field(
+        default_factory=dict,
+        description="Arbitrary caller-supplied metadata stored with the source.",
+    )
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Optional caller-supplied session identifier, stored for correlation only.",
+    )
+    mode: str = Field(
+        default="ingest",
+        description=(
+            "'ingest' stores the content as-is for a later Cognify run. 'full' also "
+            "chunks, embeds, and extracts entities/relations immediately."
+        ),
+    )
+    wait: bool = Field(
+        default=True,
+        description=(
+            "If true, wait for this run to reach a terminal state (up to the "
+            "configured timeout) before responding. If false, return as soon as the "
+            "run is durably queued."
+        ),
+    )
+    force: bool = Field(
+        default=False,
+        description="Re-process even if identical content was already remembered for this dataset.",
+    )
 
     @field_validator("dataset", "name", "session_id")
     @classmethod
@@ -40,13 +73,47 @@ class RememberUrlRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    dataset: str = Field(default="main", min_length=1)
-    url: str = Field(min_length=1, max_length=2048)
-    metadata: dict[str, JSONValue] = Field(default_factory=dict)
-    session_id: str | None = Field(default=None, min_length=1)
-    mode: str = Field(default="ingest")
-    wait: bool = Field(default=True)
-    force: bool = Field(default=False)
+    dataset: str = Field(
+        default="main",
+        min_length=1,
+        description="Target dataset slug. Created automatically only if it is 'main'.",
+    )
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description=(
+            "A single HTTPS URL to fetch and remember. Loopback, link-local, "
+            "private-network, and cloud-metadata addresses are rejected."
+        ),
+    )
+    metadata: dict[str, JSONValue] = Field(
+        default_factory=dict,
+        description="Arbitrary caller-supplied metadata stored with the source.",
+    )
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Optional caller-supplied session identifier, stored for correlation only.",
+    )
+    mode: str = Field(
+        default="ingest",
+        description=(
+            "'ingest' stores the fetched content as-is for a later Cognify run. "
+            "'full' also chunks, embeds, and extracts entities/relations immediately."
+        ),
+    )
+    wait: bool = Field(
+        default=True,
+        description=(
+            "If true, wait for this run to reach a terminal state (up to the "
+            "configured timeout) before responding. If false, return as soon as the "
+            "run is durably queued."
+        ),
+    )
+    force: bool = Field(
+        default=False,
+        description="Re-process even if identical content was already remembered for this dataset.",
+    )
 
     @field_validator("dataset", "url", "session_id")
     @classmethod
@@ -63,22 +130,44 @@ class RememberTextResult(BaseModel):
     """Result of a remember run (text/file/url; ``mode=ingest``/``full``).
 
     Business fields are optional/``None`` when the run has not yet reached
-    ``succeeded`` (SM-513, matching Cognify/Improve/Forget's B5 pattern) --
-    only ``run_id``/``status`` are guaranteed for ``queued``/``running``/
-    ``cancelling``/``cancelled``."""
+    ``succeeded`` -- only ``run_id``/``status`` are guaranteed for
+    ``queued``/``running``/``cancelling``/``cancelled``."""
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: UUID
-    status: PipelineRunStatus
-    dataset_id: UUID | None = None
-    source_id: UUID | None = None
-    document_id: UUID | None = None
-    content_hash: str | None = Field(default=None, min_length=64, max_length=64)
-    chunks: int | None = None
-    entities: int | None = None
-    relations: int | None = None
-    deduplicated: bool | None = None
+    run_id: UUID = Field(
+        description="Durable PipelineRun identifier. Poll GET /api/v1/runs/{run_id}."
+    )
+    status: PipelineRunStatus = Field(description="Current status of the underlying PipelineRun.")
+    dataset_id: UUID | None = Field(
+        default=None, description="Target dataset id. Present once the run has resolved it."
+    )
+    source_id: UUID | None = Field(
+        default=None, description="Persisted source id. Present only once the run succeeds."
+    )
+    document_id: UUID | None = Field(
+        default=None,
+        description="Normalized document id (mode=full only). Present only once the run succeeds.",
+    )
+    content_hash: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        description="SHA-256 of the normalized content, used for de-duplication.",
+    )
+    chunks: int | None = Field(
+        default=None, description="Number of chunks created (mode=full only)."
+    )
+    entities: int | None = Field(
+        default=None, description="Number of entities extracted (mode=full only)."
+    )
+    relations: int | None = Field(
+        default=None, description="Number of relations extracted (mode=full only)."
+    )
+    deduplicated: bool | None = Field(
+        default=None,
+        description="True if this content was already known and no new processing was needed.",
+    )
 
 
 __all__ = [

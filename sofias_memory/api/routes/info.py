@@ -15,14 +15,29 @@ class ApplicationInfo(BaseModel):
 
     name: str = Field(description="Application name.")
     version: str = Field(description="Application release version.")
-    environment: str = Field(description="Configured application environment.")
-    config_fingerprint: str = Field(description="Safe functional configuration fingerprint.")
+    environment: str = Field(description="Configured application environment (APP_ENV).")
+    config_fingerprint: str = Field(
+        description=(
+            "Stable hash of the functional configuration currently loaded. Two "
+            "instances with the same fingerprint have the same effective settings; "
+            "never reveals any secret value itself."
+        )
+    )
     llm_model: str = Field(description="Configured OpenAI-compatible LLM model.")
     embedding_model: str = Field(description="Configured OpenAI-compatible embedding model.")
     embedding_dimensions: int = Field(description="Configured embedding vector dimensions.")
 
 
-@router.get("/info", response_model=SuccessEnvelope[ApplicationInfo])
+@router.get(
+    "/info",
+    response_model=SuccessEnvelope[ApplicationInfo],
+    summary="Get application info",
+    description=(
+        "Returns non-secret application identity and configuration -- name, "
+        "version, environment, a configuration fingerprint, and the configured "
+        "LLM/embedding models. Requires `X-API-Key`."
+    ),
+)
 async def info(request: Request) -> SuccessEnvelope[ApplicationInfo]:
     settings = app_settings(request.app)
     return SuccessEnvelope[ApplicationInfo](

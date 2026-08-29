@@ -36,6 +36,8 @@ DOCS_PUBLIC_PATHS = frozenset(
         "/docs",
         "/docs/",
         "/openapi.json",
+        "/openapi-docs.json",
+        "/openapi-docs.json/",
         "/redoc",
         "/redoc/",
     }

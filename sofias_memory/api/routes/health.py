@@ -54,12 +54,33 @@ class RegisteredReadinessCheck:
     check: ReadinessCheck
 
 
-@router.get("/health/live", response_model=LiveHealthResponse)
+@router.get(
+    "/health/live",
+    response_model=LiveHealthResponse,
+    summary="Check process liveness",
+    description=(
+        "Reports whether the process is running at all. Never checks PostgreSQL, "
+        "Neo4j, or the worker -- a process that answers here can still have "
+        "`/health/ready` report `not_ready`. Never requires `X-API-Key`."
+    ),
+)
 async def live() -> LiveHealthResponse:
     return LiveHealthResponse()
 
 
-@router.get("/health/ready", response_model=ReadinessResponse, response_model_exclude_none=True)
+@router.get(
+    "/health/ready",
+    response_model=ReadinessResponse,
+    response_model_exclude_none=True,
+    summary="Check dependency and worker readiness",
+    description=(
+        "Reports whether PostgreSQL, Neo4j, and the internal worker are all "
+        "reachable and operational. Returns `503` with `status=not_ready` if any "
+        "check fails -- existing reads may still work, but a request that would "
+        "create a new durable PipelineRun can be rejected. Never requires "
+        "`X-API-Key`."
+    ),
+)
 async def ready(request: Request, response: Response) -> ReadinessResponse:
     checks = app_readiness_checks(request.app)
     readiness = await run_readiness_checks(checks)

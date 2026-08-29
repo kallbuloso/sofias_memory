@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Any, cast
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import HTMLResponse
 from starlette.types import ExceptionHandler
 
 from sofias_memory.api.errors import (
@@ -82,6 +85,7 @@ from sofias_memory.pipelines.steps.remember import (
     REMEMBER_RESOURCES_RESOURCE,
     RememberPipelineResources,
 )
+from sofias_memory.schemas.common import ErrorEnvelope
 from sofias_memory.services.cognify import CognifyService
 from sofias_memory.services.graph_maintenance_service import GraphMaintenanceService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
@@ -103,6 +107,71 @@ WORKER_NOT_READY_DETAIL = "worker not ready"
 # "production" default -- is fail-closed to no docs surface at all.
 DOCS_ENABLED_APP_ENVS = frozenset({"dev", "development"})
 
+API_DESCRIPTION = """\
+Sofias Memory is a single-user semantic memory and knowledge graph service.
+It ingests text, files, and HTTPS URLs (**Remember**), turns stored content
+into chunks, embeddings, entities, and relations (**Cognify**), and answers
+queries by combining vector search, lexical search, and graph traversal, with
+an optional LLM-generated answer and provenance back to the source
+(**Recall**). Background maintenance (**Improve**) refines ranking and graph
+quality; **Forget** and administrative dataset deletion remove memory.
+
+Every write (Remember, Cognify, Improve, Forget, dataset deletion) creates a
+durable, observable **PipelineRun**. Pass `wait=false` to get an immediate
+`202` response once the run is durably queued, or `wait=true` to have the
+request itself wait for the run to reach a terminal state (up to a configured
+timeout) -- both paths create and observe the exact same run; poll
+`GET /api/v1/runs/{run_id}` at any time to check progress.
+
+All routes under `/api/v1` require a static API key sent as the `X-API-Key`
+header. Use the **Authorize** button above to enter it once for this page;
+`/health/live` and `/health/ready` never require it.
+"""
+
+TAG_METADATA: list[dict[str, str]] = [
+    {"name": "health", "description": "Process liveness and dependency/worker readiness."},
+    {"name": "info", "description": "Public, non-secret application/configuration summary."},
+    {
+        "name": "remember",
+        "description": "Ingest text, files, and HTTPS URLs into durable memory pipelines.",
+    },
+    {
+        "name": "cognify",
+        "description": "Convert stored sources into chunks, embeddings, and semantic knowledge.",
+    },
+    {
+        "name": "recall",
+        "description": "Retrieve stored knowledge using the supported recall modes.",
+    },
+    {
+        "name": "improve",
+        "description": (
+            "Background hygiene: ranking feedback, entity dedup, and graph reconciliation."
+        ),
+    },
+    {"name": "forget", "description": "Remove memory by source, dataset, or everything."},
+    {
+        "name": "datasets",
+        "description": "Create, inspect, update, and administratively delete memory datasets.",
+    },
+    {"name": "runs", "description": "Observe, cancel, and retry durable PipelineRuns."},
+    {"name": "graph", "description": "Read the entity/relationship knowledge graph directly."},
+    {
+        "name": "provenance",
+        "description": "Trace retrieved evidence back to its source, document, or chunk.",
+    },
+    {
+        "name": "feedback",
+        "description": "Record relevance feedback used by Improve to adjust ranking.",
+    },
+]
+
+API_KEY_SECURITY_SCHEME_DESCRIPTION = (
+    "Static Sofias Memory API key. Enter only the key value; Swagger UI sends "
+    "it as the X-API-Key header on every request to a protected /api/v1/** "
+    "operation."
+)
+
 
 def create_app(
     settings: Settings | None = None,
@@ -123,8 +192,13 @@ def create_app(
     application = FastAPI(
         title=resolved_settings.app_name,
         version=resolved_settings.app_version,
+        description=API_DESCRIPTION,
+        openapi_tags=TAG_METADATA,
         lifespan=lifespan,
-        docs_url="/docs" if docs_enabled else None,
+        # /docs is mounted manually below, pointed at the separate
+        # documentation-only schema (/openapi-docs.json) rather than the
+        # canonical one -- see _mount_documentation_only_docs.
+        docs_url=None,
         openapi_url="/openapi.json" if docs_enabled else None,
         redoc_url=None,
     )
@@ -272,6 +346,9 @@ def create_app(
     application.add_middleware(RequestMetricsMiddleware)
 
     application.openapi = _custom_openapi(application)  # type: ignore[method-assign]
+
+    if docs_enabled:
+        _mount_documentation_only_docs(application)
 
     return application
 
@@ -478,6 +555,62 @@ header); it changes no runtime behavior, since the middleware already
 enforces it regardless of what the schema says."""
 
 
+ERROR_ENVELOPE_SCHEMA_REF = "#/components/schemas/ErrorEnvelope"
+
+MISSING_API_KEY_RESPONSE: dict[str, Any] = {
+    "description": (
+        "The X-API-Key header is missing. Returns an ErrorEnvelope with error.code=MISSING_API_KEY."
+    ),
+    "content": {"application/json": {"schema": {"$ref": ERROR_ENVELOPE_SCHEMA_REF}}},
+}
+
+INVALID_API_KEY_RESPONSE: dict[str, Any] = {
+    "description": (
+        "The X-API-Key header was sent but does not match the configured key. "
+        "Returns an ErrorEnvelope with error.code=INVALID_API_KEY."
+    ),
+    "content": {"application/json": {"schema": {"$ref": ERROR_ENVELOPE_SCHEMA_REF}}},
+}
+
+VALIDATION_ERROR_RESPONSE: dict[str, Any] = {
+    "description": (
+        "The request failed schema validation. Returns an ErrorEnvelope with "
+        "error.code=INVALID_REQUEST and error.details.errors listing each "
+        "field-level problem -- not FastAPI's default validation error shape."
+    ),
+    "content": {"application/json": {"schema": {"$ref": ERROR_ENVELOPE_SCHEMA_REF}}},
+}
+
+INTERNAL_ERROR_RESPONSE: dict[str, Any] = {
+    "description": (
+        "An unexpected internal error occurred. Returns an ErrorEnvelope with "
+        "error.code=INTERNAL_ERROR; the response never includes a stack trace "
+        "or other internal detail."
+    ),
+    "content": {"application/json": {"schema": {"$ref": ERROR_ENVELOPE_SCHEMA_REF}}},
+}
+
+# FastAPI's auto-generated response for request-validation failures
+# references its own default HTTPValidationError/ValidationError shape,
+# which this application never actually returns --
+# request_validation_error_handler always returns an ErrorEnvelope instead
+# (see sofias_memory/api/errors.py). These names are only ever replaced, not
+# added: a path without FastAPI's own "422" entry has no validatable
+# parameters/body and gets no fabricated validation-error documentation.
+_UNUSED_FASTAPI_VALIDATION_SCHEMA_NAMES = ("HTTPValidationError", "ValidationError")
+
+
+def _register_error_envelope_schema(schema: dict[str, Any]) -> None:
+    components_schemas = schema.setdefault("components", {}).setdefault("schemas", {})
+    error_envelope_schema = ErrorEnvelope.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    )
+    components_schemas.update(error_envelope_schema.pop("$defs", {}))
+    components_schemas["ErrorEnvelope"] = error_envelope_schema
+    for unused_name in _UNUSED_FASTAPI_VALIDATION_SCHEMA_NAMES:
+        components_schemas.pop(unused_name, None)
+
+
 def _custom_openapi(application: FastAPI) -> Callable[[], dict[str, Any]]:
     def openapi() -> dict[str, Any]:
         if application.openapi_schema:
@@ -486,6 +619,8 @@ def _custom_openapi(application: FastAPI) -> Callable[[], dict[str, Any]]:
         schema = get_openapi(
             title=application.title,
             version=application.version,
+            description=application.description,
+            tags=application.openapi_tags,
             routes=application.routes,
         )
         schema.setdefault("components", {})["securitySchemes"] = {
@@ -493,17 +628,87 @@ def _custom_openapi(application: FastAPI) -> Callable[[], dict[str, Any]]:
                 "type": "apiKey",
                 "in": "header",
                 "name": API_KEY_HEADER,
+                "description": API_KEY_SECURITY_SCHEME_DESCRIPTION,
             }
         }
+        _register_error_envelope_schema(schema)
+
         exempt_paths = {path.rstrip("/") for path in PUBLIC_PATHS}
         for path, operations in schema.get("paths", {}).items():
-            if path.rstrip("/") in exempt_paths:
-                continue
+            is_exempt = path.rstrip("/") in exempt_paths
             for operation in operations.values():
-                if isinstance(operation, dict):
+                if not isinstance(operation, dict):
+                    continue
+                responses = operation.setdefault("responses", {})
+                if not is_exempt:
                     operation["security"] = [{API_KEY_SECURITY_SCHEME_NAME: []}]
+                    responses["401"] = MISSING_API_KEY_RESPONSE
+                    responses["403"] = INVALID_API_KEY_RESPONSE
+                if "422" in responses:
+                    responses["422"] = VALIDATION_ERROR_RESPONSE
+                responses["500"] = INTERNAL_ERROR_RESPONSE
 
         application.openapi_schema = schema
         return application.openapi_schema
 
     return openapi
+
+
+IDEMPOTENCY_KEY_PARAM_NAME = "idempotency-key"
+"""Compared case-insensitively against a parameter's ``name`` -- matches the
+real ``Idempotency-Key`` header exactly as declared on the six routes that
+accept it, nothing else."""
+
+
+def _documentation_schema(canonical_schema: dict[str, Any]) -> dict[str, Any]:
+    """Derive the human-facing Swagger UI schema from the canonical OpenAPI
+    document: identical in every respect except that the ``Idempotency-Key``
+    header parameter is stripped from each operation. Never mutates
+    ``canonical_schema`` -- ``application.openapi_schema`` is a cached
+    dictionary shared with every caller of ``/openapi.json``, so a deep copy
+    is made first and only the copy is edited."""
+
+    doc_schema = copy.deepcopy(canonical_schema)
+    for path_item in doc_schema.get("paths", {}).values():
+        if not isinstance(path_item, dict):
+            continue
+        for operation in path_item.values():
+            if not isinstance(operation, dict):
+                continue
+            parameters = operation.get("parameters")
+            if not parameters:
+                continue
+            operation["parameters"] = [
+                parameter
+                for parameter in parameters
+                if not (
+                    parameter.get("in") == "header"
+                    and str(parameter.get("name", "")).lower() == IDEMPOTENCY_KEY_PARAM_NAME
+                )
+            ]
+    return doc_schema
+
+
+def _mount_documentation_only_docs(application: FastAPI) -> None:
+    """Mount ``/docs`` and ``/openapi-docs.json`` as a second, human-facing
+    documentation surface, separate from the canonical ``/openapi.json``.
+
+    The canonical schema is the API contract and must keep documenting
+    ``Idempotency-Key`` on every operation that actually accepts it (six
+    routes) -- that is never touched. Swagger UI, however, was found to
+    render that header as an intrusive Parameters input on every one of
+    those operations during manual review; this mounts Swagger UI against a
+    filtered copy instead, purely for human readability. Both routes are
+    ``include_in_schema=False`` so neither appears as an operation in either
+    schema."""
+
+    @application.get("/docs", include_in_schema=False)
+    async def swagger_ui() -> HTMLResponse:
+        return get_swagger_ui_html(
+            openapi_url="/openapi-docs.json",
+            title=f"{application.title} - Swagger UI",
+        )
+
+    @application.get("/openapi-docs.json", include_in_schema=False)
+    async def openapi_docs_json() -> dict[str, Any]:
+        return _documentation_schema(application.openapi())

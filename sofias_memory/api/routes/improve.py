@@ -17,6 +17,12 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Request, Response
 
 from sofias_memory.api.errors import SofiasMemoryError, current_request_id
+from sofias_memory.api.openapi_responses import (
+    DATASET_NOT_FOUND_404,
+    IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+    RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
+    WORKER_DISABLED_503,
+)
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -44,6 +50,22 @@ from sofias_memory.services.pipeline_submission import (
 from sofias_memory.services.pipeline_waiter import PipelineRunWaiter
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_KEY_DESCRIPTION = (
+    "Optional retry-safety key for this write. Reusing the same key with the "
+    "same logical request returns the original PipelineRun instead of creating "
+    "duplicate work; reusing it for different work returns an idempotency "
+    "conflict. Keys starting with 'sys:' are reserved. Leave blank for ordinary "
+    "manual testing."
+)
+RETRY_SAFETY_DESCRIPTION = (
+    "\n\n**Retry safety:** clients may optionally send an `Idempotency-Key` "
+    "header (see the canonical /openapi.json for its full parameter "
+    "documentation -- it is omitted from this human-facing page for "
+    "readability). Reusing the same key for the same logical request returns "
+    "the original run instead of creating duplicate work; reusing it for "
+    "different work returns a conflict. Ordinary manual testing does not "
+    "require it."
+)
 
 router = APIRouter(tags=["improve"])
 
@@ -51,20 +73,35 @@ router = APIRouter(tags=["improve"])
 @router.post(
     "/improve",
     response_model=SuccessEnvelope[ImproveResult],
+    summary="Improve dataset memory quality",
+    description=(
+        "Run background hygiene on a dataset: feedback-weighted ranking, entity "
+        "deduplication, relation embedding refresh, summary maintenance, and graph "
+        "reconciliation. Always explicit -- never triggered implicitly by any other "
+        "request. Creates a durable PipelineRun; use `wait=false` for an immediate "
+        "`202` or `wait=true` to wait for the terminal result." + RETRY_SAFETY_DESCRIPTION
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "The run was accepted durably and has not reached a terminal state "
                 "(wait=false, or wait=true timed out). Poll GET /api/v1/runs/{run_id}."
             )
-        }
+        },
+        HTTPStatus.BAD_REQUEST: RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
+        HTTPStatus.NOT_FOUND: DATASET_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: WORKER_DISABLED_503,
     },
 )
 async def improve(
     payload: ImproveRequest,
     request: Request,
     response: Response,
-    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
 ) -> SuccessEnvelope[ImproveResult]:
     settings = app_settings(request.app)
     session_factory = app_postgres_session_factory(request.app)

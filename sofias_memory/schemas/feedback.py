@@ -18,11 +18,23 @@ class FeedbackRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    query_id: UUID
-    target_type: FeedbackTargetType
-    target_id: UUID | None = None
-    score: FeedbackScore
-    comment: str | None = Field(default=None, max_length=FEEDBACK_COMMENT_MAX_LENGTH)
+    query_id: UUID = Field(description="The Recall query this feedback is about.")
+    target_type: FeedbackTargetType = Field(
+        description="'answer' for feedback on the generated answer, 'reference' for one specific "
+        "retrieved reference."
+    )
+    target_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Required for target_type='reference' (the reference's id); omitted for 'answer'."
+        ),
+    )
+    score: FeedbackScore = Field(description="-1 (negative), 0 (neutral), or 1 (positive).")
+    comment: str | None = Field(
+        default=None,
+        max_length=FEEDBACK_COMMENT_MAX_LENGTH,
+        description="Optional free-text comment.",
+    )
 
     @field_validator("comment")
     @classmethod

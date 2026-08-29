@@ -18,6 +18,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Request, Response
 
 from sofias_memory.api.errors import SofiasMemoryError, current_request_id
+from sofias_memory.api.openapi_responses import WORKER_DISABLED_503, error_response
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -58,6 +59,41 @@ from sofias_memory.services.pipeline_submission import (
 from sofias_memory.services.pipeline_waiter import PipelineRunWaiter
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_KEY_DESCRIPTION = (
+    "Optional retry-safety key for this write. Reusing the same key with the "
+    "same logical request returns the original PipelineRun instead of creating "
+    "duplicate work; reusing it for different work returns an idempotency "
+    "conflict. Keys starting with 'sys:' are reserved. Leave blank for ordinary "
+    "manual testing."
+)
+RETRY_SAFETY_DESCRIPTION = (
+    "\n\n**Retry safety:** clients may optionally send an `Idempotency-Key` "
+    "header (see the canonical /openapi.json for its full parameter "
+    "documentation -- it is omitted from this human-facing page for "
+    "readability). Reusing the same key for the same logical request returns "
+    "the original run instead of creating duplicate work; reusing it for "
+    "different work returns a conflict. Ordinary manual testing does not "
+    "require it."
+)
+
+_FORGET_BAD_REQUEST_400 = error_response(
+    "Invalid request. ErrorEnvelope with error.code=INVALID_REQUEST -- either "
+    "the scope fields are contradictory (e.g. everything combined with "
+    "source_id/dataset/memory_only, or a missing/wrong confirm phrase for "
+    "everything=true), or the Idempotency-Key uses the reserved 'sys:' "
+    "namespace (error.code=RESERVED_IDEMPOTENCY_KEY_NAMESPACE)."
+)
+_FORGET_NOT_FOUND_404 = error_response(
+    "The target dataset or source does not exist. ErrorEnvelope with error.code=INVALID_REQUEST."
+)
+_FORGET_CONFLICT_409 = error_response(
+    "Conflict with the requested Forget operation. ErrorEnvelope with "
+    "error.code one of: IDEMPOTENCY_CONFLICT (the same Idempotency-Key was "
+    "already used for different work), DATASET_DELETING or DATASET_DELETED "
+    "(the target dataset has an in-flight or completed administrative "
+    "delete), or INVALID_REQUEST (a conflicting Forget operation already "
+    "targets the same source/dataset)."
+)
 
 router = APIRouter(tags=["forget"])
 
@@ -65,20 +101,40 @@ router = APIRouter(tags=["forget"])
 @router.post(
     "/forget",
     response_model=SuccessEnvelope[ForgetResponseData],
+    summary="Forget memory",
+    description=(
+        "**Destructive operation.** Removes memory at one of three scopes, "
+        "determined by which fields are set: a single `source_id` (SOURCE scope), "
+        "a `dataset` alone (DATASET scope, clears the whole dataset's memory), or "
+        '`everything=true` with `confirm="DELETE EVERYTHING"` (every dataset -- '
+        "requires the exact confirmation phrase). `memory_only=true` clears derived "
+        "memory but keeps the original source for later re-Cognify. This is "
+        "distinct from administrative Dataset DELETE (`DELETE /api/v1/datasets/"
+        "{dataset_id}`), which permanently retires the dataset namespace itself. "
+        "Creates a durable PipelineRun; use `wait=false` for an immediate `202` or "
+        "`wait=true` to wait for the terminal result." + RETRY_SAFETY_DESCRIPTION
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "The run was accepted durably and has not reached a terminal state "
                 "(wait=false, or wait=true timed out). Poll GET /api/v1/runs/{run_id}."
             )
-        }
+        },
+        HTTPStatus.BAD_REQUEST: _FORGET_BAD_REQUEST_400,
+        HTTPStatus.NOT_FOUND: _FORGET_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: _FORGET_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: WORKER_DISABLED_503,
     },
 )
 async def forget(
     payload: ForgetRequest,
     request: Request,
     response: Response,
-    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
 ) -> SuccessEnvelope[ForgetResponseData]:
     scope = determine_forget_scope(
         dataset=payload.dataset,

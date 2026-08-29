@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from sofias_memory.domain import PipelineRunStatus, PipelineStepStatus, PipelineType
 from sofias_memory.schemas.common import JSONValue
@@ -19,20 +19,24 @@ class RunSummaryResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: UUID
-    pipeline_type: PipelineType
-    dataset_id: UUID | None
-    source_id: UUID | None
-    status: PipelineRunStatus
-    progress: float
-    current_step: str | None
-    attempt: int
-    created_at: datetime
-    started_at: datetime | None
-    finished_at: datetime | None
-    error_code: str | None
-    error_message: str | None
-    metrics: dict[str, JSONValue]
+    run_id: UUID = Field(description="Durable, unique identifier for this run.")
+    pipeline_type: PipelineType = Field(description="Which pipeline this run executes.")
+    dataset_id: UUID | None = Field(description="Dataset this run targets, if any.")
+    source_id: UUID | None = Field(description="Source this run targets, if any.")
+    status: PipelineRunStatus = Field(
+        description="queued, running, succeeded, failed, cancelling, or cancelled."
+    )
+    progress: float = Field(description="Fraction of planned steps completed, from 0.0 to 1.0.")
+    current_step: str | None = Field(description="Name of the step currently executing, if any.")
+    attempt: int = Field(description="1 for the original run; incremented for each manual retry.")
+    created_at: datetime = Field(description="When this run was durably created.")
+    started_at: datetime | None = Field(description="When execution began, if it has.")
+    finished_at: datetime | None = Field(
+        description="When this run reached a terminal state, if it has."
+    )
+    error_code: str | None = Field(description="Stable error code if the run failed.")
+    error_message: str | None = Field(description="Safe, public error message if the run failed.")
+    metrics: dict[str, JSONValue] = Field(description="Pipeline-specific counters/results.")
 
 
 class RunListResult(BaseModel):
@@ -47,9 +51,9 @@ class RunListResult(BaseModel):
 
 
 class RunStepErrorResult(BaseModel):
-    """Structural whitelist for a step's public error (ADR-0009 SS B): only a
-    stable ``code`` and a safe ``message`` are ever published, regardless of
-    what else the persisted ``PipelineStep.error`` JSONB happens to contain."""
+    """A step's public error: only a stable ``code`` and a safe ``message``
+    are ever published, regardless of what else the persisted step error
+    happens to contain internally."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -62,15 +66,17 @@ class RunStepResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    step_id: UUID
-    name: str
-    ordinal: int
-    status: PipelineStepStatus
-    attempt: int
-    metrics: dict[str, JSONValue]
-    error: RunStepErrorResult | None
-    started_at: datetime | None
-    finished_at: datetime | None
+    step_id: UUID = Field(description="Durable, unique identifier for this step.")
+    name: str = Field(description="Step name within the pipeline's fixed step plan.")
+    ordinal: int = Field(description="Position of this step in the plan, starting at 0.")
+    status: PipelineStepStatus = Field(description="This step's own lifecycle status.")
+    attempt: int = Field(description="1 for the first attempt; incremented on step-level retry.")
+    metrics: dict[str, JSONValue] = Field(description="Step-specific counters/results.")
+    error: RunStepErrorResult | None = Field(description="Populated only if this step failed.")
+    started_at: datetime | None = Field(description="When this step began executing, if it has.")
+    finished_at: datetime | None = Field(
+        description="When this step reached a terminal state, if it has."
+    )
 
 
 class RunDetailResult(RunSummaryResult):

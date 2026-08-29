@@ -16,6 +16,12 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Request, Response
 
 from sofias_memory.api.errors import SofiasMemoryError, current_request_id
+from sofias_memory.api.openapi_responses import (
+    DATASET_NOT_FOUND_404,
+    IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+    WORKER_DISABLED_503,
+    error_response,
+)
 from sofias_memory.domain import PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -42,6 +48,28 @@ from sofias_memory.services.pipeline_submission import (
 from sofias_memory.services.pipeline_waiter import PipelineRunWaiter
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_KEY_DESCRIPTION = (
+    "Optional retry-safety key for this write. Reusing the same key with the "
+    "same logical request returns the original PipelineRun instead of creating "
+    "duplicate work; reusing it for different work returns an idempotency "
+    "conflict. Keys starting with 'sys:' are reserved. Leave blank for ordinary "
+    "manual testing."
+)
+RETRY_SAFETY_DESCRIPTION = (
+    "\n\n**Retry safety:** clients may optionally send an `Idempotency-Key` "
+    "header (see the canonical /openapi.json for its full parameter "
+    "documentation -- it is omitted from this human-facing page for "
+    "readability). Reusing the same key for the same logical request returns "
+    "the original run instead of creating duplicate work; reusing it for "
+    "different work returns a conflict. Ordinary manual testing does not "
+    "require it."
+)
+
+_COGNIFY_BAD_REQUEST_400 = error_response(
+    "Invalid request. ErrorEnvelope with error.code=INVALID_REQUEST -- either "
+    "rebuild=true was combined with source_ids, or the Idempotency-Key uses "
+    "the reserved 'sys:' namespace (error.code=RESERVED_IDEMPOTENCY_KEY_NAMESPACE)."
+)
 
 router = APIRouter(tags=["cognify"])
 
@@ -49,20 +77,36 @@ router = APIRouter(tags=["cognify"])
 @router.post(
     "/cognify",
     response_model=SuccessEnvelope[CognifyResult],
+    summary="Cognify a dataset",
+    description=(
+        "Process a dataset's stored sources into chunks, embeddings, entities, and "
+        "relations. By default processes only pending/explicitly selected sources; "
+        "`rebuild=true` reprocesses the whole dataset onto a new generation without "
+        "ever exposing a partially-rebuilt state to readers. Creates a durable "
+        "PipelineRun; use `wait=false` for an immediate `202` or `wait=true` to wait "
+        "for the terminal result." + RETRY_SAFETY_DESCRIPTION
+    ),
     responses={
         HTTPStatus.ACCEPTED: {
             "description": (
                 "The run was accepted durably and has not reached a terminal state "
                 "(wait=false, or wait=true timed out). Poll GET /api/v1/runs/{run_id}."
             )
-        }
+        },
+        HTTPStatus.BAD_REQUEST: _COGNIFY_BAD_REQUEST_400,
+        HTTPStatus.NOT_FOUND: DATASET_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: IDEMPOTENCY_OR_DATASET_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: WORKER_DISABLED_503,
     },
 )
 async def cognify(
     payload: CognifyRequest,
     request: Request,
     response: Response,
-    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_KEY_HEADER)] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
 ) -> SuccessEnvelope[CognifyResult]:
     _validate_request(payload)
 

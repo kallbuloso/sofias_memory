@@ -249,21 +249,168 @@ async def test_correct_key_reaches_fastapi_downstream(log_stream: StringIO) -> N
 
 
 @pytest.mark.asyncio
-async def test_docs_without_api_key_are_protected(log_stream: StringIO) -> None:
+async def test_private_route_with_invalid_api_key_returns_403(log_stream: StringIO) -> None:
     async with make_client(create_app(make_settings())) as client:
+        response = await client.get("/private", headers={API_KEY_HEADER: "sf-wrong-key"})
+
+    assert response.status_code == 403
+    assert response_json(response)["error"]["code"] == "INVALID_API_KEY"
+
+
+# --- Swagger/OpenAPI: development-only, allowlisted APP_ENV (SWAGGER-001) ---
+
+
+@pytest.mark.asyncio
+async def test_docs_enabled_in_development(log_stream: StringIO) -> None:
+    async with make_client(create_app(make_settings(app_env="development"))) as client:
         response = await client.get("/docs")
+
+    assert response.status_code == 200
+    assert "swagger-ui" in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_openapi_enabled_in_development(log_stream: StringIO) -> None:
+    async with make_client(create_app(make_settings(app_env="development"))) as client:
+        response = await client.get("/openapi.json")
+
+    assert response.status_code == 200
+    schema = response.json()
+    assert schema["components"]["securitySchemes"]["ApiKeyAuth"] == {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+    }
+
+
+@pytest.mark.asyncio
+async def test_redoc_disabled_in_development(log_stream: StringIO) -> None:
+    # /redoc is never registered (redoc_url=None always), but it is always
+    # exempt from the API key check (DOCS_PUBLIC_PATHS), so an unauthenticated
+    # request reaches FastAPI's router directly and gets a genuine 404 -- not
+    # the auth middleware's 401.
+    async with make_client(create_app(make_settings(app_env="development"))) as client:
+        response = await client.get("/redoc")
+
+    assert response.status_code == 404
+
+
+def test_openapi_marks_private_routes_with_security_scheme() -> None:
+    app = create_app(make_settings(app_env="development"))
+
+    schema = app.openapi()
+
+    info_get = schema["paths"]["/api/v1/info"]["get"]
+    assert info_get["security"] == [{"ApiKeyAuth": []}]
+
+
+def test_openapi_health_route_has_no_security_requirement() -> None:
+    app = create_app(make_settings(app_env="development"))
+
+    schema = app.openapi()
+
+    live_get = schema["paths"]["/health/live"]["get"]
+    assert live_get.get("security") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_private_route_without_api_key_in_development_returns_401(
+    log_stream: StringIO,
+) -> None:
+    async with make_client(create_app(make_settings(app_env="development"))) as client:
+        response = await client.get("/api/v1/info")
 
     assert response.status_code == 401
     assert response_json(response)["error"]["code"] == "MISSING_API_KEY"
 
 
 @pytest.mark.asyncio
-async def test_openapi_without_api_key_is_protected(log_stream: StringIO) -> None:
-    async with make_client(create_app(make_settings())) as client:
-        response = await client.get("/openapi.json")
+async def test_private_route_with_invalid_key_in_development_returns_403(
+    log_stream: StringIO,
+) -> None:
+    async with make_client(create_app(make_settings(app_env="development"))) as client:
+        response = await client.get("/api/v1/info", headers={API_KEY_HEADER: "sf-wrong-key"})
 
-    assert response.status_code == 401
-    assert response_json(response)["error"]["code"] == "MISSING_API_KEY"
+    assert response.status_code == 403
+    assert response_json(response)["error"]["code"] == "INVALID_API_KEY"
+
+
+@pytest.mark.asyncio
+async def test_private_route_with_valid_key_in_development_returns_200(
+    log_stream: StringIO,
+) -> None:
+    async with make_client(create_app(make_settings(app_env="development"))) as client:
+        response = await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "app_env",
+    ["dev", "development", "DEV", "Development", " development "],
+)
+@pytest.mark.asyncio
+async def test_docs_enabled_for_every_allowlisted_app_env_alias(
+    log_stream: StringIO, app_env: str
+) -> None:
+    async with make_client(create_app(make_settings(app_env=app_env))) as client:
+        response = await client.get("/docs")
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "app_env",
+    [
+        "production",
+        "prod",
+        "test",
+        "staging",
+        "qa",
+        "PRODUCTION",
+        "produciton",
+        "something-unexpected",
+    ],
+)
+@pytest.mark.asyncio
+async def test_docs_disabled_for_every_non_allowlisted_app_env(
+    log_stream: StringIO, app_env: str
+) -> None:
+    # No X-API-Key at all: the contract requires a plain 404 (route doesn't
+    # exist), never a 401/403 auth response, for every non-allowlisted
+    # APP_ENV -- proving the allowlist, not a denylist, decides this.
+    async with make_client(create_app(make_settings(app_env=app_env))) as client:
+        docs_response = await client.get("/docs")
+        openapi_response = await client.get("/openapi.json")
+        redoc_response = await client.get("/redoc")
+
+    assert docs_response.status_code == 404
+    assert openapi_response.status_code == 404
+    assert redoc_response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_docs_disabled_by_default_test_app_env(log_stream: StringIO) -> None:
+    # make_settings() defaults to app_env="test" -- must not implicitly
+    # enable Swagger just because most of this suite uses that default.
+    # No key supplied: must be a plain 404, not an auth error.
+    async with make_client(create_app(make_settings())) as client:
+        response = await client.get("/docs")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_production_health_and_private_route_behavior_unaffected(
+    log_stream: StringIO,
+) -> None:
+    async with make_client(create_app(make_settings(app_env="production"))) as client:
+        live_response = await client.get("/health/live")
+        info_response = await client.get("/api/v1/info")
+
+    assert live_response.status_code == 200
+    assert info_response.status_code == 401
+    assert response_json(info_response)["error"]["code"] == "MISSING_API_KEY"
 
 
 @pytest.mark.asyncio

@@ -8,18 +8,26 @@ application serves itself:
 - `GET /openapi.json` — the raw OpenAPI 3.1 document.
 - `GET /docs` — Swagger UI, rendered from that same document.
 
-**Both require `X-API-Key`, like every other route except `/health/*`** — they
-are not public. That also means `/docs` is not directly usable by simply
-opening it in a browser: a plain browser request has no way to attach a
-custom header, so an anonymous visit gets a `401 MISSING_API_KEY` JSON body
-instead of the UI, and even a way to force the first request through (a
-browser extension, a header-injecting proxy) would still need to satisfy every
-follow-up request Swagger UI's own JavaScript makes (starting with fetching
-`/openapi.json` itself) the same way. The reliable way to retrieve the schema
-is:
+**Both exist only when `APP_ENV=dev` or `APP_ENV=development`** (matched
+case-insensitively, surrounding whitespace ignored). In every other
+environment — including `production`, the default — neither route is
+registered at all: `GET /docs` and `GET /openapi.json` both return a plain
+`404`, not an auth error, because the surface simply doesn't exist. `/redoc`
+is never registered in any environment (`404` always); Swagger UI is the
+product's only interactive documentation surface.
+
+When enabled, `/docs` and `/openapi.json` are public, like `/health/*` — the
+only deliberate exceptions to "every route requires `X-API-Key`" — so Swagger
+UI is directly usable in a plain browser tab without a header-injecting
+workaround. This exposes the API's *shape* (routes, request/response schemas,
+field names), never any data — every `/api/v1/**` route underneath still
+requires `X-API-Key`. Use Swagger UI's "Authorize" button to enter it once
+per page load (it is not persisted across reloads) and then "Try it out"
+calls include it automatically. A quick way to fetch just the schema without
+a browser, when docs are enabled:
 
 ```bash
-curl -sS -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" "$SOFIAS_MEMORY_URL/openapi.json"
+curl -sS "$SOFIAS_MEMORY_URL/openapi.json"
 ```
 
 This guide does not repeat those schemas; it explains how to use the API

@@ -2,6 +2,7 @@
 
 from sofias_memory.api.middleware.api_key import (
     API_KEY_HEADER,
+    DOCS_PUBLIC_PATHS,
     PUBLIC_PATHS,
     ApiKeyMiddleware,
     is_valid_api_key,
@@ -23,6 +24,7 @@ from sofias_memory.api.middleware.request_metrics import RequestMetricsMiddlewar
 __all__ = [
     "API_KEY_HEADER",
     "BYTES_PER_MIB",
+    "DOCS_PUBLIC_PATHS",
     "MAX_REQUEST_ID_LENGTH",
     "PUBLIC_PATHS",
     "ApiKeyMiddleware",

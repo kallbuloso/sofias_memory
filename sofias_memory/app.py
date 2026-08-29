@@ -17,6 +17,7 @@ from sofias_memory.api.errors import (
 )
 from sofias_memory.api.middleware import (
     API_KEY_HEADER,
+    DOCS_PUBLIC_PATHS,
     PUBLIC_PATHS,
     REQUEST_ID_HEADER,
     ApiKeyMiddleware,
@@ -97,6 +98,11 @@ from sofias_memory.services.summary_rebuild_service import SummaryRebuildService
 
 WORKER_NOT_READY_DETAIL = "worker not ready"
 
+# Allowlist, not a denylist: Swagger/OpenAPI exist only for these APP_ENV
+# values. Every other value -- including typos, "staging"/"qa", and the
+# "production" default -- is fail-closed to no docs surface at all.
+DOCS_ENABLED_APP_ENVS = frozenset({"dev", "development"})
+
 
 def create_app(
     settings: Settings | None = None,
@@ -113,10 +119,14 @@ def create_app(
     pipeline_worker_coordinator: PipelineWorkerCoordinator | None = None,
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else load_settings()
+    docs_enabled = resolved_settings.app_env.strip().lower() in DOCS_ENABLED_APP_ENVS
     application = FastAPI(
         title=resolved_settings.app_name,
         version=resolved_settings.app_version,
         lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+        redoc_url=None,
     )
     application.state.settings = resolved_settings
     if postgres_session_factory is None:
@@ -241,7 +251,15 @@ def create_app(
         RequestBodyLimitMiddleware,
         max_body_bytes=max_body_bytes_from_mebibytes(resolved_settings.max_request_body_mb),
     )
-    application.add_middleware(ApiKeyMiddleware, api_key=resolved_settings.api_key)
+    # Exempted unconditionally, not gated on docs_enabled -- whether a
+    # request here actually resolves to the Swagger UI/schema or a plain 404
+    # is decided entirely by whether FastAPI registered the route
+    # (docs_url/openapi_url/redoc_url above), not by this middleware.
+    application.add_middleware(
+        ApiKeyMiddleware,
+        api_key=resolved_settings.api_key,
+        public_paths=PUBLIC_PATHS | DOCS_PUBLIC_PATHS,
+    )
     if resolved_settings.cors_allowed_origins:
         application.add_middleware(
             CORSMiddleware,

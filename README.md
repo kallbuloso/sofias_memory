@@ -184,10 +184,15 @@ See [`docs/api.md`](docs/api.md) for the full semantic guide — response envelo
 `ErrorCode` values, `Idempotency-Key` semantics, `wait=true/false`, the
 `PipelineRun` lifecycle, and worked examples for every endpoint family (Remember,
 Recall, Cognify, Improve, Forget, Dataset management, Dataset delete, Runs).
-The formal, always-current schema is served directly by the running application at
-`/openapi.json` (and Swagger UI at `/docs`) — both require `X-API-Key` like every
-other route, so open them with `curl -H "X-API-Key: ..."` rather than a plain
-browser tab; see `docs/api.md` for why.
+The formal schema is served by the running application at `/openapi.json`,
+browsable via Swagger UI at `/docs` — but **only when `APP_ENV=dev` or
+`APP_ENV=development`**; in every other environment (including the
+`production` default) neither route is registered at all (`404`, not an
+auth error) and `/redoc` is never registered in any environment. When
+enabled, both `/docs` and `/openapi.json` are public (alongside `/health/*`)
+so Swagger UI works in a plain browser tab; every `/api/v1/**` route
+underneath still requires `X-API-Key`, entered via the UI's "Authorize"
+button. See `docs/api.md` for details.
 
 ## Async runs
 
@@ -255,10 +260,10 @@ authoritative scope.
 
 ## API documentation
 
-- Schema: `/openapi.json` (Swagger UI at `/docs`), served directly by the running
-  application — **both require `X-API-Key`** like every other route, so retrieve
-  them with `curl -H "X-API-Key: ..."`, not a plain browser tab (see
-  `docs/api.md`).
+- Schema: `/openapi.json` (Swagger UI at `/docs`) — **development-only**
+  (`APP_ENV=dev`/`development`), public and browser-usable when enabled,
+  `404`/not registered otherwise; `/api/v1/**` always requires `X-API-Key`
+  regardless (see `docs/api.md`).
 - Human-readable semantics guide: [`docs/api.md`](docs/api.md).
 
 ## Development

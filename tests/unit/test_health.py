@@ -470,11 +470,15 @@ async def test_slow_check_times_out(log_stream: StringIO) -> None:
 
 
 @pytest.mark.asyncio
-async def test_docs_continue_private(log_stream: StringIO) -> None:
+async def test_docs_disabled_outside_development(log_stream: StringIO) -> None:
+    # make_settings() here defaults to app_env="test" -- Swagger/OpenAPI are
+    # allowlisted to dev/development only (SWAGGER-001); every other
+    # environment, including this suite's default, must not register /docs.
+    # No key supplied: the contract requires a plain 404, not an auth error.
     async with make_client(create_app(make_settings())) as client:
         response = await client.get("/docs")
 
-    assert response.status_code == 401
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio

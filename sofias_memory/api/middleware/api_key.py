@@ -22,6 +22,24 @@ PUBLIC_PATHS = frozenset(
         "/health/ready/",
     }
 )
+
+# Always exempt from X-API-Key, in every environment -- not conditional on
+# whether docs are actually registered (see create_app()). Whether a request
+# here resolves to 200 or 404 is decided entirely by FastAPI's router
+# (docs_url/openapi_url are None outside dev/development, redoc_url is
+# always None): this set only ensures that decision is reachable at all. If
+# these paths were exempted only when enabled, an unauthenticated request in
+# a non-dev environment would be intercepted by the auth check first and see
+# 401 instead of the required "route doesn't exist" 404.
+DOCS_PUBLIC_PATHS = frozenset(
+    {
+        "/docs",
+        "/docs/",
+        "/openapi.json",
+        "/redoc",
+        "/redoc/",
+    }
+)
 _API_KEY_HEADER_BYTES = API_KEY_HEADER.lower().encode("ascii")
 
 ASGIMessage = MutableMapping[str, object]

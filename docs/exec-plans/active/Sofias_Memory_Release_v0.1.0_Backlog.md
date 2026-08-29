@@ -14,9 +14,29 @@ features de produto e NÃO é SM-517/B6.
 | REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE | `762a153` — `build: harden v0.1.0 release packaging`; `34658cc` — `build: complete v0.1.0 version packaging` |
 | REL-003 — Contrato operacional de migração/upgrade/backup | DONE | `3c071c5` — `docs: define v0.1.0 operational recovery contract` |
 | REL-004 — CI mínima de qualidade e integração | DONE | `f24c673` — `ci: add v0.1.0 quality and integration gates`; CI `33220003273` PASS; Integration `33222166381` PASS |
-| REL-005 — Automação de release / publicação GHCR | TODO | — |
+| REL-005 — Automação de release / publicação GHCR | IN PROGRESS / workflow implementation | baseline `997c34a`; `release.yml` + `CHANGELOG.md` implementados e validados localmente (build/labels/tag-matching), aguardando push + `v0.1.0-rc.1` real para RC PASS |
 | REL-006 — Guias de deployment + smoke de produção | TODO | — |
 | GATE-R1 — Sofias Memory v0.1.0 Release | TODO | — |
+
+## Nota de sequenciamento de execução (REL-005)
+
+A tag final `v0.1.0` **não** é criada ao final de REL-005, apesar do backlog
+original posicionar "criar v0.1.0" nesta task. Sequência congelada:
+
+```text
+REL-005 (workflow + CHANGELOG implementados)
+  → push + v0.1.0-rc.1 real (prova RC: build, OCI, GHCR auth, push, prerelease)
+  → REL-006 (guias de deployment finais + production smoke)
+  → GATE-R1 (validação final de release readiness)
+  → tag final v0.1.0
+  → GHCR :0.1.0 estável + GitHub Release v0.1.0 estável
+```
+
+Criar `v0.1.0` antes de REL-006/GATE-R1 excluiria do source tag a documentação
+final de deployment, o tooling de production smoke, e quaisquer correções que
+o smoke ainda venha a revelar. `release.yml` já está **capaz** de publicar a
+tag estável — ele só não deve ser exercitado para `v0.1.0` até esses dois
+gates fecharem.
 
 ---
 

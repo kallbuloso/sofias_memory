@@ -1,0 +1,269 @@
+name: Release
+
+# Tag-only. Never runs on a pull request or a normal push to main -- a
+# release publication is a deliberate, human-triggered act (pushing a `v*`
+# tag), not a side effect of ordinary development.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate tag against canonical version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Needed only for `gh run list` below, to prove ci.yml already
+      # succeeded for this exact commit. Scoped to this job alone.
+      actions: read
+    outputs:
+      image_version: ${{ steps.derive.outputs.image_version }}
+      kind: ${{ steps.derive.outputs.kind }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so `git merge-base --is-ancestor` below has
+          # origin/main's real ancestry to check against, not a shallow
+          # clone that only contains the tagged commit itself.
+          fetch-depth: 0
+
+      # A release must only ever be built from a commit that is genuinely
+      # part of main's history with a proven-green CI run -- never from a
+      # tag pushed at an orphan/foreign/unmerged commit.
+      - name: Verify GITHUB_SHA is on origin/main
+        run: |
+          set -euo pipefail
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_SHA} is not an ancestor of origin/main -- refusing to release from a commit that is not part of main's history"
+            exit 1
+          fi
+          echo "confirmed: ${GITHUB_SHA} is an ancestor of origin/main"
+
+      - name: Verify ci.yml succeeded for this exact commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          COUNT=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow ci.yml \
+            --commit "${GITHUB_SHA}" \
+            --event push \
+            --status success \
+            --json databaseId \
+            --jq 'length')
+          echo "successful ci.yml push runs for ${GITHUB_SHA}: ${COUNT}"
+          if [ "${COUNT}" -lt 1 ]; then
+            echo "::error::No successful ci.yml run (event=push, status=success) found for commit ${GITHUB_SHA} -- refusing to release without proven-green CI"
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: uv lock --check
+        run: uv lock --check
+
+      # Fail closed: the pushed tag's base version must equal the project's
+      # canonical version exactly. Accepted: v<version> (stable) and
+      # v<version>-rc.N for a positive integer N (release candidate).
+      # Everything else -- a different version, a missing "v", a "-beta"
+      # suffix, a non-numeric or zero/negative RC number -- fails here,
+      # before anything is built or published.
+      - name: Derive and validate release kind/version
+        id: derive
+        run: |
+          set -euo pipefail
+          CANONICAL_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          STABLE_TAG="v${CANONICAL_VERSION}"
+          TAG="${GITHUB_REF_NAME}"
+
+          echo "canonical version: ${CANONICAL_VERSION}"
+          echo "pushed tag: ${TAG}"
+
+          if [ "${TAG}" = "${STABLE_TAG}" ]; then
+            KIND=stable
+            IMAGE_VERSION="${CANONICAL_VERSION}"
+          elif [[ "${TAG}" == "${STABLE_TAG}-rc."* ]]; then
+            RC_SUFFIX="${TAG#${STABLE_TAG}-rc.}"
+            if [[ "${RC_SUFFIX}" =~ ^[1-9][0-9]*$ ]]; then
+              KIND=rc
+              IMAGE_VERSION="${CANONICAL_VERSION}-rc.${RC_SUFFIX}"
+            else
+              echo "::error::Invalid RC suffix '${RC_SUFFIX}' in tag '${TAG}' (expected a positive integer)"
+              exit 1
+            fi
+          else
+            echo "::error::Tag '${TAG}' does not match canonical version '${CANONICAL_VERSION}' (expected '${STABLE_TAG}' or '${STABLE_TAG}-rc.N')"
+            exit 1
+          fi
+
+          echo "release kind: ${KIND}"
+          echo "image version: ${IMAGE_VERSION}"
+          echo "kind=${KIND}" >> "$GITHUB_OUTPUT"
+          echo "image_version=${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      # CHANGELOG.md must document exactly the canonical version once --
+      # not zero times (forgotten), not more than once (duplicated/stale).
+      - name: Validate CHANGELOG.md has exactly one canonical version section
+        run: |
+          set -euo pipefail
+          CANONICAL_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          COUNT=$(grep -c "^## \[${CANONICAL_VERSION}\]$" CHANGELOG.md || true)
+          echo "CHANGELOG.md sections matching [${CANONICAL_VERSION}]: ${COUNT}"
+          test "${COUNT}" = "1"
+
+      - name: Settings / .env.example / Compose parity + version consistency
+        run: uv run python scripts/ci_release_consistency_check.py
+        env:
+          API_KEY: sf-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          DB_PASSWORD: ci-disposable-password
+          DB_NEO4J_PASSWORD: ci-disposable-password
+          LLM_API_KEY: sk-ci-disposable
+
+  publish:
+    name: Build, publish to GHCR, create GitHub Release
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    env:
+      IMAGE_VERSION: ${{ needs.validate.outputs.image_version }}
+      KIND: ${{ needs.validate.outputs.kind }}
+      IMAGE: ghcr.io/kallbuloso/sofias-memory
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # linux/amd64 only for v0.1.0 -- the release image's supported
+      # architecture; no multi-arch manifest is produced. Built under a
+      # local-only reference (not the real GHCR tag) so the subsequent
+      # existence check below can `docker pull` the real tag without
+      # clobbering this freshly-built candidate.
+      - name: Build release image
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/amd64 \
+            --build-arg APP_VERSION="${IMAGE_VERSION}" \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            -t local-build:candidate \
+            .
+
+      # Never publish an image whose own metadata disagrees with what this
+      # workflow believes it just built.
+      - name: Verify OCI labels before publishing
+        run: |
+          set -euo pipefail
+          ACTUAL_VERSION=$(docker inspect local-build:candidate --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+          ACTUAL_REVISION=$(docker inspect local-build:candidate --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          ACTUAL_SOURCE=$(docker inspect local-build:candidate --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')
+          echo "version: expected=${IMAGE_VERSION} actual=${ACTUAL_VERSION}"
+          echo "revision: expected=${GITHUB_SHA} actual=${ACTUAL_REVISION}"
+          echo "source: expected=https://github.com/kallbuloso/sofias_memory actual=${ACTUAL_SOURCE}"
+          test "${ACTUAL_VERSION}" = "${IMAGE_VERSION}"
+          test "${ACTUAL_REVISION}" = "${GITHUB_SHA}"
+          test "${ACTUAL_SOURCE}" = "https://github.com/kallbuloso/sofias_memory"
+
+      # GITHUB_TOKEN is the only credential used -- no PAT, no repository
+      # secret beyond what Actions already provides. Never echoed; piped
+      # via stdin only.
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Never blind-push over an existing version. A rerun of this workflow
+      # (e.g. after a transient failure partway through) must not risk
+      # publishing different bytes under a tag that was already published --
+      # GHCR tags are treated as immutable by convention.
+      - name: Check whether this tag already exists in GHCR
+        id: existing
+        run: |
+          set -euo pipefail
+          if docker pull "${IMAGE}:${IMAGE_VERSION}"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # If it already exists, this must be a rerun recovering from a
+      # partial prior publish, not a new/different build reusing the tag.
+      # Require its OCI labels to match this release exactly; anything
+      # else fails the job outright -- a new rc.N is the only sanctioned
+      # way to publish different content.
+      - name: If already published, require it matches this release exactly
+        if: steps.existing.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          EXISTING_REVISION=$(docker inspect "${IMAGE}:${IMAGE_VERSION}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          EXISTING_VERSION=$(docker inspect "${IMAGE}:${IMAGE_VERSION}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+          EXISTING_SOURCE=$(docker inspect "${IMAGE}:${IMAGE_VERSION}" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')
+          echo "already published: revision=${EXISTING_REVISION} version=${EXISTING_VERSION} source=${EXISTING_SOURCE}"
+          if [ "${EXISTING_REVISION}" != "${GITHUB_SHA}" ]; then
+            echo "::error::${IMAGE}:${IMAGE_VERSION} is already published from commit ${EXISTING_REVISION}, not this release's ${GITHUB_SHA}. Tags are immutable by convention -- publish a new rc.N instead of reusing this one with different content."
+            exit 1
+          fi
+          if [ "${EXISTING_VERSION}" != "${IMAGE_VERSION}" ] || [ "${EXISTING_SOURCE}" != "https://github.com/kallbuloso/sofias_memory" ]; then
+            echo "::error::${IMAGE}:${IMAGE_VERSION} already exists but its version/source metadata does not match this release."
+            exit 1
+          fi
+          echo "existing published image matches this exact commit/version/source -- treating as idempotent recovery from a partial prior publish; image layers will not be re-pushed, only the remaining steps (GitHub Release) will proceed."
+
+      # No `latest` tag is published for v0.1.0 (see release backlog REL-005
+      # §16/§18): the backlog treats it as optional, the PRD favors
+      # reproducibility over a floating convenience tag, and no
+      # documentation depends on it. Only the immutable, exact version tag
+      # is pushed -- and only if it is not already published.
+      - name: Push image to GHCR
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          docker tag local-build:candidate "${IMAGE}:${IMAGE_VERSION}"
+          docker push "${IMAGE}:${IMAGE_VERSION}"
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          CANONICAL_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          awk -v ver="${CANONICAL_VERSION}" '
+            $0 == "## [" ver "]" { flag=1; next }
+            /^## \[/ { flag=0 }
+            flag { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
+      # `--verify-tag` refuses to create a release for a tag that does not
+      # already exist -- this workflow never invents one; it only ever
+      # reacts to a tag that was already pushed by a human.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PRERELEASE_FLAG=""
+          LATEST_FLAG="--latest"
+          if [ "${KIND}" = "rc" ]; then
+            PRERELEASE_FLAG="--prerelease"
+            LATEST_FLAG="--latest=false"
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "Sofias Memory ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            ${PRERELEASE_FLAG} \
+            ${LATEST_FLAG}

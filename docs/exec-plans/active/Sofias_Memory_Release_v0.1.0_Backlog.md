@@ -14,9 +14,9 @@ features de produto e NÃO é SM-517/B6.
 | REL-002 — Empacotamento reprodutível, versão, ativos de release | DONE | `762a153` — `build: harden v0.1.0 release packaging`; `34658cc` — `build: complete v0.1.0 version packaging` |
 | REL-003 — Contrato operacional de migração/upgrade/backup | DONE | `3c071c5` — `docs: define v0.1.0 operational recovery contract` |
 | REL-004 — CI mínima de qualidade e integração | DONE | `f24c673` — `ci: add v0.1.0 quality and integration gates`; CI `33220003273` PASS; Integration `33222166381` PASS |
-| REL-005 — Automação de release / publicação GHCR | IMPLEMENTED / RC PASS / final v0.1.0 publication pending REL-006 + GATE-R1 | `607fb8d` — release workflow + CHANGELOG; CI `33227939187` PASS; Release RC run `33228177783` PASS; `v0.1.0-rc.1` public GHCR digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` |
-| REL-006 — Guias de deployment + smoke de produção | IMPLEMENTED / RC production smoke PASS / publication CI pending | (uncommitted, local implementation) — `docs/operations.md` §12, `README.md`, `scripts/production_smoke.py`, `tests/unit/test_production_smoke.py`; real production smoke PASS against published RC digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` (`ghcr.io/kallbuloso/sofias-memory:0.1.0-rc.1`), isolated `sofias-memory-rel006-smoke` stack, real OpenAI provider |
-| GATE-R1 — Sofias Memory v0.1.0 Release | TODO | — |
+| REL-005 — Automação de release / publicação GHCR | IMPLEMENTED / RC PASS / final v0.1.0 publication pending GATE-R1 final phase | `607fb8d` — release workflow + CHANGELOG; CI `33227939187` PASS; Release RC run `33228177783` PASS; `v0.1.0-rc.1` public GHCR digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` |
+| REL-006 — Guias de deployment + smoke de produção | DONE | `0848731` — `docs: add production deployment and smoke validation`; CI `33230847900` PASS; RC production smoke PASS against published RC digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` |
+| GATE-R1 — Sofias Memory v0.1.0 Release | PRE-PUBLICATION PASS / final artifact verification pending | (uncommitted, local audit) — FASE A: critérios 1–10, 12, 13 = PASS; critério 11 = PENDING FINAL PUBLICATION (esperado); baseline `0848731`, CI `33230847900` PASS |
 
 ## Nota de sequenciamento de execução (REL-005)
 
@@ -1032,6 +1032,32 @@ isso). Não declarado passado por este documento.
 
 Somente após todos os treze itens acima, um relatório de fechamento futuro pode
 declarar `GATE-R1 PASSED`.
+
+**Nota de execução — as duas fases de GATE-R1 (resolve a circularidade, não
+altera os treze critérios acima):** o critério 11 exige a tag `v0.1.0`, a
+imagem GHCR `:0.1.0` e a GitHub Release stable — artefatos que só existem
+*depois* que este mesmo gate autoriza a publicação. Para não exigir a tag
+antes de auditar a prontidão para publicá-la, o fechamento deste gate ocorre
+em duas fases:
+
+- **FASE A — PRE-PUBLICATION READINESS:** audita os critérios 1–10, 12 e 13
+  (tudo que pode ser verificado antes de qualquer publicação), e confirma que
+  `release.yml` está pronto para publicar a versão stable (tag exata,
+  `IMAGE_VERSION`, `--latest`/`--latest=false`, verificação de labels OCI,
+  prova de proveniência da tag, exigência de CI verde no mesmo SHA, lógica de
+  não-sobrescrita, `--verify-tag`). O critério 11 permanece
+  `PENDING FINAL PUBLICATION` nesta fase — isso é esperado, não um bloqueio.
+  Se 1–10/12/13 = PASS e 11 = PENDING FINAL PUBLICATION, o estado declarado é
+  `GATE-R1 = PRE-PUBLICATION PASS / final artifact verification pending`, e
+  **não** `GATE-R1 PASSED`. Esse estado autoriza a criação manual da tag
+  final `v0.1.0` (disparando `release.yml`), mas não a substitui.
+- **FASE B — FINAL ARTIFACT VERIFICATION:** depois que a tag dispara
+  `release.yml` e a publicação stable é concluída, esta fase valida
+  literalmente o critério 11 contra os artefatos reais publicados (tag,
+  imagem GHCR, GitHub Release) e repete qualquer checagem de
+  identidade/versionamento que dependa do artefato publicado (§2.12,
+  digest/OCI). Somente ao final da FASE B o relatório de fechamento pode
+  declarar `GATE-R1 PASSED`.
 
 ---
 

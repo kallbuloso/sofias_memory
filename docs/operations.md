@@ -370,3 +370,239 @@ separate concerns — store `API_KEY`, `LLM_API_KEY`, `DB_PASSWORD`,
 alongside the `pg_dump`/source archive. Every command in this document uses
 placeholders or environment variable references; no real secret value
 appears here.
+
+## 12. Production deployment
+
+This section closes the gap between "the image exists" and "an operator can
+actually deploy it and prove it works" (REL-006). It does not introduce a new
+architecture: `compose.yaml` is still the only canonical stack definition,
+and Portainer/EasyPanel both consume it directly — neither platform gets its
+own Compose file.
+
+### A. Deployment paths
+
+There are exactly two supported ways to get the application running, and
+both end at the same `compose.yaml`:
+
+1. **Source build** (§2 above): clone the repository, `docker compose build
+   sofias-memory` (or let `docker compose up` build it implicitly), and
+   proceed with the rest of §2.
+2. **Published GHCR image** (§C below): point `compose.yaml`'s
+   `sofias-memory.image` at a published `ghcr.io/kallbuloso/sofias-memory`
+   tag or digest instead of building locally, and skip the build step.
+
+Both paths use the identical migration, readiness, security, and smoke
+procedure — only how the image gets onto the host differs.
+
+### B. First production start
+
+Follow §2 (First start) exactly, substituting the target image (built or
+pulled per §A) for `sofias-memory:0.1.0`. Do not skip the migration step
+(§3) or the readiness check — a deployment is not "up" until
+`/health/ready` reports `ready` and a production smoke run (§H) has passed.
+
+### C. Published GHCR image
+
+Once a stable `v0.1.0` tag is published (REL-005's release workflow), the
+image is available at:
+
+```text
+ghcr.io/kallbuloso/sofias-memory:0.1.0
+```
+
+**For a release candidate** (used only to validate this very procedure, never
+recommended to end users as a production target), the equivalent is:
+
+```text
+ghcr.io/kallbuloso/sofias-memory:0.1.0-rc.1
+```
+
+Pulling requires no authentication — GHCR packages for this repository are
+public; anonymous `docker pull` works.
+
+**Note on `0.1.0-rc.1` specifically:** it was built from commit `607fb8d`,
+before `scripts/production_smoke.py` existed (REL-006) — that image does
+**not** contain the script. This does not affect §H: the production smoke
+run there is always executed from a source checkout on the *host*, as a
+standalone HTTP client against the deployed API; it never needs to run
+*inside* the target container, so it works identically regardless of what
+that image's `/app/scripts` contains. Any image built from the REL-006
+commit onward (including the eventual stable `v0.1.0`) contains
+`production_smoke.py` automatically, since `Dockerfile` already does
+`COPY scripts ./scripts`.
+
+To run the published image via the canonical `compose.yaml` without a local
+build, override the `image` value for the `sofias-memory` service at deploy
+time (Portainer/EasyPanel both expose a way to do this through their UI, and
+a source checkout can do it with a local, untracked override file passed via
+`-f`, or a one-line temporary edit of a copy of `compose.yaml` that is never
+committed) — the point is that `compose.yaml` itself stays platform-neutral
+and build-capable; deployments that want the published image supply the tag
+externally rather than the repository maintaining a second Compose file.
+
+### D. Version/digest pinning
+
+Production deployments must reference an exact, immutable identity — never a
+floating tag:
+
+- Prefer an exact version tag: `ghcr.io/kallbuloso/sofias-memory:0.1.0`.
+- For maximum reproducibility (e.g. verifying exactly what was validated
+  before a rollout), pin by digest instead:
+  `ghcr.io/kallbuloso/sofias-memory@sha256:...`.
+- **Never use `latest`.** No `latest` tag is published for this image (see
+  the release workflow) precisely so this mistake is not available.
+
+Rollback (§5) must use the same discipline: roll back to the exact previous
+version or digest, never to an unpinned reference, and remember that
+application rollback and schema rollback are two different operations.
+
+### E. Production security checklist
+
+- **TLS / reverse proxy**: putting TLS in front of the application is the
+  operator's responsibility — this project ships no TLS termination of its
+  own. Use Traefik, Nginx, Caddy, or the hosting platform's built-in layer
+  (Portainer and EasyPanel both expect this to come from outside the stack).
+  Never expose the application directly to the internet without TLS.
+- **Firewall / network**: only the application's HTTP port should be
+  reachable externally. PostgreSQL and Neo4j must stay on the internal
+  Compose network — `compose.yaml` does not publish ports for either by
+  default; do not add `ports:` entries for them in a production deployment.
+- **Secrets**:
+  - Generate `API_KEY` with `scripts/generate_api_key.py` (never hand-type
+    one).
+  - Use a strong, unique `DB_PASSWORD` and `DB_NEO4J_PASSWORD`.
+  - Treat the LLM/embedding provider key as a secret like any other.
+  - Never commit `.env` or any file containing a real secret value.
+- **Rotation**: rotating `API_KEY` or a provider key is changing the
+  environment variable and restarting the application — Settings are loaded
+  once at startup (§10 of `AGENTS.md`); there is no runtime key-management
+  endpoint, and none is planned. A rotation is not complete until the
+  application has been restarted with the new value.
+- **Volumes**: grant the smallest access necessary to whatever manages the
+  three named volumes (`sofias_memory_postgres_data`, `sofias_memory_neo4j_data`,
+  `sofias_memory_sources`). Back up PostgreSQL and the sources volume per §6;
+  Neo4j is reconstructible and not required to be backed up.
+- This project does not provide a secrets manager, external observability
+  agent, or automated certificate management — do not assume one exists
+  where it hasn't been explicitly added.
+
+### F. Portainer
+
+Portainer consumes `compose.yaml` directly as a Stack — there is no
+`compose.portainer.yaml` and none should be added.
+
+1. Create a new Stack from the repository (Git-based deploy) or by pasting
+   `compose.yaml`'s contents.
+2. Provide the required environment variables through the Stack's
+   environment variable UI — see the minimum list below; audit `.env.example`
+   for the full set before relying on defaults for anything you care about.
+3. Deploy. Portainer preserves the three named volumes declared in
+   `compose.yaml` across redeploys of the same Stack; confirm this in the
+   Volumes view before trusting it with real data.
+4. The container healthcheck already defined in `compose.yaml` (and in the
+   image itself) shows up natively in Portainer's container view — no
+   additional Portainer-specific healthcheck configuration is needed.
+5. Portainer does not provide TLS termination or a public domain by itself;
+   put a reverse proxy in front of it per §E, or use a proxy already managed
+   by your Portainer environment.
+6. Run the migration step (§B/§2 step 3) as a one-off `docker compose run`
+   equivalent — Portainer's "Execute command" / one-off container feature
+   against the `sofias-memory` service image — before starting the
+   long-running service for the first time or after any upgrade.
+7. Upgrade by changing the pinned image tag/digest (§D) to the new exact
+   version and redeploying the Stack, or by triggering a rebuild if using the
+   source-build path; always run the migration and a production smoke (§H)
+   immediately after.
+
+Minimum required environment variables (already enforced at the
+`compose.yaml` level via `:?...` interpolation — the stack will not start
+without them):
+
+```text
+API_KEY
+LLM_API_KEY
+DB_PASSWORD
+DB_NEO4J_PASSWORD
+```
+
+Audit `.env.example` for the rest before assuming any other variable's
+default is appropriate for your deployment.
+
+### G. EasyPanel
+
+EasyPanel also consumes `compose.yaml` directly — there is no
+`compose.easypanel.yaml` and none should be added.
+
+1. Create the app/stack from this repository's `compose.yaml` (EasyPanel's
+   Compose/Docker Compose service type).
+2. Set the same required environment variables as the Portainer list above
+   through EasyPanel's UI; audit `.env.example` for anything else you need.
+3. Configure persistent volumes for the three named volumes exactly as
+   declared in `compose.yaml` — do not let EasyPanel substitute ephemeral
+   storage for PostgreSQL, Neo4j, or the sources volume.
+4. EasyPanel's own domain/reverse-proxy/TLS layer satisfies §E's TLS
+   requirement; use it (or an external proxy) rather than exposing the
+   application's port directly.
+5. Run the migration manually (§B/§2 step 3) via EasyPanel's one-off
+   command/console feature before the first start and after every upgrade —
+   this project does not migrate automatically at startup, on this platform
+   or any other.
+6. Upgrade by pointing at a new exact image tag/digest (§D) or triggering a
+   rebuild, then migrate and run a production smoke (§H) before considering
+   the upgrade complete.
+
+Nothing about EasyPanel's behavior is documented here beyond what was
+verified necessary for this deployment (image/env/volume/migration/smoke) —
+this is deliberately not a general EasyPanel manual.
+
+### H. Production smoke
+
+`scripts/production_smoke.py` proves a **deployed** instance is functional —
+it never starts Compose, runs migrations, or touches Docker itself; it only
+speaks HTTP to an already-running API. It is run from a source checkout on
+the operator's own machine (or CI runner), as a standalone HTTP client — it
+does not need to exist inside the target container, and works the same way
+whether the deployed image contains a copy of it or not. Run it after every
+first start and every upgrade, against every deployment path (source-build,
+Portainer, EasyPanel, or a raw `compose.yaml` with the GHCR image
+substituted).
+
+```bash
+SOFIAS_MEMORY_API_KEY=sf-... uv run python scripts/production_smoke.py \
+  --base-url https://your-deployment.example
+```
+
+(`API_KEY` is accepted as a fallback environment variable name for
+consistency with the rest of the project's configuration. The key is never
+accepted as a CLI argument, so it never appears in a process listing, and the
+script never prints it.)
+
+The flow: `/health/live` → `/health/ready` → `GET /info` → create an isolated
+`production-smoke-<uuid>` dataset → `POST /remember` (`mode=full`,
+`wait=false`, exercising the real provider-backed pipeline) → poll the run to
+`succeeded` → `POST /recall` (`mode=chunks`) to confirm the just-remembered
+content is retrievable with correct provenance → delete the smoke dataset
+(awaiting its own async completion if the API returns `202`) in a `finally`
+block that runs even if an earlier stage failed. It exits `0` only when the
+whole flow (including cleanup) succeeded, and prints one `[PASS]`/`[FAIL]`
+line per stage plus a final `PRODUCTION SMOKE PASS`/nonzero exit. It never
+deletes anything but the dataset it just created, and it refuses (via an
+explicit guard checked immediately before the delete call) to ever touch the
+`main` dataset or a dataset not created by that same run.
+
+### I. Post-deploy verification
+
+After any first start or upgrade, before considering the deployment done:
+
+1. `/health/live` returns `200`.
+2. `/health/ready` returns `200` with all checks (`postgres`, `neo4j`,
+   `worker`) `ready`.
+3. `GET /api/v1/info` reports the version you expect to have deployed.
+4. `scripts/production_smoke.py` (§H) exits `0`.
+5. For an upgrade specifically: `alembic current` matches the target
+   version's expected head (§3), and the release notes for that version have
+   been read.
+
+If any of these fail, treat the deployment as not done — do not route
+production traffic to it — and consult §10 (Failure / abort conditions) for
+what to check before retrying.

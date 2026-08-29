@@ -79,6 +79,11 @@ docker compose up -d sofias-memory
 curl http://127.0.0.1:8000/health/ready
 ```
 
+**Production deployment** (Portainer, EasyPanel, a published GHCR image, the
+security checklist, and the production smoke test) is covered in
+[`docs/operations.md`](docs/operations.md#12-production-deployment) — this
+section and the rest of this Quick start are the source-build/local path.
+
 Prefer running from a source checkout (e.g. for development)? See
 [`docs/development.md`](docs/development.md). That flow still works and looks
 like this:

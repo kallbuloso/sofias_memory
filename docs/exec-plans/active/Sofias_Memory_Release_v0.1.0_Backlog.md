@@ -15,7 +15,7 @@ features de produto e NÃO é SM-517/B6.
 | REL-003 — Contrato operacional de migração/upgrade/backup | DONE | `3c071c5` — `docs: define v0.1.0 operational recovery contract` |
 | REL-004 — CI mínima de qualidade e integração | DONE | `f24c673` — `ci: add v0.1.0 quality and integration gates`; CI `33220003273` PASS; Integration `33222166381` PASS |
 | REL-005 — Automação de release / publicação GHCR | IMPLEMENTED / RC PASS / final v0.1.0 publication pending REL-006 + GATE-R1 | `607fb8d` — release workflow + CHANGELOG; CI `33227939187` PASS; Release RC run `33228177783` PASS; `v0.1.0-rc.1` public GHCR digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` |
-| REL-006 — Guias de deployment + smoke de produção | TODO | — |
+| REL-006 — Guias de deployment + smoke de produção | IMPLEMENTED / RC production smoke PASS / publication CI pending | (uncommitted, local implementation) — `docs/operations.md` §12, `README.md`, `scripts/production_smoke.py`, `tests/unit/test_production_smoke.py`; real production smoke PASS against published RC digest `sha256:a6f7603c6c3dc04df39dabc6f91aa339d2ac78f058cfbfb31cf032341b695b43` (`ghcr.io/kallbuloso/sofias-memory:0.1.0-rc.1`), isolated `sofias-memory-rel006-smoke` stack, real OpenAI provider |
 | GATE-R1 — Sofias Memory v0.1.0 Release | TODO | — |
 
 ## Nota de sequenciamento de execução (REL-005)

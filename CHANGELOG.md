@@ -36,9 +36,23 @@ smoke's Dataset-delete cleanup phase.
 - No database schema migration.
 - No storage format change.
 
-This release candidate (`v0.1.2-rc.1`) has not yet been validated against a
-real Easypanel deployment; EASYPANEL-001 validation for this fix is still
-pending and is not claimed complete by this entry.
+### Validation
+
+`v0.1.2-rc.1` was validated against a real Easypanel deployment:
+
+- `/health/live` and `/health/ready` PASS, with PostgreSQL, Neo4j, and the
+  worker all reported ready.
+- `/api/v1/info` reported `0.1.2-rc.1` running under `production`.
+- Provider-backed Remember and a Recall marker check both PASS.
+- A fresh administrative Dataset DELETE PASS, and the full
+  `production_smoke.py` suite PASS end to end.
+- The Dataset left `failed`/`deleting` by the `v0.1.1` production incident
+  was recovered to `Dataset.status=DELETED` through the supported run retry
+  flow, with no manual PostgreSQL, Neo4j, `graph_outbox`, or filesystem
+  repair.
+
+EASYPANEL-001's own documentation artifacts (`deploy/easypanel/compose.yaml`,
+`docs/deployment/easypanel.md`) are not yet published by this entry.
 
 ## [0.1.1]
 

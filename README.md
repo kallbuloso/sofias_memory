@@ -73,6 +73,13 @@ first-start/migration/upgrade/rollback/backup/restore contract — every command
 there was run for real against disposable infrastructure, including a
 complete non-empty backup, destroy, restore, and Neo4j-rebuild drill.
 
+> **`alembic upgrade head` below is a FIRST INSTALL / EMPTY DATABASE step.**
+> It is required once, against a brand-new, empty PostgreSQL database/volume.
+> It is **not** part of an ordinary redeploy, restart, or Stack recreation
+> that reuses an already-migrated PostgreSQL volume, and it is only needed
+> again on a later upgrade if that specific release adds new migrations. See
+> [When do I run migrations?](#when-do-i-run-migrations) below.
+
 Minimal Compose-based flow (see `docs/operations.md` §2 for the full version):
 
 ```bash
@@ -112,7 +119,8 @@ uv run python scripts/generate_api_key.py   # paste the result into API_KEY in .
 # Also set in .env: DATABASE_URL, NEO4J_URI/NEO4J_PASSWORD (pointing at the
 # containers above), LLM_API_KEY, EMBEDDING_API_KEY.
 
-# 3. Install dependencies and migrate the schema.
+# 3. Install dependencies and migrate the schema (first install only --
+#    against the brand-new, empty databases started in step 1).
 uv sync --dev
 uv run alembic upgrade head
 
@@ -124,8 +132,32 @@ curl http://127.0.0.1:8000/health/ready
 ```
 
 `compose.yaml` (`sofias-memory` + `postgres` + `neo4j`, application-only
-published by default) is what Portainer/EasyPanel consume directly — see
-[Development](docs/development.md) for more on its internal-network layout.
+published by default) is the canonical, portable local/dev stack definition
+— see [Development](docs/development.md) for more on its internal-network
+layout, and Portainer deployments consume it directly today (§F of
+`docs/operations.md`). **EasyPanel deployments use a dedicated variant**,
+[`deploy/easypanel/compose.yaml`](deploy/easypanel/compose.yaml) — see
+[`docs/deployment/easypanel.md`](docs/deployment/easypanel.md) for the
+verified, step-by-step guide.
+
+### When do I run migrations?
+
+`alembic upgrade head` is a **schema-migration** step, not a startup step —
+the application never migrates itself automatically. It is required in
+exactly two situations:
+
+| Situation | Run `alembic upgrade head`? |
+|---|---|
+| Fresh install — brand-new, empty PostgreSQL database/volume | **Yes**, once, before first starting the application. |
+| Ordinary redeploy or restart of an already-migrated deployment | No. |
+| Recreating a Compose Stack/service while reusing the same, already-migrated PostgreSQL volume | No — recreating the Stack does not reset the schema. |
+| Upgrading to a release with **no** new migration | No — verify readiness/smoke as usual, but there is nothing to migrate. |
+| Upgrading to a release **with** one or more new migrations | **Yes**, once, using the target release's image, following the backup/quiesce upgrade procedure (`docs/operations.md` §4). |
+
+`alembic current` and `alembic heads` are read-only inspection/verification
+commands — they never mutate the schema and are safe (though not required)
+to run at any time, including on every redeploy, to confirm what revision is
+currently applied.
 
 ## Configuration
 

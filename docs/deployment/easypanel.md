@@ -153,6 +153,22 @@ should still follow that document's backup-first procedure.
 6. Redeploy/restart the `sofias-memory` service so it picks up the new
    environment value.
 
+> **⚠️ This migration procedure is NOT required on every redeploy.**
+>
+> - Do **not** repeat steps 1-6 above merely because Easypanel redeployed or
+>   recreated the `sofias-memory` Compose service.
+> - If the existing `sofias_memory_postgres_data` volume is reused and
+>   already has the expected schema, migration is **not** required —
+>   redeploy/restart normally.
+> - A **new/empty** PostgreSQL volume is a fresh install and **does**
+>   require this procedure, regardless of how many other Stacks already
+>   exist.
+> - A later Sofias Memory version only requires `alembic upgrade head`
+>   again when that specific target release adds one or more **new**
+>   migrations (check its `CHANGELOG.md` entry) — not on every version bump.
+> - `alembic current` and `alembic heads` are read-only verification
+>   commands; they never modify the schema and are always safe to run.
+
 ## 5. Confirm health, then configure the domain
 
 Before exposing any public domain, confirm readiness using Easypanel's

@@ -71,15 +71,37 @@ This exact sequence was run against a genuinely empty, disposable PostgreSQL
 - Alembic is the **sole** authority for schema evolution.
 - Migrations are applied **explicitly** — `docker compose run --rm
   sofias-memory alembic upgrade head` (§2) — never automatically when the
-  application starts.
+  application starts, and never on every deploy as a matter of course.
 - A schema that doesn't match the application's expected revision leaves
   `/health/ready` at `not_ready`; the application does not guess or
   self-heal.
-- A deployment is not healthy until migration has completed and readiness
-  is confirmed.
+- A deployment is not healthy until migration has completed (when required)
+  and readiness is confirmed.
 
-Useful commands (all run the same way as step 3 above, substituting the
-Alembic subcommand):
+**When `alembic upgrade head` is required, precisely:**
+
+| Situation | `alembic upgrade head` required? |
+|---|---|
+| Fresh installation — brand-new, empty PostgreSQL database/volume (§2) | **Yes.** |
+| Ordinary application redeploy/restart (no volume change, no version change) | No. |
+| Recreating a Compose Stack/service (Portainer, EasyPanel, or otherwise) while reusing the same, already-migrated PostgreSQL persistent volume | No — recreating the Stack does not reset or otherwise affect the schema already present in that volume. |
+| Upgrading to a release with **no** new database migration | No — proceed straight to the normal health/readiness/smoke verification (§I); there is nothing to apply. |
+| Upgrading to a release **with** one or more new migrations | **Yes**, once, using the target release's image — follow the full backup/quiesce upgrade procedure (§4). |
+| A new Stack pointed at a NEW/EMPTY PostgreSQL volume or database (even if it isn't literally "the first" Stack you've ever created) | **Yes** — this is a fresh installation by definition, regardless of how many prior Stacks exist elsewhere. |
+
+Re-running `alembic upgrade head` when already at the target head is normally
+idempotent (Alembic detects there is nothing left to apply and exits
+cleanly) — the point of the table above is not that repeating it is
+dangerous, but that it is not an operational requirement you need to perform
+on every deploy, restart, or Stack recreation.
+
+`alembic current` and `alembic heads` are **read-only, diagnostic/
+verification commands** — they never mutate the schema. They are useful to
+confirm what revision is actually applied (before a backup, after a
+migration, after a restore, or just to check), but running them is never
+itself a required deployment step; they answer "what state is this database
+in?", they don't change it. Both run the same way as the migration command
+above, substituting the subcommand:
 
 ```bash
 docker compose run --rm sofias-memory alembic current
@@ -88,28 +110,34 @@ docker compose run --rm sofias-memory alembic heads
 
 ## 4. Upgrade
 
-**Current repository/local-image flow** (build-from-source, as `compose.yaml`
-does today):
+**First, check whether the target release adds any migration at all** — read
+its `CHANGELOG.md` entry and/or check `migrations/versions/` for anything
+newer than the currently-deployed revision (`alembic heads` against the
+target image vs. `alembic current` against the running deployment, §3).
+This determines whether step 5 below is performed or skipped.
 
 1. Read the release notes for the target version.
 2. Take a backup (§6) at the currently-deployed version.
-3. Pull/checkout the target version's source and rebuild the local image
-   (`docker compose build sofias-memory`), or obtain the target image once
-   REL-005 publishes versioned images (see below).
+3. Obtain the target image — either a published GHCR tag/digest (§C; the
+   normal path today) or, for a local/source-build deployment, pull/checkout
+   the target version's source and rebuild (`docker compose build
+   sofias-memory`).
 4. Quiesce the application (`docker compose stop sofias-memory`) so no new
    writes land during the migration window.
-5. Run the migration **using the target image**: `docker compose run --rm
-   sofias-memory alembic upgrade head`.
+5. **If, and only if, the target release adds a new migration:** run it
+   using the target image: `docker compose run --rm sofias-memory alembic
+   upgrade head`. **If the target release adds no new migration, skip this
+   step entirely** — there is nothing to apply, and running it anyway is
+   harmless (idempotent at head) but not required.
 6. Start the application on the target image: `docker compose up -d
    sofias-memory`.
 7. Verify readiness (`/health/ready`).
 8. Run a smoke check against a non-production dataset before considering the
    upgrade complete.
 
-**Versioned image flow (after REL-005 publishes to GHCR)** — not available
-yet; do not run these commands against an artifact that doesn't exist. Once
-published, the same eight steps apply with `image: <target-image>:<version>`
-substituted for the local build in `compose.yaml`, and no local rebuild step.
+Both the published-GHCR-image path and the local-build path follow the same
+eight steps above — only how the target image is obtained (step 3) differs;
+see §C for the published-image details.
 
 Sofias Memory does **not** promise zero-downtime upgrades. The model above requires
 a maintenance window (the app is quiesced for the duration of the migration).
@@ -375,14 +403,19 @@ appears here.
 
 This section closes the gap between "the image exists" and "an operator can
 actually deploy it and prove it works" (REL-006). It does not introduce a new
-architecture: `compose.yaml` is still the only canonical stack definition,
-and Portainer/EasyPanel both consume it directly — neither platform gets its
-own Compose file.
+architecture: `compose.yaml` is still the canonical, portable stack
+definition. Portainer consumes it directly today (§F) — there is no
+dedicated Portainer variant. **EasyPanel deployments use a dedicated
+variant**, [`deploy/easypanel/compose.yaml`](../deploy/easypanel/compose.yaml)
+(§G; see [`docs/deployment/easypanel.md`](deployment/easypanel.md) for the
+full, verified guide) — everything below in §A-§E still applies to it
+identically (same image, same migration policy, same security posture), only
+the Compose file and the platform-specific deploy mechanics differ.
 
 ### A. Deployment paths
 
-There are exactly two supported ways to get the application running, and
-both end at the same `compose.yaml`:
+There are exactly two supported ways to get the application running onto
+`compose.yaml` (or its EasyPanel variant, §G):
 
 1. **Source build** (§2 above): clone the repository, `docker compose build
    sofias-memory` (or let `docker compose up` build it implicitly), and
@@ -530,30 +563,21 @@ default is appropriate for your deployment.
 
 ### G. EasyPanel
 
-EasyPanel also consumes `compose.yaml` directly — there is no
-`compose.easypanel.yaml` and none should be added.
+EasyPanel uses a dedicated Compose variant,
+[`deploy/easypanel/compose.yaml`](../deploy/easypanel/compose.yaml) — the
+same three-service topology, database images, security posture, and
+environment contract as the root `compose.yaml`, differing only in
+`image:` (no build context) and no host port published for `sofias-memory`
+(EasyPanel routes its domain to the internal port directly instead).
 
-1. Create the app/stack from this repository's `compose.yaml` (EasyPanel's
-   Compose/Docker Compose service type).
-2. Set the same required environment variables as the Portainer list above
-   through EasyPanel's UI; audit `.env.example` for anything else you need.
-3. Configure persistent volumes for the three named volumes exactly as
-   declared in `compose.yaml` — do not let EasyPanel substitute ephemeral
-   storage for PostgreSQL, Neo4j, or the sources volume.
-4. EasyPanel's own domain/reverse-proxy/TLS layer satisfies §E's TLS
-   requirement; use it (or an external proxy) rather than exposing the
-   application's port directly.
-5. Run the migration manually (§B/§2 step 3) via EasyPanel's one-off
-   command/console feature before the first start and after every upgrade —
-   this project does not migrate automatically at startup, on this platform
-   or any other.
-6. Upgrade by pointing at a new exact image tag/digest (§D) or triggering a
-   rebuild, then migrate and run a production smoke (§H) before considering
-   the upgrade complete.
-
-Nothing about EasyPanel's behavior is documented here beyond what was
-verified necessary for this deployment (image/env/volume/migration/smoke) —
-this is deliberately not a general EasyPanel manual.
+The full, real-deployment-verified procedure — creating the service, both
+valid source options (Git or Inline), required environment variables, the
+first-install migration steps via EasyPanel's browser console, health
+verification, domain configuration, and production smoke — is documented in
+[`docs/deployment/easypanel.md`](deployment/easypanel.md). It follows the
+same migration policy as §3/§4 above: required once on a fresh install or on
+an upgrade that adds new migrations, never merely because the Stack was
+redeployed or recreated with its existing PostgreSQL volume intact.
 
 ### H. Production smoke
 

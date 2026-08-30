@@ -407,7 +407,7 @@ Stable releases (REL-005's release workflow) are published to GHCR at the
 exact version tag. The current stable image is available at:
 
 ```text
-ghcr.io/kallbuloso/sofias-memory:0.1.1
+ghcr.io/kallbuloso/sofias-memory:0.1.2
 ```
 
 **For a release candidate** (used only to validate this very procedure, never
@@ -445,7 +445,7 @@ externally rather than the repository maintaining a second Compose file.
 Production deployments must reference an exact, immutable identity — never a
 floating tag:
 
-- Prefer an exact version tag: `ghcr.io/kallbuloso/sofias-memory:0.1.1`.
+- Prefer an exact version tag: `ghcr.io/kallbuloso/sofias-memory:0.1.2`.
 - For maximum reproducibility (e.g. verifying exactly what was validated
   before a rollout), pin by digest instead:
   `ghcr.io/kallbuloso/sofias-memory@sha256:...`.

@@ -75,9 +75,11 @@ jobs:
       - name: pip-audit (runtime dependencies only)
         run: uv run pip-audit -r runtime-requirements.txt
 
+      # Keep the complete Bandit report visible in the log without turning
+      # accepted Low/Medium findings into a red GitHub Actions annotation.
+      # The following HIGH-only step is the actual blocking security gate.
       - name: bandit (full scan, informational)
-        run: uv run bandit -r sofias_memory -q
-        continue-on-error: true
+        run: uv run bandit -r sofias_memory -q || true
 
       # The actual gate: fails the job on any HIGH-severity finding. The
       # one pre-existing Medium (0.0.0.0 bind, intentional for a

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-
 _STORAGE_ENV_NAMES = (
     "STORAGE_BACKEND",
     "STORAGE_S3_BUCKET",

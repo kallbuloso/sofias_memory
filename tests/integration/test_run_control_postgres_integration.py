@@ -31,7 +31,6 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import (
     DatasetStatus,
@@ -52,6 +51,7 @@ from sofias_memory.services.cognify import CognifyService
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.remember import ingress_artifact_exists, write_ingress_bytes
+from tests.unit._app_factory import create_app
 
 RUN_CONTROL_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_RUN_CONTROL_POSTGRES_TESTS"
 RUN_CONTROL_POSTGRES_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_RUN_CONTROL_TEST_DATABASE_URL"
@@ -2052,3 +2052,284 @@ async def test_single_run_failure_worker_stays_operational_new_submission_accept
         assert second.status_code == 202
     finally:
         await coordinator.stop()
+
+
+# --- prepare_remember_retry_ingress Case 2: dedicated B1 unit regression ------
+#
+# STORAGE-009 (2026-09-01 real-MinIO validation) found that Case 2 called the
+# filesystem-only `source_storage_path` helper directly instead of routing
+# through `SourceStorageRouter` by URI scheme, so a manual retry of an
+# S3-backed Remember run whose original `_ingress` was already cleaned up
+# failed closed with `INVALID_REQUEST` instead of recovering. These tests
+# exercise `prepare_remember_retry_ingress` DIRECTLY (not through the full
+# pipeline/worker/HTTP stack already covered by
+# `test_remember_failed_after_final_storage_retry_succeeds_despite_missing_original_ingress`
+# above) using the same `storage:` injection point
+# `RememberPipelineResources.source_storage` already uses (`pipelines/steps/
+# remember.py`), so the S3 case needs only `botocore.stub.Stubber` -- no live
+# network -- while still requiring real PostgreSQL for the one authoritative
+# Source read this function performs (its own documented exception to being a
+# pure/service-layer helper). Real PostgreSQL is why this lives in
+# `tests/integration/`, not `tests/unit/`, exactly like every other
+# PostgreSQL-backed test in this file.
+
+
+async def _seed_source_for_retry_ingress(
+    session_factory: AsyncSessionFactory,
+    *,
+    dataset_id: UUID,
+    storage_uri: str,
+    content: bytes,
+) -> UUID:
+    from sofias_memory.domain import SourceKind, SourceStatus
+    from sofias_memory.infrastructure.postgres.models import Source
+
+    source_id = uuid4()
+    async with PostgresUnitOfWork(session_factory) as uow:
+        await uow.sources.add(
+            Source(
+                id=source_id,
+                dataset_id=dataset_id,
+                kind=SourceKind.TEXT,
+                name="retry-ingress-note",
+                mime_type="text/plain",
+                storage_uri=storage_uri,
+                content_sha256=sha256(content).hexdigest(),
+                byte_size=len(content),
+                metadata_={},
+                status=SourceStatus.PENDING,
+                version=1,
+            )
+        )
+        await uow.commit()
+    return source_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_ingress_case2_s3_storage_uri_routes_through_router_read(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Source.storage_uri=s3://..., original ingress missing -> Case 2 must
+    recover via `SourceStorageRouter.read()` (proven by the Stubber expecting
+    exactly one `get_object` call and nothing else), never the filesystem-only
+    helper -- and must stage the recovered bytes as the candidate's own
+    durable ingress artifact."""
+
+    import boto3
+    from botocore.stub import Stubber
+
+    from sofias_memory.infrastructure.storage.s3 import S3SourceObjectStorage, s3_object_key
+    from sofias_memory.services.remember import (
+        ingress_artifact_exists,
+        prepare_remember_retry_ingress,
+        read_ingress_bytes,
+    )
+
+    settings = make_settings(
+        tmp_path,
+        storage_backend="s3",
+        storage_s3_bucket="test-bucket",
+        storage_s3_region="us-east-1",
+        # Pinned explicitly (STORAGE-009 finding): this Stubber-based test's
+        # hand-built S3 key must match exactly what the adapter computes --
+        # both must agree on the prefix regardless of what STORAGE_S3_PREFIX
+        # the ambient process environment happens to carry (e.g. a real-S3
+        # validation run with a non-empty prefix forced via env).
+        storage_s3_prefix="",
+    )
+    session_factory = create_session_factory(postgres_engine)
+    dataset_id = await seed_dataset(session_factory, slug=f"retry-ingress-s3-{uuid4()}")
+    content = b"s3 original content recovered for retry"
+
+    client = boto3.client(
+        "s3", region_name="us-east-1", aws_access_key_id="fake", aws_secret_access_key="fake"
+    )
+    stubber = Stubber(client)
+    s3_adapter = S3SourceObjectStorage(settings, client=client)
+
+    original_run_id = uuid4()
+    candidate_run_id = uuid4()
+    # A Source row must exist before its own deterministic S3 key can be
+    # computed (the key is keyed by the Source's own id) -- seed with a
+    # placeholder `storage_uri`, then patch it to the real deterministic key
+    # once the row (and therefore its id) exists.
+    source_id = await _seed_source_for_retry_ingress(
+        session_factory,
+        dataset_id=dataset_id,
+        storage_uri="s3://test-bucket/placeholder",
+        content=content,
+    )
+    key = s3_object_key(
+        prefix="", dataset_id=dataset_id, source_id=source_id, storage_extension=".txt"
+    )
+    async with PostgresUnitOfWork(session_factory) as uow:
+        source = await uow.sources.get_by_id_for_update(source_id)
+        assert source is not None
+        source.storage_uri = f"s3://test-bucket/{key}"
+        await uow.commit()
+
+    import io
+
+    from botocore.response import StreamingBody
+
+    stubber.add_response(
+        "get_object",
+        {"Body": StreamingBody(io.BytesIO(content), len(content)), "ContentLength": len(content)},
+    )
+
+    assert not ingress_artifact_exists(tmp_path, run_id=original_run_id)
+
+    with stubber:
+        staged = await prepare_remember_retry_ingress(
+            session_factory=session_factory,
+            data_directory=tmp_path,
+            original_run_id=original_run_id,
+            original_source_id=source_id,
+            candidate_run_id=candidate_run_id,
+            source_kind="text",
+            settings=settings,
+            storage=s3_adapter,
+        )
+    stubber.assert_no_pending_responses()  # exactly one get_object call, nothing else
+
+    assert staged is True
+    assert ingress_artifact_exists(tmp_path, run_id=candidate_run_id)
+    assert read_ingress_bytes(tmp_path, run_id=candidate_run_id) == content
+    s3_adapter.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_ingress_case2_s3_read_failure_fails_per_typed_contract(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """A real, typed S3 read failure (NoSuchKey -- the object genuinely is not
+    there any more) must make Case 2 report the retry as unrecoverable
+    (`False`), per the function's own existing documented contract -- never
+    raise an untyped exception, never silently claim success."""
+
+    import boto3
+    from botocore.stub import Stubber
+
+    from sofias_memory.infrastructure.storage.s3 import S3SourceObjectStorage, s3_object_key
+    from sofias_memory.services.remember import (
+        ingress_artifact_exists,
+        prepare_remember_retry_ingress,
+    )
+
+    settings = make_settings(
+        tmp_path,
+        storage_backend="s3",
+        storage_s3_bucket="test-bucket",
+        storage_s3_region="us-east-1",
+        # Pinned explicitly (STORAGE-009 finding): this Stubber-based test's
+        # hand-built S3 key must match exactly what the adapter computes --
+        # both must agree on the prefix regardless of what STORAGE_S3_PREFIX
+        # the ambient process environment happens to carry (e.g. a real-S3
+        # validation run with a non-empty prefix forced via env).
+        storage_s3_prefix="",
+    )
+    session_factory = create_session_factory(postgres_engine)
+    dataset_id = await seed_dataset(session_factory, slug=f"retry-ingress-s3-fail-{uuid4()}")
+    content = b"s3 original content that is now gone"
+
+    client = boto3.client(
+        "s3", region_name="us-east-1", aws_access_key_id="fake", aws_secret_access_key="fake"
+    )
+    stubber = Stubber(client)
+    s3_adapter = S3SourceObjectStorage(settings, client=client)
+
+    source_id = await _seed_source_for_retry_ingress(
+        session_factory,
+        dataset_id=dataset_id,
+        storage_uri="s3://test-bucket/placeholder",
+        content=content,
+    )
+    key = s3_object_key(
+        prefix="", dataset_id=dataset_id, source_id=source_id, storage_extension=".txt"
+    )
+    async with PostgresUnitOfWork(session_factory) as uow:
+        source = await uow.sources.get_by_id_for_update(source_id)
+        assert source is not None
+        source.storage_uri = f"s3://test-bucket/{key}"
+        await uow.commit()
+
+    stubber.add_client_error("get_object", service_error_code="NoSuchKey", http_status_code=404)
+
+    original_run_id = uuid4()
+    candidate_run_id = uuid4()
+    with stubber:
+        staged = await prepare_remember_retry_ingress(
+            session_factory=session_factory,
+            data_directory=tmp_path,
+            original_run_id=original_run_id,
+            original_source_id=source_id,
+            candidate_run_id=candidate_run_id,
+            source_kind="text",
+            settings=settings,
+            storage=s3_adapter,
+        )
+
+    assert staged is False
+    assert not ingress_artifact_exists(tmp_path, run_id=candidate_run_id)
+    s3_adapter.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_ingress_case2_filesystem_storage_uri_unchanged_regression(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Regression: a `file://` Source recovering through Case 2 must behave
+    exactly as before this fix -- the router-based path must be scheme-
+    transparent, not S3-only."""
+
+    from sofias_memory.infrastructure.storage.filesystem import FilesystemSourceObjectStorage
+    from sofias_memory.services.remember import (
+        ingress_artifact_exists,
+        prepare_remember_retry_ingress,
+        read_ingress_bytes,
+    )
+
+    settings = make_settings(tmp_path)
+    session_factory = create_session_factory(postgres_engine)
+    dataset_id = await seed_dataset(session_factory, slug=f"retry-ingress-fs-{uuid4()}")
+    content = b"legacy filesystem original content"
+
+    fs_adapter = FilesystemSourceObjectStorage(tmp_path)
+    # A Source row must exist before its own deterministic filesystem path can
+    # be computed (keyed by the Source's own id) -- seed with a placeholder
+    # `storage_uri`, finalize the real on-disk object under the real id, then
+    # patch the row to the real `file://` URI (mirrors the S3 tests above).
+    source_id = await _seed_source_for_retry_ingress(
+        session_factory,
+        dataset_id=dataset_id,
+        storage_uri="file:///placeholder",
+        content=content,
+    )
+    finalize_result = await fs_adapter.finalize(
+        dataset_id=dataset_id, source_id=source_id, storage_extension=".txt", original_bytes=content
+    )
+    async with PostgresUnitOfWork(session_factory) as uow:
+        source = await uow.sources.get_by_id_for_update(source_id)
+        assert source is not None
+        source.storage_uri = finalize_result.storage_uri
+        await uow.commit()
+
+    original_run_id = uuid4()
+    candidate_run_id = uuid4()
+    staged = await prepare_remember_retry_ingress(
+        session_factory=session_factory,
+        data_directory=tmp_path,
+        original_run_id=original_run_id,
+        original_source_id=source_id,
+        candidate_run_id=candidate_run_id,
+        source_kind="text",
+        settings=settings,
+        storage=fs_adapter,
+    )
+
+    assert staged is True
+    assert ingress_artifact_exists(tmp_path, run_id=candidate_run_id)
+    assert read_ingress_bytes(tmp_path, run_id=candidate_run_id) == content

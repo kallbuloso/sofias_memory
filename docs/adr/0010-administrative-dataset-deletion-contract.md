@@ -180,6 +180,16 @@ code path.
 
 ### D9. Fixed pipeline: phases and safe points
 
+> **Forward reference (ADR-0011, accepted):** step 4 (`delete_storage`) below
+> is described in filesystem-only terms because that was the only backend
+> that existed when this ADR was written. `docs/adr/0011-durable-source-object-storage-s3-and-startup-convergence.md`
+> D28 generalizes it to "Source object storage deletion via
+> `SourceStorageRouter.delete`," routed by `storage_uri` scheme rather than
+> always filesystem, and D37–D39 add a fourth, typed `UNRESOLVED` outcome
+> that no longer blocks `finalize_tombstone` the way this section's original
+> "must complete" framing implies. This ADR's own text is not rewritten —
+> see ADR-0011 for the current, accepted contract.
+
 Five fixed steps, `CancellationRecoveryMode` classified per ADR-0009 §I / SM-507
 (`pipelines/registry.py:106-133`: `ATOMIC`, `RECONCILABLE`, `AMBIGUOUS` — default
 `AMBIGUOUS`, fail-safe):
@@ -189,7 +199,7 @@ Five fixed steps, `CancellationRecoveryMode` classified per ADR-0009 §I / SM-50
 | 1 | `begin_delete` | PostgreSQL-only, ATOMIC | `ATOMIC` |
 | 2 | `deactivate_authoritative` | PostgreSQL-only, ATOMIC | `ATOMIC` |
 | 3 | `converge_projection` | external (Neo4j via outbox), replay-safe | `RECONCILABLE` (backed solely by `graph_outbox` durable state, same shape as Forget's `ProjectionConvergenceStep`, `pipelines/steps/forget.py:326-328`) |
-| 4 | `delete_storage` | external (filesystem), idempotent | `AMBIGUOUS` (same justification as Forget's `StorageDeletionStep`, `pipelines/steps/forget.py:373-381`: a PostgreSQL-only reconciliation callback cannot prove an orphaned attempt did or did not already unlink the file before crashing) |
+| 4 | `delete_storage` | external (filesystem **or S3**, ADR-0011 D28), idempotent | `AMBIGUOUS` (same justification as Forget's `StorageDeletionStep`, `pipelines/steps/forget.py:373-381`: a PostgreSQL-only reconciliation callback cannot prove an orphaned attempt did or did not already apply its external effect before crashing) |
 | 5 | `finalize_tombstone` | PostgreSQL-only, ATOMIC | `ATOMIC` |
 
 1. **`begin_delete`** (PostgreSQL-only/ATOMIC): in one short transaction —
@@ -558,6 +568,16 @@ already produces, `domain/enums.py:24-32`), `storage_uri → NULL` only after co
 storage deletion (D26). No `PENDING`/`ACTIVE` Source survives inside a `DELETED`
 Dataset. Rows are preserved as historical tombstones (D11), consistent with existing
 FK/audit requirements.
+
+> **Forward reference (ADR-0011, accepted):** the `storage_uri → NULL`
+> clause above is superseded in one respect by ADR-0011 D37–D39:
+> `storage_uri` is cleared for `DELETED_NOW`/`ALREADY_ABSENT`/
+> `NOT_REQUESTED` outcomes, but **preserved** (not cleared) for a typed
+> `UNRESOLVED` outcome, and `finalize_tombstone` may proceed with an
+> `UNRESOLVED` result rather than waiting for confirmed physical deletion.
+> `DELETED` + a retained `storage_uri` is therefore a normal, accepted
+> tombstone state (unresolved cleanup debt), not an incomplete/invalid one.
+> See ADR-0011 D37–D39 for the current, accepted contract.
 
 ### D32. `active_generation`
 

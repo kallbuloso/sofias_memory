@@ -17,8 +17,8 @@ from typing import Any
 import httpx
 import pytest
 
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
+from tests.unit._app_factory import create_app
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"

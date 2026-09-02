@@ -6,7 +6,7 @@ import re
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from urllib.parse import urlparse, urlunparse
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -56,6 +56,24 @@ project's version."""
 
 def _secret_is_blank(value: SecretStr) -> bool:
     return not value.get_secret_value() or value.get_secret_value().isspace()
+
+
+def normalize_storage_s3_prefix(value: str) -> str:
+    """ADR-0011 D6: centralized ``STORAGE_S3_PREFIX`` normalization -- no
+    leading/trailing slash, no empty/``.``/``..``/backslash path segment.
+    Reused verbatim as a literal key-path segment by the S3 adapter, so an
+    ambiguous or unsafe prefix must fail closed here rather than let the
+    adapter silently construct an inconsistent key."""
+
+    stripped = value.strip("/")
+    if not stripped:
+        return ""
+    for segment in stripped.split("/"):
+        if not segment or segment in {".", ".."} or "\\" in segment:
+            raise ValueError(
+                "STORAGE_S3_PREFIX must not contain empty, '.', '..', or backslash segments"
+            )
+    return stripped
 
 
 def _raw_secret_is_absent(value: object) -> bool:
@@ -116,6 +134,31 @@ class Settings(BaseSettings):
     data_directory: Path = Field(default=Path("/data/sources"), alias="DATA_DIRECTORY")
     temp_directory: Path = Field(default=Path("/data/tmp"), alias="TEMP_DIRECTORY")
     max_source_size_mb: int = Field(default=50, gt=0, alias="MAX_SOURCE_SIZE_MB")
+    # ADR-0011 D2: closed two-value backend selector for where NEW finalized
+    # Source originals are written. "s3" is accepted here (the closed enum is
+    # frozen by the accepted ADR) but has no adapter yet -- SourceStorageRouter
+    # fails closed with a clear configuration error until STORAGE-002 lands.
+    storage_backend: Literal["filesystem", "s3"] = Field(
+        default="filesystem", alias="STORAGE_BACKEND"
+    )
+    # ADR-0011 D16: mandatory only when storage_backend == "s3" (validated
+    # below); filesystem startup never requires any of these. Credentials are
+    # optional so the standard AWS provider chain (env/shared config/IMDS/
+    # instance role) remains usable without forcing static secrets.
+    storage_s3_bucket: str | None = Field(default=None, alias="STORAGE_S3_BUCKET")
+    storage_s3_prefix: str = Field(default="", alias="STORAGE_S3_PREFIX")
+    storage_s3_region: str | None = Field(default=None, alias="STORAGE_S3_REGION")
+    storage_s3_endpoint_url: str | None = Field(default=None, alias="STORAGE_S3_ENDPOINT_URL")
+    storage_s3_access_key_id: SecretStr | None = Field(
+        default=None, alias="STORAGE_S3_ACCESS_KEY_ID"
+    )
+    storage_s3_secret_access_key: SecretStr | None = Field(
+        default=None, alias="STORAGE_S3_SECRET_ACCESS_KEY"
+    )
+    storage_s3_session_token: SecretStr | None = Field(
+        default=None, alias="STORAGE_S3_SESSION_TOKEN"
+    )
+    storage_s3_max_concurrency: int = Field(default=4, ge=1, alias="STORAGE_S3_MAX_CONCURRENCY")
 
     llm_base_url: str = Field(default="https://api.openai.com/v1", alias="LLM_BASE_URL")
     llm_api_key: SecretStr = Field(alias="LLM_API_KEY")
@@ -229,6 +272,21 @@ class Settings(BaseSettings):
             raise ValueError("URL must be an absolute http(s) URL")
         return value
 
+    @field_validator("storage_s3_endpoint_url")
+    @classmethod
+    def validate_storage_s3_endpoint_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("STORAGE_S3_ENDPOINT_URL must be an absolute http(s) URL")
+        return value
+
+    @field_validator("storage_s3_prefix")
+    @classmethod
+    def validate_storage_s3_prefix(cls, value: str) -> str:
+        return normalize_storage_s3_prefix(value)
+
     @field_validator("llm_api_key", "neo4j_password")
     @classmethod
     def validate_required_secret(cls, value: SecretStr) -> SecretStr:
@@ -284,6 +342,29 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ENTITY_MERGE_SIMILARITY_THRESHOLD must be greater than or equal to "
                 "ENTITY_DEDUP_SIMILARITY_THRESHOLD"
+            )
+        if self.storage_backend == "s3":
+            if not self.storage_s3_bucket or self.storage_s3_bucket.isspace():
+                raise ValueError("STORAGE_S3_BUCKET is required when STORAGE_BACKEND=s3")
+            if not self.storage_s3_region or self.storage_s3_region.isspace():
+                raise ValueError("STORAGE_S3_REGION is required when STORAGE_BACKEND=s3")
+        # Pair consistency: never mix an explicit key with a chain-resolved
+        # secret. Credentials remain fully optional (ADR-0011 D16 -- the
+        # standard provider chain is a supported, unconfigured default), but a
+        # half-supplied explicit pair is a configuration mistake, not a valid
+        # "use the chain" signal.
+        access_key_present = not _raw_secret_is_absent(self.storage_s3_access_key_id)
+        secret_key_present = not _raw_secret_is_absent(self.storage_s3_secret_access_key)
+        if access_key_present != secret_key_present:
+            raise ValueError(
+                "STORAGE_S3_ACCESS_KEY_ID and STORAGE_S3_SECRET_ACCESS_KEY must be set together"
+            )
+        if not _raw_secret_is_absent(self.storage_s3_session_token) and not (
+            access_key_present and secret_key_present
+        ):
+            raise ValueError(
+                "STORAGE_S3_SESSION_TOKEN requires STORAGE_S3_ACCESS_KEY_ID and "
+                "STORAGE_S3_SECRET_ACCESS_KEY to also be set"
             )
 
         return self

@@ -19,6 +19,15 @@ import pytest
 
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType, SourceStatus
 from sofias_memory.infrastructure.postgres.models import Dataset, PipelineRun, Source
+from sofias_memory.infrastructure.storage import (
+    InvalidSourceStorageUriError,
+    SourceStorageConflictError,
+    SourceStoragePathError,
+    SourceStorageUnavailableError,
+    StorageDeleteResult,
+    StorageDeleteStatus,
+    UnsupportedStorageBackendError,
+)
 from sofias_memory.pipelines.context import PipelineContext
 from sofias_memory.pipelines.errors import PermanentPipelineStepError
 from sofias_memory.pipelines.registry import StepResult
@@ -31,6 +40,11 @@ from sofias_memory.pipelines.steps.forget import (
     ForgetPipelineResources,
     ProjectionConvergenceStep,
     StorageDeletionStep,
+    _delete_source_storage_result,
+    _finalize_dataset_target,
+    _finalize_source_target,
+    _storage_status_by_source,
+    _storage_status_counts,
 )
 from sofias_memory.services.forget import FORGET_TARGET_CONFLICT_ERROR_CODE
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxDrainResult
@@ -542,7 +556,13 @@ async def test_storage_deletion_skips_entirely_for_memory_only() -> None:
 
     result = await StorageDeletionStep().execute(context)
 
-    assert result.output == {"sources": [], "deleted_now": 0, "already_absent": 0}
+    assert result.output == {
+        "sources": [],
+        "deleted_now": 0,
+        "already_absent": 0,
+        "unresolved": 0,
+        "not_requested": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -681,3 +701,435 @@ async def test_finalize_result_aggregates_source_scope() -> None:
     assert persisted["source_status"] == "deleted"
     assert run.dataset_id == dataset.id
     assert run.source_id == source.id
+
+
+# ---------------------------------------------------------------------------
+# ADR-0011 D37-D42 (STORAGE-005): four-outcome storage deletion consumption.
+# ---------------------------------------------------------------------------
+
+
+class _FakeDeletingStorage:
+    """A ``SourceObjectStorage``-shaped double whose ``delete()`` either
+    returns a fixed result or raises a fixed exception -- proves
+    ``_delete_source_storage_result`` translates recognized
+    ``SourceStorageError`` conditions into ``UNRESOLVED`` while an
+    unexpected exception still propagates untouched."""
+
+    def __init__(
+        self, *, result: StorageDeleteResult | None = None, raises: Exception | None = None
+    ):
+        self._result = result
+        self._raises = raises
+        self.calls = 0
+
+    async def delete(self, *, dataset_id: object, source_id: object, storage_uri: str | None):
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        assert self._result is not None
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_delete_source_storage_result_passes_through_typed_outcome() -> None:
+    storage = _FakeDeletingStorage(result=StorageDeleteResult(StorageDeleteStatus.DELETED_NOW))
+    result = await _delete_source_storage_result(
+        storage, dataset_id=uuid4(), source_id=uuid4(), storage_uri="file:///x"
+    )
+    assert result.status is StorageDeleteStatus.DELETED_NOW
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # 1. recognized dependency/unavailable delete condition -> UNRESOLVED.
+        SourceStorageUnavailableError("unavailable"),
+        # 2. invalid/unresolvable storage locator (D38: "cannot be safely
+        #    resolved" is itself an ADR-classified operational inability
+        #    for delete) -> UNRESOLVED.
+        InvalidSourceStorageUriError("invalid uri"),
+        # lost/unusable S3 configuration (D41's worked example) -> UNRESOLVED.
+        UnsupportedStorageBackendError("S3 not configured"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_delete_source_storage_result_recognized_errors_become_unresolved(
+    exc: Exception,
+) -> None:
+    storage = _FakeDeletingStorage(raises=exc)
+    result = await _delete_source_storage_result(
+        storage, dataset_id=uuid4(), source_id=uuid4(), storage_uri="s3://bucket/key"
+    )
+    assert result.status is StorageDeleteStatus.UNRESOLVED
+
+
+@pytest.mark.asyncio
+async def test_delete_source_storage_result_conflict_is_genuine_failure_not_unresolved() -> None:
+    """3. SourceStorageConflictError (a deterministic content-identity
+    conflict, not an operational inability) must propagate as a genuine
+    exception -- never silently become UNRESOLVED merely because it derives
+    from SourceStorageError. Not reachable from delete() in the current
+    adapters, but the pipeline's catch must not depend on that being true."""
+
+    storage = _FakeDeletingStorage(raises=SourceStorageConflictError("conflict"))
+    with pytest.raises(SourceStorageConflictError):
+        await _delete_source_storage_result(
+            storage, dataset_id=uuid4(), source_id=uuid4(), storage_uri="s3://bucket/key"
+        )
+
+
+@pytest.mark.asyncio
+async def test_delete_source_storage_result_path_error_is_genuine_failure_not_unresolved() -> None:
+    """4. An unclassified/invariant-defect SourceStorageError subclass
+    (SourceStoragePathError -- finalize-only/construction-time in the
+    current adapters, not reachable from delete()) must also propagate
+    rather than being absorbed into UNRESOLVED."""
+
+    storage = _FakeDeletingStorage(raises=SourceStoragePathError("path escapes root"))
+    with pytest.raises(SourceStoragePathError):
+        await _delete_source_storage_result(
+            storage, dataset_id=uuid4(), source_id=uuid4(), storage_uri="file:///x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_delete_source_storage_result_unexpected_exception_propagates() -> None:
+    """5. TypeError/unrelated defect remains a genuine failure."""
+
+    storage = _FakeDeletingStorage(raises=TypeError("programming defect"))
+    with pytest.raises(TypeError):
+        await _delete_source_storage_result(
+            storage, dataset_id=uuid4(), source_id=uuid4(), storage_uri="file:///x"
+        )
+
+
+def test_storage_status_counts_tallies_each_outcome_independently() -> None:
+    entries = [
+        {"source_id": "a", "status": "deleted_now"},
+        {"source_id": "b", "status": "already_absent"},
+        {"source_id": "c", "status": "unresolved"},
+        {"source_id": "d", "status": "not_requested"},
+        {"source_id": "e", "status": "unresolved"},
+    ]
+    counts = _storage_status_counts(entries)
+    assert counts == {
+        "deleted_now": 1,
+        "already_absent": 1,
+        "unresolved": 2,
+        "not_requested": 1,
+    }
+
+
+def test_storage_status_by_source_rejects_duplicate_source_entries() -> None:
+    source_id = uuid4()
+    storage_output = {
+        "sources": [
+            {"source_id": str(source_id), "status": "deleted_now"},
+            {"source_id": str(source_id), "status": "unresolved"},
+        ]
+    }
+    with pytest.raises(PermanentPipelineStepError):
+        _storage_status_by_source(storage_output)
+
+
+@pytest.mark.asyncio
+async def test_finalize_source_target_unresolved_preserves_storage_uri() -> None:
+    dataset = make_dataset()
+    source = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    original_uri = source.storage_uri
+
+    class Repo:
+        async def get_by_id(self, source_id: UUID) -> Source | None:
+            return source if source_id == source.id else None
+
+    class Uow:
+        sources = Repo()
+
+    mutation_output = {"proceed": True, "source_id": str(source.id)}
+    storage_status_by_source = {source.id: "unresolved"}
+
+    output = await _finalize_source_target(
+        Uow(),  # type: ignore[arg-type]
+        mutation_output,
+        memory_only=False,
+        storage_status_by_source=storage_status_by_source,
+    )
+
+    assert source.status == SourceStatus.DELETED
+    assert source.storage_uri == original_uri
+    assert output["storage_deleted"] is False
+    assert output["storage_status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_finalize_source_target_missing_result_is_invariant_failure() -> None:
+    dataset = make_dataset()
+    source = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+
+    class Repo:
+        async def get_by_id(self, source_id: UUID) -> Source | None:
+            return source if source_id == source.id else None
+
+    class Uow:
+        sources = Repo()
+
+    mutation_output = {"proceed": True, "source_id": str(source.id)}
+
+    with pytest.raises(PermanentPipelineStepError):
+        await _finalize_source_target(
+            Uow(),  # type: ignore[arg-type]
+            mutation_output,
+            memory_only=False,
+            storage_status_by_source={},
+        )
+    # The Source must not be silently finalized on missing evidence.
+    assert source.status == SourceStatus.DELETING
+
+
+@pytest.mark.asyncio
+async def test_finalize_source_target_not_requested_clears_already_null_uri() -> None:
+    dataset = make_dataset()
+    source = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    source.storage_uri = None
+
+    class Repo:
+        async def get_by_id(self, source_id: UUID) -> Source | None:
+            return source if source_id == source.id else None
+
+    class Uow:
+        sources = Repo()
+
+    mutation_output = {"proceed": True, "source_id": str(source.id)}
+    storage_status_by_source = {source.id: "not_requested"}
+
+    output = await _finalize_source_target(
+        Uow(),  # type: ignore[arg-type]
+        mutation_output,
+        memory_only=False,
+        storage_status_by_source=storage_status_by_source,
+    )
+
+    assert source.status == SourceStatus.DELETED
+    assert source.storage_uri is None
+    assert output["storage_deleted"] is False
+
+
+@pytest.mark.asyncio
+async def test_finalize_dataset_target_mixed_outcomes() -> None:
+    """ADR-0011 mixed-Dataset requirement: DELETED_NOW/ALREADY_ABSENT/
+    UNRESOLVED/NOT_REQUESTED are each handled correctly within one Dataset
+    DELETE attempt, and only the UNRESOLVED Source retains its storage_uri."""
+
+    dataset = make_dataset(status=DatasetStatus.DELETING)
+    source_deleted_now = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    source_already_absent = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    source_unresolved = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    source_null = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    source_null.storage_uri = None
+    sources = [source_deleted_now, source_already_absent, source_unresolved, source_null]
+
+    class DatasetsRepo:
+        async def get_by_id_for_update(self, dataset_id: UUID) -> Dataset | None:
+            return dataset if dataset_id == dataset.id else None
+
+    class SourcesRepo:
+        async def list_for_dataset_for_update(self, dataset_id: UUID) -> list[Source]:
+            return sources if dataset_id == dataset.id else []
+
+    class PipelineRunsRepo:
+        async def exists_administrative_delete_ownership(self, dataset_id: UUID) -> bool:
+            return False
+
+    class Uow:
+        datasets = DatasetsRepo()
+        sources = SourcesRepo()
+        pipeline_runs = PipelineRunsRepo()
+
+    target = {"dataset_id": str(dataset.id), "proceed": True}
+    storage_status_by_source = {
+        source_deleted_now.id: "deleted_now",
+        source_already_absent.id: "already_absent",
+        source_unresolved.id: "unresolved",
+        source_null.id: "not_requested",
+    }
+
+    output = await _finalize_dataset_target(
+        Uow(),  # type: ignore[arg-type]
+        target,
+        memory_only=False,
+        storage_status_by_source=storage_status_by_source,
+    )
+
+    assert source_deleted_now.storage_uri is None
+    assert source_already_absent.storage_uri is None
+    assert source_unresolved.storage_uri is not None
+    assert source_null.storage_uri is None
+    assert all(source.status == SourceStatus.DELETED for source in sources)
+    assert output["sources_deleted"] == 4
+
+
+@pytest.mark.asyncio
+async def test_finalize_dataset_target_missing_one_source_result_fails_invariant() -> None:
+    dataset = make_dataset(status=DatasetStatus.DELETING)
+    covered = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    uncovered = make_source(dataset_id=dataset.id, status=SourceStatus.DELETING)
+    sources = [covered, uncovered]
+
+    class DatasetsRepo:
+        async def get_by_id_for_update(self, dataset_id: UUID) -> Dataset | None:
+            return dataset if dataset_id == dataset.id else None
+
+    class SourcesRepo:
+        async def list_for_dataset_for_update(self, dataset_id: UUID) -> list[Source]:
+            return sources if dataset_id == dataset.id else []
+
+    class Uow:
+        datasets = DatasetsRepo()
+        sources = SourcesRepo()
+
+    target = {"dataset_id": str(dataset.id), "proceed": True}
+    # Only ONE of the two DELETING sources has an explicit storage result.
+    storage_status_by_source = {covered.id: "deleted_now"}
+
+    with pytest.raises(PermanentPipelineStepError):
+        await _finalize_dataset_target(
+            Uow(),  # type: ignore[arg-type]
+            target,
+            memory_only=False,
+            storage_status_by_source=storage_status_by_source,
+        )
+
+
+@pytest.mark.asyncio
+async def test_finalize_result_metrics_never_count_unresolved_as_deleted() -> None:
+    dataset = make_dataset()
+    source = make_source(dataset_id=dataset.id, status=SourceStatus.DELETED)
+    run = make_run()
+
+    class Repo:
+        async def get_by_id_for_update(self, run_id: UUID) -> PipelineRun | None:
+            return run
+
+    class Uow:
+        pipeline_runs = Repo()
+
+    context = make_context(
+        dataset_id=dataset.id,
+        source_id=source.id,
+        run_input={"scope": "source", "memory_only": False},
+        run_id=run.id,
+        step_outputs={
+            AUTHORITATIVE_MUTATION_STEP: {
+                "scope": "source",
+                "proceed": True,
+                "dataset_id": str(dataset.id),
+                "source_id": str(source.id),
+            },
+            "projection_convergence": {"graph_events_processed": 0},
+            STORAGE_DELETION_STEP: {
+                "deleted_now": 0,
+                "already_absent": 0,
+                "unresolved": 1,
+                "not_requested": 0,
+            },
+            "finalize_target": {
+                "source_status": "deleted",
+                "storage_deleted": False,
+                "storage_status": "unresolved",
+            },
+        },
+    )
+    result = StepResult(output={})
+
+    await FinalizeResultStep().persist(context, result, Uow())  # type: ignore[arg-type]
+
+    persisted = run.metrics["forget_result"]
+    assert persisted["storage_deleted"] is False
+    assert persisted["storage_unresolved"] == 1
+    assert persisted["storage_cleanup_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_finalize_result_metrics_cleanup_complete_true_when_no_unresolved() -> None:
+    dataset = make_dataset()
+    source = make_source(dataset_id=dataset.id, status=SourceStatus.DELETED)
+    run = make_run()
+
+    class Repo:
+        async def get_by_id_for_update(self, run_id: UUID) -> PipelineRun | None:
+            return run
+
+    class Uow:
+        pipeline_runs = Repo()
+
+    context = make_context(
+        dataset_id=dataset.id,
+        source_id=source.id,
+        run_input={"scope": "source", "memory_only": False},
+        run_id=run.id,
+        step_outputs={
+            AUTHORITATIVE_MUTATION_STEP: {
+                "scope": "source",
+                "proceed": True,
+                "dataset_id": str(dataset.id),
+                "source_id": str(source.id),
+            },
+            "projection_convergence": {"graph_events_processed": 0},
+            STORAGE_DELETION_STEP: {
+                "deleted_now": 1,
+                "already_absent": 0,
+                "unresolved": 0,
+                "not_requested": 0,
+            },
+            "finalize_target": {"source_status": "deleted", "storage_deleted": True},
+        },
+    )
+    result = StepResult(output={})
+
+    await FinalizeResultStep().persist(context, result, Uow())  # type: ignore[arg-type]
+
+    persisted = run.metrics["forget_result"]
+    assert persisted["storage_cleanup_complete"] is True
+
+
+def test_forget_module_never_catches_source_storage_error_base_class() -> None:
+    """7. STORAGE-005 exception-classification audit: the destructive
+    pipeline must never catch the ``SourceStorageError`` base class itself
+    (only the specific recognized-operational subclasses) -- a base-class
+    catch would silently reabsorb ``SourceStorageConflictError``/
+    ``SourceStoragePathError``, or any future subclass this audit did not
+    classify as delete-path/operational, into ``UNRESOLVED``."""
+
+    import ast
+    from pathlib import Path
+
+    from sofias_memory.pipelines.steps import forget
+
+    source = Path(forget.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            names = (
+                {node.type.id}
+                if isinstance(node.type, ast.Name)
+                else {elt.id for elt in getattr(node.type, "elts", []) if isinstance(elt, ast.Name)}
+            )
+            assert "SourceStorageError" not in names
+
+
+def test_forget_module_never_catches_bare_exception() -> None:
+    """ADR-0011 D37: recognized storage conditions must be classified via
+    ``SourceStorageError``, never a blanket ``except Exception`` that would
+    fabricate ``UNRESOLVED`` for a genuine programming defect."""
+
+    import ast
+    from pathlib import Path
+
+    from sofias_memory.pipelines.steps import forget
+
+    source = Path(forget.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            name = getattr(node.type, "id", None)
+            assert name not in {"Exception", "BaseException"}

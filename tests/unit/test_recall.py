@@ -13,7 +13,6 @@ from pydantic import ValidationError
 
 from sofias_memory.api.errors import SofiasMemoryError
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus
 from sofias_memory.infrastructure.postgres.models import Dataset, Query, Summary
@@ -40,6 +39,7 @@ from sofias_memory.services.recall import (
     UnitOfWorkFactory,
     reciprocal_rank_fusion,
 )
+from tests.unit._app_factory import create_app
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"

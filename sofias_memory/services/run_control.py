@@ -199,6 +199,7 @@ class RunControlService:
                 original_source_id=original.source_id,
                 candidate_run_id=candidate_run_id,
                 source_kind=str(original.input.get("source_kind", "")),
+                settings=self._settings,
             )
             if not staged:
                 raise run_not_retryable_error(original_run_id, reason="ingress_unrecoverable")

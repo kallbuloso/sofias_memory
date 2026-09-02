@@ -32,7 +32,6 @@ from sqlalchemy.exc import ArgumentError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import (
     DatasetStatus,
@@ -63,6 +62,7 @@ from sofias_memory.services.remember import (
     remember_text_run_input,
     write_ingress_bytes,
 )
+from tests.unit._app_factory import create_app
 
 REMEMBER_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_REMEMBER_POSTGRES_TESTS"
 REMEMBER_POSTGRES_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_REMEMBER_TEST_DATABASE_URL"
@@ -251,8 +251,9 @@ def build_harness(
     worker_enabled: bool = True,
     url_transport: httpx.AsyncBaseTransport | None = None,
     url_resolver: Any = None,
+    settings_overrides: dict[str, object] | None = None,
 ) -> tuple[Any, AsyncSessionFactory, PipelineRegistry, object | None]:
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, **(settings_overrides or {}))
     session_factory = create_session_factory(engine)
     neo4j_resource = None
     graph_outbox_processor: GraphOutboxProcessor | None = None
@@ -407,7 +408,13 @@ async def wait_for_terminal(
 async def test_text_ingest_wait_false_then_worker_completes(
     postgres_engine: AsyncEngine, tmp_path: Path
 ) -> None:
-    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    # This test's contract is specifically the local final-object byte
+    # identity/`file://` shape (STORAGE-009 finding) -- pin the backend
+    # explicitly rather than silently inherit whatever `STORAGE_BACKEND` the
+    # process environment happens to carry (e.g. real-S3 validation runs).
+    app, session_factory, _, _ = build_harness(
+        postgres_engine, tmp_path, settings_overrides={"storage_backend": "filesystem"}
+    )
     coordinator = app.state.pipeline_worker
     await coordinator.start()
     try:
@@ -671,7 +678,11 @@ async def test_legacy_b4_text_idempotency_key_resolves_same_run(
 async def test_file_ingest_txt_preserves_original_bytes(
     postgres_engine: AsyncEngine, tmp_path: Path
 ) -> None:
-    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    # Filesystem-specific contract (asserts the local on-disk `file://` byte
+    # identity directly) -- pin the backend explicitly (STORAGE-009 finding).
+    app, session_factory, _, _ = build_harness(
+        postgres_engine, tmp_path, settings_overrides={"storage_backend": "filesystem"}
+    )
     coordinator = app.state.pipeline_worker
     await coordinator.start()
     try:
@@ -741,8 +752,14 @@ async def test_url_ingest_fetches_only_in_worker_and_stores_bytes(
         del host, port
         return [ipaddress.ip_address("93.184.216.34")]
 
+    # Filesystem-specific contract (asserts the local on-disk `file://` byte
+    # identity directly) -- pin the backend explicitly (STORAGE-009 finding).
     app, session_factory, _, _ = build_harness(
-        postgres_engine, tmp_path, url_transport=transport, url_resolver=resolver
+        postgres_engine,
+        tmp_path,
+        url_transport=transport,
+        url_resolver=resolver,
+        settings_overrides={"storage_backend": "filesystem"},
     )
     coordinator = app.state.pipeline_worker
     await coordinator.start()

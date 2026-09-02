@@ -34,7 +34,6 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import PipelineRunStatus
 from sofias_memory.infrastructure.neo4j import Neo4jProjection, create_neo4j_resource_from_settings
@@ -56,6 +55,7 @@ from sofias_memory.services.graph_rebuild_service import GraphRebuildService
 from sofias_memory.services.graph_reconciliation_service import GraphReconciliationService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.summary_rebuild_service import SummaryRebuildService
+from tests.unit._app_factory import create_app
 
 IMPROVE_ASYNC_TESTS_ENV = "SOFIAS_MEMORY_RUN_IMPROVE_ASYNC_POSTGRES_TESTS"
 IMPROVE_ASYNC_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_IMPROVE_ASYNC_TEST_DATABASE_URL"

@@ -7,6 +7,10 @@ from sofias_memory.api.middleware.api_key import (
     ApiKeyMiddleware,
     is_valid_api_key,
 )
+from sofias_memory.api.middleware.operational_gate import (
+    NOT_OPERATIONAL_MESSAGE,
+    OperationalGateMiddleware,
+)
 from sofias_memory.api.middleware.request_body_limit import (
     BYTES_PER_MIB,
     RequestBodyLimitMiddleware,
@@ -26,8 +30,10 @@ __all__ = [
     "BYTES_PER_MIB",
     "DOCS_PUBLIC_PATHS",
     "MAX_REQUEST_ID_LENGTH",
+    "NOT_OPERATIONAL_MESSAGE",
     "PUBLIC_PATHS",
     "ApiKeyMiddleware",
+    "OperationalGateMiddleware",
     "REQUEST_ID_HEADER",
     "RequestBodyLimitMiddleware",
     "RequestIdMiddleware",

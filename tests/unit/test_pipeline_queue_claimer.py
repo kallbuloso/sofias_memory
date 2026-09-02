@@ -13,6 +13,7 @@ from sofias_memory.services.pipeline_queue_claimer import (
     PipelineRunClaimer,
     new_worker_id,
 )
+from sofias_memory.services.process_state import ClaimPolicy
 
 NOW = datetime(2026, 8, 22, 12, 0, 0, tzinfo=UTC)
 
@@ -254,3 +255,407 @@ def test_claimer_module_does_not_import_a_python_clock_authority() -> None:
 
     assert not hasattr(module, "utc_now")
     assert not hasattr(module, "datetime")
+
+
+# ---------------------------------------------------------------------------
+# ADR-0011 D31/D43 (STORAGE-007): recovery-owned claim eligibility.
+# Implements validation items 67-69 at the claim-predicate level.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeAuthoritativeMutationRepository:
+    succeeded: bool = False
+    calls: list[tuple[UUID, PipelineType]] = field(default_factory=list)
+
+    async def authoritative_mutation_succeeded(
+        self, run_id: UUID, *, pipeline_type: PipelineType
+    ) -> bool:
+        self.calls.append((run_id, pipeline_type))
+        return self.succeeded
+
+
+@pytest.mark.asyncio
+async def test_normal_policy_allows_any_pipeline_type_unconditionally() -> None:
+    repo = FakeAuthoritativeMutationRepository(succeeded=False)
+    run = make_run(dataset_id=None)
+    run.pipeline_type = PipelineType.REMEMBER
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo, run, policy=ClaimPolicy.NORMAL, recovery_owned_run_ids=frozenset()
+    )
+
+    assert allowed is True
+    assert repo.calls == []  # never even consulted -- NORMAL never needs it
+
+
+@pytest.mark.asyncio
+async def test_none_policy_never_allows_anything() -> None:
+    repo = FakeAuthoritativeMutationRepository(succeeded=True)
+    run = make_run(dataset_id=None)
+    run.pipeline_type = PipelineType.FORGET
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo, run, policy=ClaimPolicy.NONE, recovery_owned_run_ids=frozenset({run.id})
+    )
+
+    assert allowed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pipeline_type", [PipelineType.REMEMBER, PipelineType.COGNIFY, PipelineType.IMPROVE]
+)
+async def test_recovery_only_policy_rejects_non_destructive_pipeline_types(
+    pipeline_type: PipelineType,
+) -> None:
+    repo = FakeAuthoritativeMutationRepository(succeeded=True)
+    run = make_run(dataset_id=None)
+    run.pipeline_type = pipeline_type
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo,
+        run,
+        policy=ClaimPolicy.RECOVERY_ONLY,
+        # Case-B membership present too -- pipeline_type alone must still be
+        # decisive, proving the checks are independent, not merely additive.
+        recovery_owned_run_ids=frozenset({run.id}),
+    )
+
+    assert allowed is False
+    assert repo.calls == []  # never even consulted -- wrong pipeline_type is decisive alone
+
+
+@pytest.mark.asyncio
+async def test_recovery_only_policy_rejects_run_not_in_recovery_owned_set() -> None:
+    """Final fail-closed audit -- the missing negative test: R1, an unrelated
+    destructive run that is past its own authoritative mutation but whose
+    scope was never classified Case B by convergence, must NOT be claimable.
+    Pipeline type + authoritative-mutation-succeeded alone is necessary but
+    NOT sufficient -- Case-B membership (here: absence from the narrowing
+    set) is independently required."""
+
+    repo = FakeAuthoritativeMutationRepository(succeeded=True)
+    run = make_run(dataset_id=None)
+    run.pipeline_type = PipelineType.FORGET
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo, run, policy=ClaimPolicy.RECOVERY_ONLY, recovery_owned_run_ids=frozenset()
+    )
+
+    assert allowed is False
+    # Short-circuits before even consulting the durable authoritative-
+    # mutation check -- membership is checked first (cheaper, in-memory).
+    assert repo.calls == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_only_policy_rejects_forget_with_unsucceeded_mutation() -> None:
+    """D31 sixth amendment: Case-B membership alone (or pipeline_type alone,
+    tested above) is never sufficient -- a pre-authoritative-mutation Forget
+    run must never be claimable even when its scope is genuinely Case B."""
+
+    repo = FakeAuthoritativeMutationRepository(succeeded=False)
+    run = make_run(dataset_id=None)
+    run.pipeline_type = PipelineType.FORGET
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo, run, policy=ClaimPolicy.RECOVERY_ONLY, recovery_owned_run_ids=frozenset({run.id})
+    )
+
+    assert allowed is False
+    assert repo.calls == [(run.id, PipelineType.FORGET)]
+
+
+@pytest.mark.asyncio
+async def test_recovery_only_policy_allows_forget_with_succeeded_mutation() -> None:
+    """R2: a genuinely Case-B-classified Forget run, past its own
+    authoritative mutation, IS claimable -- the same worker/engine as
+    OPERATIONAL, no second execution path."""
+
+    repo = FakeAuthoritativeMutationRepository(succeeded=True)
+    run = make_run(dataset_id=None)
+    run.pipeline_type = PipelineType.FORGET
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo, run, policy=ClaimPolicy.RECOVERY_ONLY, recovery_owned_run_ids=frozenset({run.id})
+    )
+
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_only_policy_allows_dataset_delete_with_succeeded_mutation() -> None:
+    """Validation item 68: the DATASET_DELETE multi-source case -- once the
+    run's own deactivate_authoritative step has durably succeeded for its
+    complete scope AND convergence classified this run's scope as Case B,
+    the run is claim-eligible."""
+
+    repo = FakeAuthoritativeMutationRepository(succeeded=True)
+    run = make_run(dataset_id=uuid4())
+    run.pipeline_type = PipelineType.DATASET_DELETE
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo, run, policy=ClaimPolicy.RECOVERY_ONLY, recovery_owned_run_ids=frozenset({run.id})
+    )
+
+    assert allowed is True
+    assert repo.calls == [(run.id, PipelineType.DATASET_DELETE)]
+
+
+@pytest.mark.asyncio
+async def test_recovery_only_policy_rejects_dataset_delete_before_mutation_succeeds() -> None:
+    """Validation item 67: a DATASET_DELETE run targeting a Dataset with one
+    Case-B Source and one still-live Case-A Source must NOT be claimable
+    while its own deactivate_authoritative step has not yet durably
+    succeeded for the dataset's complete scope -- claiming it here would
+    risk executing a new ACTIVE -> DELETING mutation during
+    STORAGE_CONVERGING, exactly the race D43 forbids. Case-B membership is
+    present (the run's scope does include a Case-B source) -- it is the
+    unsucceeded authoritative-mutation check that must still block it."""
+
+    repo = FakeAuthoritativeMutationRepository(succeeded=False)
+    run = make_run(dataset_id=uuid4())
+    run.pipeline_type = PipelineType.DATASET_DELETE
+
+    allowed = await PipelineRunClaimer._allowed_under_policy(  # type: ignore[arg-type]
+        repo, run, policy=ClaimPolicy.RECOVERY_ONLY, recovery_owned_run_ids=frozenset({run.id})
+    )
+
+    assert allowed is False
+
+
+@dataclass
+class _OrderingRepository:
+    """Proves claim-operation ordering: discover -> validate recovery policy
+    -> ONLY THEN any ownership-changing write (arbitration lock, commit).
+    Every arbitration/commit-adjacent method raises if ever reached -- this
+    run's policy check is configured to fail, so if the implementation ever
+    claimed first and validated after, one of these would fire instead of the
+    expected clean rejection."""
+
+    run: PipelineRun
+    calls: list[str] = field(default_factory=list)
+
+    async def get_eligible_for_update(self, candidate_id: UUID) -> PipelineRun | None:
+        self.calls.append("get_eligible_for_update")
+        return self.run
+
+    async def authoritative_mutation_succeeded(
+        self, run_id: UUID, *, pipeline_type: PipelineType
+    ) -> bool:
+        self.calls.append("authoritative_mutation_succeeded")
+        return True  # would allow the claim if the ordering were wrong
+
+    async def try_advisory_lock_shared(self, key: int) -> bool:
+        raise AssertionError("must not attempt any lock before the policy check rejects")
+
+    async def try_advisory_lock_exclusive(self, key: int) -> bool:
+        raise AssertionError("must not attempt any lock before the policy check rejects")
+
+    async def get_database_now(self) -> datetime:
+        raise AssertionError("must not read a claim timestamp before the policy check rejects")
+
+    async def list_eligible_candidate_ids(self, *, limit: int) -> list[UUID]:
+        return [self.run.id]
+
+
+class _OrderingUow:
+    def __init__(self, repo: _OrderingRepository) -> None:
+        self.pipeline_runs = repo
+
+    async def __aenter__(self) -> _OrderingUow:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        raise AssertionError("must not commit a run whose recovery policy check failed")
+
+
+@pytest.mark.asyncio
+async def test_try_claim_one_validates_recovery_policy_before_any_ownership_changing_write() -> (
+    None
+):
+    """Claim atomicity/ownership: discover -> validate -> claim, never claim
+    -> validate. A run rejected by RECOVERY_ONLY (not in the narrowing set,
+    here) must never reach arbitration locking, PostgreSQL's claim-time
+    now(), or commit -- ``_OrderingRepository``'s corresponding methods
+    would raise if the implementation reached them."""
+
+    run = make_run(dataset_id=None)
+    run.pipeline_type = PipelineType.FORGET
+    repo = _OrderingRepository(run=run)
+
+    import sofias_memory.services.pipeline_queue_claimer as claimer_module
+
+    original_uow = claimer_module.PostgresUnitOfWork
+    claimer_module.PostgresUnitOfWork = lambda *_a, **_k: _OrderingUow(repo)  # type: ignore[assignment]
+    try:
+        claimer = PipelineRunClaimer(
+            session_factory=lambda: None,  # type: ignore[arg-type]
+            claim_policy=lambda: ClaimPolicy.RECOVERY_ONLY,
+            recovery_owned_run_ids=lambda: frozenset(),  # run.id NOT in the set
+        )
+        result = await claimer.try_claim_one(worker_id="wk-test")
+    finally:
+        claimer_module.PostgresUnitOfWork = original_uow
+
+    assert result is None
+    assert repo.calls == ["get_eligible_for_update"]  # rejected immediately after
+
+
+@dataclass
+class _RecoveryClaimRepository:
+    """A minimal, fully-cooperative fake for a genuinely recovery-owned run
+    claimed end to end through the real ``PipelineRunClaimer`` -- proves
+    validation items 12/13 (valid Forget/DatasetDelete recovery-owned claim)
+    using the exact same claim path OPERATIONAL uses, not a second one."""
+
+    run: PipelineRun
+    calls: list[str] = field(default_factory=list)
+    committed: bool = False
+
+    async def get_eligible_for_update(self, candidate_id: UUID) -> PipelineRun | None:
+        self.calls.append("get_eligible_for_update")
+        return self.run
+
+    async def authoritative_mutation_succeeded(
+        self, run_id: UUID, *, pipeline_type: PipelineType
+    ) -> bool:
+        self.calls.append("authoritative_mutation_succeeded")
+        return True
+
+    async def try_advisory_lock_shared(self, key: int) -> bool:
+        self.calls.append("shared_lock")
+        return True
+
+    async def try_advisory_lock_exclusive(self, key: int) -> bool:
+        self.calls.append("exclusive_lock")
+        return True
+
+    async def exists_dataset_conflict(self, dataset_id: UUID) -> bool:
+        self.calls.append("dataset_conflict")
+        return False
+
+    async def exists_any_dataset_scoped_conflict(self) -> bool:
+        self.calls.append("any_dataset_scoped_conflict")
+        return False
+
+    async def exists_other_global_conflict(self, *, exclude_run_id: UUID) -> bool:
+        self.calls.append("other_global_conflict")
+        return False
+
+    async def exists_eligible_global_with_precedence(
+        self, *, before_created_at: datetime, before_id: UUID
+    ) -> bool:
+        self.calls.append("fairness")
+        return False
+
+    async def get_database_now(self) -> datetime:
+        self.calls.append("get_database_now")
+        return NOW
+
+    async def list_eligible_candidate_ids(self, *, limit: int) -> list[UUID]:
+        return [self.run.id]
+
+
+class _RecoveryClaimUow:
+    def __init__(self, repo: _RecoveryClaimRepository) -> None:
+        self.pipeline_runs = repo
+
+    async def __aenter__(self) -> _RecoveryClaimUow:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.pipeline_runs.committed = True
+
+
+async def _claim_via_fake_repository(repo: _RecoveryClaimRepository) -> ClaimedRun | None:
+    import sofias_memory.services.pipeline_queue_claimer as claimer_module
+
+    original_uow = claimer_module.PostgresUnitOfWork
+    claimer_module.PostgresUnitOfWork = lambda *_a, **_k: _RecoveryClaimUow(repo)  # type: ignore[assignment]
+    try:
+        claimer = PipelineRunClaimer(
+            session_factory=lambda: None,  # type: ignore[arg-type]
+            claim_policy=lambda: ClaimPolicy.RECOVERY_ONLY,
+            recovery_owned_run_ids=lambda: frozenset({repo.run.id}),
+        )
+        return await claimer.try_claim_one(worker_id="wk-test")
+    finally:
+        claimer_module.PostgresUnitOfWork = original_uow
+
+
+@pytest.mark.asyncio
+async def test_try_claim_one_claims_a_genuine_recovery_owned_forget_run() -> None:
+    """Validation item 12: a Case-B-classified, authoritative-mutation-
+    succeeded FORGET run is claimed end to end (arbitration through commit)
+    through the unmodified claim path -- the same one OPERATIONAL uses."""
+
+    run = make_run(dataset_id=None)
+    run.pipeline_type = PipelineType.FORGET
+    repo = _RecoveryClaimRepository(run=run)
+
+    claimed = await _claim_via_fake_repository(repo)
+
+    assert claimed is not None
+    assert claimed.run_id == run.id
+    assert repo.committed is True
+
+
+@pytest.mark.asyncio
+async def test_try_claim_one_claims_a_genuine_recovery_owned_dataset_delete_run() -> None:
+    """Validation item 13: a Case-B-classified, authoritative-mutation-
+    succeeded DATASET_DELETE run is likewise claimed end to end through the
+    dataset-scoped arbitration path."""
+
+    run = make_run(dataset_id=uuid4())
+    run.pipeline_type = PipelineType.DATASET_DELETE
+    repo = _RecoveryClaimRepository(run=run)
+
+    claimed = await _claim_via_fake_repository(repo)
+
+    assert claimed is not None
+    assert claimed.run_id == run.id
+    assert repo.committed is True
+
+
+@pytest.mark.asyncio
+async def test_try_claim_one_scans_nothing_under_none_policy() -> None:
+    """BOOTSTRAP_MAINTENANCE: zero claims, and not even a discovery scan --
+    validation item covering test list item 13."""
+
+    class _ExplodingRepository:
+        async def list_eligible_candidate_ids(self, *, limit: int) -> list[UUID]:
+            raise AssertionError("must never scan for candidates under ClaimPolicy.NONE")
+
+    class _ExplodingUow:
+        def __init__(self) -> None:
+            self.pipeline_runs = _ExplodingRepository()
+
+        async def __aenter__(self) -> _ExplodingUow:
+            return self
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            return None
+
+    claimer = PipelineRunClaimer(
+        session_factory=lambda: None,  # type: ignore[arg-type]
+        claim_policy=lambda: ClaimPolicy.NONE,
+    )
+
+    import sofias_memory.services.pipeline_queue_claimer as claimer_module
+
+    original_uow = claimer_module.PostgresUnitOfWork
+    claimer_module.PostgresUnitOfWork = lambda *_a, **_k: _ExplodingUow()  # type: ignore[assignment]
+    try:
+        result = await claimer.try_claim_one(worker_id="wk-test")
+    finally:
+        claimer_module.PostgresUnitOfWork = original_uow
+
+    assert result is None

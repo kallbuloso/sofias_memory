@@ -20,8 +20,6 @@ from enum import StrEnum
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlparse
-from urllib.request import url2pathname
 from uuid import UUID
 
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
@@ -47,6 +45,18 @@ from sofias_memory.infrastructure.postgres.models import (
 )
 from sofias_memory.infrastructure.postgres.repositories.pipeline_runs import (
     FORGET_TARGET_CONFLICT_ERROR_CODE,
+)
+from sofias_memory.infrastructure.storage.filesystem import (
+    delete_source_storage as _delete_source_storage,
+)
+from sofias_memory.infrastructure.storage.filesystem import (
+    source_storage_path as _source_storage_path,
+)
+from sofias_memory.infrastructure.storage.port import (
+    InvalidSourceStorageUriError,
+    SourceStorageUnavailableError,
+    StorageDeleteResult,
+    StorageDeleteStatus,
 )
 from sofias_memory.ports import (
     ProjectionCommand,
@@ -497,22 +507,12 @@ class DatasetFinalizeCounts:
     sources_deleted: int
 
 
-class StorageDeleteStatus(StrEnum):
-    NOT_REQUESTED = "not_requested"
-    DELETED_NOW = "deleted_now"
-    ALREADY_ABSENT = "already_absent"
-
-
-@dataclass(frozen=True)
-class StorageDeleteResult:
-    status: StorageDeleteStatus
-
-    @property
-    def completed(self) -> bool:
-        return self.status in {
-            StorageDeleteStatus.DELETED_NOW,
-            StorageDeleteStatus.ALREADY_ABSENT,
-        }
+# StorageDeleteStatus/StorageDeleteResult now live in
+# infrastructure.storage.port (ADR-0011 D4/D14/STORAGE-001): the storage
+# boundary owns this result contract, not Forget specifically -- Dataset
+# DELETE's DeleteStorageStep needs the identical shape. Re-exported here
+# unchanged (same values, same semantics) so every existing import of these
+# names from this module keeps working.
 
 
 def empty_mutation(
@@ -865,7 +865,17 @@ def _add_command(
 
 
 # ---------------------------------------------------------------------------
-# Storage deletion safety (unchanged guards)
+# Storage deletion safety (unchanged guards).
+#
+# ADR-0011 STORAGE-001 layering correction: the actual primitives now live in
+# infrastructure.storage.filesystem (the lower-level implementation boundary
+# -- services/pipelines depend on infrastructure, never the reverse). The
+# names below are kept as thin, translating compatibility wrappers: they
+# preserve this module's exact existing public contract (SofiasMemoryError/
+# DependencyUnavailableError, same codes/status/messages) for call sites
+# STORAGE-005 has not migrated to SourceStorageRouter yet, by catching the
+# infra layer's dependency-free exceptions and re-raising the HTTP-facing
+# ones this module has always raised.
 # ---------------------------------------------------------------------------
 
 
@@ -876,18 +886,17 @@ def delete_source_storage(
     source_id: UUID,
     storage_uri: str | None,
 ) -> StorageDeleteResult:
-    if storage_uri is None:
-        return StorageDeleteResult(StorageDeleteStatus.NOT_REQUESTED)
-    target_path = source_storage_path(
-        data_directory, dataset_id=dataset_id, source_id=source_id, storage_uri=storage_uri
-    )
-    if target_path is None:
-        return StorageDeleteResult(StorageDeleteStatus.ALREADY_ABSENT)
     try:
-        target_path.unlink()
-    except OSError as exc:
+        return _delete_source_storage(
+            data_directory,
+            dataset_id=dataset_id,
+            source_id=source_id,
+            storage_uri=storage_uri,
+        )
+    except InvalidSourceStorageUriError as exc:
+        raise invalid_storage_uri_error() from exc
+    except SourceStorageUnavailableError as exc:
         raise DependencyUnavailableError(message="Source storage could not be deleted.") from exc
-    return StorageDeleteResult(StorageDeleteStatus.DELETED_NOW)
 
 
 def source_storage_path(
@@ -897,27 +906,15 @@ def source_storage_path(
     source_id: UUID,
     storage_uri: str,
 ) -> Path | None:
-    parsed = urlparse(storage_uri)
-    if parsed.scheme != "file" or parsed.netloc:
-        raise invalid_storage_uri_error()
-
-    storage_root = data_directory.resolve(strict=False)
-    expected_directory = (storage_root / str(dataset_id) / str(source_id)).resolve(strict=False)
-    raw_path = Path(url2pathname(parsed.path))
-    nominal_path = raw_path.resolve(strict=False)
-    if not expected_directory.is_relative_to(storage_root):
-        raise invalid_storage_uri_error()
-    if not nominal_path.is_relative_to(expected_directory):
-        raise invalid_storage_uri_error()
-    if not raw_path.exists():
-        return None
-
-    resolved_path = raw_path.resolve(strict=True)
-    if not resolved_path.is_relative_to(expected_directory):
-        raise invalid_storage_uri_error()
-    if not resolved_path.is_file() or resolved_path.is_dir():
-        raise invalid_storage_uri_error()
-    return resolved_path
+    try:
+        return _source_storage_path(
+            data_directory,
+            dataset_id=dataset_id,
+            source_id=source_id,
+            storage_uri=storage_uri,
+        )
+    except InvalidSourceStorageUriError as exc:
+        raise invalid_storage_uri_error() from exc
 
 
 def invalid_storage_uri_error() -> SofiasMemoryError:

@@ -284,7 +284,7 @@ def test_resource_repr_and_str_do_not_leak_password_or_uri() -> None:
 
 
 def test_create_app_stores_injected_neo4j_resource() -> None:
-    from sofias_memory.app import create_app
+    from tests.unit._app_factory import create_app
 
     fake_resource = FakeNeo4jResource()
     app = create_app(
@@ -297,7 +297,7 @@ def test_create_app_stores_injected_neo4j_resource() -> None:
 
 
 def test_create_app_can_disable_neo4j_resource() -> None:
-    from sofias_memory.app import create_app
+    from tests.unit._app_factory import create_app
 
     app = create_app(make_settings(), enable_postgres_readiness=False, enable_neo4j=False)
 
@@ -305,7 +305,7 @@ def test_create_app_can_disable_neo4j_resource() -> None:
 
 
 def test_lifespan_closes_neo4j_resource_on_shutdown() -> None:
-    from sofias_memory.app import create_app
+    from tests.unit._app_factory import create_app
 
     fake_resource = FakeNeo4jResource()
     app = create_app(
@@ -324,7 +324,7 @@ def test_lifespan_closes_neo4j_resource_on_shutdown() -> None:
 def test_lifespan_logs_do_not_leak_neo4j_password(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from sofias_memory.app import create_app
+    from tests.unit._app_factory import create_app
 
     stream = StringIO()
 
@@ -356,7 +356,7 @@ def test_lifespan_logs_do_not_leak_neo4j_password(
 
 @pytest.mark.asyncio
 async def test_live_route_does_not_check_neo4j_connectivity() -> None:
-    from sofias_memory.app import create_app
+    from tests.unit._app_factory import create_app
 
     fake_resource = FakeNeo4jResource()
     app = create_app(
@@ -375,7 +375,7 @@ async def test_live_route_does_not_check_neo4j_connectivity() -> None:
 
 @pytest.mark.asyncio
 async def test_readiness_reports_injected_neo4j_resource() -> None:
-    from sofias_memory.app import create_app
+    from tests.unit._app_factory import create_app
 
     fake_resource = FakeNeo4jResource()
     app = create_app(
@@ -389,5 +389,8 @@ async def test_readiness_reports_injected_neo4j_resource() -> None:
         response = await client.get("/health/ready")
 
     assert response.status_code == 200
-    assert response_json(response) == {"status": "ready", "checks": {"neo4j": {"ready": True}}}
+    assert response_json(response) == {
+        "status": "ready",
+        "checks": {"neo4j": {"ready": True}, "process_state": {"ready": True}},
+    }
     assert fake_resource.verify_connectivity_calls == 0

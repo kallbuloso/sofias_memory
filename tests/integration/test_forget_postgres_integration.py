@@ -33,7 +33,6 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType, SourceStatus
 from sofias_memory.infrastructure.neo4j import Neo4jProjection, create_neo4j_resource_from_settings
@@ -60,6 +59,7 @@ from sofias_memory.pipelines.steps.forget import (
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from tests.unit._app_factory import create_app
 
 FORGET_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_FORGET_POSTGRES_TESTS"
 FORGET_POSTGRES_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_FORGET_TEST_DATABASE_URL"
@@ -968,14 +968,21 @@ STORAGE_PATH_SECRET_SENTINEL = "STORAGE_PATH_SECRET_SENTINEL"
 async def test_storage_deletion_failure_never_leaks_path_through_logs_or_public_response(
     postgres_engine: AsyncEngine, tmp_path: Path
 ) -> None:
-    """SM-516 staging fix Finding 2: a real storage-path-safety rejection
-    (traversal outside the sandboxed ``data_directory``) exercised end to
-    end through the real Forget pipeline/worker/HTTP surface -- not just
-    ``redact_sensitive_data()`` in isolation. The rejected absolute target
-    embeds a unique sentinel; it must never appear in any captured JSON log
-    line, in the persisted ``PipelineStep``/``PipelineRun`` error, or in the
-    public ``GET /api/v1/runs/{run_id}`` response body. Only safe values
-    (exception type, stable error_code, generic message) may survive.
+    """SM-516 staging fix Finding 2, updated for ADR-0011 D37/D38: a real
+    storage-path-safety rejection (traversal outside the sandboxed
+    ``data_directory``) exercised end to end through the real Forget
+    pipeline/worker/HTTP surface -- not just ``redact_sensitive_data()`` in
+    isolation. Since STORAGE-005 (D37), "storage URI cannot be safely
+    resolved/validated for deletion" is a recognized ``UNRESOLVED`` storage
+    outcome, not a ``PipelineStep``/``PipelineRun`` failure -- the run now
+    *succeeds* with unresolved storage cleanup (D37's business-delete-must-
+    converge rule), rather than reaching ``failed``. This test's original
+    premise (STORAGE-009 discovered it predates D37 and was never updated)
+    asserted the pre-ADR-0011 fail-closed-the-whole-run behavior; the
+    security property it exists to protect -- the rejected absolute path/
+    sentinel must never appear in any public response or log line -- is
+    unchanged and is what this updated version still proves, now against the
+    correct (succeeded/``UNRESOLVED``) outcome.
     """
 
     log_stream = StringIO()
@@ -1028,11 +1035,12 @@ async def test_storage_deletion_failure_never_leaks_path_through_logs_or_public_
         finally:
             await coordinator.stop()
 
-        # wait=true on a run that reaches FAILED surfaces as a generic 500
-        # (forget.py's own _failed_run_error) -- never the path.
-        assert response.status_code == 500
-        error_body = response.json()
-        run_id = UUID(error_body["error"]["details"]["run_id"])
+        # ADR-0011 D37: an unresolvable storage URI is a recognized
+        # UNRESOLVED outcome, not a step/run failure -- wait=true on this
+        # run now succeeds (200), never the path.
+        assert response.status_code == 200
+        success_body = response.json()
+        run_id = UUID(success_body["data"]["run_id"])
 
         async with build_client(app) as client:
             run_response = await client.get(
@@ -1042,7 +1050,7 @@ async def test_storage_deletion_failure_never_leaks_path_through_logs_or_public_
         run_body = run_response.json()
 
         public_surfaces = {
-            "forget_error_response": error_body,
+            "forget_success_response": success_body,
             "run_detail_response": run_body,
         }
         for surface_name, surface in public_surfaces.items():
@@ -1063,15 +1071,20 @@ async def test_storage_deletion_failure_never_leaks_path_through_logs_or_public_
             assert str(escape_target) not in serialized_record
             assert malicious_uri not in serialized_record
 
-        # The run/step DID fail because of this rejection (not some
-        # unrelated error) -- confirms the test actually exercised the
-        # path-safety guard, and only ever a safe, stable error_code
-        # survived publicly.
+        # The run DID succeed with the rejection recorded as UNRESOLVED
+        # cleanup debt (not some unrelated no-op) -- confirms the test
+        # actually exercised the path-safety guard, and Source.storage_uri
+        # (never itself a public field, D23) is durably preserved as the
+        # unresolved locator (D39) -- proven only from PostgreSQL, never
+        # from a public surface.
         run_data = run_body["data"]
-        assert run_data["status"] == "failed"
-        assert run_data["error_code"] is not None
-        step_errors = [step["error"] for step in run_data["steps"] if step["error"] is not None]
-        assert step_errors, "expected at least one failed step with a safe error"
+        assert run_data["status"] == "succeeded"
+        assert success_body["data"]["storage_deleted"] is False
+
+        persisted = await get_source(session_factory, source.id)
+        assert persisted is not None
+        assert persisted.status == SourceStatus.DELETED
+        assert persisted.storage_uri == malicious_uri
     finally:
         clear_log_context()
         httpx_logger.setLevel(previous_httpx_level)

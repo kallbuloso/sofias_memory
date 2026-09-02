@@ -12,7 +12,6 @@ import pytest
 
 from sofias_memory.api.errors import SofiasMemoryError
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import PipelineRunStatus, PipelineStepStatus, PipelineType
 from sofias_memory.infrastructure.postgres.models import PipelineRun, PipelineStep
@@ -29,6 +28,7 @@ from sofias_memory.services.runs import (
     UnitOfWorkFactory,
     run_step_error_result,
 )
+from tests.unit._app_factory import create_app
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"

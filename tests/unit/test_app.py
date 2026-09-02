@@ -20,9 +20,9 @@ from sofias_memory.api.errors import (
 from sofias_memory.api.middleware import API_KEY_HEADER, REQUEST_ID_HEADER
 from sofias_memory.api.middleware.api_key import ApiKeyMiddleware
 from sofias_memory.api.middleware.request_id import RequestIdMiddleware
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.observability.logging import clear_log_context, configure_logging
+from tests.unit._app_factory import create_app
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 SECOND_API_KEY = "sf-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"

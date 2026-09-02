@@ -30,7 +30,6 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import (
     DatasetStatus,
@@ -52,6 +51,7 @@ from sofias_memory.pipelines.steps.dataset_delete import (
 from sofias_memory.pipelines.steps.forget import FORGET_RESOURCES_RESOURCE, ForgetPipelineResources
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from tests.unit._app_factory import create_app
 
 DATASET_DELETE_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_DATASET_DELETE_POSTGRES_TESTS"
 DATASET_DELETE_POSTGRES_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_DATASET_DELETE_TEST_DATABASE_URL"

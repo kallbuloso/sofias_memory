@@ -29,6 +29,8 @@ from sofias_memory.infrastructure.postgres.models import (
     Source,
     Summary,
 )
+from sofias_memory.infrastructure.storage.port import SourceObjectStorage, StorageDeleteResult
+from sofias_memory.infrastructure.storage.router import SourceStorageRouter
 from sofias_memory.ports import ProjectionCommand
 from sofias_memory.schemas.cognify import CognifyRequest
 from sofias_memory.schemas.knowledge import (
@@ -144,6 +146,11 @@ class FakeStore:
         self.loaded_datasets: list[Dataset] = []
         self.commits = 0
         self.savepoints = 0
+        self.open_uow_count = 0
+        """Instrumentation for the transaction-boundary proof: incremented on
+        FakeUnitOfWork.__aenter__, decremented on __aexit__ -- a storage read
+        observed while this is > 0 would mean external I/O ran with a
+        PostgreSQL transaction/row lock still open."""
 
 
 class FakeDatasetRepository:
@@ -406,9 +413,11 @@ class FakeUnitOfWork:
         self._store = store
 
     async def __aenter__(self) -> FakeUnitOfWork:
+        self._store.open_uow_count += 1
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._store.open_uow_count -= 1
         for dataset in self._store.loaded_datasets:
             expire = getattr(dataset, "expire", None)
             if callable(expire):
@@ -434,16 +443,19 @@ def service_for(
         FakeDocumentSummaryClient | FailingDocumentSummaryClient | None
     ) = None,
     store_for_persist: FakeStore | None = None,
+    source_storage: SourceObjectStorage | None = None,
+    settings: Settings | None = None,
 ) -> CognifyService:
     def create_uow() -> CognifyUnitOfWork:
         return cast(CognifyUnitOfWork, FakeUnitOfWork(store))
 
     service = CognifyService(
-        make_settings(tmp_path),
+        settings or make_settings(tmp_path),
         embedding_client=embedding_client,
         knowledge_extraction_client=knowledge_client or FakeKnowledgeExtractionClient(),
         document_summary_client=document_summary_client or FakeDocumentSummaryClient(),
         unit_of_work_factory=cast(UnitOfWorkFactory, create_uow),
+        source_storage=source_storage,
     )
     _STORE_BY_SERVICE[id(service)] = store_for_persist or store
     return service
@@ -659,6 +671,297 @@ async def test_cognify_rehydrates_memory_reset_document_from_source_storage(tmp_
     assert store.chunks
     assert all(forgotten_text not in chunk.text for chunk in store.chunks)
     assert all(original_text in chunk.text for chunk in store.chunks)
+
+
+class _RecordingSourceStorage:
+    """A minimal ``SourceObjectStorage``-shaped test double: proves Cognify's
+    own routing/argument-forwarding behavior without depending on
+    ``botocore.Stubber`` -- STORAGE-002 already owns adapter-level S3
+    correctness (real GET/verification/etc.)."""
+
+    def __init__(
+        self, *, bytes_to_return: bytes | None = None, error: Exception | None = None
+    ) -> None:
+        self.bytes_to_return = bytes_to_return
+        self.error = error
+        self.read_calls: list[dict[str, object]] = []
+
+    async def finalize(self, **_kwargs: object) -> str:
+        raise NotImplementedError
+
+    async def read(
+        self,
+        *,
+        dataset_id: UUID,
+        source_id: UUID,
+        storage_uri: str,
+        expected_byte_size: int,
+        expected_content_sha256: str,
+        max_bytes: int,
+    ) -> bytes:
+        self.read_calls.append(
+            {
+                "dataset_id": dataset_id,
+                "source_id": source_id,
+                "storage_uri": storage_uri,
+                "expected_byte_size": expected_byte_size,
+                "expected_content_sha256": expected_content_sha256,
+                "max_bytes": max_bytes,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        assert self.bytes_to_return is not None
+        return self.bytes_to_return
+
+    async def delete(self, **_kwargs: object) -> StorageDeleteResult:
+        raise NotImplementedError
+
+    async def verify(self, **_kwargs: object) -> bool:
+        raise NotImplementedError
+
+
+def _seed_reset_document(
+    store: FakeStore, *, original_text: str, forgotten_text: str
+) -> tuple[Dataset, Source, Document]:
+    """Same reset-document shape as the strongest existing filesystem
+    rehydration regression test above, factored out for the new STORAGE-003
+    routing/integrity/lifecycle tests below."""
+
+    dataset, source, old_document = seed_pending_source(store, forgotten_text)
+    source.content_sha256 = sha256(original_text.encode("utf-8")).hexdigest()
+    source.normalized_sha256 = source.content_sha256
+    source.byte_size = len(original_text.encode("utf-8"))
+    old_document.title = "Forgotten title"
+    old_document.language = "pt-BR"
+    old_document.metadata_ = {"document_summary": {"summary_id": str(uuid4())}}
+    old_document.is_active = False
+    reset_document = reset_document_for_recognify(old_document)
+    store.documents.append(reset_document)
+    return dataset, source, reset_document
+
+
+@pytest.mark.asyncio
+async def test_cognify_reads_s3_source_via_router_regardless_of_filesystem_backend(
+    tmp_path: Path,
+) -> None:
+    # ADR-0011 D5: read routes by storage_uri scheme, never by the current
+    # write backend -- STORAGE_BACKEND stays "filesystem" (the default) here.
+    store = FakeStore()
+    original_text = "S3-backed source bytes rehydrated through the router."
+    dataset, source, reset_document = _seed_reset_document(
+        store,
+        original_text=original_text,
+        forgotten_text="Forgotten normalized text must never be reused.",
+    )
+    source.storage_uri = "s3://bucket/v1/sources/x/y/original.txt"
+    fake_s3 = _RecordingSourceStorage(bytes_to_return=original_text.encode("utf-8"))
+    settings = make_settings(tmp_path, storage_s3_bucket="bucket", storage_s3_region="us-east-1")
+    assert settings.storage_backend == "filesystem"
+    router = SourceStorageRouter(settings, s3=fake_s3)
+
+    result = await run_cognify(
+        service_for(
+            tmp_path, store, FakeEmbeddingClient(), source_storage=router, settings=settings
+        ),
+        dataset.id,
+    )
+
+    assert result.sources_processed == 1
+    assert reset_document.normalized_text == original_text
+    assert len(fake_s3.read_calls) == 1
+    assert fake_s3.read_calls[0]["storage_uri"] == source.storage_uri
+
+
+@pytest.mark.asyncio
+async def test_cognify_reads_file_source_via_router_even_when_backend_is_s3(
+    tmp_path: Path,
+) -> None:
+    # The converse: STORAGE_BACKEND=s3, but this Source's own storage_uri is
+    # still file:// -- read must still route to the filesystem adapter.
+    store = FakeStore()
+    original_text = "Filesystem-backed source bytes remain readable after a backend flip."
+    dataset, source, reset_document = _seed_reset_document(
+        store,
+        original_text=original_text,
+        forgotten_text="Forgotten normalized text must never be reused.",
+    )
+    storage_path = tmp_path / str(dataset.id) / str(source.id) / "original.txt"
+    storage_path.parent.mkdir(parents=True)
+    storage_path.write_text(original_text, encoding="utf-8")
+    source.storage_uri = storage_path.as_uri()
+    settings = make_settings(
+        tmp_path, storage_backend="s3", storage_s3_bucket="bucket", storage_s3_region="us-east-1"
+    )
+    router = SourceStorageRouter(settings)  # no S3 adapter ever needed/constructed here
+
+    result = await run_cognify(
+        service_for(
+            tmp_path, store, FakeEmbeddingClient(), source_storage=router, settings=settings
+        ),
+        dataset.id,
+    )
+
+    assert result.sources_processed == 1
+    assert reset_document.normalized_text == original_text
+
+
+@pytest.mark.asyncio
+async def test_cognify_read_fails_closed_for_unknown_uri_scheme(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset, source, reset_document = _seed_reset_document(
+        store,
+        original_text="unreachable",
+        forgotten_text="Forgotten normalized text must never be reused.",
+    )
+    source.storage_uri = "ftp://example/original.txt"
+
+    # Storage unavailability is not this source's fault -- it propagates as
+    # the same stable DependencyUnavailableError this call site has always
+    # raised, so the engine classifies the step retryable and leaves the
+    # source's own status/derived memory completely untouched (unchanged
+    # existing contract, not a new behavior from this slice).
+    with pytest.raises(DependencyUnavailableError):
+        await run_cognify(service_for(tmp_path, store, FakeEmbeddingClient()), dataset.id)
+
+    assert source.status == SourceStatus.PENDING
+    assert reset_document.normalized_text != "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_cognify_s3_read_with_no_usable_s3_config_fails_safely(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset, source, reset_document = _seed_reset_document(
+        store,
+        original_text="unreachable",
+        forgotten_text="Forgotten normalized text must never be reused.",
+    )
+    source.storage_uri = "s3://bucket/v1/sources/x/y/original.txt"
+    # Default settings: STORAGE_BACKEND=filesystem, zero STORAGE_S3_* values.
+    settings = make_settings(tmp_path)
+    router = SourceStorageRouter(settings)
+
+    with pytest.raises(DependencyUnavailableError):
+        await run_cognify(
+            service_for(
+                tmp_path, store, FakeEmbeddingClient(), source_storage=router, settings=settings
+            ),
+            dataset.id,
+        )
+
+    assert source.status == SourceStatus.PENDING
+    # Never reinterpreted as file://, never guessed, never marked DELETED,
+    # never mutated storage_uri, derived Dataset memory left exactly as-is.
+    assert source.storage_uri == "s3://bucket/v1/sources/x/y/original.txt"
+    assert reset_document.normalized_text != "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_cognify_deleted_source_with_retained_uri_is_never_rehydrated(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset, source, reset_document = _seed_reset_document(
+        store,
+        original_text="must never be read",
+        forgotten_text="Forgotten normalized text must never be reused.",
+    )
+    source.storage_uri = "s3://bucket/v1/sources/x/y/original.txt"
+    source.status = SourceStatus.DELETED  # ADR-0011 D40: tombstone, never rehydrated
+    fake_s3 = _RecordingSourceStorage(bytes_to_return=b"must never be read")
+    settings = make_settings(tmp_path, storage_s3_bucket="bucket", storage_s3_region="us-east-1")
+    router = SourceStorageRouter(settings, s3=fake_s3)
+
+    result = await run_cognify(
+        service_for(
+            tmp_path, store, FakeEmbeddingClient(), source_storage=router, settings=settings
+        ),
+        dataset.id,
+    )
+
+    assert result.sources_processed == 0
+    assert fake_s3.read_calls == []  # storage was never even attempted
+    assert reset_document.normalized_text != "must never be read"
+
+
+@pytest.mark.asyncio
+async def test_cognify_supplies_correct_identity_to_storage_read(tmp_path: Path) -> None:
+    store = FakeStore()
+    original_text = "Identity-forwarding regression bytes."
+    dataset, source, _reset_document = _seed_reset_document(
+        store,
+        original_text=original_text,
+        forgotten_text="Forgotten normalized text must never be reused.",
+    )
+    source.storage_uri = "s3://bucket/v1/sources/x/y/original.txt"
+    fake_s3 = _RecordingSourceStorage(bytes_to_return=original_text.encode("utf-8"))
+    settings = make_settings(
+        tmp_path,
+        storage_s3_bucket="bucket",
+        storage_s3_region="us-east-1",
+        max_source_size_mb=7,
+    )
+    router = SourceStorageRouter(settings, s3=fake_s3)
+
+    await run_cognify(
+        service_for(
+            tmp_path, store, FakeEmbeddingClient(), source_storage=router, settings=settings
+        ),
+        dataset.id,
+    )
+
+    assert len(fake_s3.read_calls) == 1
+    call = fake_s3.read_calls[0]
+    assert call["dataset_id"] == source.dataset_id
+    assert call["source_id"] == source.id
+    assert call["storage_uri"] == source.storage_uri
+    assert call["expected_byte_size"] == source.byte_size
+    assert call["expected_content_sha256"] == source.content_sha256
+    assert call["max_bytes"] == 7 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_cognify_storage_read_never_runs_with_an_open_unit_of_work(
+    tmp_path: Path,
+) -> None:
+    """Transaction-boundary proof (ADR-0011 D27): the UnitOfWork
+    ``_decide_source_work_item`` uses to resolve ``work_item`` closes
+    (``__aexit__`` runs) before ``_prepare_source``/``_read_reset_document``
+    ever calls ``SourceStorageRouter.read`` -- proven here by instrumenting
+    ``FakeStore.open_uow_count`` and asserting it is exactly 0 at the moment
+    the storage read is observed, rather than trusting the code structure
+    alone."""
+
+    store = FakeStore()
+    original_text = "No PostgreSQL transaction may span storage I/O."
+    dataset, source, reset_document = _seed_reset_document(
+        store,
+        original_text=original_text,
+        forgotten_text="Forgotten normalized text must never be reused.",
+    )
+    source.storage_uri = "s3://bucket/v1/sources/x/y/original.txt"
+
+    class _AssertingSourceStorage(_RecordingSourceStorage):
+        async def read(self, **kwargs: object) -> bytes:  # type: ignore[override]
+            assert store.open_uow_count == 0, (
+                "SourceStorageRouter.read observed with a UnitOfWork still open"
+            )
+            return await super().read(**kwargs)  # type: ignore[arg-type]
+
+    fake_s3 = _AssertingSourceStorage(bytes_to_return=original_text.encode("utf-8"))
+    settings = make_settings(tmp_path, storage_s3_bucket="bucket", storage_s3_region="us-east-1")
+    router = SourceStorageRouter(settings, s3=fake_s3)
+
+    result = await run_cognify(
+        service_for(
+            tmp_path, store, FakeEmbeddingClient(), source_storage=router, settings=settings
+        ),
+        dataset.id,
+    )
+
+    assert result.sources_processed == 1
+    assert reset_document.normalized_text == original_text
+    assert fake_s3.read_calls  # the assertion above actually ran
 
 
 @pytest.mark.asyncio

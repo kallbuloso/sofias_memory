@@ -16,15 +16,28 @@ from __future__ import annotations
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
-from hashlib import sha256
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from sofias_memory.api.errors import SofiasMemoryError
+from sofias_memory.config import Settings
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.infrastructure.storage.filesystem import (
+    SourceStoragePathError as _SourceStoragePathError,
+)
+from sofias_memory.infrastructure.storage.filesystem import (
+    final_storage_content_matches,
+    final_storage_directory,
+    final_storage_path,
+    final_storage_uri,
+)
+from sofias_memory.infrastructure.storage.filesystem import (
+    write_final_storage_bytes as _write_final_storage_bytes,
+)
+from sofias_memory.infrastructure.storage.port import SourceObjectStorage
 from sofias_memory.schemas.common import ErrorCode, JSONValue
 
 DEFAULT_DATASET_SLUG = "main"
@@ -309,49 +322,19 @@ def delete_ingress_artifact(data_directory: Path, *, run_id: UUID) -> None:
 # ---------------------------------------------------------------------------
 # Final storage helpers (SM-513 SS 16/17): filesystem I/O only, never called
 # from a PipelineStep's persist().
+#
+# ADR-0011 STORAGE-001 layering correction: the actual primitives now live in
+# infrastructure.storage.filesystem (the lower-level implementation boundary
+# -- services/pipelines depend on infrastructure, never the reverse). The
+# names below are kept as thin compatibility wrappers for call sites
+# STORAGE-004 has not migrated to SourceStorageRouter yet.
+# `final_storage_directory`/`final_storage_path`/`final_storage_uri`/
+# `final_storage_content_matches` are pure (never raise) and are re-exported
+# directly (imported at module top); `write_final_storage_bytes` translates
+# the infra layer's dependency-free `SourceStoragePathError` back into this
+# module's existing `SofiasMemoryError` contract so every current caller/
+# test is unaffected.
 # ---------------------------------------------------------------------------
-
-
-def final_storage_directory(data_directory: Path, *, dataset_id: UUID, source_id: UUID) -> Path:
-    return data_directory / str(dataset_id) / str(source_id)
-
-
-def final_storage_path(
-    data_directory: Path,
-    *,
-    dataset_id: UUID,
-    source_id: UUID,
-    storage_extension: str,
-) -> Path:
-    return (
-        final_storage_directory(data_directory, dataset_id=dataset_id, source_id=source_id)
-        / f"original{storage_extension}"
-    )
-
-
-def final_storage_uri(
-    data_directory: Path,
-    *,
-    dataset_id: UUID,
-    source_id: UUID,
-    storage_extension: str,
-) -> str:
-    """Pure path computation, no filesystem access (safe to call from a
-    ``persist()`` phase, ADR-0009 SS O): the ``file://`` URI a source's final
-    storage path resolves to, assuming ``data_directory`` is already an
-    absolute, canonical root (true for ``Settings.data_directory``). Never
-    calls ``Path.resolve()`` -- that performs real syscalls (symlink
-    readback), which ``persist()`` may not do; ``dataset_id``/``source_id``
-    are trusted application-generated UUIDs here, not values parsed back
-    from an untrusted URI, so no symlink-escape re-check is needed the way
-    Forget's *read*-side ``source_storage_path`` requires."""
-
-    return final_storage_path(
-        data_directory,
-        dataset_id=dataset_id,
-        source_id=source_id,
-        storage_extension=storage_extension,
-    ).as_uri()
 
 
 def write_final_storage_bytes(
@@ -368,38 +351,20 @@ def write_final_storage_bytes(
     from client input), so the guard here only needs to prevent this
     function's own output from ever escaping ``data_directory``."""
 
-    storage_root = data_directory.resolve()
-    target_directory = (storage_root / str(dataset_id) / str(source_id)).resolve()
-    if not target_directory.is_relative_to(storage_root):
+    try:
+        return _write_final_storage_bytes(
+            data_directory,
+            dataset_id=dataset_id,
+            source_id=source_id,
+            storage_extension=storage_extension,
+            original_bytes=original_bytes,
+        )
+    except _SourceStoragePathError as exc:
         raise SofiasMemoryError(
             code=ErrorCode.INTERNAL_ERROR,
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             message="Source storage path is invalid.",
-        )
-    target_directory.mkdir(parents=True, exist_ok=True)
-    target_path = target_directory / f"original{storage_extension}"
-    temporary_path = target_directory / f"original{storage_extension}.tmp"
-    temporary_path.write_bytes(original_bytes)
-    temporary_path.replace(target_path)
-    return final_storage_uri(
-        data_directory,
-        dataset_id=dataset_id,
-        source_id=source_id,
-        storage_extension=storage_extension,
-    )
-
-
-def final_storage_content_matches(path: Path, *, content_sha256: str) -> bool:
-    """Whether an already-existing final storage file's content hash matches
-    the expected content identity -- the idempotent-replay check that lets
-    :class:`~sofias_memory.pipelines.steps.remember.FinalizeStorageStep`
-    treat a file already present (a prior attempt's own write, or a crash
-    exactly after the copy but before the ``storage_uri`` commit) as safely
-    done rather than re-copying or failing."""
-
-    if not path.is_file():
-        return False
-    return sha256(path.read_bytes()).hexdigest() == content_sha256
+        ) from exc
 
 
 async def prepare_remember_retry_ingress(
@@ -410,6 +375,8 @@ async def prepare_remember_retry_ingress(
     original_source_id: UUID | None,
     candidate_run_id: UUID,
     source_kind: str,
+    settings: Settings,
+    storage: SourceObjectStorage | None = None,
 ) -> bool:
     """SM-514 SS 34/35: recover durable bytes for a manual-retry child run's
     own ``candidate_run_id``-keyed ingress artifact, using only what the
@@ -424,6 +391,13 @@ async def prepare_remember_retry_ingress(
     ``False`` only when TEXT/FILE has nothing durable to redo step 1 with --
     the caller must then fail the retry closed rather than create a child
     doomed to `REMEMBER_INGRESS_MISSING`.
+
+    ``storage`` is an injection point mirroring
+    ``RememberPipelineResources.source_storage`` (``pipelines/steps/remember.py``):
+    production call sites leave it ``None`` and a ``SourceStorageRouter`` is
+    built from ``settings``; tests inject a fake/Stubbed
+    :class:`~sofias_memory.infrastructure.storage.port.SourceObjectStorage` to
+    prove Case 2 routes by scheme without needing live S3 (STORAGE-009).
     """
 
     # Case 1 -- the original run's own ingress directory is still present
@@ -454,31 +428,47 @@ async def prepare_remember_retry_ingress(
 
     # Case 2 -- original ingress is gone (finalize_storage already
     # succeeded and cleaned it up): recover bytes from the authoritative
-    # Source's own final storage, validating path safety and content hash
-    # before trusting it (reuses Forget's already-audited safe-path guard,
-    # SM-512 -- never a second implementation of the same safety property).
+    # Source's own final storage. Reads route by `storage_uri` scheme via
+    # the storage router (ADR-0011 D4/D13), never by `STORAGE_BACKEND` --
+    # this recovers identically whether the original final object is a
+    # legacy filesystem write or a real S3 object (STORAGE-009 live-MinIO
+    # finding: this case previously called the filesystem-only
+    # `source_storage_path` helper directly and hard-failed closed with
+    # `INVALID_REQUEST` for any `s3://` Source instead of recovering).
     if original_source_id is not None:
         async with PostgresUnitOfWork(session_factory) as uow:
             source = await uow.sources.get_by_id(original_source_id)
             storage_uri = source.storage_uri if source is not None else None
             dataset_id = source.dataset_id if source is not None else None
             content_sha256 = source.content_sha256 if source is not None else None
-        if storage_uri is not None and dataset_id is not None:
-            from sofias_memory.services.forget import source_storage_path
+            byte_size = source.byte_size if source is not None else None
+        if (
+            storage_uri is not None
+            and dataset_id is not None
+            and content_sha256 is not None
+            and byte_size is not None
+        ):
+            from sofias_memory.infrastructure.storage.port import SourceStorageError
+            from sofias_memory.infrastructure.storage.router import SourceStorageRouter
 
-            path = source_storage_path(
-                data_directory,
-                dataset_id=dataset_id,
-                source_id=original_source_id,
-                storage_uri=storage_uri,
-            )
-            if path is not None:
-                raw_bytes = path.read_bytes()
-                if sha256(raw_bytes).hexdigest() == content_sha256:
-                    write_ingress_bytes(
-                        data_directory, run_id=candidate_run_id, raw_bytes=raw_bytes
-                    )
-                    return True
+            router = storage or SourceStorageRouter(settings)
+            recovered_bytes: bytes | None
+            try:
+                recovered_bytes = await router.read(
+                    dataset_id=dataset_id,
+                    source_id=original_source_id,
+                    storage_uri=storage_uri,
+                    expected_byte_size=byte_size,
+                    expected_content_sha256=content_sha256,
+                    max_bytes=settings.max_source_size_mb * 1024 * 1024,
+                )
+            except SourceStorageError:
+                recovered_bytes = None
+            if recovered_bytes is not None:
+                write_ingress_bytes(
+                    data_directory, run_id=candidate_run_id, raw_bytes=recovered_bytes
+                )
+                return True
 
     # Case 4 -- TEXT/FILE with neither a live ingress artifact nor
     # recoverable final storage: no durable bytes exist anywhere to redo

@@ -45,6 +45,15 @@ SETTINGS_ENV_NAMES = {
     "DATA_DIRECTORY",
     "TEMP_DIRECTORY",
     "MAX_SOURCE_SIZE_MB",
+    "STORAGE_BACKEND",
+    "STORAGE_S3_BUCKET",
+    "STORAGE_S3_PREFIX",
+    "STORAGE_S3_REGION",
+    "STORAGE_S3_ENDPOINT_URL",
+    "STORAGE_S3_ACCESS_KEY_ID",
+    "STORAGE_S3_SECRET_ACCESS_KEY",
+    "STORAGE_S3_SESSION_TOKEN",
+    "STORAGE_S3_MAX_CONCURRENCY",
     "LLM_BASE_URL",
     "LLM_API_KEY",
     "LLM_MODEL",
@@ -119,6 +128,7 @@ def test_minimal_valid_configuration_uses_prd_defaults() -> None:
     assert settings.entity_merge_similarity_threshold == 0.95
     assert settings.worker_enabled is True
     assert settings.log_document_content is False
+    assert settings.storage_backend == "filesystem"
 
 
 def test_api_key_valid() -> None:
@@ -205,6 +215,172 @@ def test_embedding_api_key_can_override_llm_api_key() -> None:
 
 def test_embedding_dimensions_invalid() -> None:
     assert_invalid(embedding_dimensions=0)
+
+
+def test_storage_backend_accepts_s3_with_mandatory_write_config() -> None:
+    # ADR-0011 D2/D16: the closed enum accepts "s3" once the settings
+    # actually mandatory for writes (bucket, region) are also supplied.
+    settings = make_settings(
+        storage_backend="s3",
+        storage_s3_bucket="sofias-memory-sources",
+        storage_s3_region="us-east-1",
+    )
+
+    assert settings.storage_backend == "s3"
+    assert settings.storage_s3_bucket == "sofias-memory-sources"
+
+
+def test_storage_backend_rejects_unknown_value() -> None:
+    assert_invalid(storage_backend="minio")
+
+
+def test_default_backend_filesystem_requires_zero_s3_configuration() -> None:
+    # Existing filesystem installs must start with zero S3 values present.
+    settings = make_settings()
+
+    assert settings.storage_backend == "filesystem"
+    assert settings.storage_s3_bucket is None
+    assert settings.storage_s3_region is None
+    assert settings.storage_s3_endpoint_url is None
+    assert settings.storage_s3_access_key_id is None
+    assert settings.storage_s3_secret_access_key is None
+    assert settings.storage_s3_session_token is None
+    assert settings.storage_s3_prefix == ""
+    assert settings.storage_s3_max_concurrency == 4
+
+
+def test_storage_backend_s3_without_bucket_is_rejected() -> None:
+    assert_invalid(storage_backend="s3", storage_s3_region="us-east-1")
+
+
+def test_storage_backend_s3_without_region_is_rejected() -> None:
+    assert_invalid(storage_backend="s3", storage_s3_bucket="sofias-memory-sources")
+
+
+def test_storage_backend_s3_blank_bucket_is_rejected() -> None:
+    assert_invalid(storage_backend="s3", storage_s3_bucket="   ", storage_s3_region="us-east-1")
+
+
+def test_storage_backend_s3_with_endpoint_url_and_credential_chain_is_valid() -> None:
+    # MinIO / S3-compatible endpoint, no static credentials -- provider chain
+    # (env/shared config/IMDS/instance role) remains fully usable.
+    settings = make_settings(
+        storage_backend="s3",
+        storage_s3_bucket="sofias-memory-sources",
+        storage_s3_region="us-east-1",
+        storage_s3_endpoint_url="https://minio.internal:9000",
+    )
+
+    assert settings.storage_s3_endpoint_url == "https://minio.internal:9000"
+    assert settings.storage_s3_access_key_id is None
+
+
+def test_storage_s3_endpoint_url_rejects_non_http_scheme() -> None:
+    assert_invalid(
+        storage_backend="s3",
+        storage_s3_bucket="b",
+        storage_s3_region="us-east-1",
+        storage_s3_endpoint_url="ftp://minio.internal",
+    )
+
+
+def test_storage_s3_explicit_credential_pair_is_valid() -> None:
+    settings = make_settings(
+        storage_backend="s3",
+        storage_s3_bucket="sofias-memory-sources",
+        storage_s3_region="us-east-1",
+        storage_s3_access_key_id="AKIAFAKEEXAMPLE",
+        storage_s3_secret_access_key="fake-secret-value",
+    )
+
+    assert settings.storage_s3_access_key_id is not None
+    assert settings.storage_s3_access_key_id.get_secret_value() == "AKIAFAKEEXAMPLE"
+
+
+def test_storage_s3_access_key_without_secret_is_rejected() -> None:
+    assert_invalid(
+        storage_backend="s3",
+        storage_s3_bucket="b",
+        storage_s3_region="us-east-1",
+        storage_s3_access_key_id="AKIAFAKEEXAMPLE",
+    )
+
+
+def test_storage_s3_secret_without_access_key_is_rejected() -> None:
+    assert_invalid(
+        storage_backend="s3",
+        storage_s3_bucket="b",
+        storage_s3_region="us-east-1",
+        storage_s3_secret_access_key="fake-secret-value",
+    )
+
+
+def test_storage_s3_session_token_without_credential_pair_is_rejected() -> None:
+    assert_invalid(
+        storage_backend="s3",
+        storage_s3_bucket="b",
+        storage_s3_region="us-east-1",
+        storage_s3_session_token="fake-session-token",
+    )
+
+
+def test_storage_s3_session_token_with_credential_pair_is_valid() -> None:
+    settings = make_settings(
+        storage_backend="s3",
+        storage_s3_bucket="b",
+        storage_s3_region="us-east-1",
+        storage_s3_access_key_id="AKIAFAKEEXAMPLE",
+        storage_s3_secret_access_key="fake-secret-value",
+        storage_s3_session_token="fake-session-token",
+    )
+
+    assert settings.storage_s3_session_token is not None
+
+
+@pytest.mark.parametrize(
+    ("raw_prefix", "normalized"),
+    [
+        ("", ""),
+        ("sources", "sources"),
+        ("/sources/", "sources"),
+        ("sources/v1", "sources/v1"),
+    ],
+)
+def test_storage_s3_prefix_normalization(raw_prefix: str, normalized: str) -> None:
+    settings = make_settings(storage_s3_prefix=raw_prefix)
+
+    assert settings.storage_s3_prefix == normalized
+
+
+@pytest.mark.parametrize(
+    "unsafe_prefix",
+    ["../escape", "a/../b", "a//b", "a/./b", "a\\b", "//sources//v1//"],
+)
+def test_storage_s3_prefix_rejects_unsafe_forms(unsafe_prefix: str) -> None:
+    assert_invalid(storage_s3_prefix=unsafe_prefix)
+
+
+def test_storage_s3_max_concurrency_must_be_positive() -> None:
+    assert_invalid(storage_s3_max_concurrency=0)
+
+
+def test_storage_s3_secrets_are_redacted_in_repr() -> None:
+    settings = make_settings(
+        storage_backend="s3",
+        storage_s3_bucket="b",
+        storage_s3_region="us-east-1",
+        storage_s3_access_key_id="AKIAFAKEEXAMPLE",
+        storage_s3_secret_access_key="super-secret-value",
+        storage_s3_session_token="super-secret-token",
+    )
+
+    rendered = repr(settings)
+    dumped = str(settings.model_dump())
+
+    assert "super-secret-value" not in rendered
+    assert "super-secret-value" not in dumped
+    assert "super-secret-token" not in rendered
+    assert "AKIAFAKEEXAMPLE" not in rendered
 
 
 def test_chunk_overlap_greater_than_or_equal_to_max_is_rejected() -> None:
@@ -532,6 +708,47 @@ def test_non_functional_configuration_does_not_change_fingerprint(
     changed = make_settings(**{field_name: value}).config_fingerprint()
 
     assert changed == baseline
+
+
+def test_storage_backend_switch_does_not_change_fingerprint() -> None:
+    # ADR-0011 D18: storage location is physical persistence configuration,
+    # not semantic processing configuration -- a PipelineRun resuming after a
+    # filesystem->S3 flip must not fail purely because the fingerprint moved.
+    baseline = make_settings().config_fingerprint()
+    changed = make_settings(
+        storage_backend="s3",
+        storage_s3_bucket="sofias-memory-sources",
+        storage_s3_region="us-east-1",
+        storage_s3_endpoint_url="https://minio.internal:9000",
+        storage_s3_access_key_id="AKIAFAKEEXAMPLE",
+        storage_s3_secret_access_key="fake-secret-value",
+        storage_s3_session_token="fake-session-token",
+        storage_s3_prefix="sources",
+        storage_s3_max_concurrency=16,
+    ).config_fingerprint()
+
+    assert changed == baseline
+
+
+def test_storage_fingerprint_payload_never_mentions_s3_settings() -> None:
+    settings = make_settings(
+        storage_backend="s3",
+        storage_s3_bucket="sofias-memory-sources",
+        storage_s3_region="us-east-1",
+        storage_s3_access_key_id="AKIAFAKEEXAMPLE",
+        storage_s3_secret_access_key="fake-secret-value",
+    )
+
+    payload = build_config_fingerprint_payload(settings)
+    canonical = canonical_config_fingerprint_payload(payload)
+
+    for forbidden in (
+        "storage",
+        "sofias-memory-sources",
+        "AKIAFAKEEXAMPLE",
+        "fake-secret-value",
+    ):
+        assert forbidden not in canonical
 
 
 def test_fingerprint_is_sha256_hex() -> None:

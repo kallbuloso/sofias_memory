@@ -37,12 +37,8 @@ import asyncio
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from hashlib import sha256
 from http import HTTPStatus
-from pathlib import Path
 from typing import Protocol, cast
-from urllib.parse import urlparse
-from urllib.request import url2pathname
 from uuid import UUID, uuid4, uuid5
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -71,6 +67,8 @@ from sofias_memory.infrastructure.postgres.models import (
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.infrastructure.storage.port import SourceObjectStorage, SourceStorageError
+from sofias_memory.infrastructure.storage.router import SourceStorageRouter
 from sofias_memory.loaders.text import (
     CSV_FILE_MIME_TYPE,
     DOCX_FILE_MIME_TYPE,
@@ -458,6 +456,7 @@ class CognifyService:
         document_summary_client: DocumentSummaryClient,
         session_factory: AsyncSessionFactory | None = None,
         unit_of_work_factory: UnitOfWorkFactory | None = None,
+        source_storage: SourceObjectStorage | None = None,
     ) -> None:
         if unit_of_work_factory is None and session_factory is None:
             raise ValueError("session_factory or unit_of_work_factory is required")
@@ -469,6 +468,12 @@ class CognifyService:
             cast(AsyncSessionFactory, session_factory)
         )
         self._tokenizer = TextTokenizer(settings.embedding_model)
+        # ADR-0011 D4/D13: the only storage boundary Cognify depends on --
+        # never a direct filesystem Path or S3 SDK type. Defaults to a
+        # self-sufficient router (constructible from Settings alone, no
+        # global composition/lifespan dependency) so this slice does not
+        # need to redesign application-wide wiring (that is STORAGE-007's).
+        self._source_storage: SourceObjectStorage = source_storage or SourceStorageRouter(settings)
 
     # -- external/computation phase -------------------------------------
 
@@ -788,9 +793,7 @@ class CognifyService:
             embeddings: tuple[list[float], ...] = ()
         else:
             refreshed_document = (
-                await asyncio.to_thread(self._read_reset_document, work_item)
-                if work_item.rehydrate_document
-                else None
+                await self._read_reset_document(work_item) if work_item.rehydrate_document else None
             )
             normalized_text = (
                 refreshed_document.normalized_text
@@ -1437,30 +1440,36 @@ class CognifyService:
         await uow.relations.add(relation)
         return relation, True
 
-    def _read_reset_document(self, work_item: CognifySourceWorkItem) -> PreparedText:
-        """Reload and validate source bytes for a content-free reset document."""
+    async def _read_reset_document(self, work_item: CognifySourceWorkItem) -> PreparedText:
+        """Reload and validate source bytes for a content-free reset document.
 
-        storage_path = source_storage_path_for_cognify(
-            self._settings.data_directory,
-            dataset_id=work_item.dataset_id,
-            source_id=work_item.source_id,
-            storage_uri=work_item.source_storage_uri,
-        )
+        ADR-0011 D4/D13/D37: rehydration goes through ``SourceStorageRouter``
+        only -- this method never knows whether the original lives at
+        ``file://`` or ``s3://``, never resolves a filesystem ``Path``
+        itself, and never imports an S3 SDK type. The router already proves
+        byte-count and SHA-256 identity and enforces ``max_bytes``; this
+        method does not duplicate that checking.
+        """
+
+        if work_item.source_storage_uri is None:
+            raise DependencyUnavailableError("Source storage is unavailable.")
         max_bytes = self._settings.max_source_size_mb * 1024 * 1024
         try:
-            actual_size = storage_path.stat().st_size
-        except OSError as exc:
+            original_bytes = await self._source_storage.read(
+                dataset_id=work_item.dataset_id,
+                source_id=work_item.source_id,
+                storage_uri=work_item.source_storage_uri,
+                expected_byte_size=work_item.source_byte_size,
+                expected_content_sha256=work_item.source_content_sha256,
+                max_bytes=max_bytes,
+            )
+        except SourceStorageError as exc:
+            # Preserves source_storage_path_for_cognify's exact prior
+            # contract: every storage failure mode (missing/oversized/
+            # hash-mismatched/traversal-invalid/unreachable-backend) surfaces
+            # as the same stable DependencyUnavailableError this call site
+            # has always raised -- never a raw botocore/pathlib detail.
             raise DependencyUnavailableError("Source storage is unavailable.") from exc
-        if actual_size > max_bytes or actual_size != work_item.source_byte_size:
-            raise DependencyUnavailableError("Source storage is unavailable.")
-        try:
-            original_bytes = storage_path.read_bytes()
-        except OSError as exc:
-            raise DependencyUnavailableError("Source storage is unavailable.") from exc
-        if len(original_bytes) != work_item.source_byte_size:
-            raise DependencyUnavailableError("Source storage is unavailable.")
-        if sha256(original_bytes).hexdigest() != work_item.source_content_sha256:
-            raise DependencyUnavailableError("Source storage is unavailable.")
         extension = SOURCE_EXTENSION_BY_MIME_TYPE.get(work_item.source_mime_type)
         if extension is None:
             raise DependencyUnavailableError("Source storage is unavailable.")
@@ -1784,43 +1793,6 @@ def _projection_command_identity(command: ProjectionCommand) -> tuple[str, str, 
             command.identity["to_chunk_id"],
         )
     return command.aggregate_type, command.aggregate_id, None
-
-
-def source_storage_path_for_cognify(
-    data_directory: Path,
-    *,
-    dataset_id: UUID,
-    source_id: UUID,
-    storage_uri: str | None,
-) -> Path:
-    """Resolve a stored source file without accepting paths outside its source directory."""
-
-    if storage_uri is None:
-        raise DependencyUnavailableError("Source storage is unavailable.")
-    parsed = urlparse(storage_uri)
-    if parsed.scheme != "file" or parsed.netloc:
-        raise DependencyUnavailableError("Source storage is unavailable.")
-    storage_root = data_directory.resolve(strict=False)
-    expected_directory = (storage_root / str(dataset_id) / str(source_id)).resolve(strict=False)
-    raw_path = Path(url2pathname(parsed.path))
-    nominal_path = raw_path.resolve(strict=False)
-    if (
-        not expected_directory.is_relative_to(storage_root)
-        or not nominal_path.is_relative_to(expected_directory)
-        or not raw_path.exists()
-    ):
-        raise DependencyUnavailableError("Source storage is unavailable.")
-    try:
-        resolved_path = raw_path.resolve(strict=True)
-    except OSError as exc:
-        raise DependencyUnavailableError("Source storage is unavailable.") from exc
-    if (
-        not resolved_path.is_relative_to(expected_directory)
-        or not resolved_path.is_file()
-        or resolved_path.is_dir()
-    ):
-        raise DependencyUnavailableError("Source storage is unavailable.")
-    return resolved_path
 
 
 def _snapshot_persistence_error() -> SofiasMemoryError:

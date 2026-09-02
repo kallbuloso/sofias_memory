@@ -14,10 +14,10 @@ from sofias_memory.api.middleware import (
     REQUEST_ID_HEADER,
     RequestBodyLimitMiddleware,
 )
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.observability.logging import clear_log_context, configure_logging
 from sofias_memory.schemas.common import ErrorCode
+from tests.unit._app_factory import create_app
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"

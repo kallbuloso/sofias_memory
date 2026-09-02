@@ -35,6 +35,19 @@ services:
       DATA_DIRECTORY: "/data/sources"
       TEMP_DIRECTORY: "/data/tmp"
       MAX_SOURCE_SIZE_MB: "${MAX_SOURCE_SIZE_MB:-50}"
+      # ADR-0011: filesystem remains the default -- STORAGE_BACKEND is never
+      # forced to "s3" here. Setting it (and the STORAGE_S3_* values below)
+      # is entirely the operator's opt-in via .env; every S3 field is empty/
+      # unset by default and forwarded only when the operator supplies it.
+      STORAGE_BACKEND: "${STORAGE_BACKEND:-filesystem}"
+      STORAGE_S3_BUCKET: "${STORAGE_S3_BUCKET:-}"
+      STORAGE_S3_PREFIX: "${STORAGE_S3_PREFIX:-}"
+      STORAGE_S3_REGION: "${STORAGE_S3_REGION:-}"
+      STORAGE_S3_ENDPOINT_URL: "${STORAGE_S3_ENDPOINT_URL:-}"
+      STORAGE_S3_ACCESS_KEY_ID: "${STORAGE_S3_ACCESS_KEY_ID:-}"
+      STORAGE_S3_SECRET_ACCESS_KEY: "${STORAGE_S3_SECRET_ACCESS_KEY:-}"
+      STORAGE_S3_SESSION_TOKEN: "${STORAGE_S3_SESSION_TOKEN:-}"
+      STORAGE_S3_MAX_CONCURRENCY: "${STORAGE_S3_MAX_CONCURRENCY:-4}"
       LLM_BASE_URL: "${LLM_BASE_URL:-https://api.openai.com/v1}"
       LLM_API_KEY: "${LLM_API_KEY:?LLM_API_KEY is required}"
       LLM_MODEL: "${LLM_MODEL:-gpt-5-mini}"

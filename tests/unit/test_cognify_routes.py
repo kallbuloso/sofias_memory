@@ -18,7 +18,6 @@ import httpx
 import pytest
 
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import PipelineRunStatus, PipelineType
 from sofias_memory.schemas.common import ErrorCode
@@ -29,6 +28,7 @@ from sofias_memory.services.pipeline_submission import (
     worker_disabled_error,
 )
 from sofias_memory.services.pipeline_waiter import WaitOutcome
+from tests.unit._app_factory import create_app
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"

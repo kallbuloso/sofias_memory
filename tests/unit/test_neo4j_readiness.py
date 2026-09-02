@@ -9,7 +9,6 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sofias_memory.app import create_app
 from sofias_memory.config import API_KEY_PREFIX, Settings
 from sofias_memory.infrastructure.neo4j import (
     NEO4J_NOT_READY_DETAIL,
@@ -29,6 +28,7 @@ from sofias_memory.infrastructure.postgres.readiness import (
 )
 from sofias_memory.lifespan import NEO4J_STARTUP_PROBE_QUERY
 from sofias_memory.observability.logging import clear_log_context, configure_logging
+from tests.unit._app_factory import create_app
 
 VALID_API_KEY = f"{API_KEY_PREFIX}{'a' * 32}"
 VALID_DATABASE_URL = "postgresql+asyncpg://sofias_memory:db-secret@postgres:5432/db"
@@ -681,7 +681,10 @@ def test_create_app_registers_neo4j_readiness_check() -> None:
         neo4j_readiness_checker=as_neo4j_checker(checker),
     )
 
-    assert [registered.name for registered in app.state.readiness_checks] == ["neo4j"]
+    assert [registered.name for registered in app.state.readiness_checks] == [
+        "process_state",
+        "neo4j",
+    ]
 
 
 @pytest.mark.asyncio
@@ -705,6 +708,7 @@ async def test_ready_route_reports_postgres_and_neo4j_ready() -> None:
         "checks": {
             "neo4j": {"ready": True},
             "postgres": {"ready": True},
+            "process_state": {"ready": True},
         },
     }
 
@@ -728,7 +732,10 @@ async def test_ready_route_reports_neo4j_not_ready_with_safe_detail() -> None:
     assert response.status_code == 503
     assert response_json(response) == {
         "status": "not_ready",
-        "checks": {"neo4j": {"ready": False, "detail": NEO4J_NOT_READY_DETAIL}},
+        "checks": {
+            "neo4j": {"ready": False, "detail": NEO4J_NOT_READY_DETAIL},
+            "process_state": {"ready": True},
+        },
     }
 
 
@@ -824,26 +831,36 @@ def test_lifespan_bootstraps_once_and_closes_once(monkeypatch: pytest.MonkeyPatc
     assert resource.driver.close_calls == 1
 
 
-def test_lifespan_bootstrap_failure_prevents_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lifespan_bootstrap_failure_keeps_process_alive_and_not_operational(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0011 D33 (STORAGE-007): a bootstrap failure (here, Neo4j) no
+    longer aborts application startup -- it never crash-loops the process.
+    The ASGI app starts normally; the background bootstrap task logs the
+    failure and retries; the process never reaches OPERATIONAL from this
+    failed attempt."""
+
     resource = FakeNeo4jResource()
 
     async def fail_bootstrap(resource_to_bootstrap: object) -> None:
         raise RuntimeError("bootstrap failed")
 
     monkeypatch.setattr("sofias_memory.lifespan.ensure_neo4j_schema", fail_bootstrap)
+    monkeypatch.setattr("sofias_memory.lifespan.BOOTSTRAP_RETRY_INTERVAL_SECONDS", 1000.0)
 
-    with (
-        pytest.raises(RuntimeError, match="bootstrap failed"),
-        TestClient(
-            create_app(
-                make_settings(),
-                enable_postgres_readiness=False,
-                neo4j_resource=as_neo4j_resource(resource),
-            )
-        ),
-    ):
-        pass
+    app = create_app(
+        make_settings(),
+        enable_postgres_readiness=False,
+        neo4j_resource=as_neo4j_resource(resource),
+    )
+    with TestClient(app) as client:
+        response = client.get("/health/live")
+        assert response.status_code == 200
+        holder = app.state.process_state_holder
+        assert holder.state.value == "bootstrap_maintenance"
 
+    # lifespan's own shutdown path always closes the Neo4j resource exactly
+    # once, regardless of whether bootstrap ever succeeded.
     assert resource.close_calls == 1
 
 
@@ -861,16 +878,14 @@ def test_lifespan_bootstrap_logs_do_not_leak_secret(
 
     monkeypatch.setattr("sofias_memory.lifespan.configure_logging", configure_logging_for_test)
     monkeypatch.setattr("sofias_memory.lifespan.ensure_neo4j_schema", fail_bootstrap)
+    monkeypatch.setattr("sofias_memory.lifespan.BOOTSTRAP_RETRY_INTERVAL_SECONDS", 1000.0)
     try:
-        with (
-            pytest.raises(RuntimeError),
-            TestClient(
-                create_app(
-                    make_settings(),
-                    enable_postgres_readiness=False,
-                    neo4j_resource=as_neo4j_resource(FakeNeo4jResource()),
-                )
-            ),
+        with TestClient(
+            create_app(
+                make_settings(),
+                enable_postgres_readiness=False,
+                neo4j_resource=as_neo4j_resource(FakeNeo4jResource()),
+            )
         ):
             pass
     finally:

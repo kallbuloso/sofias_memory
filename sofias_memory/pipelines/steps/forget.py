@@ -45,8 +45,17 @@ from uuid import UUID
 from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineType, SourceStatus
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.infrastructure.storage import (
+    InvalidSourceStorageUriError,
+    SourceObjectStorage,
+    SourceStorageRouter,
+    SourceStorageUnavailableError,
+    StorageDeleteResult,
+    StorageDeleteStatus,
+    UnsupportedStorageBackendError,
+)
 from sofias_memory.pipelines.context import PipelineContext
-from sofias_memory.pipelines.errors import PermanentPipelineStepError, RetryablePipelineStepError
+from sofias_memory.pipelines.errors import PermanentPipelineStepError
 from sofias_memory.pipelines.registry import (
     CancellationRecoveryMode,
     PipelineDefinition,
@@ -63,7 +72,6 @@ from sofias_memory.services.forget import (
     ForgetScope,
     apply_dataset_forget_mutation,
     apply_source_forget_mutation,
-    delete_source_storage,
     empty_dataset_mutation_part,
     empty_mutation,
     same_forget_intent,
@@ -88,6 +96,26 @@ FORGET_DEPENDENCY_ERROR_CODE = "FORGET_DEPENDENCY_UNAVAILABLE"
 FORGET_DEPENDENCY_ERROR_MESSAGE = "A Forget dependency was unavailable."
 FORGET_RESOURCE_MISSING_ERROR_CODE = "FORGET_RESOURCE_MISSING"
 FORGET_RESOURCE_MISSING_MESSAGE = "Forget processing resources are not configured."
+FORGET_STORAGE_RESULT_MISSING_ERROR_CODE = "FORGET_STORAGE_RESULT_MISSING"
+FORGET_STORAGE_RESULT_MISSING_MESSAGE = (
+    "Forget storage deletion result is missing for a Source being finalized."
+)
+FORGET_STORAGE_RESULT_DUPLICATE_ERROR_CODE = "FORGET_STORAGE_RESULT_DUPLICATE"
+FORGET_STORAGE_RESULT_DUPLICATE_MESSAGE = (
+    "Forget storage deletion produced more than one result for the same Source."
+)
+
+# ADR-0011 D37: the four StorageDeleteResult outcomes this step consumes,
+# spelled as their durable string values (StepResult output is plain JSON).
+_STORAGE_STATUS_DELETED_NOW = StorageDeleteStatus.DELETED_NOW.value
+_STORAGE_STATUS_ALREADY_ABSENT = StorageDeleteStatus.ALREADY_ABSENT.value
+_STORAGE_STATUS_NOT_REQUESTED = StorageDeleteStatus.NOT_REQUESTED.value
+_STORAGE_STATUS_UNRESOLVED = StorageDeleteStatus.UNRESOLVED.value
+_STORAGE_STATUSES_CLEARING_URI = (
+    _STORAGE_STATUS_DELETED_NOW,
+    _STORAGE_STATUS_ALREADY_ABSENT,
+    _STORAGE_STATUS_NOT_REQUESTED,
+)
 
 
 @dataclass(frozen=True)
@@ -95,12 +123,18 @@ class ForgetPipelineResources:
     """Everything a Forget step needs, built once per process (SM-512).
 
     No embedding/LLM client at all -- Forget is pure PostgreSQL + Neo4j +
-    filesystem. ``graph_outbox_drain`` is ``None`` only when the process has
-    no Neo4j resource configured at all (mirrors Improve's
-    ``ImprovePipelineResources``, SM-511)."""
+    the ADR-0011 Source storage boundary. ``graph_outbox_drain`` is ``None``
+    only when the process has no Neo4j resource configured at all (mirrors
+    Improve's ``ImprovePipelineResources``, SM-511)."""
 
     settings: Settings
     graph_outbox_drain: GraphOutboxBatchProcessor | None
+    source_storage: SourceObjectStorage | None = None
+    """Injection point mirroring Cognify/Remember's own ``source_storage``
+    parameter (STORAGE-003/004): ``None`` in production wiring, where a
+    ``SourceStorageRouter`` is constructed lazily per call in
+    :func:`_source_storage` -- never eagerly here, so a settings-only
+    resource never depends on S3 configuration being present."""
 
 
 def _resources(context: PipelineContext) -> ForgetPipelineResources:
@@ -110,6 +144,10 @@ def _resources(context: PipelineContext) -> ForgetPipelineResources:
             FORGET_RESOURCE_MISSING_ERROR_CODE, FORGET_RESOURCE_MISSING_MESSAGE
         )
     return cast(ForgetPipelineResources, resource)
+
+
+def _source_storage(resources: ForgetPipelineResources) -> SourceObjectStorage:
+    return resources.source_storage or SourceStorageRouter(resources.settings)
 
 
 def _scope(run_input: Mapping[str, Any]) -> ForgetScope:
@@ -373,56 +411,60 @@ def _proceeding_dataset_ids(mutation_output: Mapping[str, Any]) -> list[UUID]:
 class StorageDeletionStep:
     """AMBIGUOUS cancellation recovery (SM-512 SS 27): a PostgreSQL-only
     reconciliation callback cannot prove whether an orphaned RUNNING attempt
-    already unlinked the file before crashing, so stale-``CANCELLING``
-    recovery cannot safely report ``CANCELLED`` for this step -- it fails
-    safe instead. The target stays ``DELETING`` (a durable, recovery-aware
-    state, not corruption): a later semantically-compatible retry resumes
-    and safely re-observes/deletes the file (``delete_source_storage`` is
-    idempotent -- an already-absent file converges cleanly)."""
+    already reached a terminal outcome for a Source's storage before
+    crashing, so stale-``CANCELLING`` recovery cannot safely report
+    ``CANCELLED`` for this step -- it fails safe instead. The target stays
+    ``DELETING`` (a durable, recovery-aware state, not corruption): a later
+    semantically-compatible retry resumes and safely re-observes/deletes via
+    ``SourceStorageRouter.delete`` (idempotent -- an already-absent object
+    converges cleanly to ``ALREADY_ABSENT``).
+
+    ADR-0011 D37: a recognized storage-layer failure for one Source (lost
+    S3 configuration, credentials, timeout, Object Lock, an unsafe-to-
+    resolve URI, ...) becomes an explicit, successful ``UNRESOLVED`` result
+    for that Source -- never a step failure, and never silently skipped.
+    Only an exception outside :class:`SourceStorageError` (a genuine
+    programming defect) propagates as a real step failure."""
 
     async def execute(self, context: PipelineContext) -> StepResult:
         mutation_output = context.step_outputs.get(AUTHORITATIVE_MUTATION_STEP, {})
         memory_only = bool(context.run_input.get("memory_only", False))
         if memory_only:
-            return StepResult(output={"sources": [], "deleted_now": 0, "already_absent": 0})
+            return StepResult(
+                output={
+                    "sources": [],
+                    "deleted_now": 0,
+                    "already_absent": 0,
+                    "unresolved": 0,
+                    "not_requested": 0,
+                }
+            )
 
         scope = mutation_output.get("scope")
         resources = _resources(context)
+        storage = _source_storage(resources)
         entries: list[dict[str, Any]] = []
-        try:
-            if scope == ForgetScope.SOURCE.value:
-                if mutation_output.get("proceed"):
-                    entry = await _delete_one_source_storage(
-                        context,
-                        resources,
-                        dataset_id=UUID(str(mutation_output["dataset_id"])),
-                        source_id=UUID(str(mutation_output["source_id"])),
+        if scope == ForgetScope.SOURCE.value:
+            if mutation_output.get("proceed"):
+                entry = await _delete_one_source_storage(
+                    context,
+                    storage,
+                    dataset_id=UUID(str(mutation_output["dataset_id"])),
+                    source_id=UUID(str(mutation_output["source_id"])),
+                )
+                if entry is not None:
+                    entries.append(entry)
+        else:
+            for target in mutation_output.get("targets", []):
+                if not target.get("proceed"):
+                    continue
+                entries.extend(
+                    await _delete_dataset_storage(
+                        context, storage, dataset_id=UUID(str(target["dataset_id"]))
                     )
-                    if entry is not None:
-                        entries.append(entry)
-            else:
-                for target in mutation_output.get("targets", []):
-                    if not target.get("proceed"):
-                        continue
-                    entries.extend(
-                        await _delete_dataset_storage(
-                            context, resources, dataset_id=UUID(str(target["dataset_id"]))
-                        )
-                    )
-        except OSError as exc:  # pragma: no cover - defensive, delete_source_storage already wraps
-            raise RetryablePipelineStepError(
-                FORGET_DEPENDENCY_ERROR_CODE, FORGET_DEPENDENCY_ERROR_MESSAGE
-            ) from exc
+                )
 
-        deleted_now = sum(1 for entry in entries if entry["status"] == "deleted_now")
-        already_absent = sum(1 for entry in entries if entry["status"] == "already_absent")
-        return StepResult(
-            output={
-                "sources": entries,
-                "deleted_now": deleted_now,
-                "already_absent": already_absent,
-            }
-        )
+        return StepResult(output={"sources": entries, **_storage_status_counts(entries)})
 
     async def persist(
         self, context: PipelineContext, result: StepResult, uow: PostgresUnitOfWork
@@ -433,9 +475,64 @@ class StorageDeletionStep:
         no_op_compensate(context, result)
 
 
+def _storage_status_counts(entries: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "deleted_now": sum(
+            1 for entry in entries if entry["status"] == _STORAGE_STATUS_DELETED_NOW
+        ),
+        "already_absent": sum(
+            1 for entry in entries if entry["status"] == _STORAGE_STATUS_ALREADY_ABSENT
+        ),
+        "unresolved": sum(1 for entry in entries if entry["status"] == _STORAGE_STATUS_UNRESOLVED),
+        "not_requested": sum(
+            1 for entry in entries if entry["status"] == _STORAGE_STATUS_NOT_REQUESTED
+        ),
+    }
+
+
+async def _delete_source_storage_result(
+    storage: SourceObjectStorage, *, dataset_id: UUID, source_id: UUID, storage_uri: str | None
+) -> StorageDeleteResult:
+    """The one place ``StorageDeletionStep``/``DeleteStorageStep`` call the
+    router.
+
+    STORAGE-005 exception-classification audit (ADR-0011 D37/D38): catches
+    only the ``SourceStorageError`` subclasses that a delete-path raise site
+    can actually produce and that the ADR itself classifies as a recognized
+    operational inability -- lost/unusable backend configuration
+    (``UnsupportedStorageBackendError``, e.g. D41's lost-S3-config
+    scenario), an unavailable backend/dependency
+    (``SourceStorageUnavailableError``), or a storage locator that cannot be
+    safely resolved (``InvalidSourceStorageUriError``, D38's "path/storage
+    dependency cannot be safely resolved" clause).
+
+    Deliberately narrower than the ``SourceStorageError`` base class:
+    ``SourceStorageConflictError`` (a deterministic content-identity
+    conflict -- not reachable from ``delete()`` today, but never an
+    operational inability if it ever were) and ``SourceStoragePathError``
+    (a finalize-only/construction-time defect, not reachable from
+    ``delete()`` at all) are deliberately left uncaught here, so either one
+    -- or any other current/future ``SourceStorageError`` subclass this
+    audit did not classify as delete-path/operational -- surfaces as a
+    genuine ``PipelineStep`` failure rather than being silently absorbed
+    into ``UNRESOLVED``. An exception outside this hierarchy entirely (a
+    programming defect) is untouched here and propagates as-is."""
+
+    try:
+        return await storage.delete(
+            dataset_id=dataset_id, source_id=source_id, storage_uri=storage_uri
+        )
+    except (
+        SourceStorageUnavailableError,
+        InvalidSourceStorageUriError,
+        UnsupportedStorageBackendError,
+    ):
+        return StorageDeleteResult(StorageDeleteStatus.UNRESOLVED)
+
+
 async def _delete_one_source_storage(
     context: PipelineContext,
-    resources: ForgetPipelineResources,
+    storage: SourceObjectStorage,
     *,
     dataset_id: UUID,
     source_id: UUID,
@@ -445,18 +542,15 @@ async def _delete_one_source_storage(
         snapshot = None if source is None else (source.status, source.storage_uri)
     if snapshot is None or snapshot[0] != SourceStatus.DELETING:
         return None
-    result = delete_source_storage(
-        resources.settings.data_directory,
-        dataset_id=dataset_id,
-        source_id=source_id,
-        storage_uri=snapshot[1],
+    result = await _delete_source_storage_result(
+        storage, dataset_id=dataset_id, source_id=source_id, storage_uri=snapshot[1]
     )
     return {"source_id": str(source_id), "status": result.status.value}
 
 
 async def _delete_dataset_storage(
     context: PipelineContext,
-    resources: ForgetPipelineResources,
+    storage: SourceObjectStorage,
     *,
     dataset_id: UUID,
 ) -> list[dict[str, Any]]:
@@ -468,11 +562,8 @@ async def _delete_dataset_storage(
     for source_id, status, storage_uri in snapshots:
         if status != SourceStatus.DELETING:
             continue
-        result = delete_source_storage(
-            resources.settings.data_directory,
-            dataset_id=dataset_id,
-            source_id=source_id,
-            storage_uri=storage_uri,
+        result = await _delete_source_storage_result(
+            storage, dataset_id=dataset_id, source_id=source_id, storage_uri=storage_uri
         )
         entries.append({"source_id": str(source_id), "status": result.status.value})
     return entries
@@ -496,10 +587,7 @@ class FinalizeTargetStep:
         mutation_output = context.step_outputs.get(AUTHORITATIVE_MUTATION_STEP, {})
         storage_output = context.step_outputs.get(STORAGE_DELETION_STEP, {})
         memory_only = bool(context.run_input.get("memory_only", False))
-        storage_status_by_source = {
-            UUID(str(entry["source_id"])): entry["status"]
-            for entry in storage_output.get("sources", [])
-        }
+        storage_status_by_source = _storage_status_by_source(storage_output)
 
         scope = mutation_output.get("scope")
         if scope == ForgetScope.SOURCE.value:
@@ -528,6 +616,37 @@ class FinalizeTargetStep:
         no_op_compensate(context, result)
 
 
+def _storage_status_by_source(storage_output: Mapping[str, Any]) -> dict[UUID, str]:
+    """ADR-0011 D37 per-Source coverage: a dict keyed by ``source_id`` makes
+    a duplicate entry structurally impossible to *store* silently -- this
+    still detects one explicitly (rather than the later entry silently
+    overwriting the earlier one) so a bookkeeping defect in the storage step
+    itself is never masked."""
+
+    by_source: dict[UUID, str] = {}
+    for entry in storage_output.get("sources", []):
+        source_id = UUID(str(entry["source_id"]))
+        if source_id in by_source:
+            raise PermanentPipelineStepError(
+                FORGET_STORAGE_RESULT_DUPLICATE_ERROR_CODE, FORGET_STORAGE_RESULT_DUPLICATE_MESSAGE
+            )
+        by_source[source_id] = str(entry["status"])
+    return by_source
+
+
+def _require_storage_status(source_id: UUID, storage_status_by_source: Mapping[UUID, str]) -> str:
+    """ADR-0011 D37: a missing per-Source storage result is an internal
+    invariant failure, never interpreted as an implicit ``UNRESOLVED`` (or
+    any other) outcome -- the Source must not be silently finalized based on
+    missing evidence."""
+
+    if source_id not in storage_status_by_source:
+        raise PermanentPipelineStepError(
+            FORGET_STORAGE_RESULT_MISSING_ERROR_CODE, FORGET_STORAGE_RESULT_MISSING_MESSAGE
+        )
+    return storage_status_by_source[source_id]
+
+
 async def _finalize_source_target(
     uow: PostgresUnitOfWork,
     mutation_output: Mapping[str, Any],
@@ -536,7 +655,7 @@ async def _finalize_source_target(
     storage_status_by_source: Mapping[UUID, str],
 ) -> dict[str, Any]:
     if not mutation_output.get("proceed"):
-        return {"source_status": None, "storage_deleted": False}
+        return {"source_status": None, "storage_deleted": False, "storage_status": None}
     source_id = UUID(str(mutation_output["source_id"]))
     source = await uow.sources.get_by_id(source_id)
     if source is None:
@@ -545,17 +664,27 @@ async def _finalize_source_target(
         )
 
     final_status = SourceStatus.PENDING if memory_only else SourceStatus.DELETED
+    storage_status: str | None = None
     if source.status == SourceStatus.DELETING:
+        if final_status == SourceStatus.DELETED:
+            # A DELETING -> DELETED transition is exactly the case ADR-0011
+            # D37's per-Source coverage requirement covers; memory_only's
+            # DELETING -> PENDING transition never requests storage
+            # deletion at all, so it is exempt (D37).
+            storage_status = _require_storage_status(source_id, storage_status_by_source)
+            if storage_status in _STORAGE_STATUSES_CLEARING_URI:
+                source.storage_uri = None
+            # UNRESOLVED (D39): storage_uri is preserved unchanged.
         source.status = final_status
-    storage_status = storage_status_by_source.get(source_id)
-    storage_deleted = storage_status in ("deleted_now", "already_absent")
-    if (
-        final_status == SourceStatus.DELETED
-        and storage_deleted
-        and source.status == SourceStatus.DELETED
-    ):
-        source.storage_uri = None
-    return {"source_status": source.status.value, "storage_deleted": storage_deleted}
+    storage_deleted = storage_status in (
+        _STORAGE_STATUS_DELETED_NOW,
+        _STORAGE_STATUS_ALREADY_ABSENT,
+    )
+    return {
+        "source_status": source.status.value,
+        "storage_deleted": storage_deleted,
+        "storage_status": storage_status,
+    }
 
 
 async def _finalize_dataset_target(
@@ -586,14 +715,14 @@ async def _finalize_dataset_target(
     for source in sources:
         if source.status != SourceStatus.DELETING:
             continue
-        source.status = final_status
         if final_status == SourceStatus.DELETED:
-            storage_status = storage_status_by_source.get(source.id)
-            if storage_status in ("deleted_now", "already_absent"):
+            storage_status = _require_storage_status(source.id, storage_status_by_source)
+            if storage_status in _STORAGE_STATUSES_CLEARING_URI:
                 source.storage_uri = None
             sources_deleted += 1
         else:
             sources_pending += 1
+        source.status = final_status
     # ADR-0010 D28/D42 defense-in-depth: re-evaluate administrative ownership
     # immediately before writing ACTIVE, even though target enumeration
     # (list_ids_for_everything_forget) already excludes an
@@ -644,6 +773,15 @@ class FinalizeResultStep:
         graph_events_processed = int(projection_output.get("graph_events_processed", 0) or 0)
         storage_deleted_count = int(storage_output.get("deleted_now", 0) or 0)
         storage_already_absent = int(storage_output.get("already_absent", 0) or 0)
+        # ADR-0011 D39: storage_unresolved/storage_not_requested are tracked
+        # as separate counters, never folded into storage_deleted/
+        # storage_already_absent -- a PipelineRun may legitimately succeed
+        # with storage_unresolved > 0 (D37's business-delete-must-converge
+        # rule); storage_cleanup_complete is false whenever any cleanup
+        # obligation in this run's scope remains unresolved.
+        storage_unresolved_count = int(storage_output.get("unresolved", 0) or 0)
+        storage_not_requested_count = int(storage_output.get("not_requested", 0) or 0)
+        storage_cleanup_complete = storage_unresolved_count == 0
 
         if scope == ForgetScope.SOURCE.value:
             metric_key = FORGET_RESULT_METRIC_KEY
@@ -666,6 +804,10 @@ class FinalizeResultStep:
                 "graph_events_enqueued": int(mutation_output.get("graph_events_enqueued", 0) or 0),
                 "graph_events_processed": graph_events_processed,
                 "storage_deleted": bool(finalize_output.get("storage_deleted", False)),
+                "storage_status": finalize_output.get("storage_status"),
+                "storage_unresolved": storage_unresolved_count,
+                "storage_not_requested": storage_not_requested_count,
+                "storage_cleanup_complete": storage_cleanup_complete,
             }
             run.dataset_id = UUID(str(mutation_output["dataset_id"]))
             run.source_id = UUID(str(mutation_output["source_id"]))
@@ -696,6 +838,9 @@ class FinalizeResultStep:
                 "graph_events_processed": graph_events_processed,
                 "storage_deleted": storage_deleted_count,
                 "storage_already_absent": storage_already_absent,
+                "storage_unresolved": storage_unresolved_count,
+                "storage_not_requested": storage_not_requested_count,
+                "storage_cleanup_complete": storage_cleanup_complete,
             }
             if target.get("dataset_id"):
                 run.dataset_id = UUID(str(target["dataset_id"]))
@@ -743,6 +888,9 @@ class FinalizeResultStep:
                 "graph_events_processed": graph_events_processed,
                 "storage_deleted": storage_deleted_count,
                 "storage_already_absent": storage_already_absent,
+                "storage_unresolved": storage_unresolved_count,
+                "storage_not_requested": storage_not_requested_count,
+                "storage_cleanup_complete": storage_cleanup_complete,
             }
 
         run.metrics = {**run.metrics, metric_key: run_result}

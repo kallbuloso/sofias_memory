@@ -32,6 +32,8 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -42,7 +44,19 @@ from sofias_memory.config import Settings
 from sofias_memory.domain import DatasetStatus, PipelineType, SourceKind, SourceStatus
 from sofias_memory.infrastructure.postgres.models import Document, PipelineRun, Source
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
-from sofias_memory.loaders.text import PreparedText, TextFileLoadError, prepare_text_content
+from sofias_memory.infrastructure.storage import (
+    FinalizeResult,
+    SourceObjectStorage,
+    SourceStorageConflictError,
+    SourceStorageError,
+    SourceStorageRouter,
+)
+from sofias_memory.loaders.text import (
+    PreparedText,
+    TextFileLoadError,
+    canonical_storage_extension_for_mime_type,
+    prepare_text_content,
+)
 from sofias_memory.loaders.text import prepare_text_file_content as _prepare_text_file_content
 from sofias_memory.loaders.url import fetch_https_url
 from sofias_memory.pipelines.context import PipelineContext
@@ -70,14 +84,11 @@ from sofias_memory.services.remember import (
     UNTOKENIZED_SENTINEL,
     delete_ingress_artifact,
     document_metadata,
-    final_storage_content_matches,
     final_storage_path,
-    final_storage_uri,
     ingress_artifact_exists,
     read_ingress_bytes,
     read_ingress_filename,
     source_name,
-    write_final_storage_bytes,
     write_ingress_bytes,
 )
 
@@ -133,6 +144,12 @@ class RememberPipelineResources:
     exercise the real worker's URL-fetch step against a local
     ``httpx.MockTransport`` and a fake DNS resolver instead of the public
     internet, without adding a second URL-fetching code path."""
+    source_storage: SourceObjectStorage | None = None
+    """Injection point mirroring Cognify's own ``source_storage`` parameter
+    (STORAGE-003): ``None`` in production wiring, where a
+    ``SourceStorageRouter`` is constructed lazily per call in
+    :func:`_source_storage` -- never eagerly here, so a settings-only
+    resource never depends on S3 configuration being present."""
 
 
 def _resources(context: PipelineContext) -> RememberPipelineResources:
@@ -142,6 +159,22 @@ def _resources(context: PipelineContext) -> RememberPipelineResources:
             REMEMBER_RESOURCE_MISSING_ERROR_CODE, REMEMBER_RESOURCE_MISSING_MESSAGE
         )
     return cast(RememberPipelineResources, resource)
+
+
+def _source_storage(resources: RememberPipelineResources) -> SourceObjectStorage:
+    return resources.source_storage or SourceStorageRouter(resources.settings)
+
+
+def _translate_storage_error(
+    exc: SourceStorageError,
+) -> PermanentPipelineStepError | RetryablePipelineStepError:
+    if isinstance(exc, SourceStorageConflictError):
+        return PermanentPipelineStepError(
+            REMEMBER_STORAGE_CONFLICT_ERROR_CODE, REMEMBER_STORAGE_CONFLICT_MESSAGE
+        )
+    return RetryablePipelineStepError(
+        REMEMBER_DEPENDENCY_ERROR_CODE, REMEMBER_DEPENDENCY_ERROR_MESSAGE
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,14 +482,77 @@ class PrepareAndIngestStep:
 # ---------------------------------------------------------------------------
 
 
+def _locate_verified_legacy_final(
+    data_directory: Path,
+    *,
+    dataset_id: UUID,
+    source_id: UUID,
+    mime_type: str,
+    expected_byte_size: int,
+    expected_content_sha256: str,
+) -> bytes | None:
+    """ADR-0011 B1/D35: the *only* legacy-final lookup this step ever
+    performs -- deterministic-only, no glob, no recursive search, no
+    client-supplied filename. The legacy extension is derived from
+    ``Source.mime_type`` via the same centralized mapping STORAGE-001
+    established (never from the upload-derived ``storage_extension``, which
+    may legitimately differ in edge cases the mapping already resolves
+    identically for every kind this pipeline supports today).
+
+    Returns the verified legacy bytes, or ``None`` when nothing recoverable
+    exists at the exact deterministic legacy location (B1 case 4, or an
+    unmappable ``mime_type`` -- both fail closed the same way, via the
+    caller's own ``REMEMBER_INGRESS_MISSING`` error). A file present at the
+    exact identity but failing size/hash validation (B1 case 5: wrong
+    identity) is never uploaded, overwritten, or deleted -- it is simply
+    treated as unusable, and the caller fails closed exactly as case 4.
+    """
+
+    try:
+        legacy_extension = canonical_storage_extension_for_mime_type(mime_type)
+    except ValueError:
+        return None
+
+    legacy_path = final_storage_path(
+        data_directory,
+        dataset_id=dataset_id,
+        source_id=source_id,
+        storage_extension=legacy_extension,
+    )
+    if not legacy_path.is_file():
+        return None
+
+    legacy_bytes = legacy_path.read_bytes()
+    if len(legacy_bytes) != expected_byte_size:
+        return None
+    if sha256(legacy_bytes).hexdigest() != expected_content_sha256:
+        return None
+    return legacy_bytes
+
+
 class FinalizeStorageStep:
     """AMBIGUOUS cancellation recovery (mirrors Forget's
     ``StorageDeletionStep``, SM-512): a PostgreSQL-only reconciliation
-    callback cannot prove whether an orphaned attempt already copied the
-    final file before crashing. The copy itself is fully idempotent (a file
-    already present with the expected content hash is treated as done, a
-    wrong-content collision fails safe), so a retry after any crash always
-    converges correctly regardless of how recovery classifies it."""
+    callback cannot prove whether an orphaned attempt already wrote the
+    final object before crashing. The write itself is fully idempotent for
+    both backends (a target already present with the expected content hash
+    is treated as done, a wrong-content collision fails safe), so a retry
+    after any crash always converges correctly regardless of how recovery
+    classifies it.
+
+    ADR-0011 B1: if the durable ``_ingress`` artifact is absent AND the
+    deterministic target does not yet match (the only way this combination
+    happens is a prior attempt that removed ingress before ever persisting
+    ``storage_uri``, then had ``STORAGE_BACKEND`` flipped to ``s3`` before
+    this retry), the *same* retry recovers via the legacy filesystem final
+    object left behind by the earlier filesystem-backend attempt --
+    verified byte-for-byte against this run's own persisted identity, never
+    re-fetched, never re-derived. This is Remember-owned recovery on the
+    existing retry path, not a separate migration mechanism (D9/D35): the
+    legacy local copy is deliberately left in place afterwards -- a
+    redundant copy after a successful repoint is safe and expected, and its
+    cleanup is explicitly STORAGE-006's job, not this step's.
+    """
 
     async def execute(self, context: PipelineContext) -> StepResult:
         resources = _resources(context)
@@ -475,38 +571,120 @@ class FinalizeStorageStep:
         source_id = UUID(str(upstream["source_id"]))
         storage_extension = str(upstream["storage_extension"])
         content_sha256 = str(upstream["content_sha256"])
+        byte_size = int(upstream["byte_size"])
+        mime_type = str(upstream["mime_type"])
+        storage = _source_storage(resources)
 
-        final_path = final_storage_path(
-            data_directory,
-            dataset_id=dataset_id,
-            source_id=source_id,
-            storage_extension=storage_extension,
+        target_uri = storage.deterministic_uri(
+            dataset_id=dataset_id, source_id=source_id, storage_extension=storage_extension
         )
-        if final_storage_content_matches(final_path, content_sha256=content_sha256):
-            status = "already_present"
-        else:
-            if final_path.exists():
-                raise PermanentPipelineStepError(
-                    REMEMBER_STORAGE_CONFLICT_ERROR_CODE, REMEMBER_STORAGE_CONFLICT_MESSAGE
-                )
-            if not ingress_artifact_exists(data_directory, run_id=context.run_id):
-                raise PermanentPipelineStepError(
-                    REMEMBER_INGRESS_MISSING_ERROR_CODE, REMEMBER_INGRESS_MISSING_MESSAGE
-                )
+        try:
+            already_matches = await storage.verify(
+                dataset_id=dataset_id,
+                source_id=source_id,
+                storage_uri=target_uri,
+                content_sha256=content_sha256,
+            )
+        except SourceStorageError as exc:
+            raise _translate_storage_error(exc) from exc
+
+        if already_matches:
+            # Best-effort GC only after the final storage is confirmed to
+            # hold the expected content -- never before, and never
+            # authoritative (identical placement to the pre-STORAGE-004
+            # filesystem-only version of this step).
+            delete_ingress_artifact(data_directory, run_id=context.run_id)
+            return StepResult(
+                output={
+                    "storage_status": "already_present",
+                    "storage_written": False,
+                    "storage_uri": target_uri,
+                }
+            )
+
+        if ingress_artifact_exists(data_directory, run_id=context.run_id):
             raw_bytes = read_ingress_bytes(data_directory, run_id=context.run_id)
-            write_final_storage_bytes(
-                data_directory,
+            finalize_result = await self._finalize(
+                storage,
                 dataset_id=dataset_id,
                 source_id=source_id,
                 storage_extension=storage_extension,
                 original_bytes=raw_bytes,
             )
-            status = "written"
+            delete_ingress_artifact(data_directory, run_id=context.run_id)
+            status = "already_present" if finalize_result.already_present else "written"
+            return StepResult(
+                output={
+                    "storage_status": status,
+                    "storage_written": not finalize_result.already_present,
+                    "storage_uri": finalize_result.storage_uri,
+                }
+            )
 
-        # Best-effort GC only after the final storage is confirmed to hold
-        # the expected content -- never before, and never authoritative.
-        delete_ingress_artifact(data_directory, run_id=context.run_id)
-        return StepResult(output={"storage_status": status, "storage_written": status == "written"})
+        if resources.settings.storage_backend != "s3":
+            # No B1 recovery path exists for the filesystem backend: an
+            # absent target with absent ingress is unrecoverable by
+            # definition (there is no separate "legacy" location to fall
+            # back to when the deterministic target already *is* the
+            # filesystem location).
+            raise PermanentPipelineStepError(
+                REMEMBER_INGRESS_MISSING_ERROR_CODE, REMEMBER_INGRESS_MISSING_MESSAGE
+            )
+
+        # ADR-0011 B1: ingress absent, S3 target absent/non-matching --
+        # recover from the legacy filesystem final object left behind by an
+        # earlier filesystem-backend attempt, verified against this run's
+        # own persisted identity only.
+        legacy_bytes = _locate_verified_legacy_final(
+            data_directory,
+            dataset_id=dataset_id,
+            source_id=source_id,
+            mime_type=mime_type,
+            expected_byte_size=byte_size,
+            expected_content_sha256=content_sha256,
+        )
+        if legacy_bytes is None:
+            raise PermanentPipelineStepError(
+                REMEMBER_INGRESS_MISSING_ERROR_CODE, REMEMBER_INGRESS_MISSING_MESSAGE
+            )
+
+        finalize_result = await self._finalize(
+            storage,
+            dataset_id=dataset_id,
+            source_id=source_id,
+            storage_extension=storage_extension,
+            original_bytes=legacy_bytes,
+        )
+        # Deliberately NOT deleting the legacy local file here: crash safety
+        # requires the repoint to be durably persisted first (persist() runs
+        # strictly after this method returns), and that local cleanup is
+        # STORAGE-006's job (ADR-0011 D9/D35), not this step's.
+        return StepResult(
+            output={
+                "storage_status": "recovered_legacy",
+                "storage_written": True,
+                "storage_uri": finalize_result.storage_uri,
+            }
+        )
+
+    async def _finalize(
+        self,
+        storage: SourceObjectStorage,
+        *,
+        dataset_id: UUID,
+        source_id: UUID,
+        storage_extension: str,
+        original_bytes: bytes,
+    ) -> FinalizeResult:
+        try:
+            return await storage.finalize(
+                dataset_id=dataset_id,
+                source_id=source_id,
+                storage_extension=storage_extension,
+                original_bytes=original_bytes,
+            )
+        except SourceStorageError as exc:
+            raise _translate_storage_error(exc) from exc
 
     async def persist(
         self,
@@ -516,7 +694,6 @@ class FinalizeStorageStep:
     ) -> None:
         if result.output.get("storage_status") == "skipped_dedup":
             return
-        resources = _resources(context)
         upstream = context.step_outputs.get(PREPARE_AND_INGEST_STEP, {})
         source_id = UUID(str(upstream["source_id"]))
         source = await uow.sources.get_by_id_for_update(source_id)
@@ -525,12 +702,14 @@ class FinalizeStorageStep:
                 REMEMBER_TARGET_MISSING_ERROR_CODE, REMEMBER_TARGET_MISSING_MESSAGE
             )
         if source.storage_uri is None:
-            source.storage_uri = final_storage_uri(
-                resources.settings.data_directory,
-                dataset_id=UUID(str(upstream["dataset_id"])),
-                source_id=source_id,
-                storage_extension=str(upstream["storage_extension"]),
-            )
+            storage_uri = result.output.get("storage_uri")
+            if not isinstance(storage_uri, str) or not storage_uri:
+                # Structurally impossible given execute()'s own contract --
+                # every non-skipped-dedup branch always sets storage_uri.
+                raise PermanentPipelineStepError(
+                    REMEMBER_TARGET_MISSING_ERROR_CODE, REMEMBER_TARGET_MISSING_MESSAGE
+                )
+            source.storage_uri = storage_uri
 
     async def compensate(self, context: PipelineContext, result: StepResult) -> None:
         no_op_compensate(context, result)
@@ -703,6 +882,8 @@ def finalize_storage_input(
         "deduplicated": upstream.get("deduplicated"),
         "storage_extension": upstream.get("storage_extension"),
         "content_sha256": upstream.get("content_sha256"),
+        "mime_type": upstream.get("mime_type"),
+        "byte_size": upstream.get("byte_size"),
     }
 
 

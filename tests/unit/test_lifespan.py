@@ -221,11 +221,16 @@ def _bare_app_for_lifespan(
 
 @pytest.mark.asyncio
 async def test_recovery_completes_before_worker_start_when_enabled() -> None:
+    """STORAGE-007: recovery/worker.start() now run inside the background
+    bootstrap task rather than blocking ``lifespan()`` itself (ADR-0011
+    D33) -- explicitly await ``app.state.bootstrap_task`` to observe the
+    same ordering guarantee this test has always asserted."""
+
     recovery = _RecordingRecoveryService()
     app, worker = _bare_app_for_lifespan(worker_enabled=True, recovery=recovery)
 
     async with lifespan(app):
-        pass
+        await app.state.bootstrap_task
 
     assert worker.start_called
     assert recovery.called
@@ -238,7 +243,7 @@ async def test_recovery_never_runs_when_worker_disabled() -> None:
     app, worker = _bare_app_for_lifespan(worker_enabled=False, recovery=recovery)
 
     async with lifespan(app):
-        pass
+        await app.state.bootstrap_task
 
     assert not worker.start_called
     assert not recovery.called

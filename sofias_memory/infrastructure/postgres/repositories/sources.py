@@ -151,6 +151,22 @@ class SourceRepository:
         result = await self._session.scalars(statement)
         return list(result)
 
+    async def list_all_for_storage_convergence(self) -> list[Source]:
+        """Every Source, across every dataset, in deterministic id order.
+
+        ADR-0011 D7/D8 (STORAGE-006): storage convergence classifies durable
+        state globally, not per-dataset -- a plain, unlocked read (the
+        classifier never mutates from this query; any repoint happens later,
+        per-Source, in its own short CAS transaction). Single-user MVP scale
+        (AGENTS.md) makes a full scan acceptable here, matching
+        ``list_ids_for_everything_forget``'s existing precedent for
+        Forget Everything.
+        """
+
+        statement = select(Source).order_by(Source.id)
+        result = await self._session.scalars(statement)
+        return list(result)
+
     async def list_for_dataset_paginated(
         self,
         *,

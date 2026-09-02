@@ -22,9 +22,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -37,6 +39,7 @@ from sofias_memory.services.pipeline_queue_claimer import (
     PipelineRunClaimer,
     new_worker_id,
 )
+from sofias_memory.services.process_state import ClaimPolicy
 
 logger = get_logger(__name__)
 
@@ -111,6 +114,8 @@ class PipelineWorkerCoordinator:
         shutdown_grace_seconds: float = DEFAULT_WORKER_SHUTDOWN_GRACE_SECONDS,
         graph_outbox_processor: GraphOutboxProcessor | None = None,
         resources: Mapping[str, Any] | None = None,
+        claim_policy: Callable[[], ClaimPolicy] | None = None,
+        recovery_owned_run_ids: Callable[[], AbstractSet[UUID]] | None = None,
     ) -> None:
         """``resources`` is the explicitly-populated
         :attr:`PipelineContext.resources` map handed to the engine this
@@ -118,7 +123,18 @@ class PipelineWorkerCoordinator:
         when an ``engine`` is injected -- that engine already carries its own
         resources. Graph projection is not among them: it converges through
         ``graph_outbox_processor``'s own autonomous loop, never from inside a
-        pipeline step."""
+        pipeline step.
+
+        ``claim_policy`` (ADR-0011 D31/D43, STORAGE-007) is forwarded to the
+        internally-constructed :class:`PipelineRunClaimer` only -- ignored
+        when a ``claimer`` is injected, since that claimer already owns its
+        own policy. ``None`` keeps every existing caller's behavior
+        unchanged (always-``NORMAL``, ``PipelineRunClaimer``'s own default).
+        Read fresh on every claim attempt, never cached here.
+
+        ``recovery_owned_run_ids`` (final fail-closed audit) is likewise
+        forwarded only to an internally-constructed claimer; ``None`` keeps
+        ``PipelineRunClaimer``'s own always-empty default."""
 
         self._session_factory = session_factory
         self._registry = registry
@@ -126,7 +142,15 @@ class PipelineWorkerCoordinator:
         self._poll_interval_seconds = poll_interval_ms / 1000.0
         self._heartbeat_interval_seconds = heartbeat_interval_seconds(stale_after_seconds)
         self._max_concurrent_datasets = max_concurrent_datasets
-        self._claimer = claimer or PipelineRunClaimer(session_factory)
+        if claimer is not None:
+            self._claimer = claimer
+        else:
+            claimer_kwargs: dict[str, Any] = {}
+            if claim_policy is not None:
+                claimer_kwargs["claim_policy"] = claim_policy
+            if recovery_owned_run_ids is not None:
+                claimer_kwargs["recovery_owned_run_ids"] = recovery_owned_run_ids
+            self._claimer = PipelineRunClaimer(session_factory, **claimer_kwargs)
         self._engine = engine or PipelineEngine(session_factory, registry, resources=resources)
         self._shutdown_grace_seconds = shutdown_grace_seconds
         self._graph_outbox_processor = graph_outbox_processor

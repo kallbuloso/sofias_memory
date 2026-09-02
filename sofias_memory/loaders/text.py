@@ -45,6 +45,55 @@ MIME_TYPE_BY_SOURCE_EXTENSION = {
     ".pdf": PDF_FILE_MIME_TYPE,
     ".docx": DOCX_FILE_MIME_TYPE,
 }
+
+
+def _build_storage_extension_by_mime_type() -> dict[str, str]:
+    """ADR-0011 D6/D35: the single centralized, durable-input-based
+    ``mime_type -> canonical storage extension`` mapping. ``Source.mime_type``
+    is persisted; a client's original upload extension is not, so this is the
+    only mapping D35's post-CAS legacy-object locator can ever use.
+
+    Derived from the two existing source-extension-keyed tables above rather
+    than hand-maintained a second time, and actively verified consistent at
+    import time: every source extension already sharing a mime type with
+    another (``.md``/``.markdown``, ``.htm``/``.html``) must also already
+    agree on the storage extension, or this mapping would not be a well-
+    defined function -- fail loudly here rather than silently picking one.
+    """
+
+    mapping: dict[str, str] = {}
+    for source_extension, mime_type in MIME_TYPE_BY_SOURCE_EXTENSION.items():
+        storage_extension = STORAGE_EXTENSION_BY_SOURCE_EXTENSION[source_extension]
+        existing = mapping.get(mime_type)
+        if existing is not None and existing != storage_extension:
+            raise AssertionError(
+                f"mime type {mime_type!r} maps to inconsistent storage extensions "
+                f"({existing!r} vs {storage_extension!r}); ADR-0011 D35 requires a "
+                "single deterministic mime_type -> storage_extension mapping."
+            )
+        mapping[mime_type] = storage_extension
+    return mapping
+
+
+STORAGE_EXTENSION_BY_MIME_TYPE: dict[str, str] = _build_storage_extension_by_mime_type()
+
+
+def canonical_storage_extension_for_mime_type(mime_type: str) -> str:
+    """The canonical storage extension for a durable ``Source.mime_type``.
+
+    Raises :class:`ValueError` for an unmapped mime type -- callers (D35's
+    legacy-object locator, and any future call site) must fail closed and
+    never guess a storage extension.
+    """
+
+    try:
+        return STORAGE_EXTENSION_BY_MIME_TYPE[mime_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"No canonical storage extension is known for mime type {mime_type!r}."
+        ) from exc
+
+
 ALLOWED_CONTROL_CHARACTERS = frozenset({"\t", "\n", "\r", "\f"})
 HTML_BLOCK_TAGS = frozenset(
     {

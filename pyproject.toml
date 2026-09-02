@@ -28,6 +28,7 @@ dependencies = [
     "beautifulsoup4>=4.13,<5",
     "lxml>=5,<7",
     "charset-normalizer>=3.4,<4",
+    "boto3>=1.34,<2",
 ]
 
 [dependency-groups]
@@ -72,6 +73,14 @@ disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 no_implicit_optional = true
+
+# boto3/botocore ship no inline types and no py.typed marker; the separate
+# boto3-stubs/botocore-stubs packages are not added (ADR-0011 D17 -- boto3's
+# own transitive dependencies are the only new pins this project takes on).
+# Untyped access to the client is confined to infrastructure/storage/s3.py.
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -10,8 +10,8 @@ from fastapi import FastAPI
 
 from sofias_memory.api.middleware import API_KEY_HEADER, REQUEST_ID_HEADER
 from sofias_memory.api.routes.health import ReadinessCheckResult
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
+from tests.unit._app_factory import create_app
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 INVALID_API_KEY = "sf-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"

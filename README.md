@@ -48,7 +48,9 @@ original release discovery/backlog.
   outbox that drives graph projection.
 - **Neo4j is a reconstructible projection**, never authoritative — it can always
   be rebuilt from PostgreSQL (`scripts/rebuild_graph.py`).
-- Source originals are stored on a local filesystem volume.
+- Source originals are stored on a local filesystem volume by default, or
+  optionally in S3/an S3-compatible bucket (`STORAGE_BACKEND=s3`) — see
+  `docs/operations.md` §13.
 - LLM and embedding calls go through any **OpenAI-compatible** endpoint.
 - All private routes require a static `X-API-Key` header.
 
@@ -170,7 +172,7 @@ grouped by area:
 | Application/API | `API_KEY`, `HTTP_HOST`, `HTTP_PORT`, `LOG_LEVEL`, `CORS_ALLOWED_ORIGINS`, `MAX_REQUEST_BODY_MB` |
 | PostgreSQL | `DATABASE_URL`, `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW` |
 | Neo4j | `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` |
-| Storage | `DATA_DIRECTORY`, `TEMP_DIRECTORY`, `MAX_SOURCE_SIZE_MB` |
+| Storage | `DATA_DIRECTORY`, `TEMP_DIRECTORY`, `MAX_SOURCE_SIZE_MB`, `STORAGE_BACKEND`, `STORAGE_S3_*` (optional — see `docs/operations.md` §13) |
 | LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS` |
 | Embeddings | `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` |
 | Chunking/retrieval | `CHUNK_MAX_TOKENS`, `RECALL_DEFAULT_TOP_K`, `RECALL_RRF_K` |
@@ -195,8 +197,9 @@ containers. This keeps `extra="forbid"` meaningful on the application's own
 - `GET /health/live` — process liveness only. No dependency checks. Never
   requires `X-API-Key`.
 - `GET /health/ready` — checks PostgreSQL (reachable, correct schema),
-  Neo4j (reachable), and the internal worker (operational). Never requires
-  `X-API-Key`.
+  Neo4j (reachable), and the internal worker (operational); with
+  `STORAGE_BACKEND=s3` it also checks that startup storage convergence has
+  completed (`docs/operations.md` §13). Never requires `X-API-Key`.
 
 If `WORKER_ENABLED=false`, or the worker's background tasks are unexpectedly
 dead, `/health/live` can stay `ok` while `/health/ready` reports `not_ready`:
@@ -247,7 +250,11 @@ lifecycle and `Idempotency-Key` contract.
 
 Three named volumes back the canonical `compose.yaml` stack:
 PostgreSQL data, Neo4j data, and original source files. PostgreSQL and the source
-volume are authoritative; Neo4j is always reconstructible from PostgreSQL.
+volume are authoritative; Neo4j is always reconstructible from PostgreSQL. The
+source-files volume (`DATA_DIRECTORY`) remains mandatory even with
+`STORAGE_BACKEND=s3` — it holds durable ingress staging and in-transit
+migration state regardless of where finalized Source originals ultimately
+live (`docs/operations.md` §13.2).
 
 ## Backup and restore
 
@@ -290,9 +297,13 @@ including that limitation's exact operational consequence, is in
 
 By design, not because they were forgotten: multi-user accounts, ACL/roles/
 tenancy, a frontend, MCP integration, arbitrary Cypher execution, a runtime
-settings API, cloud sync, external message queues, a multi-worker/HA cluster, or
-remote object storage. See `docs/product/Sofias_Memory_PRD_SPECS.md` for the full,
-authoritative scope.
+settings API, cloud sync, external message queues, and a multi-worker/HA
+cluster. S3-compatible remote object storage for Source originals **is**
+supported (`STORAGE_BACKEND=s3`, `docs/operations.md` §13) as an explicit,
+closed, first-party backend — not a generic storage-provider plugin system;
+see `docs/adr/0011-durable-source-object-storage-s3-and-startup-convergence.md`.
+See `docs/product/Sofias_Memory_PRD_SPECS.md` for the full, authoritative
+scope.
 
 ## API documentation
 

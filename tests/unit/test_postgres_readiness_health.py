@@ -7,13 +7,13 @@ import pytest
 from fastapi import FastAPI
 
 from sofias_memory.api.routes.health import ReadinessCheckResult
-from sofias_memory.app import create_app
 from sofias_memory.config import API_KEY_PREFIX, Settings
 from sofias_memory.infrastructure.postgres.readiness import (
     POSTGRES_NOT_READY_DETAIL,
     PostgresReadinessChecker,
     PostgresReadinessResult,
 )
+from tests.unit._app_factory import create_app
 
 VALID_API_KEY = f"{API_KEY_PREFIX}{'a' * 32}"
 VALID_DATABASE_URL = "postgresql+asyncpg://sofias_memory:db-secret@postgres:5432/db"
@@ -87,7 +87,7 @@ async def test_ready_route_reports_postgres_ready_when_checker_is_healthy() -> N
     assert response.status_code == 200
     assert response_json(response) == {
         "status": "ready",
-        "checks": {"postgres": {"ready": True}},
+        "checks": {"postgres": {"ready": True}, "process_state": {"ready": True}},
     }
     assert fake_checker.check_calls == 1
 
@@ -110,7 +110,10 @@ async def test_ready_route_reports_postgres_not_ready_when_checker_fails() -> No
     assert response.status_code == 503
     assert response_json(response) == {
         "status": "not_ready",
-        "checks": {"postgres": {"ready": False, "detail": POSTGRES_NOT_READY_DETAIL}},
+        "checks": {
+            "postgres": {"ready": False, "detail": POSTGRES_NOT_READY_DETAIL},
+            "process_state": {"ready": True},
+        },
     }
     assert fake_checker.check_calls == 1
 

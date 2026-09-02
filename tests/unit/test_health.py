@@ -19,6 +19,7 @@ from sofias_memory.api.routes.health import (
 from sofias_memory.app import create_app as create_production_app
 from sofias_memory.config import Settings
 from sofias_memory.observability.logging import clear_log_context, configure_logging
+from sofias_memory.services.process_state import ProcessState, ProcessStateHolder
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
@@ -59,12 +60,23 @@ def create_app(
     settings: Settings,
     readiness_checks: ReadinessCheckRegistry = (),
 ) -> FastAPI:
+    """This file's own local wrapper (mirrors ``tests/unit/_app_factory.py``,
+    which is not reused here because most call sites pass positional-only
+    ``readiness_checks`` this wrapper's own narrower signature models): every
+    test below issues requests via ``httpx.ASGITransport`` without ever
+    running the ASGI lifespan protocol, so it must deliberately opt into an
+    already-``OPERATIONAL`` holder -- ``create_production_app`` itself now
+    defaults fail-closed to ``BOOTSTRAP_MAINTENANCE`` (final fail-closed
+    audit). The dedicated fail-closed tests below construct
+    ``create_production_app`` directly instead, to prove the real default."""
+
     return create_production_app(
         settings,
         readiness_checks=readiness_checks,
         enable_postgres_readiness=False,
         enable_neo4j=False,
         enable_worker=False,
+        process_state_holder=ProcessStateHolder(state=ProcessState.OPERATIONAL),
     )
 
 
@@ -173,7 +185,13 @@ async def test_readiness_without_checks_returns_ready(log_stream: StringIO) -> N
     async with make_client(create_app(make_settings())) as client:
         response = await client.get("/health/ready")
 
-    assert response_json(response) == {"status": "ready", "checks": {}}
+    # ADR-0011 D20 (STORAGE-007): "process_state" is now always present --
+    # `create_app`'s default holder is OPERATIONAL for any app that never
+    # runs the ASGI lifespan protocol (see app.py's own documented choice).
+    assert response_json(response) == {
+        "status": "ready",
+        "checks": {"process_state": {"ready": True}},
+    }
 
 
 @pytest.mark.asyncio
@@ -205,7 +223,10 @@ async def test_check_name_comes_from_registry_not_result(log_stream: StringIO) -
     ) as client:
         response = await client.get("/health/ready")
 
-    assert response_json(response)["checks"] == {"postgresql": {"ready": True}}
+    assert response_json(response)["checks"] == {
+        "postgresql": {"ready": True},
+        "process_state": {"ready": True},
+    }
 
 
 def test_readiness_check_result_does_not_know_its_own_name() -> None:
@@ -246,7 +267,7 @@ async def test_two_distinct_registered_names_appear_separately(
     ) as client:
         response = await client.get("/health/ready")
 
-    assert set(response_json(response)["checks"]) == {"postgresql", "neo4j"}
+    assert set(response_json(response)["checks"]) == {"postgresql", "neo4j", "process_state"}
 
 
 def test_empty_readiness_check_name_is_rejected() -> None:
@@ -279,7 +300,8 @@ def test_mapping_readiness_check_registry_has_unique_keys_structurally() -> None
         },
     )
 
-    assert len(app.state.readiness_checks) == 2
+    # +1 for the always-present "process_state" check (ADR-0011 D20).
+    assert len(app.state.readiness_checks) == 3
 
 
 @pytest.mark.asyncio
@@ -321,7 +343,10 @@ async def test_check_names_and_safe_details_appear(log_stream: StringIO) -> None
         response = await client.get("/health/ready")
 
     body = response_json(response)
-    assert body["checks"] == {"postgresql": {"ready": False, "detail": "dependency unavailable"}}
+    assert body["checks"] == {
+        "postgresql": {"ready": False, "detail": "dependency unavailable"},
+        "process_state": {"ready": True},
+    }
 
 
 @pytest.mark.asyncio
@@ -337,7 +362,7 @@ async def test_readiness_result_order_is_deterministic(log_stream: StringIO) -> 
     ) as client:
         response = await client.get("/health/ready")
 
-    assert list(response_json(response)["checks"]) == ["alpha", "zeta"]
+    assert list(response_json(response)["checks"]) == ["alpha", "process_state", "zeta"]
 
 
 @pytest.mark.asyncio
@@ -420,7 +445,7 @@ async def test_multiple_async_checks_are_executed_correctly(log_stream: StringIO
         response = await client.get("/health/ready")
 
     assert response.status_code == 200
-    assert set(response_json(response)["checks"]) == {"first", "second"}
+    assert set(response_json(response)["checks"]) == {"first", "second", "process_state"}
 
 
 @pytest.mark.asyncio
@@ -450,8 +475,8 @@ async def test_two_apps_have_independent_readiness_checks(log_stream: StringIO) 
     async with make_client(second) as second_client:
         second_response = await second_client.get("/health/ready")
 
-    assert list(response_json(first_response)["checks"]) == ["first"]
-    assert list(response_json(second_response)["checks"]) == ["second"]
+    assert list(response_json(first_response)["checks"]) == ["first", "process_state"]
+    assert list(response_json(second_response)["checks"]) == ["process_state", "second"]
 
 
 @pytest.mark.asyncio

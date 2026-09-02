@@ -24,6 +24,7 @@ from sofias_memory.api.middleware import (
     PUBLIC_PATHS,
     REQUEST_ID_HEADER,
     ApiKeyMiddleware,
+    OperationalGateMiddleware,
     RequestBodyLimitMiddleware,
     RequestIdMiddleware,
     RequestMetricsMiddleware,
@@ -69,6 +70,7 @@ from sofias_memory.infrastructure.postgres.readiness import (
     POSTGRES_NOT_READY_DETAIL,
     PostgresReadinessChecker,
 )
+from sofias_memory.infrastructure.storage import SourceObjectStorage, SourceStorageRouter
 from sofias_memory.lifespan import lifespan
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
 from sofias_memory.pipelines.steps.cognify import COGNIFY_SERVICE_RESOURCE
@@ -98,9 +100,12 @@ from sofias_memory.services.operational_metrics import (
 )
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from sofias_memory.services.process_state import ProcessState, ProcessStateHolder
+from sofias_memory.services.storage_convergence import StorageConvergenceService
 from sofias_memory.services.summary_rebuild_service import SummaryRebuildService
 
 WORKER_NOT_READY_DETAIL = "worker not ready"
+PROCESS_NOT_OPERATIONAL_DETAIL = "process not operational"
 
 # Allowlist, not a denylist: Swagger/OpenAPI exist only for these APP_ENV
 # values. Every other value -- including typos, "staging"/"qa", and the
@@ -186,6 +191,7 @@ def create_app(
     enable_worker: bool = True,
     pipeline_registry: PipelineRegistry | None = None,
     pipeline_worker_coordinator: PipelineWorkerCoordinator | None = None,
+    process_state_holder: ProcessStateHolder | None = None,
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else load_settings()
     docs_enabled = resolved_settings.app_env.strip().lower() in DOCS_ENABLED_APP_ENVS
@@ -203,6 +209,22 @@ def create_app(
         redoc_url=None,
     )
     application.state.settings = resolved_settings
+    # ADR-0011 D31/D43 (final fail-closed audit): the production composition
+    # root defaults fail-closed -- BOOTSTRAP_MAINTENANCE, never OPERATIONAL.
+    # A business request must never become executable merely because ASGI
+    # lifespan did not run (uvicorn/hypercorn misconfiguration, embedded ASGI
+    # usage, a test harness forgetting lifespan, a future alternative app
+    # runner): without a successful bootstrap, the only safe state is
+    # maintenance. `lifespan()` (a real process boot) still always force-
+    # resets this holder to BOOTSTRAP_MAINTENANCE at its own start regardless
+    # of what is passed here, so this parameter only ever matters for a
+    # holder nobody's lifespan drives -- an explicit, deliberate opt-in
+    # (`process_state_holder=ProcessStateHolder(state=ProcessState.OPERATIONAL)`)
+    # for a test that wants to exercise an ordinary route without bootstrapping
+    # the runtime, never an environment/pytest detection.
+    if process_state_holder is None:
+        process_state_holder = ProcessStateHolder(state=ProcessState.BOOTSTRAP_MAINTENANCE)
+    application.state.process_state_holder = process_state_holder
     if postgres_session_factory is None:
         postgres_engine = create_async_engine_from_settings(resolved_settings)
         application.state.postgres_engine = postgres_engine
@@ -228,6 +250,21 @@ def create_app(
             ("neo4j", _neo4j_readiness_check(neo4j_checker)),
             *resolved_readiness_checks,
         )
+    # ADR-0011 D20 (STORAGE-007): OPERATIONAL is the only process state that
+    # may ever report ready -- this check alone makes /health/ready NOT_READY
+    # throughout BOOTSTRAP_MAINTENANCE/STORAGE_CONVERGING regardless of every
+    # other individual dependency check's own result.
+    resolved_readiness_checks = (
+        ("process_state", _process_state_readiness_check(process_state_holder)),
+        *resolved_readiness_checks,
+    )
+    # ADR-0011 D2/D4 (STORAGE-007): one application-owned SourceStorageRouter,
+    # constructed unconditionally (cheap -- the S3 client, if ever needed, is
+    # still built lazily on first real use) and injected everywhere a
+    # SourceObjectStorage boundary is needed, so the lazily-created S3
+    # client/adapter has exactly one clear shutdown owner (lifespan.py).
+    source_storage_router = SourceStorageRouter(resolved_settings)
+    application.state.source_storage_router = source_storage_router
     # Resolved unconditionally: the Cognify route submits against the same
     # closed registry the worker executes with (ADR-0009 SS O), so it must be
     # reachable even when a test injects its own coordinator.
@@ -254,6 +291,7 @@ def create_app(
         resolved_settings,
         session_factory=application.state.postgres_session_factory,
         neo4j_resource=active_neo4j_resource,
+        source_storage=source_storage_router,
     )
     application.state.pipeline_resources = pipeline_resources
 
@@ -273,6 +311,15 @@ def create_app(
             max_concurrent_datasets=resolved_settings.worker_max_concurrent_datasets,
             graph_outbox_processor=graph_outbox_processor,
             resources=pipeline_resources,
+            # ADR-0011 D31/D43 (STORAGE-007): read fresh on every claim
+            # attempt -- never cached, never persisted. NONE during
+            # BOOTSTRAP_MAINTENANCE, RECOVERY_ONLY during STORAGE_CONVERGING,
+            # NORMAL only once OPERATIONAL.
+            claim_policy=lambda: process_state_holder.claim_policy,
+            # Final fail-closed audit: the same holder's narrowing set of
+            # Case-B-classified run ids, also read fresh on every attempt --
+            # only ever consulted while claim_policy is RECOVERY_ONLY.
+            recovery_owned_run_ids=lambda: process_state_holder.recovery_owned_run_ids,
         )
         application.state.pipeline_worker = worker_coordinator
         application.state.pipeline_recovery = PipelineRecoveryService(
@@ -286,6 +333,17 @@ def create_app(
             *resolved_readiness_checks,
         )
     application.state.readiness_checks = validate_readiness_checks(resolved_readiness_checks)
+
+    # ADR-0011 D7 (STORAGE-007): the same shared session factory/router this
+    # process already built above -- StorageConvergenceService is a no-op
+    # itself whenever STORAGE_BACKEND=filesystem (checked internally), so
+    # constructing it unconditionally here costs nothing and keeps the
+    # bootstrap task's own wiring uniform.
+    application.state.storage_convergence_service = StorageConvergenceService(
+        resolved_settings,
+        session_factory=application.state.postgres_session_factory,
+        source_storage=source_storage_router,
+    )
 
     # SM-516 SS 19-20: local operational visibility, deliberately independent
     # of worker enablement -- built unconditionally so it stays available
@@ -334,6 +392,15 @@ def create_app(
         api_key=resolved_settings.api_key,
         public_paths=PUBLIC_PATHS | DOCS_PUBLIC_PATHS,
     )
+    # ADR-0011 D31/D43 (STORAGE-007): the request-side half of the
+    # business-route lifecycle gate -- checked after API-key authentication
+    # succeeds, so an invalid/missing key always produces the same 401/403
+    # regardless of process state (existing auth contract preserved
+    # unchanged). Health endpoints are exempt (same PUBLIC_PATHS set).
+    application.add_middleware(
+        OperationalGateMiddleware,
+        state_holder=process_state_holder,
+    )
     if resolved_settings.cors_allowed_origins:
         application.add_middleware(
             CORSMiddleware,
@@ -358,6 +425,7 @@ def build_pipeline_resources(
     *,
     session_factory: AsyncSessionFactory,
     neo4j_resource: Neo4jResource | None = None,
+    source_storage: SourceObjectStorage | None = None,
 ) -> Mapping[str, Any]:
     """The engine's explicitly-populated ``PipelineContext.resources`` map.
 
@@ -387,6 +455,7 @@ def build_pipeline_resources(
                 embedding_client=OpenAIEmbeddingClient(settings),
                 knowledge_extraction_client=OpenAIKnowledgeExtractionClient(settings),
                 document_summary_client=OpenAIDocumentSummaryClient(settings),
+                source_storage=source_storage,
             )
         return _cognify_service
 
@@ -441,10 +510,18 @@ def build_pipeline_resources(
                     session_factory=session_factory, projection=projection
                 ),
             )
-        return ForgetPipelineResources(settings=settings, graph_outbox_drain=graph_outbox_drain)
+        return ForgetPipelineResources(
+            settings=settings,
+            graph_outbox_drain=graph_outbox_drain,
+            source_storage=source_storage,
+        )
 
     def build_remember_resources() -> RememberPipelineResources:
-        return RememberPipelineResources(settings=settings, cognify_service=build_cognify_service())
+        return RememberPipelineResources(
+            settings=settings,
+            cognify_service=build_cognify_service(),
+            source_storage=source_storage,
+        )
 
     def build_dataset_delete_resources() -> DatasetDeletePipelineResources:
         # Same shape as Forget's own resources (SM-515, ADR-0010 D9) --
@@ -461,7 +538,9 @@ def build_pipeline_resources(
                 ),
             )
         return DatasetDeletePipelineResources(
-            settings=settings, graph_outbox_drain=graph_outbox_drain
+            settings=settings,
+            graph_outbox_drain=graph_outbox_drain,
+            source_storage=source_storage,
         )
 
     return _PipelineResources(
@@ -515,6 +594,24 @@ def _neo4j_readiness_check(
         return ReadinessCheckResult(
             ready=result.ready,
             detail=None if result.ready else NEO4J_NOT_READY_DETAIL,
+        )
+
+    return check
+
+
+def _process_state_readiness_check(
+    holder: ProcessStateHolder,
+) -> Callable[[], Awaitable[ReadinessCheckResult]]:
+    """ADR-0011 D20: OPERATIONAL is the only process state that may ever
+    report ready -- BOOTSTRAP_MAINTENANCE and STORAGE_CONVERGING both
+    report `/health/ready = NOT_READY` unconditionally, regardless of what
+    every other individual dependency check reports."""
+
+    async def check() -> ReadinessCheckResult:
+        ready = holder.is_operational
+        return ReadinessCheckResult(
+            ready=ready,
+            detail=None if ready else PROCESS_NOT_OPERATIONAL_DETAIL,
         )
 
     return check

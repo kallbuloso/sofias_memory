@@ -117,7 +117,12 @@ Versão 1:
 - Neo4j 5.x;
 - OpenAI-compatible API para LLM;
 - OpenAI-compatible API para embeddings;
-- filesystem local;
+- armazenamento de Source originals: exatamente dois backends de primeira parte,
+  fechados (ADR-0011 D2/D17) — `filesystem` local (padrão) e `s3` (AWS S3 ou
+  endpoint S3-compatível explicitamente configurado, ex. MinIO), via `boto3`
+  (`[project.dependencies]`, nunca extra opcional). Nenhum backend adicional,
+  nenhum plugin/provider registry — qualquer terceiro backend exige novo ADR
+  explícito;
 - worker interno;
 - PostgreSQL como fila/estado dos pipelines.
 

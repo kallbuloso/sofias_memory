@@ -33,7 +33,6 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.middleware import API_KEY_HEADER
-from sofias_memory.app import create_app
 from sofias_memory.config import Settings
 from sofias_memory.domain import (
     PipelineRunStatus,
@@ -64,6 +63,7 @@ from sofias_memory.services.cognify import COGNIFY_RESULT_METRIC_KEY, CognifySer
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_queue_claimer import PipelineRunClaimer
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from tests.unit._app_factory import create_app
 
 COGNIFY_ASYNC_TESTS_ENV = "SOFIAS_MEMORY_RUN_COGNIFY_ASYNC_POSTGRES_TESTS"
 COGNIFY_ASYNC_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_COGNIFY_ASYNC_TEST_DATABASE_URL"

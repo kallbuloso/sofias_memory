@@ -48,6 +48,19 @@ request would permanently poison every later, correctly-intentioned retry.
 """
 
 
+AUTHORITATIVE_MUTATION_STEP_NAMES_BY_PIPELINE_TYPE: dict[PipelineType, str] = {
+    PipelineType.FORGET: "authoritative_mutation",
+    PipelineType.DATASET_DELETE: "deactivate_authoritative",
+}
+"""ADR-0011 D31 sixth amendment / D43: the single, shared mapping of which
+``PipelineStep`` name durably proves a destructive run's authoritative
+mutation completed, for each destructive ``pipeline_type``. Used by both
+:meth:`PipelineRunRepository.find_compatible_destructive_lineage` (D34 Case
+B, Source-classification level) and
+:meth:`PipelineRunRepository.authoritative_mutation_succeeded` (D31/D43,
+run-claim level) -- one definition, never two subtly different ones."""
+
+
 class PipelineRunRepository:
     """Persistence operations for durable pipeline runs."""
 
@@ -637,6 +650,109 @@ class PipelineRunRepository:
         )
         result = await self._session.scalar(statement)
         return cast(PipelineRun | None, result)
+
+    async def find_compatible_destructive_lineage(
+        self, *, dataset_id: UUID, source_id: UUID
+    ) -> PipelineRun | None:
+        """ADR-0011 D34 Case B: the most recent durable ``forget`` or
+        ``dataset_delete`` run whose scope provably includes this exact
+        Source **and** which has actually reached the step that mutates
+        ``Source.status`` to ``deleting`` -- mirrors
+        :meth:`exists_administrative_delete_ownership`'s discipline (ADR-0010
+        D28: "don't infer ownership from status alone"). Mere run existence
+        is not proof of an actual `DELETING`-causing effect; a `queued` run
+        that never executed, or one whose scope only nominally overlaps,
+        must never be mistaken for the owner of a missing local object.
+
+        Scope match: a FORGET run is compatible if it targeted this exact
+        ``source_id``, this exact ``dataset_id`` (dataset-scope, with
+        ``source_id IS NULL``), or is an EVERYTHING-scope run (both
+        ``dataset_id``/``source_id`` ``NULL``) -- the same widened match
+        :meth:`find_running_forget_for_dataset_except` already uses. A
+        DATASET_DELETE run is compatible if it targeted this exact
+        ``dataset_id``. FORGET runs marked
+        ``FORGET_TARGET_CONFLICT_ERROR_CODE`` are excluded -- they never
+        touched authoritative state (same exclusion as
+        :meth:`find_latest_forget_for_source_except`/
+        :meth:`find_latest_forget_for_dataset_except`).
+        """
+
+        forget_scope = or_(
+            PipelineRun.source_id == source_id,
+            and_(PipelineRun.dataset_id == dataset_id, PipelineRun.source_id.is_(None)),
+            and_(PipelineRun.dataset_id.is_(None), PipelineRun.source_id.is_(None)),
+        )
+        mutation_step_succeeded = (
+            select(PipelineStep.id)
+            .where(
+                PipelineStep.run_id == PipelineRun.id,
+                PipelineStep.status == PipelineStepStatus.SUCCEEDED,
+                or_(
+                    *(
+                        and_(
+                            PipelineRun.pipeline_type == pipeline_type,
+                            PipelineStep.name == step_name,
+                        )
+                        for pipeline_type, step_name in (
+                            AUTHORITATIVE_MUTATION_STEP_NAMES_BY_PIPELINE_TYPE.items()
+                        )
+                    )
+                ),
+            )
+            .exists()
+        )
+        statement = (
+            select(PipelineRun)
+            .where(
+                or_(
+                    and_(
+                        PipelineRun.pipeline_type == PipelineType.FORGET,
+                        forget_scope,
+                        PipelineRun.error_code.is_distinct_from(FORGET_TARGET_CONFLICT_ERROR_CODE),
+                    ),
+                    and_(
+                        PipelineRun.pipeline_type == PipelineType.DATASET_DELETE,
+                        PipelineRun.dataset_id == dataset_id,
+                    ),
+                ),
+                mutation_step_succeeded,
+            )
+            .order_by(PipelineRun.created_at.desc(), PipelineRun.id.desc())
+            .limit(1)
+        )
+        result = await self._session.scalar(statement)
+        return cast(PipelineRun | None, result)
+
+    async def authoritative_mutation_succeeded(
+        self, run_id: UUID, *, pipeline_type: PipelineType
+    ) -> bool:
+        """ADR-0011 D31 sixth amendment / D43: the run-claim-level half of
+        the predicate :meth:`find_compatible_destructive_lineage` already
+        applies at the Source-classification level -- whether THIS run's own
+        authoritative destructive mutation step has durably `succeeded`.
+        Case-B Source membership alone is never sufficient to make a run
+        claim-eligible during STORAGE_CONVERGING (D31); this is the direct,
+        run-scoped check the worker's claim path uses once it already holds
+        the candidate row locked (so ``pipeline_type`` is already known,
+        avoiding a redundant join back to ``pipeline_runs``). A
+        ``pipeline_type`` with no destructive authoritative-mutation step at
+        all (``remember``, ``cognify``, ``improve``) always returns
+        ``False`` -- this predicate is only ever meaningful for
+        ``forget``/``dataset_delete``.
+        """
+
+        step_name = AUTHORITATIVE_MUTATION_STEP_NAMES_BY_PIPELINE_TYPE.get(pipeline_type)
+        if step_name is None:
+            return False
+        statement = select(
+            exists().where(
+                PipelineStep.run_id == run_id,
+                PipelineStep.status == PipelineStepStatus.SUCCEEDED,
+                PipelineStep.name == step_name,
+            )
+        )
+        result = await self._session.scalar(statement)
+        return bool(result)
 
     async def exists_administrative_delete_ownership(self, dataset_id: UUID) -> bool:
         """ADR-0010 D28's frozen ``administratively_deleting`` predicate,

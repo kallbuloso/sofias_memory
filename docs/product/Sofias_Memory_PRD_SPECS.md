@@ -265,7 +265,9 @@ O Sofias Memory deverá permitir que aplicações Laravel, n8n, agentes e servi�
 - múltiplas API keys;
 - billing e quotas por usuário;
 - providers de banco alternativos;
-- S3 e object storage remoto;
+- object storage remoto genérico/plugin de providers (S3-compatível é
+  suportado como backend fechado de primeira parte para Source originals,
+  `STORAGE_BACKEND=s3`, ADR-0011 — não um sistema de plugins);
 - Slack, Google Drive, Notion, GitHub e outras integrações;
 - cloud client, `serve`, `push` e sync entre instâncias;
 - agentic search e execução de tools;

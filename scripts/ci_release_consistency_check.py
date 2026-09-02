@@ -66,12 +66,28 @@ def load_settings_aliases() -> set[str]:
     return aliases
 
 
-def load_env_example_keys() -> set[str]:
+def load_env_example_keys(settings_aliases: set[str]) -> set[str]:
     text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     keys: set[str] = set()
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
+        if not stripped:
+            continue
+
+        # Optional settings may intentionally be documented as commented
+        # placeholders (for example the STORAGE_S3_* surface). Count only the
+        # canonical ``# KEY=...`` form and only when KEY is a real Settings
+        # alias, so prose comments containing '=' can never become declarations.
+        if stripped.startswith("#"):
+            candidate = stripped.removeprefix("#").strip()
+            if "=" not in candidate:
+                continue
+            key = candidate.split("=", 1)[0].strip()
+            if key in settings_aliases:
+                keys.add(key)
+            continue
+
+        if "=" not in stripped:
             continue
         keys.add(stripped.split("=", 1)[0].strip())
     return keys
@@ -105,7 +121,7 @@ def main() -> int:
     failures: list[str] = []
 
     settings_aliases = load_settings_aliases()
-    env_example_keys = load_env_example_keys()
+    env_example_keys = load_env_example_keys(settings_aliases)
 
     config = render_compose_config()
     app_service = cast(dict[str, Any], config["services"]["sofias-memory"])

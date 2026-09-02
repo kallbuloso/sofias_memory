@@ -1526,3 +1526,35 @@ not silently reinterpret the ADR in code. Report:
 - the smallest architecture amendment that would resolve it.
 
 Do not resume coding on the affected slice until that report has been reviewed.
+
+## POST-COMPLETION — Wasabi provider-compatibility smoke (2026-09-02)
+
+**This note does not reopen this plan, does not change Gate G's verdict, and
+does not alter the completed checklist/gate state above.** Gate G already
+passed using real MinIO (see the STORAGE-009 continuation/closure addenda
+above) — that remains the authoritative, production-shaped validation
+evidence for ADR-0011.
+
+A separate, narrower provider-compatibility smoke was subsequently run
+against real Wasabi (a second, independent S3-compatible provider) to check
+interoperability, not to re-validate the storage/convergence/recovery
+contract Gate G already covers. Result: **PASS, zero code changes required.**
+The unmodified `S3SourceObjectStorage`/`SourceStorageRouter` implementation
+worked against Wasabi exactly as designed — real probe, finalize/PUT via the
+real adapter, HEAD + byte-size + SHA-256 identity verification (including
+this implementation's metadata-key case-normalization, confirmed harmless
+against a provider that already lower-cases custom metadata keys), GET via
+the canonical `s3://bucket/key` locator, idempotent re-finalize, the
+deterministic-conflict fail-closed path (`SourceStorageConflictError`,
+original object unchanged), and the full delete lifecycle
+(`DELETED_NOW` then `ALREADY_ABSENT`). TLS was used normally throughout.
+Bucket versioning was only inspected (observed unset) — never enabled,
+disabled, or otherwise administered; no bucket was created or deleted; only
+a temporary, unique validation prefix was used and fully cleaned up
+afterward.
+
+Full evidence and required-API-contract documentation now live in
+`docs/operations.md` §13.16 ("Validated S3-compatible providers"), which
+also states explicitly that MinIO/Wasabi are evidence of compatibility, not
+an allowlist, and that Sofias Memory remains provider-neutral at the
+application layer. No ADR-0011 D-section changed as a result of this smoke.

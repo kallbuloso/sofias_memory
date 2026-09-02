@@ -50,7 +50,9 @@ original release discovery/backlog.
   be rebuilt from PostgreSQL (`scripts/rebuild_graph.py`).
 - Source originals are stored on a local filesystem volume by default, or
   optionally in S3/an S3-compatible bucket (`STORAGE_BACKEND=s3`) — see
-  `docs/operations.md` §13.
+  `docs/operations.md` §13. S3-compatible source storage has been validated
+  against real MinIO and Wasabi endpoints with no provider-specific code —
+  see `docs/operations.md` §13.16 for scope and evidence.
 - LLM and embedding calls go through any **OpenAI-compatible** endpoint.
 - All private routes require a static `X-API-Key` header.
 

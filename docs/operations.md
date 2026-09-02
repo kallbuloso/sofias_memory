@@ -720,14 +720,14 @@ stated here.
 **Scope note on how this section was produced.** Every claim below was
 checked against the actual runtime code and its own test suite (unit and
 integration), the way the rest of this document's procedures were checked
-against a real deployment. Unlike §§1–12, however, the **end-to-end S3/MinIO
-walkthrough itself was not executed** while writing this section — no Docker
-runtime was available in the environment this section was authored in. This
-is a real, disclosed limitation, not a claim of equivalent verification;
-treat the procedures below as reviewed-correct-against-the-implementation,
-not as separately walked-through-live evidence the way §2–§12 already are.
-An operator following this section for the first time should treat it with
-the same care as any first production use of a new capability.
+against a real deployment. The end-to-end S3 walkthrough itself has since
+been executed against a real S3-compatible endpoint as part of ADR-0011's
+Gate G production-shaped validation, and a separate provider-compatibility
+smoke has been run against a second, independent provider — see §13.16 for
+the evidence and its scope. An operator following this section for the first
+time should still treat it with the same care as any first production use of
+a new capability, and should not assume every S3-compatible provider behaves
+identically to the two validated here (§13.16).
 
 ### 13.1. Configuration surface
 
@@ -847,6 +847,26 @@ that does not itself have "regions" in the AWS sense — most such providers,
 including MinIO, accept an arbitrary placeholder value here (e.g.
 `us-east-1`); consult your provider's own `boto3`-compatibility notes if
 unsure.
+
+The exact same configuration surface — no provider-specific settings —
+targets any validated S3-compatible provider by changing only
+`STORAGE_S3_ENDPOINT_URL`/`STORAGE_S3_REGION`/credentials. For Wasabi
+(§13.16), the endpoint/region shape looks like:
+
+```env
+STORAGE_BACKEND=s3
+STORAGE_S3_BUCKET=sofias-memory-sources
+STORAGE_S3_PREFIX=production
+STORAGE_S3_REGION=us-east-1
+STORAGE_S3_ENDPOINT_URL=https://s3.wasabisys.com
+STORAGE_S3_ACCESS_KEY_ID=REPLACE_WITH_YOUR_ACCESS_KEY
+STORAGE_S3_SECRET_ACCESS_KEY=REPLACE_WITH_YOUR_SECRET_KEY
+STORAGE_S3_MAX_CONCURRENCY=4
+```
+
+(no real keys shown — replace both credential values with your own; use the
+Wasabi region-specific endpoint, e.g. `s3.<region>.wasabisys.com`, if your
+bucket is not in Wasabi's default region).
 
 A local MinIO container for development/testing (not part of production
 `compose.yaml` — add it only to a local/dev override file if you need one,
@@ -1212,3 +1232,84 @@ values):
   (`storage_unresolved` metric on a Forget/Dataset-DELETE run):** expected
   and non-blocking (§13.6) — the run itself still succeeded; track the
   metric if your compliance posture needs guaranteed physical purge.
+
+### 13.16. Validated S3-compatible providers
+
+**This is evidence of compatibility, not an allowlist.** Sofias Memory's
+storage layer is provider-neutral at the application level: it speaks only
+the standard S3 API surface listed below via `boto3`, with no
+provider-specific branching or configuration anywhere in
+`sofias_memory/infrastructure/storage/s3.py`. Any S3-compatible provider that
+faithfully implements that surface is expected to work; this repository does
+not promise compatibility with a provider that has not actually been
+exercised, and does not gate `STORAGE_BACKEND=s3` on the provider being one
+of the two below.
+
+**Required S3 API contract.** The exact `boto3` operations this
+implementation performs, confirmed against the adapter code (not assumed
+from the ADR): `put_object`, `get_object`, `head_object`, `delete_object`,
+`delete_objects`, `get_bucket_versioning`, and `list_object_versions`
+(paginated) — see §13.5 for the full minimum-IAM-permission mapping for each.
+Ordinary runtime never requires `CreateBucket`, `DeleteBucket`, or
+`PutBucketVersioning` — bucket provisioning and versioning configuration are
+exclusively operator/administrator actions performed outside this
+application, once, before pointing `STORAGE_BACKEND=s3` at a bucket.
+Provider compatibility, in practice, comes down to two things: (1) standard
+object CRUD (`put_object`/`get_object`/`head_object`/`delete_object`) behaving
+per the S3 API, and (2) — only if you enable bucket versioning — the
+provider faithfully supporting S3's version/list/delete semantics
+(`list_object_versions` correctly enumerating every version and delete
+marker for an exact key, `delete_objects`/`delete_object` with a `VersionId`
+correctly removing them). A provider that only partially implements
+versioning (e.g. reports `get_bucket_versioning` as `Enabled` but does not
+support `list_object_versions` correctly) would surface as `UNRESOLVED`
+cleanup outcomes (§13.6), not silent data loss — the adapter never claims a
+physical delete it cannot verify.
+
+**MinIO.** Used as the production-shaped backend for ADR-0011's own Gate G
+validation (the real end-to-end walkthrough referenced in the scope note
+above): real PostgreSQL + real filesystem + real MinIO, exercising the
+complete storage/convergence/recovery contract end to end — fresh S3
+install, `filesystem → s3` startup convergence (`BOOTSTRAP_MAINTENANCE` →
+`STORAGE_CONVERGING` → `OPERATIONAL`), Remember/Cognify/Forget against
+`s3://` Sources, `DELETED_NOW`/`ALREADY_ABSENT`/`UNRESOLVED` outcomes,
+versioned-bucket delete-all-versions-and-markers, restart/idempotency from
+durable state alone, and the maintenance-surface HTTP contract
+(`/health/live`=200, `/health/ready`=503 `NOT_READY`, business routes 503
+`DEPENDENCY_UNAVAILABLE`) throughout `STORAGE_CONVERGING`. This is the
+strongest evidence this document has for any provider — see
+`docs/exec-plans/completed/adr-0011-source-object-storage-s3.md` for the full
+account.
+
+**Wasabi.** A separate, narrower provider-compatibility smoke (not a repeat
+of the full Gate G battery) confirmed the same, unmodified
+`S3SourceObjectStorage` implementation works against real Wasabi with **zero
+provider-specific code changes**: real application probe
+(`SourceStorageRouter`/`S3SourceObjectStorage` construction and D21's
+put/get/delete probe), finalize/PUT through the real adapter, `HEAD` +
+byte-size + SHA-256 identity verification (including this implementation's
+metadata-key case-normalization — Wasabi happens to return custom metadata
+keys already lower-cased, so this exercised the normalization as a
+confirmed-harmless no-op rather than the case it was written for), `GET`
+through the canonical `s3://bucket/key` locator with exact byte/hash
+verification, idempotent re-finalize (identical bytes reused, no duplicate
+object), the deterministic-conflict path (differing bytes rejected with the
+typed `SourceStorageConflictError`, original object left unchanged), and the
+full delete lifecycle (`DELETED_NOW` then `ALREADY_ABSENT` on a second
+delete). TLS was used normally throughout (never disabled). Bucket
+versioning was only *inspected* (`GetBucketVersioning`, observed unset/never
+configured on the tested bucket) — never enabled, disabled, or otherwise
+administered; this smoke intentionally did not repeat MinIO's live versioned-
+delete validation above, since that is a Gate G concern already covered.
+
+**Security/IAM notes applicable to every provider (unchanged, not
+provider-specific — see §13.5 for the full policy):** use a private bucket
+with authenticated access only, scope application credentials to the
+least-privilege object/bucket-read capabilities in §13.5's IAM policy (never
+a broader grant), and never grant this application `CreateBucket`/
+`DeleteBucket`/bucket-policy/versioning-administration permissions — ordinary
+runtime does not need them and never calls them. Do not assume any given S3-
+compatible provider's IAM/policy model, action names, or semantics are
+identical to AWS's in every detail (§13.5 already says this) — this applies
+equally to MinIO and Wasabi; consult each provider's own policy
+documentation when translating the JSON policy in §13.5.

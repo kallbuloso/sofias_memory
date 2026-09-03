@@ -3,9 +3,9 @@
 This document covers running Sofias Memory directly on a developer machine against
 a local database stack, running checks/tests, and the caveats specific to that local
 setup. It is not a production deployment guide — see [`README.md`](../README.md) for
-the product overview and [`docs/api.md`](api.md) for API semantics. Deployment guides
-covering Docker/Portainer/EasyPanel in more depth are planned for a later release
-task (see `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md`, REL-006).
+the product overview, [`docs/api.md`](api.md) for API semantics, and
+[`docs/operations.md`](operations.md) / [`docs/deployment/easypanel.md`](deployment/easypanel.md)
+for the production deployment contract.
 
 ## Toolchain
 
@@ -120,7 +120,7 @@ neo4j:7687
 These scripts run from a source checkout via `uv run python scripts/...` as
 shown below. They are also packaged inside the release image itself (see
 `docs/operations.md`), so the same scripts run there too, with no source
-checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.1.2
+checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.2.0
 run --no-sync python scripts/rebuild_graph.py --all --confirm-all`.
 
 ```bash
@@ -137,9 +137,9 @@ uv run python scripts/rebuild_graph.py --all
 
 ## Notes on Portainer/EasyPanel during development
 
-`compose.yaml` is the canonical, portable stack definition and is what both
-Portainer and EasyPanel consume directly — there is no development-specific
-override file for either platform, and none should be added just to expose the
-database ports above. Full production deployment guidance for these platforms is
-tracked as later release work (REL-006); this document only concerns local
-development, not deployment.
+`compose.yaml` is the canonical, portable stack definition and is consumed
+directly by Portainer. EasyPanel uses the dedicated
+`deploy/easypanel/compose.yaml` deployment artifact; see
+`docs/deployment/easypanel.md`. No development-specific override should be added
+just to expose the database ports above; this document only concerns local
+development, not production deployment.

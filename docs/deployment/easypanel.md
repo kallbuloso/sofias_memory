@@ -1,8 +1,8 @@
 # Easypanel Deployment (EASYPANEL-001)
 
 This is the proven, canonical guide for deploying Sofias Memory on Easypanel
-from the already-published, immutable release image
-`ghcr.io/kallbuloso/sofias-memory:0.1.2` — no build, no source checkout, no
+from the exact release image
+`ghcr.io/kallbuloso/sofias-memory:0.2.0` — no build, no source checkout, no
 `Dockerfile` is required on the Easypanel host. The Compose definition used is
 [`deploy/easypanel/compose.yaml`](../../deploy/easypanel/compose.yaml), a
 deployment-only variant of the root [`compose.yaml`](../../compose.yaml) with
@@ -11,13 +11,12 @@ environment contract — the only differences are `image:` instead of `build:`,
 and no host port published for `sofias-memory` (Easypanel routes its domain
 directly to the container's internal port instead).
 
-For maximum reproducibility (e.g. verifying exactly what was validated below),
-the exact image may optionally be pinned by digest instead of tag:
-`ghcr.io/kallbuloso/sofias-memory@sha256:324f0d912f955257271442238a4fff42ae21c3ff234a9e8e1586537e4c917421`
-(the same digest published for the `0.1.2` tag). The canonical
-`deploy/easypanel/compose.yaml` itself uses the exact version tag, not the
-digest — see `docs/operations.md` §D for the general version/digest pinning
-policy.
+For maximum reproducibility, the published `0.2.0` image may optionally be
+pinned by its GHCR digest instead of tag after publication. The canonical
+`deploy/easypanel/compose.yaml` itself uses the exact version tag, not a digest;
+see `docs/operations.md` §D for the general version/digest pinning policy.
+Historical validation evidence below remains explicitly tied to the version that
+was actually exercised and is not rewritten as if it had been run on `0.2.0`.
 
 This guide does not repeat the general operational contract (migration
 policy, backup/restore, rollback) — see [`docs/operations.md`](../operations.md)
@@ -55,7 +54,7 @@ build path:    /
 compose file:  deploy/easypanel/compose.yaml
 ```
 
-A specific stable tag (e.g. `v0.1.2`) may be used instead of `main` for a
+A specific stable tag (e.g. `v0.2.0`) may be used instead of `main` for a
 pinned, reproducible source reference.
 
 **Option B — Inline Compose.** Select Easypanel's **Inline**/**paste Compose

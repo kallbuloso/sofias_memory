@@ -3,9 +3,9 @@ services:
     build:
       context: .
       args:
-        APP_VERSION: "${APP_VERSION:-0.1.2}"
+        APP_VERSION: "${APP_VERSION:-0.2.0}"
         VCS_REF: "${VCS_REF:-local}"
-    image: sofias-memory:0.1.2
+    image: sofias-memory:0.2.0
     restart: unless-stopped
     depends_on:
       postgres:
@@ -17,7 +17,7 @@ services:
     environment:
       APP_NAME: "${APP_NAME:-Sofias Memory}"
       APP_ENV: "${APP_ENV:-production}"
-      APP_VERSION: "${APP_VERSION:-0.1.2}"
+      APP_VERSION: "${APP_VERSION:-0.2.0}"
       API_KEY: "${API_KEY:?API_KEY is required}"
       HTTP_HOST: "0.0.0.0"
       HTTP_PORT: "8000"

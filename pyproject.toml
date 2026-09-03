@@ -1,6 +1,6 @@
 [project]
 name = "sofias-memory"
-version = "0.1.2"
+version = "0.2.0"
 description = "Single-user semantic memory and knowledge graph service."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

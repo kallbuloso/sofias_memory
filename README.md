@@ -13,10 +13,11 @@ Remember, Cognify, Recall, Improve, Forget, Dataset lifecycle, and Run
 retry/cancel are all implemented and durable, running through a single internal
 worker with PostgreSQL as the queue and source of truth. **v0.1.0** was the
 first stable MVP release; **v0.1.1** improved Swagger/OpenAPI documentation
-and developer UX; **v0.1.2** is a patch release fixing a `graph_outbox`
-UPSERT/DELETE ordering and cross-row claim-race defect found during
-administrative Dataset deletion (see `CHANGELOG.md`), with no business API,
-pipeline, or storage contract change — see
+and developer UX; **v0.1.2** fixed a `graph_outbox` UPSERT/DELETE ordering and
+cross-row claim-race defect; **v0.2.0** adds durable S3-compatible storage for
+Source originals, startup filesystem→S3 convergence/recovery, and validated
+MinIO/Wasabi interoperability while keeping `filesystem` as the default
+backend (see `CHANGELOG.md`) — see
 `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.
 

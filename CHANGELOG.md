@@ -2,6 +2,93 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.2.0]
+
+Minor release adding durable S3-compatible storage for Source originals while
+preserving the existing filesystem backend and public API contract.
+
+### Durable S3-compatible Source storage
+
+- Added `filesystem` and `s3` as the two supported first-party storage
+  backends for finalized Source originals; `filesystem` remains the default.
+- Added deterministic `s3://bucket/key` storage through the existing
+  `SourceObjectStorage`/`SourceStorageRouter` boundary, with SHA-256 and byte
+  size verification, idempotent finalize, and typed conflict detection.
+- Reads and deletes follow each persisted Source URI scheme, so historical
+  `file://` and `s3://` Sources can coexist safely regardless of the current
+  write backend.
+- Added explicit destructive-storage outcomes:
+  `NOT_REQUESTED`, `DELETED_NOW`, `ALREADY_ABSENT`, and `UNRESOLVED`, including
+  version-aware deletion semantics when bucket versioning is enabled.
+
+### Startup convergence and recovery
+
+- Added fail-closed process states
+  `BOOTSTRAP_MAINTENANCE` → `STORAGE_CONVERGING` → `OPERATIONAL`.
+- Enabling `STORAGE_BACKEND=s3` on an existing filesystem deployment
+  automatically converges eligible `file://` Source originals to S3 at startup
+  using verify-before-CAS repointing and post-CAS exact local cleanup.
+- `/health/live` remains available during convergence; `/health/ready` and
+  business routes remain unavailable until convergence reaches a clean fixed
+  point.
+- Added durable crash/restart handling for Remember finalization and
+  filesystem→S3 convergence without holding PostgreSQL locks across external
+  storage I/O.
+- Added D43 lifecycle exclusion so supported single-process deployments cannot
+  start new destructive authoritative transitions for live Case-A Sources
+  during storage convergence; an observed `DELETING` transition at the CAS
+  boundary now fails closed as a named integrity violation.
+
+### Provider validation
+
+- Completed production-shaped Gate-G validation against a real MinIO
+  S3-compatible endpoint, including migration, restart/idempotency,
+  conflict/absence semantics, and version-aware destructive deletion.
+- Completed a separate provider-compatibility smoke against real Wasabi
+  (`us-east-1`) with the same adapter and no provider-specific code changes:
+  probe, finalize/PUT, HEAD metadata verification, GET/hash/size,
+  idempotency, conflict fail-closed, and delete/positive-absence all passed.
+- The validated providers are compatibility evidence, not an allowlist; the
+  application remains provider-neutral at the S3 API boundary.
+
+### Deployment and operations
+
+- Added complete S3 configuration, IAM/least-privilege guidance,
+  filesystem→S3 upgrade/convergence, backup/restore, rollback, outage, and
+  troubleshooting documentation.
+- `DATA_DIRECTORY` remains mandatory and persistent in both storage modes
+  because it still owns durable ingress and in-transit recovery/migration
+  state.
+- Documented the single-process `stop old -> start new` deployment invariant
+  required while S3 convergence is in use.
+- Added and validated the dedicated EasyPanel deployment artifact and clarified
+  when Alembic migrations are required versus ordinary redeploys.
+
+### Security and CI
+
+- Raised the `pypdf` runtime dependency floor to `>=6.16.1,<7`; the lock now
+  resolves to a release with the known runtime advisories fixed.
+- Kept runtime `pip-audit` as a blocking CI gate and HIGH-severity Bandit
+  findings blocking while retaining the full Bandit report as informational.
+- Strengthened Settings / `.env.example` / Compose parity validation,
+  including intentionally-commented optional S3 placeholders.
+
+### Compatibility and upgrade notes
+
+- No public API path or request/response business contract is intentionally
+  changed by this release.
+- No new database schema migration is introduced by `0.2.0`.
+- Existing filesystem deployments continue to work without any S3
+  configuration.
+- Switching an existing deployment from `filesystem` to `s3` performs
+  automatic forward convergence at startup; there is intentionally no
+  automatic S3→filesystem reverse migration.
+- After any Source has been durably repointed to `s3://`, rolling the
+  application back to a pre-S3 release is not a safe ordinary image rollback;
+  follow the backup/restore procedure documented in `docs/operations.md`.
+- PostgreSQL remains authoritative and Neo4j remains a reconstructible
+  projection.
+
 ## [0.1.2]
 
 Patch release for a production defect found by the EASYPANEL-001 production

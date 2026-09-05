@@ -103,6 +103,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
         "0010_pipeline_runs_operational_unique_constraint.py",
         "0011_add_dataset_delete_pipeline_type.py",
         "0012_create_sessions_foundation.py",
+        "0013_session_entry_external_id_trim_invariant.py",
     ]
 
 

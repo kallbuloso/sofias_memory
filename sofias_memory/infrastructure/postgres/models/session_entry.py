@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from sofias_memory.domain import SESSION_ID_MAX_LENGTH
+from sofias_memory.domain import SESSION_ENTRY_EXTERNAL_ID_MAX_LENGTH
 from sofias_memory.infrastructure.postgres.base import Base
 
 
@@ -19,14 +19,15 @@ class SessionEntry(Base):
     """Append-only durable contextual history record for a Session.
 
     ``role`` is open-ended ``TEXT`` (not a PostgreSQL enum): it is contextual
-    metadata only and is never mapped to a privileged LLM provider role. This
-    model is persistence-only in SM-601 -- no public API exists yet.
+    metadata only and is never mapped to a privileged LLM provider role.
 
-    ``external_id`` is an optional, immutable, caller-supplied correlation
-    identity scoped to one Session (e.g. for future retry-safe append), not
-    a Session-wide external key like ``Session.key`` -- it reuses
-    ``SESSION_ID_MAX_LENGTH`` only because the two happen to share the same
-    255-character bound, not because they are the same concept.
+    ``external_id`` is an optional, immutable, caller-supplied correlation/
+    idempotency identity scoped to one Session (SM-603 retry-safe append) --
+    not a Session-wide external key like ``Session.key``. It has its own
+    dedicated domain constant/normalization primitive
+    (``SESSION_ENTRY_EXTERNAL_ID_MAX_LENGTH``), independent of
+    ``Session``'s ``SESSION_ID_MAX_LENGTH``, even though both currently bound
+    at 255 characters.
     """
 
     __tablename__ = "session_entries"
@@ -44,8 +45,16 @@ class SessionEntry(Base):
             name="external_id_not_blank",
         ),
         CheckConstraint(
-            f"external_id IS NULL OR char_length(external_id) <= {SESSION_ID_MAX_LENGTH}",
+            "external_id IS NULL OR "
+            f"char_length(external_id) <= {SESSION_ENTRY_EXTERNAL_ID_MAX_LENGTH}",
             name="external_id_max_length",
+        ),
+        # 0013: authoritative trim invariant -- a caller must never persist a
+        # non-canonical (padded) external_id, even bypassing the API layer's
+        # own normalize_session_entry_external_id() call.
+        CheckConstraint(
+            "external_id IS NULL OR external_id = btrim(external_id)",
+            name="external_id_trimmed",
         ),
     )
 

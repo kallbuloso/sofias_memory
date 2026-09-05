@@ -140,15 +140,30 @@ def test_session_management_routes_present_with_exact_methods() -> None:
     assert set(paths["/api/v1/sessions/{session_uuid}/restore"]) == {"post"}
 
 
-def test_session_entry_and_recall_context_surfaces_not_yet_introduced() -> None:
-    """SM-603/SM-604 scope, explicitly deferred by SM-602."""
+def test_session_entry_routes_present_with_exact_methods_and_no_mutation() -> None:
+    """SM-603: append-only SessionEntry API plus the lightweight Session
+    query-history projection. No PATCH/DELETE surface of any kind, at the
+    item or collection level, is ever introduced for SessionEntry."""
 
     schema = openapi_schema()
     paths = schema["paths"]
     assert isinstance(paths, dict)
 
-    assert "/api/v1/sessions/{session_uuid}/entries" not in paths
-    assert "/api/v1/sessions/{session_uuid}/queries" not in paths
+    assert set(paths["/api/v1/sessions/{session_uuid}/entries"]) == {"get", "post"}
+    assert set(paths["/api/v1/sessions/{session_uuid}/queries"]) == {"get"}
+    assert "/api/v1/sessions/{session_uuid}/entries/{entry_id}" not in paths
+
+    for path, operations in paths.items():
+        if path.startswith("/api/v1/sessions/{session_uuid}/entries"):
+            assert "patch" not in operations
+            assert "delete" not in operations
+            assert "put" not in operations
+
+
+def test_recall_session_context_surface_not_yet_introduced() -> None:
+    """SM-604 scope, explicitly deferred by SM-603."""
+
+    schema = openapi_schema()
     assert "include_session_context" not in json.dumps(schema)
 
 

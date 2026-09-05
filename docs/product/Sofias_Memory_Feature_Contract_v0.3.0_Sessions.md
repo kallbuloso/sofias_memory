@@ -442,11 +442,9 @@ Request:
 
 A operação deve verificar a Session sob transação adequada antes do insert.
 
-Session archived:
-
-```text
-409 SESSION_ARCHIVED
-```
+Uma Session archived bloqueia **nova admissão**, não a observação/replay de trabalho já
+admitido. A semântica exata, incluindo a precedência entre replay e `SESSION_ARCHIVED`,
+está congelada em "Replay depois de archive" abaixo.
 
 ### Sem `external_id`
 
@@ -498,6 +496,72 @@ A SessionEntry existente nunca é mutada. Nenhum novo ErrorCode é introduzido p
 caso — reutiliza-se `IDEMPOTENCY_CONFLICT`, o mesmo já usado por outras operações
 idempotentes do Sofias Memory.
 
+### Replay depois de archive
+
+Decisão congelada (sem novo ADR): uma Session archived bloqueia **nova atividade**, mas
+não bloqueia a observação/replay de uma operação já admitida anteriormente.
+
+Se:
+
+```text
+external_id já existe
++
+payload semântico é idêntico
+```
+
+o POST é um safe replay de atividade já admitida. Portanto, mesmo com a Session
+archived:
+
+```text
+Session archived
++ existing external_id
++ same payload
+→ 201
+→ mesma SessionEntry
+```
+
+Nenhuma nova atividade é criada.
+
+Se:
+
+```text
+Session archived
++ existing external_id
++ different payload
+```
+
+o conflito de identidade já existente tem precedência sobre `SESSION_ARCHIVED`:
+
+```text
+→ 409 IDEMPOTENCY_CONFLICT
+```
+
+Se:
+
+```text
+Session archived
++ external_id inexistente
+```
+
+ou sem `external_id`:
+
+```text
+→ 409 SESSION_ARCHIVED
+```
+
+Precedência completa da decisão de admissão:
+
+```text
+1. existing external_id + same payload      → 201 replay
+2. existing external_id + different payload → 409 IDEMPOTENCY_CONFLICT
+3. missing external_id (ou sem external_id) + Session archived → 409 SESSION_ARCHIVED
+4. caso contrário (Session active)          → 201, nova SessionEntry
+```
+
+Essa distinção é necessária para preservar retry safety: um caller que já teve sua
+operação admitida antes do archive nunca deve ver essa mesma operação falhar apenas
+porque a Session foi arquivada depois.
+
 ### Concorrência
 
 Duas requisições concorrentes para:
@@ -521,9 +585,11 @@ different payload semântico
 uma requisição pode vencer a criação; a outra deve observar `409 IDEMPOTENCY_CONFLICT`.
 
 A defesa authoritative no PostgreSQL é a partial unique index
-`UNIQUE(session_id, external_id) WHERE external_id IS NOT NULL`, já criada pela
-foundation de persistência (SM-601). A aplicação desta lógica de replay/conflito no
-endpoint HTTP é responsabilidade do ticket que implementa a SessionEntry API.
+`UNIQUE(session_id, external_id) WHERE external_id IS NOT NULL`, criada pela foundation
+de persistência. O row lock da Session (mesmo usado por archive/restore) já serializa
+todo append para aquele `session_uuid`, portanto a resolução de replay/conflito nunca
+depende apenas dessa constraint no caminho normal; a constraint permanece como defesa
+authoritative caso essa serialização seja contornada.
 
 ---
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sofias_memory.infrastructure.postgres.models import Query
@@ -33,15 +33,20 @@ class QueryRepository:
         limit: int = 50,
         offset: int = 0,
     ) -> list[Query]:
-        """Newest-first Queries for a Session (foundation for SM-603's
-        ``GET /sessions/{session_uuid}/queries``; no public API in SM-601)."""
+        """Deterministic ``(created_at, id)`` ordering, oldest-first, for
+        ``GET /api/v1/sessions/{session_uuid}/queries`` (SM-603)."""
 
         statement = (
             select(Query)
             .where(Query.session_id == session_id)
-            .order_by(Query.created_at.desc(), Query.id.desc())
+            .order_by(Query.created_at.asc(), Query.id.asc())
             .limit(limit)
             .offset(offset)
         )
         result = await self._session.scalars(statement)
         return list(result)
+
+    async def count_by_session(self, session_id: UUID) -> int:
+        statement = select(func.count()).select_from(Query).where(Query.session_id == session_id)
+        result = await self._session.scalar(statement)
+        return int(result or 0)

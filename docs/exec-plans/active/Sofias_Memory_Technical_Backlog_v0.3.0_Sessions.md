@@ -432,6 +432,25 @@ endpoint é responsabilidade do SM-603.
 Ausência de `external_id` continua sendo append não idempotente (comportamento normal,
 sem safe replay).
 
+## Replay depois de archive
+
+Decisão congelada (sem novo ADR): archive bloqueia nova atividade, não a
+observação/replay de atividade já admitida.
+
+Precedência de admissão, nesta ordem:
+
+```text
+1. existing external_id + same payload      → 201 replay
+2. existing external_id + different payload → 409 IDEMPOTENCY_CONFLICT
+3. missing external_id (ou sem external_id) + Session archived → 409 SESSION_ARCHIVED
+4. caso contrário (Session active)          → 201, nova SessionEntry
+```
+
+Ou seja: `Session archived + existing external_id + same payload` continua `201` com a
+mesma SessionEntry; `Session archived + existing external_id + different payload`
+continua `409 IDEMPOTENCY_CONFLICT` (precedência sobre `SESSION_ARCHIVED`); somente
+`Session archived + external_id inexistente/ausente` retorna `409 SESSION_ARCHIVED`.
+
 ## Admission barrier
 
 Append deve tomar uma decisão atomicamente consistente com archive.
@@ -515,7 +534,13 @@ Comprovar:
   mutar a SessionEntry existente;
 - concorrência same-key/same-payload converge para uma única SessionEntry;
 - concorrência same-key/different-payload produz exatamente um vencedor e um
-  `409 IDEMPOTENCY_CONFLICT`.
+  `409 IDEMPOTENCY_CONFLICT`;
+- replay (`external_id` + payload idêntico) contra Session archived continua `201`
+  com a mesma SessionEntry;
+- `external_id` + payload diferente contra Session archived retorna
+  `409 IDEMPOTENCY_CONFLICT`, não `SESSION_ARCHIVED`;
+- novo append (sem `external_id`, ou `external_id` inexistente) contra Session
+  archived retorna `409 SESSION_ARCHIVED`.
 
 ---
 

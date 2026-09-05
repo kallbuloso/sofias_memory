@@ -414,7 +414,7 @@ async def test_session_entry_external_id_may_repeat_across_different_sessions(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_query_list_by_session_returns_newest_first(
+async def test_query_list_by_session_returns_oldest_first(
     postgres_session_factory: AsyncSessionFactory,
 ) -> None:
     session = build_session(key=f"sm601-queries-{uuid4().hex}")
@@ -435,9 +435,13 @@ async def test_query_list_by_session_returns_newest_first(
 
         async with PostgresUnitOfWork(postgres_session_factory) as uow:
             listed = await uow.queries.list_by_session(session.id)
+            total = await uow.queries.count_by_session(session.id)
             await uow.commit()
 
-        assert [query.id for query in listed] == [query.id for query in reversed(queries)]
+        # SM-603: GET /sessions/{session_uuid}/queries orders (created_at, id)
+        # ascending -- oldest first, matching SessionEntry's own default.
+        assert [query.id for query in listed] == [query.id for query in queries]
+        assert total == len(queries)
     finally:
         await cleanup_sessions(
             postgres_session_factory,

@@ -25,6 +25,11 @@ from sofias_memory.domain.pipeline_lifecycle import (
     validate_run_transition,
     validate_step_transition,
 )
+from sofias_memory.domain.session_entry_external_id import (
+    SESSION_ENTRY_EXTERNAL_ID_MAX_LENGTH,
+    InvalidSessionEntryExternalIdError,
+    normalize_session_entry_external_id,
+)
 from sofias_memory.domain.session_id import (
     SESSION_ID_MAX_LENGTH,
     InvalidSessionIdError,
@@ -33,12 +38,14 @@ from sofias_memory.domain.session_id import (
 
 __all__ = [
     "RUN_TRANSITIONS",
+    "SESSION_ENTRY_EXTERNAL_ID_MAX_LENGTH",
     "SESSION_ID_MAX_LENGTH",
     "STEP_TRANSITIONS",
     "TERMINAL_RUN_STATUSES",
     "DatasetStatus",
     "GraphOutboxOperation",
     "GraphOutboxStatus",
+    "InvalidSessionEntryExternalIdError",
     "InvalidSessionIdError",
     "MemoryEntryType",
     "PipelineProgressOutOfBoundsError",
@@ -52,6 +59,7 @@ __all__ = [
     "SourceKind",
     "SourceStatus",
     "SummaryTargetType",
+    "normalize_session_entry_external_id",
     "normalize_session_id",
     "validate_progress",
     "validate_run_transition",

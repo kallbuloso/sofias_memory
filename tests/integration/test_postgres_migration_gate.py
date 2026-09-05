@@ -66,6 +66,7 @@ EXPECTED_CHECK_CONSTRAINTS = frozenset(
         "ck_sessions_name_max_length",
         "ck_session_entries_external_id_not_blank",
         "ck_session_entries_external_id_max_length",
+        "ck_session_entries_external_id_trimmed",
     }
 )
 EXPECTED_FK_DELETE_POLICIES = {
@@ -391,7 +392,7 @@ def test_postgres_migration_gate_from_empty_database(
         # 0011 documents that PostgreSQL cannot drop a single native enum
         # value, so downgrading past that boundary is intentionally
         # unsupported (ADR-0010 D34) -- this is the documented restriction
-        # holding, not a migration defect. Head is additive (0012), so this
+        # holding, not a migration defect. Head is additive (0013), so this
         # branch is not normally reached from head; it stays here so this
         # test still behaves correctly if 0011 ever becomes head again (e.g.
         # a future revision is reverted). The database is untouched (still
@@ -499,12 +500,16 @@ async def assert_last_migration_downgraded(
         schema = await current_schema(connection)
         tables = await base_tables(connection, schema=schema)
         revisions = await database_revisions(connection, schema=schema)
+        constraints = await constraints_by_name(connection, schema=schema)
 
     assert revisions == frozenset({expected_revision})
-    # 0012 (SM-601) is purely additive: downgrading it removes only the
-    # Sessions foundation, never any earlier table.
-    assert {"sessions", "session_entries"}.isdisjoint(tables)
+    # 0013 (SM-603) is a single additive check constraint on top of an
+    # already-existing table: downgrading it removes only that constraint,
+    # never any table (0012's Sessions foundation, or anything earlier).
+    assert "ck_session_entries_external_id_trimmed" not in constraints
     assert {
+        "sessions",
+        "session_entries",
         "datasets",
         "chunks",
         "feedback",
@@ -512,6 +517,11 @@ async def assert_last_migration_downgraded(
         "pipeline_steps",
         "graph_outbox",
     } <= tables
+    # The other 0012 session_entries checks/index must survive a 0013-only
+    # downgrade -- this proves the downgrade removed exactly one constraint,
+    # not the whole table's constraint set.
+    assert "ck_session_entries_external_id_not_blank" in constraints
+    assert "ck_session_entries_external_id_max_length" in constraints
 
 
 def assert_hnsw_halfvec_index(definition: str) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from http import HTTPStatus
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Query, Request
@@ -13,6 +13,16 @@ from sofias_memory.api.openapi_responses import error_response
 from sofias_memory.domain import SessionStatus
 from sofias_memory.lifespan import app_postgres_session_factory
 from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
+from sofias_memory.schemas.session_entries import (
+    SESSION_ENTRY_PAGE_DEFAULT_LIMIT,
+    SESSION_ENTRY_PAGE_MAX_LIMIT,
+    SESSION_QUERY_PAGE_DEFAULT_LIMIT,
+    SESSION_QUERY_PAGE_MAX_LIMIT,
+    SessionEntryCreateRequest,
+    SessionEntryListResult,
+    SessionEntryResult,
+    SessionQueryListResult,
+)
 from sofias_memory.schemas.sessions import (
     SESSION_PAGE_DEFAULT_LIMIT,
     SESSION_PAGE_MAX_LIMIT,
@@ -21,6 +31,7 @@ from sofias_memory.schemas.sessions import (
     SessionResult,
     SessionUpdateRequest,
 )
+from sofias_memory.services.session_entries import SessionEntryService
 from sofias_memory.services.sessions import SessionService
 
 _SESSION_NOT_FOUND_404 = error_response(
@@ -29,6 +40,13 @@ _SESSION_NOT_FOUND_404 = error_response(
 _SESSION_CREATE_CONFLICT_409 = error_response(
     "A Session with this session_id already exists. Explicit create never "
     "upserts. ErrorEnvelope with error.code=INVALID_REQUEST."
+)
+_SESSION_ENTRY_APPEND_CONFLICT_409 = error_response(
+    "Conflict appending a SessionEntry. ErrorEnvelope with error.code one of: "
+    "SESSION_ARCHIVED (the Session is archived and admits no new activity -- "
+    "does not apply to a safe replay of already-admitted work), or "
+    "IDEMPOTENCY_CONFLICT (external_id was already used with a different "
+    "role/content/metadata payload)."
 )
 
 router = APIRouter(tags=["sessions"])
@@ -168,6 +186,101 @@ async def restore_session(
     service = SessionService(session_factory=app_postgres_session_factory(request.app))
     result = await service.restore_session(session_uuid)
     return SuccessEnvelope[SessionResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.post(
+    "/sessions/{session_uuid}/entries",
+    response_model=SuccessEnvelope[SessionEntryResult],
+    status_code=HTTPStatus.CREATED,
+    summary="Append a SessionEntry",
+    description=(
+        "Append explicit contextual history to a Session. Without "
+        "`external_id`, every request creates a new entry (not idempotent). "
+        "With `external_id`: a replay with an identical role/content/metadata "
+        "payload resolves and returns the existing entry (still `201`, no "
+        "second row, even against an archived Session); a payload conflict "
+        "or a brand-new append against an archived Session is rejected."
+    ),
+    responses={
+        HTTPStatus.NOT_FOUND: _SESSION_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: _SESSION_ENTRY_APPEND_CONFLICT_409,
+    },
+)
+async def append_session_entry(
+    session_uuid: UUID,
+    payload: SessionEntryCreateRequest,
+    request: Request,
+) -> SuccessEnvelope[SessionEntryResult]:
+    service = SessionEntryService(session_factory=app_postgres_session_factory(request.app))
+    result = await service.append_entry(session_uuid, payload)
+    return SuccessEnvelope[SessionEntryResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.get(
+    "/sessions/{session_uuid}/entries",
+    response_model=SuccessEnvelope[SessionEntryListResult],
+    summary="List SessionEntries",
+    description=(
+        "List a Session's contextual history, paginated. Allowed for both "
+        "active and archived Sessions. No semantic search."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _SESSION_NOT_FOUND_404},
+)
+async def list_session_entries(
+    session_uuid: UUID,
+    request: Request,
+    limit: int = Query(
+        default=SESSION_ENTRY_PAGE_DEFAULT_LIMIT, ge=1, le=SESSION_ENTRY_PAGE_MAX_LIMIT
+    ),
+    offset: int = Query(default=0, ge=0),
+    order: Annotated[
+        Literal["asc", "desc"],
+        Query(description="Sort direction over (created_at, entry_id)."),
+    ] = "asc",
+) -> SuccessEnvelope[SessionEntryListResult]:
+    service = SessionEntryService(session_factory=app_postgres_session_factory(request.app))
+    result = await service.list_entries(
+        session_uuid,
+        limit=limit,
+        offset=offset,
+        ascending=order == "asc",
+    )
+    return SuccessEnvelope[SessionEntryListResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.get(
+    "/sessions/{session_uuid}/queries",
+    response_model=SuccessEnvelope[SessionQueryListResult],
+    summary="List a Session's Query history",
+    description=(
+        "Lightweight, paginated projection of Queries associated with this "
+        "Session (oldest first). Full provenance, references, timings, and "
+        "session_context_entry_ids remain the responsibility of the existing "
+        "Query Provenance endpoint. Allowed for both active and archived "
+        "Sessions; never mutates the Session."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _SESSION_NOT_FOUND_404},
+)
+async def list_session_queries(
+    session_uuid: UUID,
+    request: Request,
+    limit: int = Query(
+        default=SESSION_QUERY_PAGE_DEFAULT_LIMIT, ge=1, le=SESSION_QUERY_PAGE_MAX_LIMIT
+    ),
+    offset: int = Query(default=0, ge=0),
+) -> SuccessEnvelope[SessionQueryListResult]:
+    service = SessionEntryService(session_factory=app_postgres_session_factory(request.app))
+    result = await service.list_queries(session_uuid, limit=limit, offset=offset)
+    return SuccessEnvelope[SessionQueryListResult](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
     )

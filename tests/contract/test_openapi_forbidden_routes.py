@@ -126,6 +126,32 @@ def test_dataset_delete_route_present() -> None:
     assert "delete" in paths["/api/v1/datasets/{dataset_id}"]
 
 
+def test_session_management_routes_present_with_exact_methods() -> None:
+    """SM-602 scope: only Session management, no hard delete."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert set(paths["/api/v1/sessions"]) == {"get", "post"}
+    assert set(paths["/api/v1/sessions/{session_uuid}"]) == {"get", "patch"}
+    assert "delete" not in paths["/api/v1/sessions/{session_uuid}"]
+    assert set(paths["/api/v1/sessions/{session_uuid}/archive"]) == {"post"}
+    assert set(paths["/api/v1/sessions/{session_uuid}/restore"]) == {"post"}
+
+
+def test_session_entry_and_recall_context_surfaces_not_yet_introduced() -> None:
+    """SM-603/SM-604 scope, explicitly deferred by SM-602."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert "/api/v1/sessions/{session_uuid}/entries" not in paths
+    assert "/api/v1/sessions/{session_uuid}/queries" not in paths
+    assert "include_session_context" not in json.dumps(schema)
+
+
 def test_private_routes_require_api_key_security() -> None:
     schema = openapi_schema()
     paths = schema["paths"]

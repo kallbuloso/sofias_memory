@@ -99,7 +99,7 @@ class GraphOutboxStatus(StrEnum):
 
 
 class SessionStatus(StrEnum):
-    """Lifecycle status for first-class durable Sessions (ADR-0012)."""
+    """Lifecycle status for first-class durable Sessions."""
 
     ACTIVE = "active"
     ARCHIVED = "archived"

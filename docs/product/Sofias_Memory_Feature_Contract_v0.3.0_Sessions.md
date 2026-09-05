@@ -775,6 +775,37 @@ O Recall continua normalmente.
 
 ---
 
+## 12.1 Geração sem hits de knowledge
+
+Em `mode == rag`, ausência de chunks recuperados normalmente resulta em resposta padrão de ausência de evidência, sem chamar o LLM.
+
+Essa regra passa a ter uma exceção explícita: Session Context selecionado é, por si só, entrada válida de geração.
+
+```text
+hits == []
+session context == []
+    → resposta padrão de ausência de evidência, LLM não é chamado
+```
+
+```text
+hits == []
+session context != []
+    → LLM é chamado normalmente
+```
+
+Nesse segundo caso:
+
+```text
+context == []
+references == []
+```
+
+no `RecallResult`, mas `session_context_entry_ids` da Query permanece populado com as entries efetivamente usadas na geração.
+
+Retrieval de knowledge não muda em nenhum dos dois casos.
+
+---
+
 # 13. Context safety
 
 SessionEntry é dado não confiável.

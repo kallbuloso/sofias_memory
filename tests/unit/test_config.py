@@ -77,6 +77,8 @@ SETTINGS_ENV_NAMES = {
     "RECALL_DEFAULT_TOP_K",
     "RECALL_MAX_TOP_K",
     "RECALL_RRF_K",
+    "SESSION_CONTEXT_MAX_ENTRIES",
+    "SESSION_CONTEXT_MAX_CHARS",
     "ENTITY_DEDUP_SIMILARITY_THRESHOLD",
     "ENTITY_MERGE_SIMILARITY_THRESHOLD",
     "WORKER_ENABLED",
@@ -124,6 +126,8 @@ def test_minimal_valid_configuration_uses_prd_defaults() -> None:
     assert settings.embedding_dimensions == 3072
     assert settings.chunk_max_tokens == 900
     assert settings.recall_default_top_k == 12
+    assert settings.session_context_max_entries == 20
+    assert settings.session_context_max_chars == 16000
     assert settings.entity_dedup_similarity_threshold == 0.90
     assert settings.entity_merge_similarity_threshold == 0.95
     assert settings.worker_enabled is True
@@ -413,6 +417,8 @@ def test_chunk_min_greater_than_max_is_rejected() -> None:
         ("recall_default_top_k", 0),
         ("recall_max_top_k", 0),
         ("recall_rrf_k", 0),
+        ("session_context_max_entries", 0),
+        ("session_context_max_chars", 0),
         ("worker_poll_interval_ms", 0),
         ("worker_stale_after_seconds", 0),
         ("worker_max_concurrent_datasets", 0),
@@ -761,6 +767,26 @@ def test_build_config_fingerprint_matches_settings_method() -> None:
     settings = make_settings()
 
     assert build_config_fingerprint(settings) == settings.config_fingerprint()
+
+
+def test_session_context_limits_are_excluded_from_config_fingerprint() -> None:
+    """SM-604: SESSION_CONTEXT_MAX_* only affects Recall RAG composition, not
+    Cognify/Remember/PipelineRun work identity -- it must never enter the
+    fingerprint, and a Query already records the exact SessionEntry ids used
+    instead of relying on these limits being inferable later."""
+
+    baseline = make_settings()
+    changed = make_settings(
+        session_context_max_entries=baseline.session_context_max_entries + 5,
+        session_context_max_chars=baseline.session_context_max_chars + 5000,
+    )
+
+    assert build_config_fingerprint(baseline) == build_config_fingerprint(changed)
+
+    payload = build_config_fingerprint_payload(changed)
+    canonical = canonical_config_fingerprint_payload(payload)
+    assert "session_context" not in payload
+    assert "session" not in canonical
 
 
 def test_fingerprint_payload_has_schema_version_and_prompt_versions() -> None:

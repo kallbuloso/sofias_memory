@@ -1,7 +1,8 @@
-"""SessionEntry-specific PostgreSQL repository (ADR-0012, SM-601/SM-603)."""
+"""SessionEntry-specific PostgreSQL repository (ADR-0012, SM-601/SM-603/SM-604)."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import cast
 from uuid import UUID
 
@@ -75,3 +76,43 @@ class SessionEntryRepository:
         )
         result = await self._session.scalar(statement)
         return int(result or 0)
+
+    async def list_recent_for_context(
+        self,
+        session_id: UUID,
+        *,
+        limit: int,
+    ) -> list[SessionEntry]:
+        """Newest-first candidates for Recall Session Context selection
+        (SM-604), bounded to at most ``limit`` rows -- the selection
+        algorithm never needs more than ``SESSION_CONTEXT_MAX_ENTRIES``
+        candidates regardless of how much history a Session has."""
+
+        statement = (
+            select(SessionEntry)
+            .where(SessionEntry.session_id == session_id)
+            .order_by(SessionEntry.created_at.desc(), SessionEntry.id.desc())
+            .limit(limit)
+        )
+        result = await self._session.scalars(statement)
+        return list(result)
+
+    async def list_by_ids_for_session(
+        self,
+        session_id: UUID,
+        entry_ids: Sequence[UUID],
+    ) -> list[SessionEntry]:
+        """Scoped provenance hydration primitive (SM-604 SS 31): every row
+        returned is guaranteed to belong to ``session_id`` because the
+        filter is part of the query itself, never a post-hoc check against
+        a bare ``WHERE id IN (...)`` result -- callers must never trust a
+        stored id array to authorize hydration by itself."""
+
+        if not entry_ids:
+            return []
+        statement = select(SessionEntry).where(
+            SessionEntry.session_id == session_id,
+            SessionEntry.id.in_(entry_ids),
+        )
+        result = await self._session.scalars(statement)
+        return list(result)

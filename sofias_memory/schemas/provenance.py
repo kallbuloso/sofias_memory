@@ -124,6 +124,19 @@ class QueryProvenanceReference(BaseModel):
     source_name: str | None
 
 
+class SessionContextProvenanceItem(BaseModel):
+    """One SessionEntry used in this Query's RAG generation, safely
+    re-hydrated and scoped to the Query's own Session. Ordered exactly as
+    ``Query.session_context_entry_ids`` (oldest -> newest)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_id: UUID
+    role: str | None
+    content: str | None
+    available: bool
+
+
 class QueryProvenanceResult(BaseModel):
     """Audit metadata and safely re-hydrated references for one past query."""
 
@@ -137,3 +150,5 @@ class QueryProvenanceResult(BaseModel):
     model: str | None
     created_at: datetime
     references: list[QueryProvenanceReference]
+    session_uuid: UUID | None
+    session_context: list[SessionContextProvenanceItem]

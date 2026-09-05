@@ -193,6 +193,8 @@ class Settings(BaseSettings):
     recall_default_top_k: int = Field(default=12, gt=0, alias="RECALL_DEFAULT_TOP_K")
     recall_max_top_k: int = Field(default=100, gt=0, alias="RECALL_MAX_TOP_K")
     recall_rrf_k: int = Field(default=60, gt=0, alias="RECALL_RRF_K")
+    session_context_max_entries: int = Field(default=20, ge=1, alias="SESSION_CONTEXT_MAX_ENTRIES")
+    session_context_max_chars: int = Field(default=16000, ge=1, alias="SESSION_CONTEXT_MAX_CHARS")
 
     graph_subgraph_max_depth: int = Field(default=3, gt=0, alias="GRAPH_SUBGRAPH_MAX_DEPTH")
     graph_subgraph_max_relations: int = Field(

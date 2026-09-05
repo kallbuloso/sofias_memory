@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from sofias_memory.domain import normalize_session_id
+
 RecallMode = Literal["chunks", "rag", "summaries", "graph", "hybrid", "triplets"]
 
 
@@ -70,13 +72,31 @@ class RecallRequest(BaseModel):
     )
     session_id: str | None = Field(
         default=None,
-        max_length=255,
-        description="Optional caller-supplied session identifier, stored for correlation only.",
+        description=(
+            "Optional caller-supplied Session external key. When present, the "
+            "Session is resolved or lazily created (rejected if archived) and "
+            "the resulting Query is associated with it -- this is a first-class "
+            "association, not mere correlation metadata."
+        ),
+    )
+    include_session_context: bool = Field(
+        default=False,
+        description=(
+            "Opt-in: inject a bounded snapshot of this Session's most recent "
+            "SessionEntries into RAG generation. Only valid when session_id is "
+            "set, mode=rag, and only_context=false; any other combination is "
+            "400 INVALID_REQUEST. Never silently ignored."
+        ),
     )
     filters: RecallFilters = Field(
         default_factory=RecallFilters,
         description="Optional fixed filters applied to chunk retrieval.",
     )
+
+    @field_validator("session_id")
+    @classmethod
+    def normalize_session_id_field(cls, value: str | None) -> str | None:
+        return normalize_session_id(value)
 
     @field_validator("query")
     @classmethod
@@ -207,3 +227,10 @@ class RecallResult(BaseModel):
         default_factory=list, description="Relations returned by graph/triplets/hybrid modes."
     )
     timings_ms: dict[str, int] = Field(description="Per-stage timing breakdown in milliseconds.")
+    session_uuid: UUID | None = Field(
+        default=None,
+        description=(
+            "The Session this Recall was associated with (resolved or lazily "
+            "created), or null when no session_id was supplied."
+        ),
+    )

@@ -707,6 +707,9 @@ Comprovar:
 - seleção bounded determinística;
 - nenhuma entry truncada;
 - snapshot não inclui entry criada depois da admission;
+- archive depois da admission não cancela o Recall em andamento;
+- sem hits de knowledge e sem Session Context selecionado: resposta padrão de ausência de evidência, LLM não é chamado;
+- sem hits de knowledge mas com Session Context selecionado: LLM é chamado, `context`/`references` do `RecallResult` ficam vazios, e `Query.session_context_entry_ids` permanece populado;
 - retrieval permanece inalterado;
 - provenance registra IDs exatos;
 - provenance fail-safe contra cross-Session mismatch;

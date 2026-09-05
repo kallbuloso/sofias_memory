@@ -12,8 +12,14 @@ from uuid import UUID, uuid4
 
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import Settings
-from sofias_memory.domain import DatasetStatus
-from sofias_memory.infrastructure.postgres.models import Dataset, Query
+from sofias_memory.domain import (
+    DatasetStatus,
+    SessionContextCandidate,
+    SessionStatus,
+    render_session_context_block,
+    select_session_context,
+)
+from sofias_memory.infrastructure.postgres.models import Dataset, Query, Session, SessionEntry
 from sofias_memory.infrastructure.postgres.repositories.chunks import RetrievedChunk
 from sofias_memory.infrastructure.postgres.repositories.entities import RecalledEntity
 from sofias_memory.infrastructure.postgres.repositories.relation_evidence import (
@@ -26,7 +32,7 @@ from sofias_memory.infrastructure.postgres.repositories.summaries import (
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
-from sofias_memory.schemas.common import ErrorCode
+from sofias_memory.schemas.common import ErrorCode, utc_now
 from sofias_memory.schemas.recall import (
     RecallContextItem,
     RecallEntity,
@@ -37,6 +43,7 @@ from sofias_memory.schemas.recall import (
     RecallResult,
     RecallSummaryContextItem,
 )
+from sofias_memory.services.session_entries import session_archived_error
 
 NO_EVIDENCE_ANSWER = "No sufficient evidence was found in memory to answer this query."
 REFERENCE_QUOTE_MAX_CHARS = 500
@@ -102,6 +109,17 @@ class QueryRepositoryForRecall(Protocol):
     async def add(self, query: Query) -> Query: ...
 
 
+class SessionRepositoryForRecall(Protocol):
+    async def get_or_create_by_key(self, candidate: Session) -> Session: ...
+    async def get_by_id_for_update(self, session_id: UUID) -> Session | None: ...
+
+
+class SessionEntryRepositoryForRecall(Protocol):
+    async def list_recent_for_context(
+        self, session_id: UUID, *, limit: int
+    ) -> list[SessionEntry]: ...
+
+
 class EntityRepositoryForRecall(Protocol):
     async def list_active_for_recall(
         self,
@@ -156,6 +174,8 @@ class RecallUnitOfWork(Protocol):
     relations: RelationRepositoryForRecall
     relation_evidence: RelationEvidenceRepositoryForRecall
     summaries: SummaryRepositoryForRecall
+    sessions: SessionRepositoryForRecall
+    session_entries: SessionEntryRepositoryForRecall
 
     async def __aenter__(self) -> RecallUnitOfWork: ...
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
@@ -169,6 +189,22 @@ type UnitOfWorkFactory = Callable[[], RecallUnitOfWork]
 class RecallDatasetSnapshot:
     id: UUID
     slug: str
+
+
+@dataclass(frozen=True)
+class SessionAdmission:
+    """Result of resolving/creating and locking a Session for one Recall.
+
+    ``session_context_entry_ids`` is oldest -> newest, exactly the ids
+    handed to RAG generation (``[]`` when Session Context was not
+    requested, or nothing fit the budget). ``session_context_block`` is the
+    already-rendered text for that same selection, or ``None`` when there
+    is nothing to inject.
+    """
+
+    session_uuid: UUID
+    session_context_entry_ids: list[UUID]
+    session_context_block: str | None
 
 
 @dataclass(frozen=True)
@@ -220,9 +256,11 @@ class RecallService:
         )
 
     async def recall(self, request: RecallRequest) -> RecallResult:
+        self._validate_include_session_context(request)
         self._validate_supported_mode(request)
         started_at = time.perf_counter()
         datasets = await self._resolve_datasets(request.datasets)
+        session_admission = await self._admit_session(request)
 
         embedding_started_at = time.perf_counter()
         query_embedding = await self._embed_query(request.query)
@@ -235,6 +273,7 @@ class RecallService:
                 query_embedding=query_embedding,
                 embedding_ms=embedding_ms,
                 started_at=started_at,
+                session_admission=session_admission,
             )
 
         retrieval_started_at = time.perf_counter()
@@ -261,7 +300,7 @@ class RecallService:
         )
         references = all_references if request.include_references else []
         generation_started_at = time.perf_counter()
-        answer = await self._answer(request, hits, graph_hydration)
+        answer = await self._answer(request, hits, graph_hydration, session_admission)
         generation_ms = elapsed_ms(generation_started_at)
         timings_ms = {
             "embedding": embedding_ms,
@@ -276,6 +315,7 @@ class RecallService:
             answer=answer,
             references=all_references,
             timings_ms=timings_ms,
+            session_admission=session_admission,
         )
         return RecallResult(
             query_id=query_id,
@@ -286,7 +326,35 @@ class RecallService:
             entities=graph_hydration.entities,
             relations=graph_hydration.relations,
             timings_ms=timings_ms,
+            session_uuid=session_admission.session_uuid if session_admission else None,
         )
+
+    def _validate_include_session_context(self, request: RecallRequest) -> None:
+        """Feature Contract SS 7/11.3: `include_session_context=true` is only
+        ever valid for `session_id != null, mode == rag, only_context ==
+        false`. Enforced here -- an application-level check, deliberately
+        not a Pydantic model_validator -- so an invalid combination always
+        surfaces as `400 INVALID_REQUEST`, not an incidental `422`, and so
+        it runs before any dataset lookup, Session admission, or external
+        call."""
+
+        if not request.include_session_context:
+            return
+        if request.session_id is None or request.mode != "rag" or request.only_context:
+            raise SofiasMemoryError(
+                code=ErrorCode.INVALID_REQUEST,
+                status_code=HTTPStatus.BAD_REQUEST,
+                message=(
+                    "include_session_context requires session_id, mode='rag', "
+                    "and only_context=false."
+                ),
+                details={
+                    "include_session_context": True,
+                    "session_id": request.session_id is not None,
+                    "mode": request.mode,
+                    "only_context": request.only_context,
+                },
+            )
 
     def _validate_supported_mode(self, request: RecallRequest) -> None:
         if request.top_k is not None and request.top_k > self._settings.recall_max_top_k:
@@ -295,6 +363,64 @@ class RecallService:
                 status_code=HTTPStatus.BAD_REQUEST,
                 message="Recall top_k exceeds the configured maximum.",
                 details={"top_k": request.top_k},
+            )
+
+    async def _admit_session(self, request: RecallRequest) -> SessionAdmission | None:
+        """Feature Contract SS 9/11: lazy Session resolution, admission
+        barrier, and (opt-in) Session Context snapshot -- one short
+        transaction, committed *before* embeddings/retrieval/Neo4j/LLM ever
+        run (SS 12). The Session row lock (`get_by_id_for_update`, the same
+        primitive `archive`/`restore`/SessionEntry append already use) is
+        what linearizes this against a concurrent archive."""
+
+        if request.session_id is None:
+            return None
+
+        now = utc_now()
+        candidate = Session(
+            id=uuid4(),
+            key=request.session_id,
+            name=None,
+            status=SessionStatus.ACTIVE,
+            metadata_={},
+            created_at=now,
+            updated_at=now,
+            archived_at=None,
+        )
+        async with self._unit_of_work_factory() as uow:
+            resolved = await uow.sessions.get_or_create_by_key(candidate)
+            session = await uow.sessions.get_by_id_for_update(resolved.id)
+            assert session is not None  # noqa: S101 - just resolved/created above
+            if session.status == SessionStatus.ARCHIVED:
+                raise session_archived_error(session.id)
+
+            session_context_entry_ids: list[UUID] = []
+            session_context_block: str | None = None
+            if request.include_session_context:
+                recent = await uow.session_entries.list_recent_for_context(
+                    session.id,
+                    limit=self._settings.session_context_max_entries,
+                )
+                candidates = [
+                    SessionContextCandidate(
+                        entry_id=entry.id, role=entry.role, content=entry.content
+                    )
+                    for entry in recent
+                ]
+                selected = select_session_context(
+                    candidates,
+                    max_entries=self._settings.session_context_max_entries,
+                    max_chars=self._settings.session_context_max_chars,
+                )
+                if selected:
+                    session_context_entry_ids = [candidate.entry_id for candidate in selected]
+                    session_context_block = render_session_context_block(selected)
+
+            await uow.commit()
+            return SessionAdmission(
+                session_uuid=session.id,
+                session_context_entry_ids=session_context_entry_ids,
+                session_context_block=session_context_block,
             )
 
     async def _resolve_datasets(self, slugs: list[str]) -> list[RecallDatasetSnapshot]:
@@ -333,6 +459,7 @@ class RecallService:
         query_embedding: list[float],
         embedding_ms: int,
         started_at: float,
+        session_admission: SessionAdmission | None,
     ) -> RecallResult:
         retrieval_started_at = time.perf_counter()
         async with self._unit_of_work_factory() as uow:
@@ -356,6 +483,7 @@ class RecallService:
             answer=None,
             references=[],
             timings_ms=timings_ms,
+            session_admission=session_admission,
         )
         return RecallResult(
             query_id=query_id,
@@ -366,6 +494,7 @@ class RecallService:
             entities=[],
             relations=[],
             timings_ms=timings_ms,
+            session_uuid=session_admission.session_uuid if session_admission else None,
         )
 
     async def _vector_search(
@@ -482,7 +611,11 @@ class RecallService:
         request: RecallRequest,
         hits: Sequence[RecallChunkHit],
         graph_hydration: GraphRecallHydration,
+        session_admission: SessionAdmission | None,
     ) -> str | None:
+        session_context_block = (
+            session_admission.session_context_block if session_admission else None
+        )
         if request.mode in {"chunks", "triplets"} or request.only_context:
             return None
         if (
@@ -493,12 +626,16 @@ class RecallService:
             return NO_EVIDENCE_ANSWER
         if request.mode == "hybrid" and not hits:
             return NO_EVIDENCE_ANSWER
-        if request.mode == "rag" and not hits:
+        if request.mode == "rag" and not hits and session_context_block is None:
+            # Feature Contract SS 27: with no knowledge hits, generation is
+            # normally skipped -- but a selected Session Context is itself
+            # valid generation input, so this early exit only applies when
+            # there is nothing at all (no hits, no Session Context).
             return NO_EVIDENCE_ANSWER
         try:
             return await self._rag_answer_client.answer(
                 request.query,
-                answer_context(request, hits, graph_hydration),
+                answer_context(request, hits, graph_hydration, session_context_block),
             )
         except SofiasMemoryError:
             raise
@@ -513,6 +650,7 @@ class RecallService:
         answer: str | None,
         references: Sequence[RecallReference],
         timings_ms: dict[str, int],
+        session_admission: SessionAdmission | None,
     ) -> UUID:
         query_id = uuid4()
         query = Query(
@@ -524,6 +662,10 @@ class RecallService:
             references=audit_references(references),
             timings=timings_ms,
             model=self._settings.llm_model if generated_with_llm(request, answer) else None,
+            session_id=session_admission.session_uuid if session_admission else None,
+            session_context_entry_ids=(
+                session_admission.session_context_entry_ids if session_admission else []
+            ),
         )
         async with self._unit_of_work_factory() as uow:
             await uow.queries.add(query)
@@ -726,12 +868,28 @@ def answer_context(
     request: RecallRequest,
     hits: Sequence[RecallChunkHit],
     graph_hydration: GraphRecallHydration,
+    session_context_block: str | None = None,
 ) -> str:
+    """The full text placed inside the RAG client's own
+    ``<untrusted_context>`` wrapper (SS 48: this composition happens
+    entirely on our side; the client/prompt are unchanged).
+
+    ``session_context_block`` is only ever non-``None`` for ``mode=rag``
+    (SS 7 forbids the combination for every other mode), so graph/hybrid
+    composition is untouched.
+    """
+
     if request.mode == "graph":
         return graph_context(graph_hydration)
     if request.mode == "hybrid":
         return hybrid_context(hits, graph_hydration)
-    return rag_context(hits)
+    knowledge = rag_context(hits)
+    if session_context_block is None:
+        return knowledge
+    sections = [f"[SESSION CONTEXT]\n{session_context_block}"]
+    if knowledge:
+        sections.append(f"[KNOWLEDGE CONTEXT]\n{knowledge}")
+    return "\n\n".join(sections)
 
 
 def audit_references(references: Sequence[RecallReference]) -> dict[str, object]:

@@ -25,6 +25,13 @@ from sofias_memory.domain.pipeline_lifecycle import (
     validate_run_transition,
     validate_step_transition,
 )
+from sofias_memory.domain.session_context import (
+    SESSION_CONTEXT_BLOCK_SEPARATOR,
+    SessionContextCandidate,
+    render_session_context_block,
+    render_session_context_entry,
+    select_session_context,
+)
 from sofias_memory.domain.session_entry_external_id import (
     SESSION_ENTRY_EXTERNAL_ID_MAX_LENGTH,
     InvalidSessionEntryExternalIdError,
@@ -38,6 +45,7 @@ from sofias_memory.domain.session_id import (
 
 __all__ = [
     "RUN_TRANSITIONS",
+    "SESSION_CONTEXT_BLOCK_SEPARATOR",
     "SESSION_ENTRY_EXTERNAL_ID_MAX_LENGTH",
     "SESSION_ID_MAX_LENGTH",
     "STEP_TRANSITIONS",
@@ -55,12 +63,16 @@ __all__ = [
     "PipelineStepTransitionError",
     "PipelineTransitionError",
     "PipelineType",
+    "SessionContextCandidate",
     "SessionStatus",
     "SourceKind",
     "SourceStatus",
     "SummaryTargetType",
     "normalize_session_entry_external_id",
     "normalize_session_id",
+    "render_session_context_block",
+    "render_session_context_entry",
+    "select_session_context",
     "validate_progress",
     "validate_run_transition",
     "validate_step_transition",

@@ -17,6 +17,7 @@ from sofias_memory.infrastructure.postgres.models import (
     Entity,
     Query,
     Relation,
+    SessionEntry,
     Source,
 )
 from sofias_memory.infrastructure.postgres.repositories.chunks import RetrievedChunk
@@ -189,6 +190,7 @@ class FakeStore:
         self.relations: list[Relation] = []
         self.evidence: list[RecalledRelationEvidence] = []
         self.queries: list[Query] = []
+        self.session_entries: list[SessionEntry] = []
 
 
 class FakeDatasetRepository:
@@ -321,6 +323,21 @@ class FakeQueryRepository:
         return next((q for q in self._store.queries if q.id == query_id), None)
 
 
+class FakeSessionEntryRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def list_by_ids_for_session(
+        self, session_id: UUID, entry_ids: list[UUID]
+    ) -> list[SessionEntry]:
+        ids = set(entry_ids)
+        return [
+            entry
+            for entry in self._store.session_entries
+            if entry.session_id == session_id and entry.id in ids
+        ]
+
+
 class FakeUnitOfWork:
     def __init__(self, store: FakeStore) -> None:
         self.datasets = FakeDatasetRepository(store)
@@ -331,6 +348,7 @@ class FakeUnitOfWork:
         self.relations = FakeRelationRepository(store)
         self.relation_evidence = FakeRelationEvidenceRepository(store)
         self.queries = FakeQueryRepository(store)
+        self.session_entries = FakeSessionEntryRepository(store)
 
     async def __aenter__(self) -> FakeUnitOfWork:
         return self
@@ -627,6 +645,8 @@ def make_query(
     query_id: UUID | None = None,
     dataset_ids: list[UUID] | None = None,
     references_items: list[dict[str, object]] | None = None,
+    session_id: UUID | None = None,
+    session_context_entry_ids: list[UUID] | None = None,
 ) -> Query:
     return Query(
         id=query_id or uuid4(),
@@ -637,6 +657,26 @@ def make_query(
         references={"items": references_items or []},
         timings={"total": 10},
         model="gpt-5-mini",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        session_id=session_id,
+        session_context_entry_ids=session_context_entry_ids or [],
+    )
+
+
+def make_session_entry(
+    session_id: UUID,
+    *,
+    entry_id: UUID | None = None,
+    role: str = "user",
+    content: str = "Earlier turn content.",
+) -> SessionEntry:
+    return SessionEntry(
+        id=entry_id or uuid4(),
+        session_id=session_id,
+        external_id=None,
+        role=role,
+        content=content,
+        metadata_={},
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
@@ -733,3 +773,125 @@ async def test_provenance_query_does_not_depend_on_neo4j(tmp_path: Path) -> None
     signature = inspect.signature(ProvenanceService.__init__)
     assert "graph_client" not in signature.parameters
     assert "neo4j" not in str(signature).lower()
+
+
+# --- PROVENANCE QUERY SESSION CONTEXT (SM-604) -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provenance_query_without_session_returns_empty_session_context(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    query = make_query()
+    store.queries.append(query)
+    service = service_for(tmp_path, store)
+
+    result = await service.query(query.id)
+
+    assert result.session_uuid is None
+    assert result.session_context == []
+
+
+@pytest.mark.asyncio
+async def test_provenance_query_with_session_but_no_context_ids_returns_empty(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    session_id = uuid4()
+    query = make_query(session_id=session_id)
+    store.queries.append(query)
+    service = service_for(tmp_path, store)
+
+    result = await service.query(query.id)
+
+    assert result.session_uuid == session_id
+    assert result.session_context == []
+
+
+@pytest.mark.asyncio
+async def test_provenance_query_hydrates_session_context_in_stored_order(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    session_id = uuid4()
+    older = make_session_entry(session_id, role="user", content="What is memory?")
+    newer = make_session_entry(session_id, role="assistant", content="It is durable.")
+    store.session_entries.extend([older, newer])
+    query = make_query(session_id=session_id, session_context_entry_ids=[older.id, newer.id])
+    store.queries.append(query)
+    service = service_for(tmp_path, store)
+
+    result = await service.query(query.id)
+
+    assert result.session_uuid == session_id
+    assert [item.entry_id for item in result.session_context] == [older.id, newer.id]
+    assert [item.available for item in result.session_context] == [True, True]
+    assert result.session_context[0].role == "user"
+    assert result.session_context[0].content == "What is memory?"
+    assert result.session_context[1].role == "assistant"
+    assert result.session_context[1].content == "It is durable."
+
+
+@pytest.mark.asyncio
+async def test_provenance_query_missing_session_entry_is_unavailable_not_dropped(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    session_id = uuid4()
+    surviving = make_session_entry(session_id)
+    deleted_id = uuid4()
+    store.session_entries.append(surviving)
+    query = make_query(session_id=session_id, session_context_entry_ids=[deleted_id, surviving.id])
+    store.queries.append(query)
+    service = service_for(tmp_path, store)
+
+    result = await service.query(query.id)
+
+    assert len(result.session_context) == 2
+    assert result.session_context[0].entry_id == deleted_id
+    assert result.session_context[0].available is False
+    assert result.session_context[0].role is None
+    assert result.session_context[0].content is None
+    assert result.session_context[1].entry_id == surviving.id
+    assert result.session_context[1].available is True
+
+
+@pytest.mark.asyncio
+async def test_provenance_query_cross_session_entry_never_leaks(tmp_path: Path) -> None:
+    store = FakeStore()
+    owning_session_id = uuid4()
+    other_session_id = uuid4()
+    foreign_entry = make_session_entry(
+        other_session_id, content="Belongs to a different session entirely."
+    )
+    store.session_entries.append(foreign_entry)
+    query = make_query(session_id=owning_session_id, session_context_entry_ids=[foreign_entry.id])
+    store.queries.append(query)
+    service = service_for(tmp_path, store)
+
+    result = await service.query(query.id)
+
+    assert len(result.session_context) == 1
+    assert result.session_context[0].entry_id == foreign_entry.id
+    assert result.session_context[0].available is False
+    assert result.session_context[0].role is None
+    assert result.session_context[0].content is None
+
+
+@pytest.mark.asyncio
+async def test_provenance_query_null_session_with_stray_ids_hydrates_nothing(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    stray_id = uuid4()
+    query = make_query(session_id=None, session_context_entry_ids=[stray_id])
+    store.queries.append(query)
+    service = service_for(tmp_path, store)
+
+    result = await service.query(query.id)
+
+    assert result.session_uuid is None
+    assert len(result.session_context) == 1
+    assert result.session_context[0].entry_id == stray_id
+    assert result.session_context[0].available is False

@@ -23,6 +23,7 @@ from sofias_memory.infrastructure.postgres.models import (
     Entity,
     Query,
     Relation,
+    SessionEntry,
     Source,
 )
 from sofias_memory.infrastructure.postgres.repositories.chunks import RetrievedChunk
@@ -39,6 +40,7 @@ from sofias_memory.schemas.provenance import (
     QueryProvenanceResult,
     RelationEvidenceItem,
     RelationProvenanceResult,
+    SessionContextProvenanceItem,
     SourceProvenanceChunk,
     SourceProvenanceDocument,
     SourceProvenanceResult,
@@ -105,6 +107,12 @@ class QueryRepositoryForProvenance(Protocol):
     async def get_by_id(self, query_id: UUID) -> Query | None: ...
 
 
+class SessionEntryRepositoryForProvenance(Protocol):
+    async def list_by_ids_for_session(
+        self, session_id: UUID, entry_ids: Sequence[UUID]
+    ) -> list[SessionEntry]: ...
+
+
 class ProvenanceUnitOfWork(Protocol):
     datasets: DatasetRepositoryForProvenance
     sources: SourceRepositoryForProvenance
@@ -114,6 +122,7 @@ class ProvenanceUnitOfWork(Protocol):
     relations: RelationRepositoryForProvenance
     relation_evidence: RelationEvidenceRepositoryForProvenance
     queries: QueryRepositoryForProvenance
+    session_entries: SessionEntryRepositoryForProvenance
 
     async def __aenter__(self) -> ProvenanceUnitOfWork: ...
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
@@ -286,6 +295,8 @@ class ProvenanceService:
                 )
                 references.append(_reference_from_item(item, hydrated))
 
+            session_context = await _hydrate_session_context(uow, query)
+
             return QueryProvenanceResult(
                 query_id=query.id,
                 query_text=query.query_text,
@@ -295,7 +306,47 @@ class ProvenanceService:
                 model=query.model,
                 created_at=query.created_at,
                 references=references,
+                session_uuid=query.session_id,
+                session_context=session_context,
             )
+
+
+async def _hydrate_session_context(
+    uow: ProvenanceUnitOfWork,
+    query: Query,
+) -> list[SessionContextProvenanceItem]:
+    """SM-604 SS 31/32: a stored ``session_context_entry_ids`` id never
+    authorizes hydration by itself. Every position is preserved for every
+    stored id; only entries provably scoped to ``query.session_id`` (matched
+    inside the repository query itself, not by a bare ``WHERE id IN (...)``
+    followed by trusting the caller) come back ``available=True``.
+    """
+
+    entry_ids = list(query.session_context_entry_ids or [])
+    if not entry_ids:
+        return []
+
+    if query.session_id is None:
+        # Defensive: never hydrate from a legacy/corrupted array with no
+        # owning Session, even if it happens to be non-empty.
+        return [
+            SessionContextProvenanceItem(
+                entry_id=entry_id, role=None, content=None, available=False
+            )
+            for entry_id in entry_ids
+        ]
+
+    hydrated = await uow.session_entries.list_by_ids_for_session(query.session_id, entry_ids)
+    by_id = {entry.id: entry for entry in hydrated}
+    return [
+        SessionContextProvenanceItem(
+            entry_id=entry_id,
+            role=by_id[entry_id].role if entry_id in by_id else None,
+            content=by_id[entry_id].content if entry_id in by_id else None,
+            available=entry_id in by_id,
+        )
+        for entry_id in entry_ids
+    ]
 
 
 class _ReferenceItem:

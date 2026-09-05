@@ -160,11 +160,36 @@ def test_session_entry_routes_present_with_exact_methods_and_no_mutation() -> No
             assert "put" not in operations
 
 
-def test_recall_session_context_surface_not_yet_introduced() -> None:
-    """SM-604 scope, explicitly deferred by SM-603."""
+def test_recall_session_context_surface_is_present() -> None:
+    """SM-604: `include_session_context` is a first-class, documented
+    RecallRequest field (opt-in, default false) -- the SM-603 guard that
+    asserted this surface did not exist yet is superseded by this positive
+    contract."""
 
     schema = openapi_schema()
-    assert "include_session_context" not in json.dumps(schema)
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+    recall_request = schemas["RecallRequest"]
+    assert isinstance(recall_request, dict)
+    properties = recall_request["properties"]
+    assert isinstance(properties, dict)
+
+    include_session_context = properties["include_session_context"]
+    assert include_session_context["default"] is False
+    assert include_session_context["type"] == "boolean"
+    assert "session_id" in properties
+
+    recall_result = schemas["RecallResult"]
+    assert isinstance(recall_result, dict)
+    assert "session_uuid" in recall_result["properties"]
+
+    query_provenance_result = schemas["QueryProvenanceResult"]
+    assert isinstance(query_provenance_result, dict)
+    assert "session_uuid" in query_provenance_result["properties"]
+    assert "session_context" in query_provenance_result["properties"]
+    assert "SessionContextProvenanceItem" in schemas
 
 
 def test_private_routes_require_api_key_security() -> None:

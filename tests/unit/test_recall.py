@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock
@@ -14,8 +15,14 @@ from pydantic import ValidationError
 from sofias_memory.api.errors import SofiasMemoryError
 from sofias_memory.api.middleware import API_KEY_HEADER
 from sofias_memory.config import Settings
-from sofias_memory.domain import DatasetStatus
-from sofias_memory.infrastructure.postgres.models import Dataset, Query, Summary
+from sofias_memory.domain import DatasetStatus, SessionStatus
+from sofias_memory.infrastructure.postgres.models import (
+    Dataset,
+    Query,
+    Session,
+    SessionEntry,
+    Summary,
+)
 from sofias_memory.infrastructure.postgres.repositories.chunks import (
     ChunkRepository,
     RetrievedChunk,
@@ -30,7 +37,8 @@ from sofias_memory.infrastructure.postgres.repositories.summaries import (
     RetrievedDocumentSummary,
     SummaryRepository,
 )
-from sofias_memory.schemas.recall import RecallFilters, RecallRequest, RecallResult
+from sofias_memory.schemas.common import ErrorCode
+from sofias_memory.schemas.recall import RecallFilters, RecallMode, RecallRequest, RecallResult
 from sofias_memory.services.recall import (
     NO_EVIDENCE_ANSWER,
     GraphRecallRecord,
@@ -99,6 +107,8 @@ class FakeStore:
         self.relations: list[RecalledRelation] = []
         self.evidence: list[RecalledRelationEvidence] = []
         self.summaries: list[RecalledDocumentSummary] = []
+        self.sessions: list[Session] = []
+        self.session_entries: list[SessionEntry] = []
         self.commits = 0
 
 
@@ -187,6 +197,33 @@ class FakeSummaryRepository:
         return self._store.summary_vector_results[: cast(int, kwargs["limit"])]
 
 
+class FakeSessionRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def get_or_create_by_key(self, candidate: Session) -> Session:
+        existing = next((s for s in self._store.sessions if s.key == candidate.key), None)
+        if existing is not None:
+            return existing
+        self._store.sessions.append(candidate)
+        return candidate
+
+    async def get_by_id_for_update(self, session_id: UUID) -> Session | None:
+        return next((s for s in self._store.sessions if s.id == session_id), None)
+
+
+class FakeSessionEntryRepository:
+    def __init__(self, store: FakeStore) -> None:
+        self._store = store
+
+    async def list_recent_for_context(self, session_id: UUID, *, limit: int) -> list[SessionEntry]:
+        matching = [
+            entry for entry in self._store.session_entries if entry.session_id == session_id
+        ]
+        matching.sort(key=lambda entry: (entry.created_at, entry.id), reverse=True)
+        return matching[:limit]
+
+
 class FakeUnitOfWork:
     def __init__(self, store: FakeStore) -> None:
         self.datasets = FakeDatasetRepository(store)
@@ -196,6 +233,8 @@ class FakeUnitOfWork:
         self.relations = FakeRelationRepository(store)
         self.relation_evidence = FakeRelationEvidenceRepository(store)
         self.summaries = FakeSummaryRepository(store)
+        self.sessions = FakeSessionRepository(store)
+        self.session_entries = FakeSessionEntryRepository(store)
         self._store = store
 
     async def __aenter__(self) -> FakeUnitOfWork:
@@ -280,6 +319,49 @@ def retrieved_summary(
         text="Document summary about Sofias Memory.",
         score=score,
     )
+
+
+def seed_session(
+    store: FakeStore,
+    key: str,
+    *,
+    status: SessionStatus = SessionStatus.ACTIVE,
+    updated_at: datetime | None = None,
+) -> Session:
+    now = updated_at or datetime(2026, 1, 1, tzinfo=UTC)
+    session = Session(
+        id=uuid4(),
+        key=key,
+        name=None,
+        status=status,
+        metadata_={},
+        created_at=now,
+        updated_at=now,
+        archived_at=now if status == SessionStatus.ARCHIVED else None,
+    )
+    store.sessions.append(session)
+    return session
+
+
+def seed_session_entry(
+    store: FakeStore,
+    session_id: UUID,
+    *,
+    role: str = "user",
+    content: str = "Earlier turn content.",
+    created_at: datetime,
+) -> SessionEntry:
+    entry = SessionEntry(
+        id=uuid4(),
+        session_id=session_id,
+        external_id=None,
+        role=role,
+        content=content,
+        metadata_={},
+        created_at=created_at,
+    )
+    store.session_entries.append(entry)
+    return entry
 
 
 class FakeGraphRecallClient:
@@ -817,3 +899,367 @@ async def test_recall_route_returns_the_standard_envelope(
     assert payload["meta"]["request_id"]
     assert graph_response.json()["data"]["mode"] == "graph"
     assert len(injected_resources) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"session_id": None},
+        {"mode": "chunks"},
+        {"mode": "graph"},
+        {"mode": "summaries"},
+        {"mode": "triplets"},
+        {"only_context": True},
+    ],
+)
+async def test_include_session_context_rejects_every_invalid_combination(
+    tmp_path: Path, overrides: dict[str, object]
+) -> None:
+    store = FakeStore()
+    seed_dataset(store)
+    service, embedding, rag = service_for(tmp_path, store)
+    fields: dict[str, object] = {
+        "query": "memory",
+        "session_id": "conversation-1",
+        "mode": "rag",
+        "only_context": False,
+        "include_session_context": True,
+    }
+    fields.update(overrides)
+
+    with pytest.raises(SofiasMemoryError) as exc_info:
+        await service.recall(RecallRequest(**fields))
+
+    assert exc_info.value.code == ErrorCode.INVALID_REQUEST
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST
+    assert embedding.calls == []
+    assert rag.calls == []
+    assert store.queries == []
+    assert store.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_recall_missing_dataset_rejects_before_any_session_admission(
+    tmp_path: Path,
+) -> None:
+    """SM-604 final audit SS 1: Dataset resolution runs strictly before
+    Session admission. A brand-new `session_id` combined with a
+    non-existent dataset must fail with the pre-existing 404 Dataset
+    behavior and leave zero Session/Query side effects -- invalid requests
+    must never orphan a lazily-created Session."""
+
+    store = FakeStore()
+    service, embedding, rag = service_for(tmp_path, store)
+
+    with pytest.raises(SofiasMemoryError) as exc_info:
+        await service.recall(
+            RecallRequest(
+                query="memory",
+                datasets=["does-not-exist"],
+                session_id="brand-new-session",
+            )
+        )
+
+    assert exc_info.value.status_code == HTTPStatus.NOT_FOUND
+    assert embedding.calls == []
+    assert rag.calls == []
+    assert store.queries == []
+    assert store.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_recall_session_id_is_normalized_before_admission(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    service, _, _ = service_for(tmp_path, store)
+
+    result = await service.recall(RecallRequest(query="memory", session_id="  conversation-1  "))
+
+    assert result.session_uuid is not None
+    assert len(store.sessions) == 1
+    assert store.sessions[0].key == "conversation-1"
+
+
+@pytest.mark.asyncio
+async def test_recall_lazily_creates_session_and_associates_query(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    service, _, _ = service_for(tmp_path, store)
+
+    result = await service.recall(RecallRequest(query="memory", session_id="conversation-1"))
+
+    assert len(store.sessions) == 1
+    created = store.sessions[0]
+    assert result.session_uuid == created.id
+    assert store.queries[-1].session_id == created.id
+    assert store.queries[-1].session_context_entry_ids == []
+
+
+@pytest.mark.asyncio
+async def test_recall_reuses_existing_session_by_key_without_duplicating(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    existing = seed_session(store, "conversation-1")
+    service, _, _ = service_for(tmp_path, store)
+
+    result = await service.recall(RecallRequest(query="memory", session_id="conversation-1"))
+
+    assert len(store.sessions) == 1
+    assert result.session_uuid == existing.id
+    assert store.queries[-1].session_id == existing.id
+
+
+@pytest.mark.asyncio
+async def test_recall_rejects_archived_session_with_zero_side_effects(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    archived = seed_session(store, "conversation-1", status=SessionStatus.ARCHIVED)
+    service, embedding, rag = service_for(tmp_path, store)
+
+    with pytest.raises(SofiasMemoryError) as exc_info:
+        await service.recall(RecallRequest(query="memory", session_id="conversation-1"))
+
+    assert exc_info.value.code == ErrorCode.SESSION_ARCHIVED
+    assert exc_info.value.status_code == HTTPStatus.CONFLICT
+    assert embedding.calls == []
+    assert rag.calls == []
+    assert store.queries == []
+    assert len(store.sessions) == 1
+    assert store.sessions[0].id == archived.id
+
+
+@pytest.mark.asyncio
+async def test_recall_session_context_is_selected_and_injected_into_rag(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    hit = retrieved_chunk(dataset.id)
+    store.vector_results = [hit]
+    session = seed_session(store, "conversation-1")
+    older = seed_session_entry(
+        store,
+        session.id,
+        role="user",
+        content="What is Sofias Memory?",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    newer = seed_session_entry(
+        store,
+        session.id,
+        role="assistant",
+        content="It is a durable memory service.",
+        created_at=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    service, _, rag = service_for(tmp_path, store)
+
+    result = await service.recall(
+        RecallRequest(
+            query="memory",
+            mode="rag",
+            session_id="conversation-1",
+            include_session_context=True,
+        )
+    )
+
+    assert result.answer == "Grounded answer."
+    assert rag.calls
+    _, context = rag.calls[0]
+    assert "[SESSION CONTEXT]" in context
+    assert "[KNOWLEDGE CONTEXT]" in context
+    assert context.index("[SESSION CONTEXT]") < context.index("[KNOWLEDGE CONTEXT]")
+    assert older.content in context
+    assert newer.content in context
+    assert context.index(older.content) < context.index(newer.content)
+    assert store.queries[-1].session_context_entry_ids == [older.id, newer.id]
+
+
+@pytest.mark.asyncio
+async def test_recall_no_knowledge_hits_but_selected_session_context_still_calls_llm(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    seed_dataset(store)
+    session = seed_session(store, "conversation-1")
+    entry = seed_session_entry(
+        store,
+        session.id,
+        content="Prior turn.",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    service, _, rag = service_for(tmp_path, store)
+
+    result = await service.recall(
+        RecallRequest(
+            query="memory",
+            mode="rag",
+            session_id="conversation-1",
+            include_session_context=True,
+        )
+    )
+
+    assert rag.calls
+    assert result.answer == "Grounded answer."
+    assert result.context == []
+    assert result.references == []
+    assert store.queries[-1].session_context_entry_ids == [entry.id]
+
+
+@pytest.mark.asyncio
+async def test_recall_session_context_empty_when_nothing_fits_budget(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    session = seed_session(store, "conversation-1")
+    seed_session_entry(
+        store,
+        session.id,
+        content="This single entry is far too long to fit inside a tiny character budget.",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    settings = make_settings(tmp_path, session_context_max_chars=1)
+    service, _, rag = service_for(tmp_path, store, settings=settings)
+
+    result = await service.recall(
+        RecallRequest(
+            query="memory",
+            mode="rag",
+            session_id="conversation-1",
+            include_session_context=True,
+        )
+    )
+
+    assert result.answer == "Grounded answer."
+    assert rag.calls
+    _, context = rag.calls[0]
+    assert "[SESSION CONTEXT]" not in context
+    assert store.queries[-1].session_context_entry_ids == []
+
+
+@pytest.mark.asyncio
+async def test_recall_persists_session_fields_even_when_query_content_is_private(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    session = seed_session(store, "conversation-1")
+    entry = seed_session_entry(
+        store,
+        session.id,
+        content="Prior turn.",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    settings = make_settings(tmp_path, store_query_content=False)
+    service, _, _ = service_for(tmp_path, store, settings=settings)
+
+    await service.recall(
+        RecallRequest(
+            query="memory",
+            mode="rag",
+            session_id="conversation-1",
+            include_session_context=True,
+        )
+    )
+
+    persisted = store.queries[-1]
+    assert persisted.query_text is None
+    assert persisted.answer is None
+    assert persisted.session_id == session.id
+    assert persisted.session_context_entry_ids == [entry.id]
+
+
+@pytest.mark.asyncio
+async def test_recall_retrieval_is_unaffected_by_session_context(tmp_path: Path) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    session = seed_session(store, "conversation-1")
+    seed_session_entry(
+        store,
+        session.id,
+        content="Prior turn that must never leak into embeddings or lexical search.",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    service, embedding, _ = service_for(tmp_path, store)
+
+    await service.recall(
+        RecallRequest(
+            query="memory",
+            mode="rag",
+            session_id="conversation-1",
+            include_session_context=True,
+        )
+    )
+
+    assert embedding.calls == [["memory"]]
+
+
+@pytest.mark.asyncio
+async def test_recall_admission_never_touches_session_updated_at_or_creates_entries(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    dataset = seed_dataset(store)
+    store.vector_results = [retrieved_chunk(dataset.id)]
+    fixed_updated_at = datetime(2020, 1, 1, tzinfo=UTC)
+    session = seed_session(store, "conversation-1", updated_at=fixed_updated_at)
+    seed_session_entry(
+        store,
+        session.id,
+        content="Prior turn.",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    entry_count_before = len(store.session_entries)
+    service, _, _ = service_for(tmp_path, store)
+
+    await service.recall(
+        RecallRequest(
+            query="memory",
+            mode="rag",
+            session_id="conversation-1",
+            include_session_context=True,
+        )
+    )
+
+    assert store.sessions[0].updated_at == fixed_updated_at
+    assert len(store.session_entries) == entry_count_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["chunks", "rag", "summaries", "graph", "hybrid", "triplets"])
+async def test_recall_associates_session_identically_across_every_mode(
+    tmp_path: Path, mode: str
+) -> None:
+    """SM-604 final audit SS 2: with `include_session_context=false`, every
+    supported Recall mode must resolve/create the same ACTIVE Session,
+    associate the Query with it, leave `session_context_entry_ids` empty,
+    and populate `RecallResult.session_uuid` -- `summaries` in particular
+    has its own early-return code path (`_recall_summaries`) that must not
+    diverge from the others."""
+
+    store = FakeStore()
+    seed_dataset(store)
+    graph = FakeGraphRecallClient()
+    service, _, _ = service_for(tmp_path, store, graph_client=graph)
+
+    result = await service.recall(
+        RecallRequest(
+            query="memory",
+            mode=cast(RecallMode, mode),
+            session_id="conversation-1",
+            include_session_context=False,
+        )
+    )
+
+    assert len(store.sessions) == 1
+    session = store.sessions[0]
+    assert session.status == SessionStatus.ACTIVE
+    assert result.session_uuid == session.id
+    assert len(store.queries) == 1
+    persisted = store.queries[0]
+    assert persisted.session_id == session.id
+    assert persisted.session_context_entry_ids == []

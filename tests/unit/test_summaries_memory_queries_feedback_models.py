@@ -140,6 +140,8 @@ def test_queries_columns_nullable_content_and_types_are_exact() -> None:
         "references",
         "timings",
         "model",
+        "session_id",
+        "session_context_entry_ids",
         "created_at",
     ]
 
@@ -154,8 +156,21 @@ def test_queries_columns_nullable_content_and_types_are_exact() -> None:
     assert isinstance(columns["references"].type, JSONB)
     assert isinstance(columns.timings.type, JSONB)
     assert columns.created_at.type.timezone is True
+    assert columns.session_id.nullable is True
+    assert columns.session_context_entry_ids.nullable is False
+    assert columns.session_context_entry_ids.type.compile(dialect=postgresql.dialect()) == (
+        "UUID[]"
+    )
     assert "query_hash" not in columns
     assert "answer_hash" not in columns
+
+    fks = foreign_keys(Query)
+    assert fks["fk_queries_session_id_sessions"].ondelete == "SET NULL"
+    query_indexes = indexes(Query)
+    assert index_columns(query_indexes["ix_queries_session_id_created_at"]) == [
+        "session_id",
+        "created_at",
+    ]
 
 
 def test_feedback_columns_fk_score_target_and_index_are_exact() -> None:

@@ -20,6 +20,8 @@ from sofias_memory.infrastructure.postgres.repositories import (
     QueryRepository,
     RelationEvidenceRepository,
     RelationRepository,
+    SessionEntryRepository,
+    SessionRepository,
     SourceRepository,
     SummaryRepository,
 )
@@ -48,6 +50,8 @@ class PostgresUnitOfWork:
         self._queries: QueryRepository | None = None
         self._feedback: FeedbackRepository | None = None
         self._graph_outbox: GraphOutboxRepository | None = None
+        self._sessions: SessionRepository | None = None
+        self._session_entries: SessionEntryRepository | None = None
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -71,6 +75,8 @@ class PostgresUnitOfWork:
         self._queries = QueryRepository(session)
         self._feedback = FeedbackRepository(session)
         self._graph_outbox = GraphOutboxRepository(session)
+        self._sessions = SessionRepository(session)
+        self._session_entries = SessionEntryRepository(session)
         return self
 
     async def __aexit__(
@@ -171,6 +177,18 @@ class PostgresUnitOfWork:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._graph_outbox
 
+    @property
+    def sessions(self) -> SessionRepository:
+        if self._sessions is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._sessions
+
+    @property
+    def session_entries(self) -> SessionEntryRepository:
+        if self._session_entries is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._session_entries
+
     def savepoint(self) -> AsyncSessionTransaction:
         """A nested transaction (SAVEPOINT) inside this unit of work.
 
@@ -225,3 +243,5 @@ class PostgresUnitOfWork:
         self._queries = None
         self._feedback = None
         self._graph_outbox = None
+        self._sessions = None
+        self._session_entries = None

@@ -44,6 +44,8 @@ REQUIRED_TABLES = frozenset(
         "pipeline_runs",
         "pipeline_steps",
         "graph_outbox",
+        "sessions",
+        "session_entries",
     }
 )
 
@@ -186,6 +188,8 @@ def test_schema_guard_policy_constants_are_exact() -> None:
                 "pipeline_runs",
                 "pipeline_steps",
                 "graph_outbox",
+                "sessions",
+                "session_entries",
             }
         )
         == REQUIRED_TABLES

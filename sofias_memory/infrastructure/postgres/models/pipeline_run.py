@@ -63,6 +63,7 @@ class PipelineRun(Base):
         Index("ix_pipeline_runs_created_at", "created_at"),
         Index("ix_pipeline_runs_status_next_attempt_at", "status", "next_attempt_at"),
         Index("ix_pipeline_runs_retry_of_run_id", "retry_of_run_id"),
+        Index("ix_pipeline_runs_session_id", "session_id"),
         # ADR-0009 SS D's partial unique operational-run backstop, activated
         # by SM-513 (migration 0010) now that Remember -- the last
         # direct-RUNNING B4 writer -- has moved to the B5 runtime: every
@@ -120,5 +121,10 @@ class PipelineRun(Base):
     retry_of_run_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("pipeline_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    session_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="SET NULL"),
         nullable=True,
     )

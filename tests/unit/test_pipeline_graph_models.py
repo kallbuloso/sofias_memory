@@ -61,6 +61,7 @@ def test_pipeline_runs_columns_types_nullability_and_fks_are_exact() -> None:
         "finished_at",
         "next_attempt_at",
         "retry_of_run_id",
+        "session_id",
     ]
 
     columns = PipelineRun.__table__.c
@@ -104,6 +105,9 @@ def test_pipeline_runs_columns_types_nullability_and_fks_are_exact() -> None:
     assert columns.next_attempt_at.type.timezone is True
     assert columns.retry_of_run_id.nullable is True
     assert isinstance(columns.retry_of_run_id.type, PostgreSQLUUID)
+    assert columns.session_id.nullable is True
+    assert isinstance(columns.session_id.type, PostgreSQLUUID)
+    assert fks["fk_pipeline_runs_session_id_sessions"].ondelete == "SET NULL"
     assert "updated_at" not in columns
 
 
@@ -126,6 +130,7 @@ def test_pipeline_runs_checks_and_indexes_are_exact() -> None:
         "uq_pipeline_runs_idempotency_key",
         "ix_pipeline_runs_status_next_attempt_at",
         "ix_pipeline_runs_retry_of_run_id",
+        "ix_pipeline_runs_session_id",
         "uq_pipeline_runs_dataset_id_operational",
     }
     assert index_columns(model_indexes["ix_pipeline_runs_status"]) == ["status"]

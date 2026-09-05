@@ -102,6 +102,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
         "0009_graph_outbox_processing_lease.py",
         "0010_pipeline_runs_operational_unique_constraint.py",
         "0011_add_dataset_delete_pipeline_type.py",
+        "0012_create_sessions_foundation.py",
     ]
 
 

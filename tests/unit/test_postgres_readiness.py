@@ -173,7 +173,7 @@ def test_embedding_type_rejects_wrong_vector_dimension() -> None:
 
 
 def test_code_heads_loader_reads_current_alembic_head_without_shelling_out() -> None:
-    assert load_code_heads() == frozenset({"0011"})
+    assert load_code_heads() == frozenset({"0012"})
 
 
 class FakeResult:

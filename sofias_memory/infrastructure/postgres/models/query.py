@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Text
 from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
@@ -18,6 +18,7 @@ class Query(Base):
     """Persisted query audit metadata and optional content."""
 
     __tablename__ = "queries"
+    __table_args__ = (Index("ix_queries_session_id_created_at", "session_id", "created_at"),)
 
     id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
@@ -34,6 +35,16 @@ class Query(Base):
     references: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     timings: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     model: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    session_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    session_context_entry_ids: Mapped[list[UUID]] = mapped_column(
+        ARRAY(PostgreSQLUUID(as_uuid=True)),
+        nullable=False,
+        server_default=sql_text("'{}'"),
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

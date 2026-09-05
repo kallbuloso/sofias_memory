@@ -49,6 +49,7 @@ EXPECTED_UNIQUE_CONSTRAINTS = frozenset(
         "uq_datasets_slug",
         "uq_sources_dataset_id_content_sha256_version",
         "uq_chunks_document_id_generation_ordinal",
+        "uq_sessions_key",
     }
 )
 EXPECTED_CHECK_CONSTRAINTS = frozenset(
@@ -60,6 +61,11 @@ EXPECTED_CHECK_CONSTRAINTS = frozenset(
         "ck_pipeline_runs_attempt_non_negative",
         "ck_pipeline_steps_attempt_non_negative",
         "ck_graph_outbox_attempt_non_negative",
+        "ck_sessions_key_not_blank",
+        "ck_sessions_key_max_length",
+        "ck_sessions_name_max_length",
+        "ck_session_entries_external_id_not_blank",
+        "ck_session_entries_external_id_max_length",
     }
 )
 EXPECTED_FK_DELETE_POLICIES = {
@@ -71,6 +77,9 @@ EXPECTED_FK_DELETE_POLICIES = {
     "fk_relation_evidence_chunk_id_chunks": "RESTRICT",
     "fk_entity_mentions_entity_id_entities": "CASCADE",
     "fk_entity_mentions_chunk_id_chunks": "CASCADE",
+    "fk_session_entries_session_id_sessions": "CASCADE",
+    "fk_queries_session_id_sessions": "SET NULL",
+    "fk_pipeline_runs_session_id_sessions": "SET NULL",
 }
 POSTGRES_FK_DELETE_ACTION_NAMES = {
     "a": "NO ACTION",
@@ -108,6 +117,10 @@ EXPECTED_INDEXES = frozenset(
         "ix_graph_outbox_dataset_id",
         "ix_graph_outbox_aggregate",
         "ix_graph_outbox_status_processing_started_at",
+        "ix_session_entries_session_id_created_at_id",
+        "uq_session_entries_session_id_external_id",
+        "ix_queries_session_id_created_at",
+        "ix_pipeline_runs_session_id",
     }
 )
 EMBEDDING_COLUMNS = (
@@ -375,11 +388,14 @@ def test_postgres_migration_gate_from_empty_database(
     try:
         command.downgrade(config, "-1")
     except NotImplementedError:
-        # Head (0011) documents that PostgreSQL cannot drop a single native
-        # enum value, so downgrading past it is intentionally unsupported
-        # (ADR-0010 D34) -- this is the documented restriction holding, not
-        # a migration defect. The database is untouched (still at head), so
-        # there is nothing further to round-trip.
+        # 0011 documents that PostgreSQL cannot drop a single native enum
+        # value, so downgrading past that boundary is intentionally
+        # unsupported (ADR-0010 D34) -- this is the documented restriction
+        # holding, not a migration defect. Head is additive (0012), so this
+        # branch is not normally reached from head; it stays here so this
+        # test still behaves correctly if 0011 ever becomes head again (e.g.
+        # a future revision is reverted). The database is untouched (still
+        # at head), so there is nothing further to round-trip.
         asyncio.run(assert_complete_b2_schema(disposable_postgres_url, expected_revision=head))
         return
 
@@ -463,6 +479,9 @@ async def assert_complete_b2_schema(
     assert_partial_unique_idempotency_index(
         indexes["uq_pipeline_runs_idempotency_key"]["definition"]
     )
+    assert_partial_unique_session_entry_external_id_index(
+        indexes["uq_session_entries_session_id_external_id"]["definition"]
+    )
     assert embedding_types == {
         ("chunks", "embedding"): "vector(3072)",
         ("entities", "embedding"): "vector(3072)",
@@ -482,8 +501,17 @@ async def assert_last_migration_downgraded(
         revisions = await database_revisions(connection, schema=schema)
 
     assert revisions == frozenset({expected_revision})
-    assert {"pipeline_runs", "pipeline_steps", "graph_outbox"}.isdisjoint(tables)
-    assert {"datasets", "chunks", "feedback"} <= tables
+    # 0012 (SM-601) is purely additive: downgrading it removes only the
+    # Sessions foundation, never any earlier table.
+    assert {"sessions", "session_entries"}.isdisjoint(tables)
+    assert {
+        "datasets",
+        "chunks",
+        "feedback",
+        "pipeline_runs",
+        "pipeline_steps",
+        "graph_outbox",
+    } <= tables
 
 
 def assert_hnsw_halfvec_index(definition: str) -> None:
@@ -510,6 +538,13 @@ def assert_partial_unique_idempotency_index(definition: str) -> None:
     assert "(idempotency_key)" in normalized
     assert "where (idempotency_key is not null)" in normalized
     assert "payload_hash" not in normalized
+
+
+def assert_partial_unique_session_entry_external_id_index(definition: str) -> None:
+    normalized = " ".join(definition.lower().split())
+    assert "create unique index" in normalized
+    assert "(session_id, external_id)" in normalized
+    assert "where (external_id is not null)" in normalized
 
 
 def postgres_fk_delete_action_name(delete_action: str) -> str:
@@ -1372,4 +1407,4 @@ def test_schema_guard_policy_reused_by_migration_gate() -> None:
     )
     assert frozenset({"owner_id", "tenant_id"}) == FORBIDDEN_COLUMNS
     assert frozenset({"vector", "pg_trgm", "citext"}) == REQUIRED_EXTENSIONS
-    assert len(REQUIRED_TABLES) == 15
+    assert len(REQUIRED_TABLES) == 17

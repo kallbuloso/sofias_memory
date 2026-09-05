@@ -167,6 +167,8 @@ def test_base_metadata_contains_only_dataset_product_table_at_this_stage() -> No
         "queries",
         "relation_evidence",
         "relations",
+        "session_entries",
+        "sessions",
         "sources",
         "summaries",
     }

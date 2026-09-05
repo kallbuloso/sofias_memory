@@ -19,6 +19,8 @@ from sofias_memory.infrastructure.postgres.models import (
     Query,
     Relation,
     RelationEvidence,
+    Session,
+    SessionEntry,
     Source,
     Summary,
 )
@@ -61,6 +63,8 @@ __all__ = [
     "REQUIRED_EXTENSIONS",
     "Relation",
     "RelationEvidence",
+    "Session",
+    "SessionEntry",
     "Source",
     "Summary",
     "EMBEDDING_COLUMNS",

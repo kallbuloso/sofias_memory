@@ -23,6 +23,7 @@ def _apply_list_page_filters(
     statuses: list[PipelineRunStatus] | None,
     dataset_id: UUID | None,
     pipeline_type: PipelineType | None,
+    session_id: UUID | None = None,
 ) -> _SelectAny:
     """Shared predicate set for :meth:`PipelineRunRepository.list_page` and
     :meth:`PipelineRunRepository.count_page` (SM-508) -- count and list must
@@ -34,6 +35,8 @@ def _apply_list_page_filters(
         statement = statement.where(PipelineRun.dataset_id == dataset_id)
     if pipeline_type is not None:
         statement = statement.where(PipelineRun.pipeline_type == pipeline_type)
+    if session_id is not None:
+        statement = statement.where(PipelineRun.session_id == session_id)
     return statement
 
 
@@ -113,13 +116,16 @@ class PipelineRunRepository:
         statuses: list[PipelineRunStatus] | None = None,
         dataset_id: UUID | None = None,
         pipeline_type: PipelineType | None = None,
+        session_id: UUID | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[PipelineRun]:
         """Filtered, paginated listing for the Runs API (SM-508).
 
         Newest first. Filters are optional and additive; no filter means no
-        restriction on that dimension.
+        restriction on that dimension. ``session_id`` is a SM-601 foundation
+        primitive -- the Runs API does not expose it as a public filter yet
+        (SM-605).
         """
 
         statement = _apply_list_page_filters(
@@ -127,6 +133,7 @@ class PipelineRunRepository:
             statuses=statuses,
             dataset_id=dataset_id,
             pipeline_type=pipeline_type,
+            session_id=session_id,
         ).order_by(PipelineRun.created_at.desc(), PipelineRun.id.desc())
         statement = statement.limit(limit).offset(offset)
         result = await self._session.scalars(statement)
@@ -138,6 +145,7 @@ class PipelineRunRepository:
         statuses: list[PipelineRunStatus] | None = None,
         dataset_id: UUID | None = None,
         pipeline_type: PipelineType | None = None,
+        session_id: UUID | None = None,
     ) -> int:
         """Total matching rows for :meth:`list_page`'s identical filter set (SM-508)."""
 
@@ -146,6 +154,7 @@ class PipelineRunRepository:
             statuses=statuses,
             dataset_id=dataset_id,
             pipeline_type=pipeline_type,
+            session_id=session_id,
         )
         result = await self._session.scalar(statement)
         return int(result or 0)

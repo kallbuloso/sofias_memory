@@ -96,3 +96,10 @@ class GraphOutboxStatus(StrEnum):
     PROCESSING = "processing"
     DONE = "done"
     FAILED = "failed"
+
+
+class SessionStatus(StrEnum):
+    """Lifecycle status for first-class durable Sessions (ADR-0012)."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"

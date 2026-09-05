@@ -154,10 +154,30 @@ Campos mínimos:
 ```text
 id           UUID PK
 session_id   UUID FK → sessions.id
+external_id  TEXT nullable
 role         TEXT NOT NULL
 content      TEXT NOT NULL
 metadata     JSONB NOT NULL
 created_at   TIMESTAMPTZ
+```
+
+Na API:
+
+```text
+id         → entry_id
+session_id → session_uuid
+```
+
+Formato público:
+
+```text
+entry_id
+session_uuid
+external_id
+role
+content
+metadata
+created_at
 ```
 
 `SessionEntry` é append-only no v0.3.0.
@@ -179,6 +199,29 @@ tool
 O valor de `role` é apenas metadata contextual.
 
 Ele **nunca** é transformado automaticamente em role privilegiada de um provider LLM.
+
+### `external_id`
+
+`external_id` é uma identidade de correlation/idempotency opcional, fornecida pelo caller,
+para permitir append retry-safe de SessionEntry.
+
+Regras:
+
+```text
+string | null
+```
+
+- optional;
+- caller-supplied;
+- trimmed;
+- 1 a 255 caracteres quando presente;
+- case-sensitive;
+- imutável;
+- unique dentro de uma única Session;
+- o mesmo `external_id` pode existir em Sessions diferentes.
+
+Este conceito não é vinculado a nenhum caller específico (ex.: Sofia's Assistant) nem a
+qualquer noção de `Turn`. É uma primitive genérica de correlation.
 
 ---
 
@@ -388,11 +431,14 @@ Request:
 
 ```json
 {
+  "external_id": "caller-stable-id",
   "role": "user",
   "content": "Quais clientes discutimos anteriormente?",
   "metadata": {}
 }
 ```
+
+`external_id` é opcional.
 
 A operação deve verificar a Session sob transação adequada antes do insert.
 
@@ -401,6 +447,83 @@ Session archived:
 ```text
 409 SESSION_ARCHIVED
 ```
+
+### Sem `external_id`
+
+Comportamento append normal:
+
+```text
+sempre cria uma nova SessionEntry
+→ 201
+```
+
+### Com `external_id` ainda inexistente na Session
+
+```text
+cria SessionEntry
+→ 201
+```
+
+### Replay: mesmo `external_id` + mesmo payload semântico
+
+A operação resolve a SessionEntry já existente. Não cria uma segunda row.
+
+Payload semântico, para efeito deste contrato, é exatamente:
+
+```text
+role
+content
+metadata
+```
+
+`external_id` identifica a operação; `entry_id`/`created_at` gerados não entram na
+comparação.
+
+Para manter o endpoint simples e consistente como operação de criação idempotente:
+
+```text
+201
+```
+
+também no replay idempotente, retornando a mesma SessionEntry (mesmo `entry_id`).
+Não existe `200` reservado para distinguir replay de criação nova.
+
+### Mesmo `external_id` + payload semântico diferente
+
+```text
+409 IDEMPOTENCY_CONFLICT
+```
+
+A SessionEntry existente nunca é mutada. Nenhum novo ErrorCode é introduzido para este
+caso — reutiliza-se `IDEMPOTENCY_CONFLICT`, o mesmo já usado por outras operações
+idempotentes do Sofias Memory.
+
+### Concorrência
+
+Duas requisições concorrentes para:
+
+```text
+same session_uuid
+same external_id
+same payload semântico
+```
+
+devem convergir para uma única SessionEntry.
+
+Para:
+
+```text
+same session_uuid
+same external_id
+different payload semântico
+```
+
+uma requisição pode vencer a criação; a outra deve observar `409 IDEMPOTENCY_CONFLICT`.
+
+A defesa authoritative no PostgreSQL é a partial unique index
+`UNIQUE(session_id, external_id) WHERE external_id IS NOT NULL`, já criada pela
+foundation de persistência (SM-601). A aplicação desta lógica de replay/conflito no
+endpoint HTTP é responsabilidade do ticket que implementa a SessionEntry API.
 
 ---
 

@@ -386,6 +386,7 @@ GET  /api/v1/sessions/{session_uuid}/queries
 Payload mínimo:
 
 ```text
+external_id  optional
 role
 content
 metadata
@@ -398,6 +399,38 @@ Não adicionar PATCH ou DELETE.
 `role` permanece open-ended.
 
 `content` deve possuir limite público explícito e coberto por teste.
+
+`external_id`, quando presente, usa a normalização já congelada no Feature Contract
+(trim, 1..255 chars, case-sensitive, imutável, unique por Session) — não reimplementar
+essa validação de forma independente.
+
+## external_id safe replay
+
+Sem `external_id`: append normal, sempre cria uma nova SessionEntry, `201`.
+
+Com `external_id` inexistente na Session: cria SessionEntry, `201`.
+
+Com `external_id` já existente na Session:
+
+- payload semântico idêntico (`role` + `content` + `metadata`) → resolve a SessionEntry
+  existente, não cria segunda row, responde `201` com a mesma SessionEntry (mesmo
+  `entry_id`). Não introduzir `200` para distinguir replay de criação nova;
+- payload semântico diferente → `409 IDEMPOTENCY_CONFLICT`, sem mutar a SessionEntry
+  existente. Não criar novo ErrorCode; reutilizar `IDEMPOTENCY_CONFLICT`.
+
+Concorrência:
+
+- `same session_uuid` + `same external_id` + `same payload semântico` → duas requisições
+  concorrentes devem convergir para uma única SessionEntry;
+- `same session_uuid` + `same external_id` + `different payload semântico` → uma
+  requisição vence a criação, a outra observa `409 IDEMPOTENCY_CONFLICT`.
+
+A partial unique index `uq_session_entries_session_id_external_id` (SM-601) é a defesa
+authoritative no PostgreSQL para ambos os casos acima; a lógica de resolução/conflito no
+endpoint é responsabilidade do SM-603.
+
+Ausência de `external_id` continua sendo append não idempotente (comportamento normal,
+sem safe replay).
 
 ## Admission barrier
 
@@ -473,7 +506,16 @@ Comprovar:
 - role não é enum;
 - nenhuma interpretação de role como security/LLM privilege;
 - Session Queries lista somente Queries associadas;
-- SessionEntry continua ausente do Neo4j/outbox.
+- SessionEntry continua ausente do Neo4j/outbox;
+- append sem `external_id` continua não idempotente;
+- append com `external_id` novo cria normalmente;
+- replay com `external_id` + payload semântico idêntico resolve a mesma SessionEntry
+  (mesmo `entry_id`, sem segunda row, `201`);
+- `external_id` + payload semântico diferente retorna `409 IDEMPOTENCY_CONFLICT` sem
+  mutar a SessionEntry existente;
+- concorrência same-key/same-payload converge para uma única SessionEntry;
+- concorrência same-key/different-payload produz exatamente um vencedor e um
+  `409 IDEMPOTENCY_CONFLICT`.
 
 ---
 

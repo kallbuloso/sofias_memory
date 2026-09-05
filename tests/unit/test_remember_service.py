@@ -17,6 +17,7 @@ from uuid import uuid4
 import pytest
 
 from sofias_memory.api.errors import SofiasMemoryError
+from sofias_memory.pipelines.hashing import canonical_work_payload_hash
 from sofias_memory.services.remember import (
     delete_ingress_artifact,
     final_storage_content_matches,
@@ -145,6 +146,36 @@ def test_force_changes_the_work_identity() -> None:
         force=True,
     )
     assert base != forced
+
+
+def test_session_id_changes_the_work_identity_and_payload_hash() -> None:
+    """SM-605 SS 9: Session is part of Remember's semantic identity -- a
+    request differing only in session_id must never resolve to the same
+    idempotent work, and this must hold at both layers: the raw work_input
+    dict (what `same_remember_intent`'s legacy fallback also inspects) and
+    the actual `payload_hash` the submission layer compares first."""
+
+    session_a = remember_text_run_input(
+        dataset="main",
+        content_sha256="a" * 64,
+        name=None,
+        metadata={},
+        session_id="session-a",
+        mode="ingest",
+        force=False,
+    )
+    session_b = remember_text_run_input(
+        dataset="main",
+        content_sha256="a" * 64,
+        name=None,
+        metadata={},
+        session_id="session-b",
+        mode="ingest",
+        force=False,
+    )
+    assert session_a != session_b
+    assert canonical_work_payload_hash(session_a) != canonical_work_payload_hash(session_b)
+    assert not same_remember_intent(session_a, session_b)
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ from sqlalchemy.exc import IntegrityError
 
 from sofias_memory.api.errors import SofiasMemoryError
 from sofias_memory.domain import TERMINAL_RUN_STATUSES, PipelineRunStatus, PipelineType
-from sofias_memory.infrastructure.postgres.models import PipelineRun, PipelineStep
+from sofias_memory.infrastructure.postgres.models import PipelineRun, PipelineStep, Session
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.pipelines.hashing import canonical_work_payload_hash
@@ -47,6 +47,18 @@ class PipelineStepRepositoryForSubmission(Protocol):
     async def add_many(self, steps: list[PipelineStep]) -> list[PipelineStep]: ...
 
 
+class SessionRepositoryForSubmission(Protocol):
+    """SM-605: the slice a ``PreparationHook`` needs to resolve/lazily
+    create and lock a Session inside the same submission transaction as the
+    ``PipelineRun`` it will be attached to -- structurally identical to
+    ``SessionRepositoryForRecall`` (``services.recall``), reused by name
+    only, not by import, to keep this module's Protocol surface self
+    contained."""
+
+    async def get_or_create_by_key(self, candidate: Session) -> Session: ...
+    async def get_by_id_for_update(self, session_id: UUID) -> Session | None: ...
+
+
 class SubmissionUnitOfWork(Protocol):
     """Structurally identical to the slice of ``PostgresUnitOfWork`` that
     :func:`~sofias_memory.services.pipeline_lifecycle.create_run_with_steps`
@@ -57,6 +69,7 @@ class SubmissionUnitOfWork(Protocol):
 
     pipeline_runs: PipelineRunRepositoryForSubmission
     pipeline_steps: PipelineStepRepositoryForSubmission
+    sessions: SessionRepositoryForSubmission
 
     async def __aenter__(self) -> SubmissionUnitOfWork: ...
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
@@ -113,6 +126,11 @@ class SubmissionTargets:
 
     dataset_id: UUID | None
     source_id: UUID | None
+    session_id: UUID | None = None
+    """SM-605: the authoritative Session FK for this operation (``PipelineRun.
+    session_id``), resolved/locked by the hook itself inside this same
+    transaction -- ``None`` for every pipeline type that has no Session
+    concept. Defaults to ``None`` so no unrelated hook needs updating."""
 
 
 PreparationHook = Callable[[SubmissionUnitOfWork], Coroutine[None, None, SubmissionTargets]]
@@ -196,6 +214,7 @@ class _RunSnapshot:
     pipeline_type: PipelineType
     dataset_id: UUID | None
     source_id: UUID | None
+    session_id: UUID | None
     status: PipelineRunStatus
     payload_hash: str
     input: Mapping[str, JSONValue]
@@ -208,6 +227,7 @@ def _snapshot(run: PipelineRun) -> _RunSnapshot:
         pipeline_type=run.pipeline_type,
         dataset_id=run.dataset_id,
         source_id=run.source_id,
+        session_id=run.session_id,
         status=run.status,
         payload_hash=run.payload_hash,
         input=cast("Mapping[str, JSONValue]", run.input),
@@ -241,6 +261,10 @@ class SubmissionOutcome:
     source_id: UUID | None
     status: PipelineRunStatus
     created: bool
+    session_id: UUID | None = None
+    """SM-605: the authoritative ``PipelineRun.session_id`` -- for a replay
+    (``created=False``), the ORIGINAL run's persisted association, never
+    re-resolved from the new request's own ``session_id``."""
     """``True``: a brand-new ``PipelineRun`` was just committed. ``False``:
     an existing run was resolved via ``Idempotency-Key`` (any status,
     including terminal safe-replay)."""
@@ -469,6 +493,7 @@ class PipelineSubmissionService:
             source_id=existing.source_id,
             status=existing.status,
             created=False,
+            session_id=existing.session_id,
             retry_of_run_id=existing.retry_of_run_id,
         )
 
@@ -510,6 +535,7 @@ class PipelineSubmissionService:
                 steps=step_plan,
                 run_id=run_id,
                 retry_of_run_id=retry_of_run_id,
+                session_id=targets.session_id,
             )
             await uow.commit()
             new_run_id = run.id
@@ -528,6 +554,7 @@ class PipelineSubmissionService:
             source_id=current.source_id,
             status=current.status,
             created=True,
+            session_id=current.session_id,
             retry_of_run_id=current.retry_of_run_id,
         )
 

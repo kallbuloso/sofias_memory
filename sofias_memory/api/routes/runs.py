@@ -46,7 +46,8 @@ router = APIRouter(tags=["runs"])
     response_model=SuccessEnvelope[RunListResult],
     summary="List pipeline runs",
     description=(
-        "List durable PipelineRuns, paginated, optionally filtered by status, type, or dataset."
+        "List durable PipelineRuns, paginated, optionally filtered by status, type, "
+        "dataset, or the Session they are associated with."
     ),
 )
 async def list_runs(
@@ -56,6 +57,10 @@ async def list_runs(
     status: Annotated[list[PipelineRunStatus] | None, Query()] = None,
     pipeline_type: Annotated[PipelineType | None, Query(alias="type")] = None,
     dataset_id: Annotated[UUID | None, Query()] = None,
+    session_uuid: Annotated[
+        UUID | None,
+        Query(description="Filter to runs associated with this Session's structural UUID."),
+    ] = None,
 ) -> SuccessEnvelope[RunListResult]:
     service = RunService(session_factory=app_postgres_session_factory(request.app))
     result = await service.list_runs(
@@ -64,6 +69,7 @@ async def list_runs(
         statuses=status,
         dataset_id=dataset_id,
         pipeline_type=pipeline_type,
+        session_id=session_uuid,
     )
     return SuccessEnvelope[RunListResult](
         data=result,

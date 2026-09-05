@@ -37,9 +37,10 @@ from sofias_memory.domain import (
     PipelineRunStatus,
     PipelineStepStatus,
     PipelineType,
+    SessionStatus,
 )
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
-from sofias_memory.infrastructure.postgres.models import Dataset
+from sofias_memory.infrastructure.postgres.models import Dataset, Session
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
@@ -51,6 +52,7 @@ from sofias_memory.services.cognify import CognifyService
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.remember import ingress_artifact_exists, write_ingress_bytes
+from sofias_memory.services.sessions import SessionService
 from tests.unit._app_factory import create_app
 
 RUN_CONTROL_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_RUN_CONTROL_POSTGRES_TESTS"
@@ -90,6 +92,8 @@ _TEST_TABLES = (
     "pipeline_runs",
     "feedback",
     "queries",
+    "session_entries",
+    "sessions",
     "memory_entries",
     "summaries",
     "relation_evidence",
@@ -297,6 +301,7 @@ async def get_run(session_factory: AsyncSessionFactory, run_id: UUID) -> SimpleN
             attempt=run.attempt,
             source_id=run.source_id,
             dataset_id=run.dataset_id,
+            session_id=run.session_id,
             retry_of_run_id=run.retry_of_run_id,
             next_attempt_at=run.next_attempt_at,
             metrics=dict(run.metrics),
@@ -746,6 +751,206 @@ async def test_retry_of_retry_builds_lineage_chain(
     c_run = await get_run(session_factory, c_id)
     assert c_run is not None and c_run.retry_of_run_id == b_id
     assert c_run.attempt == 0
+    await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_preserves_active_session(postgres_engine: AsyncEngine, tmp_path: Path) -> None:
+    """SM-605 SS 31/32: manual retry preserves the original run's
+    authoritative `PipelineRun.session_id` FK -- never re-resolved by
+    external key -- and the child's Run API response exposes the same
+    `session_uuid`."""
+
+    from sofias_memory.services.pipeline_lifecycle import transition_run
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    session_key = f"conv-active-{uuid4().hex}"
+    response = await post_remember(
+        app,
+        {"dataset": "main", "content": "with session", "wait": False, "session_id": session_key},
+    )
+    assert response.status_code == 202
+    assert response.json()["data"]["session_uuid"] is not None
+    original_id = UUID(response.json()["data"]["run_id"])
+    original = await get_run(session_factory, original_id)
+    assert original is not None
+    assert original.session_id is not None
+
+    async with PostgresUnitOfWork(session_factory) as uow:
+        run = await uow.pipeline_runs.get_by_id_for_update(original_id)
+        assert run is not None
+        now = await uow.pipeline_runs.get_database_now()
+        transition_run(run, PipelineRunStatus.RUNNING, now=now, worker_id="w1")
+        transition_run(run, PipelineRunStatus.FAILED, now=now, error_code="X", error_message="e")
+        await uow.commit()
+
+    retry_response = await post_retry(app, original_id)
+    assert retry_response.status_code == 202
+    assert retry_response.json()["data"]["session_uuid"] == str(original.session_id)
+    child_id = UUID(retry_response.json()["data"]["run_id"])
+    child = await get_run(session_factory, child_id)
+    assert child is not None
+    assert child.session_id == original.session_id
+    await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_permitted_and_preserves_archived_session(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """SM-605 SS 33: retry never re-verifies the Session ACTIVE -- it is a
+    continuation of previously-admitted work, not a new semantic admission."""
+
+    from sofias_memory.services.pipeline_lifecycle import transition_run
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    session_key = f"conv-archived-{uuid4().hex}"
+    response = await post_remember(
+        app,
+        {
+            "dataset": "main",
+            "content": "with archived session",
+            "wait": False,
+            "session_id": session_key,
+        },
+    )
+    assert response.status_code == 202
+    original_id = UUID(response.json()["data"]["run_id"])
+    original = await get_run(session_factory, original_id)
+    assert original is not None
+    assert original.session_id is not None
+
+    await SessionService(session_factory=session_factory).archive_session(original.session_id)
+
+    async with PostgresUnitOfWork(session_factory) as uow:
+        run = await uow.pipeline_runs.get_by_id_for_update(original_id)
+        assert run is not None
+        now = await uow.pipeline_runs.get_database_now()
+        transition_run(run, PipelineRunStatus.RUNNING, now=now, worker_id="w1")
+        transition_run(run, PipelineRunStatus.FAILED, now=now, error_code="X", error_message="e")
+        await uow.commit()
+
+    retry_response = await post_retry(app, original_id)
+    assert retry_response.status_code == 202
+    child_id = UUID(retry_response.json()["data"]["run_id"])
+    child = await get_run(session_factory, child_id)
+    assert child is not None
+    assert child.session_id == original.session_id
+
+    async with session_factory() as raw_session:
+        session_row = await raw_session.get(Session, original.session_id)
+    assert session_row is not None
+    assert session_row.status == SessionStatus.ARCHIVED
+    await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_existing_child_replay_ignores_session_archived_after_creation(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """SM-605 SS 34: a repeated retry call must return the already-created
+    child via the internal `sys:retry:{original}` idempotency slot without
+    ever requiring the Session to still be ACTIVE."""
+
+    from sofias_memory.services.pipeline_lifecycle import transition_run
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    session_key = f"conv-replay-{uuid4().hex}"
+    response = await post_remember(
+        app,
+        {
+            "dataset": "main",
+            "content": "replay after archive",
+            "wait": False,
+            "session_id": session_key,
+        },
+    )
+    assert response.status_code == 202
+    original_id = UUID(response.json()["data"]["run_id"])
+    original = await get_run(session_factory, original_id)
+    assert original is not None
+    assert original.session_id is not None
+
+    async with PostgresUnitOfWork(session_factory) as uow:
+        run = await uow.pipeline_runs.get_by_id_for_update(original_id)
+        assert run is not None
+        now = await uow.pipeline_runs.get_database_now()
+        transition_run(run, PipelineRunStatus.RUNNING, now=now, worker_id="w1")
+        transition_run(run, PipelineRunStatus.FAILED, now=now, error_code="X", error_message="e")
+        await uow.commit()
+
+    first_retry = await post_retry(app, original_id)
+    assert first_retry.status_code == 202
+    first_child_id = UUID(first_retry.json()["data"]["run_id"])
+
+    await SessionService(session_factory=session_factory).archive_session(original.session_id)
+
+    second_retry = await post_retry(app, original_id)
+    assert second_retry.status_code == 202
+    assert UUID(second_retry.json()["data"]["run_id"]) == first_child_id
+    assert second_retry.json()["data"]["session_uuid"] == str(original.session_id)
+    await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retry_of_legacy_run_without_first_class_session_stays_null(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """SM-605 SS 35: a pre-v0.3.0 historical run may carry legacy textual
+    `session_id` inside `input`, but `PipelineRun.session_id` is NULL for
+    it -- retry must never infer/backfill a Session from that legacy text."""
+
+    from sofias_memory.services.pipeline_lifecycle import transition_run
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path, worker_claims=False)
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    response = await post_remember(app, {"dataset": "main", "content": "legacy row", "wait": False})
+    assert response.status_code == 202
+    assert response.json()["data"]["session_uuid"] is None
+    original_id = UUID(response.json()["data"]["run_id"])
+
+    async with postgres_engine.begin() as connection:
+        await connection.execute(
+            text(
+                "UPDATE pipeline_runs "
+                'SET input = input || \'{"session_id": "legacy-text"}\'::jsonb '
+                "WHERE id = :id"
+            ),
+            {"id": str(original_id)},
+        )
+
+    async with PostgresUnitOfWork(session_factory) as uow:
+        run = await uow.pipeline_runs.get_by_id_for_update(original_id)
+        assert run is not None
+        now = await uow.pipeline_runs.get_database_now()
+        transition_run(run, PipelineRunStatus.RUNNING, now=now, worker_id="w1")
+        transition_run(run, PipelineRunStatus.FAILED, now=now, error_code="X", error_message="e")
+        await uow.commit()
+
+    original = await get_run(session_factory, original_id)
+    assert original is not None
+    assert original.session_id is None
+    assert original.input.get("session_id") == "legacy-text"
+
+    retry_response = await post_retry(app, original_id)
+    assert retry_response.status_code == 202
+    assert retry_response.json()["data"]["session_uuid"] is None
+    child_id = UUID(retry_response.json()["data"]["run_id"])
+    child = await get_run(session_factory, child_id)
+    assert child is not None
+    assert child.session_id is None
+    assert child.input.get("session_id") == "legacy-text"
     await coordinator.stop()
 
 

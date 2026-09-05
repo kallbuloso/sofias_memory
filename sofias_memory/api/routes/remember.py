@@ -31,8 +31,15 @@ from sofias_memory.api.openapi_responses import (
     WORKER_DISABLED_503,
 )
 from sofias_memory.config import Settings
-from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
-from sofias_memory.infrastructure.postgres.models import Dataset
+from sofias_memory.domain import (
+    DatasetStatus,
+    InvalidSessionIdError,
+    PipelineRunStatus,
+    PipelineType,
+    SessionStatus,
+    normalize_session_id,
+)
+from sofias_memory.infrastructure.postgres.models import Dataset, Session
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.lifespan import (
@@ -48,7 +55,13 @@ from sofias_memory.loaders.text import (
     sanitize_upload_filename,
 )
 from sofias_memory.loaders.url import normalize_and_validate_https_url
-from sofias_memory.schemas.common import ErrorCode, JSONValue, ResponseMeta, SuccessEnvelope
+from sofias_memory.schemas.common import (
+    ErrorCode,
+    JSONValue,
+    ResponseMeta,
+    SuccessEnvelope,
+    utc_now,
+)
 from sofias_memory.schemas.remember import (
     RememberTextRequest,
     RememberTextResult,
@@ -74,6 +87,7 @@ from sofias_memory.services.remember import (
     validate_remember_mode,
     write_ingress_bytes,
 )
+from sofias_memory.services.session_entries import session_archived_error
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 IDEMPOTENCY_KEY_DESCRIPTION = (
@@ -164,7 +178,7 @@ async def remember_text(
         candidate_run_id=candidate_run_id,
         work_input=work_input,
         idempotency_key=idempotency_key,
-        prepare=_dataset_preparation_hook(payload.dataset),
+        prepare=_remember_preparation_hook(payload.dataset, payload.session_id),
     )
 
     status = await _await_if_requested(
@@ -237,7 +251,7 @@ async def remember_url(
         candidate_run_id=candidate_run_id,
         work_input=work_input,
         idempotency_key=idempotency_key,
-        prepare=_dataset_preparation_hook(payload.dataset),
+        prepare=_remember_preparation_hook(payload.dataset, payload.session_id),
     )
 
     status = await _await_if_requested(
@@ -288,7 +302,12 @@ async def remember_file(
     session_id: Annotated[
         str | None,
         Form(
-            description="Optional caller-supplied session identifier, stored for correlation only."
+            description=(
+                "Optional caller-supplied Session external key. When present, the "
+                "Session is resolved or lazily created (rejected if archived) and "
+                "the resulting PipelineRun is associated with it -- this is a "
+                "first-class association, not mere correlation metadata."
+            )
         ),
     ] = None,
     mode: Annotated[
@@ -323,6 +342,7 @@ async def remember_file(
     ] = None,
 ) -> SuccessEnvelope[RememberTextResult]:
     validate_remember_mode(mode)
+    normalized_session_id = _normalize_form_session_id(session_id)
     settings = app_settings(request.app)
     session_factory = app_postgres_session_factory(request.app)
 
@@ -341,7 +361,7 @@ async def remember_file(
         content_sha256=content_sha256,
         filename=filename,
         metadata=parsed_metadata,
-        session_id=session_id.strip() if session_id else None,
+        session_id=normalized_session_id,
         mode=mode,
         force=force,
     )
@@ -361,7 +381,7 @@ async def remember_file(
         candidate_run_id=candidate_run_id,
         work_input=work_input,
         idempotency_key=idempotency_key,
-        prepare=_dataset_preparation_hook(dataset_slug),
+        prepare=_remember_preparation_hook(dataset_slug, normalized_session_id),
     )
 
     status = await _await_if_requested(
@@ -429,7 +449,36 @@ async def _await_if_requested(
     return waited.status
 
 
-def _dataset_preparation_hook(dataset_slug: str) -> PreparationHook:
+def _normalize_form_session_id(session_id: str | None) -> str | None:
+    """SM-605 SS 7: File's multipart form has no Pydantic request body, so
+    the shared normalization primitive is applied explicitly here -- never
+    `.strip()` ad hoc -- yielding byte-for-byte the same accept/reject rules
+    Text and URL get for free from their schema's field_validator."""
+
+    try:
+        return normalize_session_id(session_id)
+    except InvalidSessionIdError as exc:
+        raise SofiasMemoryError(
+            code=ErrorCode.INVALID_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST,
+            message=str(exc),
+        ) from exc
+
+
+def _remember_preparation_hook(
+    dataset_slug: str, normalized_session_id: str | None
+) -> PreparationHook:
+    """SM-605 SS 13/14: resolves/validates the Dataset first -- a Session is
+    never lazily materialized for a request whose Dataset turns out to be
+    invalid -- then, only if a normalized `session_id` was supplied,
+    resolves/lazily-creates the Session and locks its row (the same
+    `get_or_create_by_key` + `get_by_id_for_update` admission barrier
+    Recall's own Session admission uses, SM-604) before returning both
+    targets to the shared submission transaction. Everything here runs
+    inside that one transaction; an archived Session or an invalid Dataset
+    both roll the whole attempt back with zero PipelineRun/PipelineStep rows
+    created."""
+
     async def prepare(uow: SubmissionUnitOfWork) -> SubmissionTargets:
         postgres_uow = cast(PostgresUnitOfWork, uow)
         dataset = await postgres_uow.datasets.get_by_slug(dataset_slug)
@@ -451,7 +500,28 @@ def _dataset_preparation_hook(dataset_slug: str) -> PreparationHook:
             )
         if dataset.status != DatasetStatus.ACTIVE:
             raise dataset_not_found_error(dataset_slug)
-        return SubmissionTargets(dataset_id=dataset.id, source_id=None)
+
+        session_uuid = None
+        if normalized_session_id is not None:
+            now = utc_now()
+            candidate = Session(
+                id=uuid4(),
+                key=normalized_session_id,
+                name=None,
+                status=SessionStatus.ACTIVE,
+                metadata_={},
+                created_at=now,
+                updated_at=now,
+                archived_at=None,
+            )
+            resolved = await postgres_uow.sessions.get_or_create_by_key(candidate)
+            session = await postgres_uow.sessions.get_by_id_for_update(resolved.id)
+            assert session is not None  # noqa: S101 - just resolved/created above
+            if session.status == SessionStatus.ARCHIVED:
+                raise session_archived_error(session.id)
+            session_uuid = session.id
+
+        return SubmissionTargets(dataset_id=dataset.id, source_id=None, session_id=session_uuid)
 
     return prepare
 
@@ -464,11 +534,15 @@ async def _respond(
     status: PipelineRunStatus,
 ) -> SuccessEnvelope[RememberTextResult]:
     if status == PipelineRunStatus.SUCCEEDED:
-        result = await _succeeded_result(session_factory, run_id=outcome.run_id)
+        result = await _succeeded_result(
+            session_factory, run_id=outcome.run_id, session_uuid=outcome.session_id
+        )
     elif status == PipelineRunStatus.FAILED:
         raise await _failed_run_error(session_factory, run_id=outcome.run_id)
     else:
-        result = RememberTextResult(run_id=outcome.run_id, status=status)
+        result = RememberTextResult(
+            run_id=outcome.run_id, status=status, session_uuid=outcome.session_id
+        )
         if status != PipelineRunStatus.CANCELLED:
             response.status_code = HTTPStatus.ACCEPTED
 
@@ -482,6 +556,7 @@ async def _succeeded_result(
     session_factory: AsyncSessionFactory,
     *,
     run_id: UUID,
+    session_uuid: UUID | None,
 ) -> RememberTextResult:
     metrics = await _run_metrics(session_factory, run_id=run_id)
     persisted = metrics.get(REMEMBER_RESULT_METRIC_KEY)
@@ -503,6 +578,7 @@ async def _succeeded_result(
         entities=int(persisted["entities"]) if persisted.get("entities") is not None else None,
         relations=int(persisted["relations"]) if persisted.get("relations") is not None else None,
         deduplicated=bool(persisted["deduplicated"]) if "deduplicated" in persisted else None,
+        session_uuid=session_uuid,
     )
 
 

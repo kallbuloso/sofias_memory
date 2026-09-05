@@ -23,6 +23,15 @@ class RunSummaryResult(BaseModel):
     pipeline_type: PipelineType = Field(description="Which pipeline this run executes.")
     dataset_id: UUID | None = Field(description="Dataset this run targets, if any.")
     source_id: UUID | None = Field(description="Source this run targets, if any.")
+    session_uuid: UUID | None = Field(
+        default=None,
+        description=(
+            "The Session this run is first-class associated with, if any. A "
+            "manual retry preserves the original run's association. A "
+            "pre-v0.3.0 historical run is always null here, even if its "
+            "legacy input payload contains a textual session_id."
+        ),
+    )
     status: PipelineRunStatus = Field(
         description="queued, running, succeeded, failed, cancelling, or cancelled."
     )

@@ -27,6 +27,7 @@ from sofias_memory.services.runs import (
     RunUnitOfWork,
     UnitOfWorkFactory,
     run_step_error_result,
+    run_summary_result,
 )
 from tests.unit._app_factory import create_app
 
@@ -55,6 +56,7 @@ def pipeline_run(
     pipeline_type: PipelineType = PipelineType.REMEMBER,
     dataset_id: UUID | None = None,
     source_id: UUID | None = None,
+    session_id: UUID | None = None,
     status: PipelineRunStatus = PipelineRunStatus.QUEUED,
     progress: float = 0.0,
     current_step: str | None = None,
@@ -71,6 +73,7 @@ def pipeline_run(
         pipeline_type=pipeline_type,
         dataset_id=dataset_id,
         source_id=source_id,
+        session_id=session_id,
         status=status,
         idempotency_key=None,
         payload_hash="a" * 64,
@@ -140,6 +143,7 @@ class FakePipelineRunRepository:
         statuses: list[PipelineRunStatus] | None,
         dataset_id: UUID | None,
         pipeline_type: PipelineType | None,
+        session_id: UUID | None = None,
     ) -> list[PipelineRun]:
         runs = self._store.runs
         if statuses:
@@ -148,6 +152,8 @@ class FakePipelineRunRepository:
             runs = [run for run in runs if run.dataset_id == dataset_id]
         if pipeline_type is not None:
             runs = [run for run in runs if run.pipeline_type == pipeline_type]
+        if session_id is not None:
+            runs = [run for run in runs if run.session_id == session_id]
         return sorted(runs, key=lambda run: (run.created_at, run.id), reverse=True)
 
     async def list_page(
@@ -156,11 +162,15 @@ class FakePipelineRunRepository:
         statuses: list[PipelineRunStatus] | None = None,
         dataset_id: UUID | None = None,
         pipeline_type: PipelineType | None = None,
+        session_id: UUID | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[PipelineRun]:
         ordered = self._filtered(
-            statuses=statuses, dataset_id=dataset_id, pipeline_type=pipeline_type
+            statuses=statuses,
+            dataset_id=dataset_id,
+            pipeline_type=pipeline_type,
+            session_id=session_id,
         )
         return ordered[offset : offset + limit]
 
@@ -170,9 +180,15 @@ class FakePipelineRunRepository:
         statuses: list[PipelineRunStatus] | None = None,
         dataset_id: UUID | None = None,
         pipeline_type: PipelineType | None = None,
+        session_id: UUID | None = None,
     ) -> int:
         return len(
-            self._filtered(statuses=statuses, dataset_id=dataset_id, pipeline_type=pipeline_type)
+            self._filtered(
+                statuses=statuses,
+                dataset_id=dataset_id,
+                pipeline_type=pipeline_type,
+                session_id=session_id,
+            )
         )
 
 
@@ -298,6 +314,33 @@ async def test_list_runs_filters_by_dataset_id() -> None:
     page = await service_for(store).list_runs(limit=50, offset=0, dataset_id=dataset_id)
 
     assert [item.run_id for item in page.items] == [matching.id]
+
+
+@pytest.mark.asyncio
+async def test_list_runs_filters_by_session_uuid() -> None:
+    store = FakeStore()
+    session_id = uuid4()
+    matching = pipeline_run(session_id=session_id)
+    other = pipeline_run(session_id=uuid4())
+    unassociated = pipeline_run(session_id=None)
+    store.runs.extend([matching, other, unassociated])
+
+    page = await service_for(store).list_runs(limit=50, offset=0, session_id=session_id)
+
+    assert [item.run_id for item in page.items] == [matching.id]
+    assert page.items[0].session_uuid == session_id
+    assert page.total == 1
+
+
+@pytest.mark.asyncio
+async def test_list_runs_session_uuid_valid_but_unused_returns_empty_not_404() -> None:
+    store = FakeStore()
+    store.runs.append(pipeline_run())
+
+    page = await service_for(store).list_runs(limit=50, offset=0, session_id=uuid4())
+
+    assert page.items == []
+    assert page.total == 0
 
 
 @pytest.mark.asyncio
@@ -467,6 +510,25 @@ async def test_get_run_timestamps_are_populated_for_a_finished_run() -> None:
     assert detail.finished_at == finished
 
 
+def test_run_summary_result_exposes_session_uuid_from_the_persisted_fk() -> None:
+    session_id = uuid4()
+    run = pipeline_run(session_id=session_id)
+
+    assert run_summary_result(run).session_uuid == session_id
+
+
+def test_run_summary_result_legacy_run_with_textual_input_session_id_is_null() -> None:
+    """SM-605 SS 35/59: a pre-v0.3.0 historical run may carry a legacy
+    textual `session_id` inside `input`, but `PipelineRun.session_id` (the
+    only authoritative FK) is NULL for it -- no inference/backfill ever
+    reinterprets the legacy payload as a first-class association."""
+
+    run = pipeline_run(session_id=None)
+    run.input = {"session_id": "legacy-text-session", "secret": "never-public"}
+
+    assert run_summary_result(run).session_uuid is None
+
+
 def test_run_summary_public_projection_does_not_expose_sensitive_run_fields() -> None:
     run = pipeline_run()
     result = RunSummaryResult(
@@ -585,6 +647,7 @@ async def test_runs_routes_return_envelope_require_api_key_and_reject_bad_filter
             statuses: list[PipelineRunStatus] | None = None,
             dataset_id: UUID | None = None,
             pipeline_type: PipelineType | None = None,
+            session_id: UUID | None = None,
         ) -> RunListResult:
             assert (limit, offset) == (2, 1)
             return RunListResult(
@@ -650,6 +713,58 @@ async def test_runs_routes_return_envelope_require_api_key_and_reject_bad_filter
     assert offset_negative.status_code == 422
     assert invalid_status.status_code == 422
     assert invalid_type.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_runs_route_session_uuid_filter_composes_with_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = uuid4()
+    expected_session_id = uuid4()
+    received: dict[str, object] = {}
+
+    class FakeRunService:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def list_runs(
+            self,
+            *,
+            limit: int,
+            offset: int,
+            statuses: list[PipelineRunStatus] | None = None,
+            dataset_id: UUID | None = None,
+            pipeline_type: PipelineType | None = None,
+            session_id: UUID | None = None,
+        ) -> RunListResult:
+            received["session_id"] = session_id
+            received["statuses"] = statuses
+            return RunListResult(
+                items=[run_summary(run_id)],
+                limit=limit,
+                offset=offset,
+                total=1,
+            )
+
+    monkeypatch.setattr("sofias_memory.api.routes.runs.RunService", FakeRunService)
+    app = create_app(make_settings(tmp_path), enable_postgres_readiness=False, enable_neo4j=False)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            f"/api/v1/runs?session_uuid={expected_session_id}&status=queued",
+            headers={API_KEY_HEADER: EXPECTED_API_KEY},
+        )
+        malformed = await client.get(
+            "/api/v1/runs?session_uuid=not-a-uuid",
+            headers={API_KEY_HEADER: EXPECTED_API_KEY},
+        )
+
+    assert response.status_code == 200
+    assert received["session_id"] == expected_session_id
+    assert received["statuses"] == [PipelineRunStatus.QUEUED]
+    assert malformed.status_code == 422
 
 
 @pytest.mark.asyncio

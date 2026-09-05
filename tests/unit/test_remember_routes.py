@@ -13,14 +13,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
 from sofias_memory.api.middleware import API_KEY_HEADER
 from sofias_memory.config import Settings
-from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
+from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType, SessionStatus
+from sofias_memory.infrastructure.postgres.models import Session
 from sofias_memory.schemas.common import ErrorCode
 from sofias_memory.services.pipeline_submission import (
     SubmissionOutcome,
@@ -81,6 +82,7 @@ class Recorder:
     wait_timed_out: bool = False
     submit_error: Exception | None = None
     run: FakeRun = field(default_factory=FakeRun)
+    sessions: dict[str, Session] = field(default_factory=dict)
 
 
 def install_fakes(monkeypatch: pytest.MonkeyPatch, recorder: Recorder) -> None:
@@ -101,7 +103,7 @@ def install_fakes(monkeypatch: pytest.MonkeyPatch, recorder: Recorder) -> None:
             del legacy_intent_equivalent
             if recorder.submit_error is not None:
                 raise recorder.submit_error
-            targets = await prepare(FakeSubmissionUnitOfWork())
+            targets = await prepare(FakeSubmissionUnitOfWork(recorder.sessions))
             recorder.submits.append(
                 {
                     "pipeline_type": pipeline_type,
@@ -154,6 +156,9 @@ class FakeDataset:
 
 
 class FakeSubmissionUnitOfWork:
+    def __init__(self, sessions_store: dict[str, Session] | None = None) -> None:
+        self._sessions_store = sessions_store if sessions_store is not None else {}
+
     @property
     def datasets(self) -> Any:
         class _Datasets:
@@ -167,6 +172,23 @@ class FakeSubmissionUnitOfWork:
                 return FakeDataset()
 
         return _Datasets()
+
+    @property
+    def sessions(self) -> Any:
+        store = self._sessions_store
+
+        class _Sessions:
+            async def get_or_create_by_key(self, candidate: Session) -> Session:
+                existing = store.get(candidate.key)
+                if existing is not None:
+                    return existing
+                store[candidate.key] = candidate
+                return candidate
+
+            async def get_by_id_for_update(self, session_id: UUID) -> Session | None:
+                return next((s for s in store.values() if s.id == session_id), None)
+
+        return _Sessions()
 
 
 def make_app(tmp_path: Path, **settings_overrides: object) -> Any:
@@ -463,6 +485,353 @@ async def test_remember_url_wait_false_never_fetches(
     assert not ingress_artifact_exists(tmp_path, run_id=run_id)
     assert recorder.submits[0]["work_input"]["source_kind"] == "url"
     assert "content_sha256" not in recorder.submits[0]["work_input"]
+
+
+# ---------------------------------------------------------------------------
+# SESSION (SM-605)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remember_text_without_session_id_has_null_session_uuid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember", json={"dataset": "main", "content": "hello", "wait": False}
+        )
+    assert response.status_code == 202
+    assert response.json()["data"]["session_uuid"] is None
+    assert recorder.submits[0]["targets"].session_id is None
+    assert recorder.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_remember_text_lazily_creates_session_and_targets_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={
+                "dataset": "main",
+                "content": "hello",
+                "wait": False,
+                "session_id": "  conversation-1  ",
+            },
+        )
+    assert response.status_code == 202
+    assert len(recorder.sessions) == 1
+    created = recorder.sessions["conversation-1"]
+    assert recorder.submits[0]["targets"].session_id == created.id
+    assert recorder.submits[0]["work_input"]["session_id"] == "conversation-1"
+
+
+@pytest.mark.asyncio
+async def test_remember_text_reuses_existing_active_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    existing = Session(id=uuid4(), key="conversation-1", status=SessionStatus.ACTIVE)
+    recorder.sessions["conversation-1"] = existing
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={
+                "dataset": "main",
+                "content": "hello",
+                "wait": False,
+                "session_id": "conversation-1",
+            },
+        )
+    assert response.status_code == 202
+    assert len(recorder.sessions) == 1
+    assert recorder.submits[0]["targets"].session_id == existing.id
+
+
+@pytest.mark.asyncio
+async def test_remember_text_archived_session_rejects_with_zero_run_and_response_carries_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    archived = Session(id=uuid4(), key="conversation-1", status=SessionStatus.ARCHIVED)
+    recorder.sessions["conversation-1"] = archived
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={
+                "dataset": "main",
+                "content": "hello",
+                "wait": False,
+                "session_id": "conversation-1",
+            },
+        )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "SESSION_ARCHIVED"
+    assert not recorder.submits
+
+
+@pytest.mark.asyncio
+async def test_remember_text_invalid_dataset_with_new_session_creates_neither(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SM-605 SS 14: Dataset resolution runs before Session resolution inside
+    the preparation hook -- an invalid Dataset must never leave a lazily
+    materialized Session behind."""
+
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={
+                "dataset": "missing",
+                "content": "hello",
+                "wait": False,
+                "session_id": "brand-new-session",
+            },
+        )
+    assert response.status_code == 404
+    assert recorder.sessions == {}
+    assert not recorder.submits
+
+
+@pytest.mark.asyncio
+async def test_remember_text_session_uuid_surfaces_in_succeeded_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RememberTextResult.session_uuid is read from the SubmissionOutcome
+    (authoritative), never re-derived from persisted metrics."""
+
+    recorder = Recorder()
+    session_uuid = uuid4()
+    recorder.outcome = SubmissionOutcome(
+        run_id=RUN_ID,
+        pipeline_type=PipelineType.REMEMBER,
+        dataset_id=DATASET_ID,
+        source_id=SOURCE_ID,
+        status=PipelineRunStatus.SUCCEEDED,
+        created=True,
+        session_id=session_uuid,
+    )
+    recorder.run = FakeRun(
+        id=RUN_ID,
+        metrics={
+            REMEMBER_RESULT_METRIC_KEY: {
+                "dataset_id": str(DATASET_ID),
+                "source_id": str(SOURCE_ID),
+                "document_id": str(DOCUMENT_ID),
+                "content_hash": "a" * 64,
+                "chunks": 0,
+                "entities": 0,
+                "relations": 0,
+                "deduplicated": False,
+            }
+        },
+    )
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={
+                "dataset": "main",
+                "content": "hello",
+                "wait": True,
+                "session_id": "conversation-1",
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["data"]["session_uuid"] == str(session_uuid)
+
+
+@pytest.mark.asyncio
+async def test_remember_text_queued_response_surfaces_session_uuid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    session_uuid = uuid4()
+    recorder.outcome = SubmissionOutcome(
+        run_id=RUN_ID,
+        pipeline_type=PipelineType.REMEMBER,
+        dataset_id=DATASET_ID,
+        source_id=None,
+        status=PipelineRunStatus.QUEUED,
+        created=True,
+        session_id=session_uuid,
+    )
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={
+                "dataset": "main",
+                "content": "hello",
+                "wait": False,
+                "session_id": "conversation-1",
+            },
+        )
+    assert response.status_code == 202
+    assert response.json()["data"]["session_uuid"] == str(session_uuid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_id", "expected_status"),
+    [
+        ("", 422),
+        ("   ", 422),
+        ("x" * 256, 422),
+    ],
+)
+async def test_remember_text_session_id_normalization_rejects_invalid_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_id: str, expected_status: int
+) -> None:
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={"dataset": "main", "content": "hello", "wait": False, "session_id": session_id},
+        )
+    assert response.status_code == expected_status
+    assert not recorder.submits
+
+
+@pytest.mark.asyncio
+async def test_remember_text_session_id_255_chars_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    session_id = "x" * 255
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={"dataset": "main", "content": "hello", "wait": False, "session_id": session_id},
+        )
+    assert response.status_code == 202
+    assert recorder.submits[0]["work_input"]["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_remember_text_session_id_preserves_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember",
+            json={
+                "dataset": "main",
+                "content": "hello",
+                "wait": False,
+                "session_id": "Conversation-MixedCase-1",
+            },
+        )
+    assert response.status_code == 202
+    assert recorder.submits[0]["work_input"]["session_id"] == "Conversation-MixedCase-1"
+
+
+@pytest.mark.asyncio
+async def test_remember_url_session_id_uses_shared_normalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember/url",
+            json={
+                "dataset": "main",
+                "url": "https://example.com/a",
+                "wait": False,
+                "session_id": "  conversation-1  ",
+            },
+        )
+        blank = await client.post(
+            "/api/v1/remember/url",
+            json={
+                "dataset": "main",
+                "url": "https://example.com/b",
+                "wait": False,
+                "session_id": "   ",
+            },
+        )
+    assert response.status_code == 202
+    assert recorder.submits[0]["work_input"]["session_id"] == "conversation-1"
+    assert blank.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_remember_file_session_id_uses_shared_normalization_not_bare_strip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SM-605 SS 7: File must reject a blank/too-long session_id exactly like
+    Text/URL, proving it no longer uses a bare ``.strip()``."""
+
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        trimmed = await client.post(
+            "/api/v1/remember/file",
+            data={"dataset": "main", "wait": "false", "session_id": "  conversation-1  "},
+            files={"file": ("note.txt", b"hello world", "text/plain")},
+        )
+        blank = await client.post(
+            "/api/v1/remember/file",
+            data={"dataset": "main", "wait": "false", "session_id": "   "},
+            files={"file": ("note2.txt", b"hello world", "text/plain")},
+        )
+        too_long = await client.post(
+            "/api/v1/remember/file",
+            data={"dataset": "main", "wait": "false", "session_id": "x" * 256},
+            files={"file": ("note3.txt", b"hello world", "text/plain")},
+        )
+    assert trimmed.status_code == 202
+    assert recorder.submits[0]["work_input"]["session_id"] == "conversation-1"
+    assert blank.status_code == 400
+    assert too_long.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_remember_file_session_id_normalized_before_reading_upload_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SM-605 SS 7: an invalid session_id must reject before any upload
+    bytes are read/staged -- proven by asserting zero ingress artifacts are
+    ever written for the rejected request."""
+
+    recorder = Recorder()
+    install_fakes(monkeypatch, recorder)
+    app = make_app(tmp_path)
+    async with build_client(app) as client:
+        response = await client.post(
+            "/api/v1/remember/file",
+            data={"dataset": "main", "wait": "false", "session_id": "   "},
+            files={"file": ("note.txt", b"hello world", "text/plain")},
+        )
+    assert response.status_code == 400
+    ingress_root = tmp_path / "_ingress"
+    assert not ingress_root.exists() or not any(ingress_root.iterdir())
 
 
 # ---------------------------------------------------------------------------

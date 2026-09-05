@@ -36,6 +36,7 @@ class PipelineRunRepositoryForRuns(Protocol):
         statuses: list[PipelineRunStatus] | None = None,
         dataset_id: UUID | None = None,
         pipeline_type: PipelineType | None = None,
+        session_id: UUID | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[PipelineRun]: ...
@@ -46,6 +47,7 @@ class PipelineRunRepositoryForRuns(Protocol):
         statuses: list[PipelineRunStatus] | None = None,
         dataset_id: UUID | None = None,
         pipeline_type: PipelineType | None = None,
+        session_id: UUID | None = None,
     ) -> int: ...
 
 
@@ -87,12 +89,14 @@ class RunService:
         statuses: list[PipelineRunStatus] | None = None,
         dataset_id: UUID | None = None,
         pipeline_type: PipelineType | None = None,
+        session_id: UUID | None = None,
     ) -> RunListResult:
         async with self._unit_of_work_factory() as uow:
             runs = await uow.pipeline_runs.list_page(
                 statuses=statuses,
                 dataset_id=dataset_id,
                 pipeline_type=pipeline_type,
+                session_id=session_id,
                 limit=limit,
                 offset=offset,
             )
@@ -100,6 +104,7 @@ class RunService:
                 statuses=statuses,
                 dataset_id=dataset_id,
                 pipeline_type=pipeline_type,
+                session_id=session_id,
             )
             return RunListResult(
                 items=[run_summary_result(run) for run in runs],
@@ -123,6 +128,7 @@ def run_summary_result(run: PipelineRun) -> RunSummaryResult:
         pipeline_type=run.pipeline_type,
         dataset_id=run.dataset_id,
         source_id=run.source_id,
+        session_uuid=run.session_id,
         status=run.status,
         progress=run.progress,
         current_step=run.current_step,

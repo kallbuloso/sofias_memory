@@ -85,6 +85,7 @@ class _OriginalSnapshot:
     pipeline_type: PipelineType
     dataset_id: UUID | None
     source_id: UUID | None
+    session_id: UUID | None
     input: dict[str, JSONValue]
 
 
@@ -250,6 +251,7 @@ class RunControlService:
                 pipeline_type=original.pipeline_type,
                 dataset_id=original.dataset_id,
                 source_id=original.source_id,
+                session_id=original.session_id,
                 input=input_,
             )
 
@@ -277,14 +279,21 @@ class RunControlService:
 
 def _retry_preparation_hook(original: _OriginalSnapshot) -> PreparationHook:
     async def prepare(uow: SubmissionUnitOfWork) -> SubmissionTargets:
-        # Closed, pipeline-agnostic rule (SM-514 SS 19): preserve exactly
-        # what the ORIGINAL submission already resolved as authoritative --
-        # never re-derive, never guess, never open-heuristic per type. Each
-        # pipeline's own original PreparationHook already validated these
-        # ids once; a retry is not a new semantic request, so there is
-        # nothing new to validate here.
+        # Closed, pipeline-agnostic rule (SM-514 SS 19, extended SM-605 SS
+        # 32): preserve exactly what the ORIGINAL submission already
+        # resolved as authoritative -- never re-derive, never guess, never
+        # open-heuristic per type. Each pipeline's own original
+        # PreparationHook already validated these ids once (including any
+        # Session admission/lock); a retry is not a new semantic admission,
+        # so there is nothing new to validate here -- in particular, the
+        # original's Session is never re-verified ACTIVE, and never
+        # re-resolved by external key, even if it is now archived.
         del uow
-        return SubmissionTargets(dataset_id=original.dataset_id, source_id=original.source_id)
+        return SubmissionTargets(
+            dataset_id=original.dataset_id,
+            source_id=original.source_id,
+            session_id=original.session_id,
+        )
 
     return prepare
 

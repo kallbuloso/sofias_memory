@@ -48,6 +48,7 @@ async def create_run_with_steps(
     steps: Sequence[StepPlan],
     retry_of_run_id: UUID | None = None,
     run_id: UUID | None = None,
+    session_id: UUID | None = None,
 ) -> PipelineRun:
     """Materialize a ``queued`` PipelineRun and its ``queued`` PipelineSteps.
 
@@ -64,6 +65,12 @@ async def create_run_with_steps(
     passes it through here -- the run this transaction creates then reuses
     that exact id instead of generating an unrelated one, so the worker's
     ingress lookup by ``context.run_id`` always finds what the route staged.
+
+    ``session_id`` (SM-605) is the authoritative FK to ``sessions.id``,
+    resolved by the caller's own ``PreparationHook`` inside this same
+    transaction -- never re-derived here, never inferred from ``input``.
+    Defaults to ``None`` so every pipeline type other than Remember (and
+    Remember retry) is completely unaffected.
     """
 
     run = PipelineRun(
@@ -71,6 +78,7 @@ async def create_run_with_steps(
         pipeline_type=pipeline_type,
         dataset_id=dataset_id,
         source_id=source_id,
+        session_id=session_id,
         status=PipelineRunStatus.QUEUED,
         idempotency_key=idempotency_key,
         payload_hash=payload_hash,

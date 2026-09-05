@@ -6,8 +6,15 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from sofias_memory.domain import PipelineRunStatus
+from sofias_memory.domain import PipelineRunStatus, normalize_session_id
 from sofias_memory.schemas.common import JSONValue
+
+SESSION_ID_DESCRIPTION = (
+    "Optional caller-supplied Session external key. When present, the "
+    "Session is resolved or lazily created (rejected if archived) and the "
+    "resulting PipelineRun is associated with it -- this is a first-class "
+    "association, not mere correlation metadata."
+)
 
 
 class RememberTextRequest(BaseModel):
@@ -32,11 +39,7 @@ class RememberTextRequest(BaseModel):
         default_factory=dict,
         description="Arbitrary caller-supplied metadata stored with the source.",
     )
-    session_id: str | None = Field(
-        default=None,
-        min_length=1,
-        description="Optional caller-supplied session identifier, stored for correlation only.",
-    )
+    session_id: str | None = Field(default=None, description=SESSION_ID_DESCRIPTION)
     mode: str = Field(
         default="ingest",
         description=(
@@ -57,7 +60,7 @@ class RememberTextRequest(BaseModel):
         description="Re-process even if identical content was already remembered for this dataset.",
     )
 
-    @field_validator("dataset", "name", "session_id")
+    @field_validator("dataset", "name")
     @classmethod
     def strip_non_content_fields(cls, value: str | None) -> str | None:
         if value is None:
@@ -66,6 +69,11 @@ class RememberTextRequest(BaseModel):
         if not stripped:
             raise ValueError("value must not be empty")
         return stripped
+
+    @field_validator("session_id")
+    @classmethod
+    def normalize_session_id_field(cls, value: str | None) -> str | None:
+        return normalize_session_id(value)
 
 
 class RememberUrlRequest(BaseModel):
@@ -90,11 +98,7 @@ class RememberUrlRequest(BaseModel):
         default_factory=dict,
         description="Arbitrary caller-supplied metadata stored with the source.",
     )
-    session_id: str | None = Field(
-        default=None,
-        min_length=1,
-        description="Optional caller-supplied session identifier, stored for correlation only.",
-    )
+    session_id: str | None = Field(default=None, description=SESSION_ID_DESCRIPTION)
     mode: str = Field(
         default="ingest",
         description=(
@@ -115,7 +119,7 @@ class RememberUrlRequest(BaseModel):
         description="Re-process even if identical content was already remembered for this dataset.",
     )
 
-    @field_validator("dataset", "url", "session_id")
+    @field_validator("dataset", "url")
     @classmethod
     def strip_url_fields(cls, value: str | None) -> str | None:
         if value is None:
@@ -124,6 +128,11 @@ class RememberUrlRequest(BaseModel):
         if not stripped:
             raise ValueError("value must not be empty")
         return stripped
+
+    @field_validator("session_id")
+    @classmethod
+    def normalize_session_id_field(cls, value: str | None) -> str | None:
+        return normalize_session_id(value)
 
 
 class RememberTextResult(BaseModel):
@@ -167,6 +176,14 @@ class RememberTextResult(BaseModel):
     deduplicated: bool | None = Field(
         default=None,
         description="True if this content was already known and no new processing was needed.",
+    )
+    session_uuid: UUID | None = Field(
+        default=None,
+        description=(
+            "The Session this run is first-class associated with, if any. Null "
+            "when no session_id was supplied, or for a pre-v0.3.0 historical "
+            "run even if its legacy payload contains a textual session_id."
+        ),
     )
 
 

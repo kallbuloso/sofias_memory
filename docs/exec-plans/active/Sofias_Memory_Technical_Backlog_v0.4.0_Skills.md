@@ -105,7 +105,7 @@ Implementar:
 ### Domínio
 
 - função única e compartilhada de normalização/validação de `name` (mesmo padrão de `normalize_session_id`), usada por create e por import (SM-703);
-- função única e compartilhada de canonicalização de conteúdo de revisão (Feature Contract §12.7: JSON UTF-8 canônico, chaves ordenadas, separadores estáveis, `procedure` normalizado para LF, `tags`/`declared_tools` ordenados) usada tanto pelo cálculo de `content_sha256` quanto, futuramente, pela geração determinística de export (SM-703);
+- função única e compartilhada de canonicalização de conteúdo de revisão, implementando exatamente o objeto canônico e as regras de campo ausente/opcional já congelados no Feature Contract §12.7.1/§12.7.2 (oito chaves fixas, `license`/`compatibility` ausentes → `null`, `metadata` ausente → `{}`, `tags`/`declared_tools` ausentes → `[]`, JSON UTF-8 com `sort_keys=true`, `procedure` normalizado para LF) — nenhuma decisão de representação canônica fica em aberto para esta task, é implementação direta da regra já congelada; usada tanto pelo cálculo de `content_sha256` quanto, futuramente, pela geração determinística de export (SM-703);
 - lógica de próximo `revision` monotônico, concurrency-safe, serializada por um lock por-Skill (Feature Contract §6.2) que também serializa `PATCH current_revision`/archive/restore — implementar o mecanismo de lock aqui, mesmo que as rotas que o exercitam só cheguem no SM-702+;
 - repositories para `skills`/`skill_revisions`, sem SQL espalhado por routes/pipelines.
 
@@ -186,6 +186,7 @@ Atualizar `tests/contract/test_openapi_forbidden_routes.py` para remover `/skill
 A task só encerra quando:
 
 - os 8 endpoints acima estão implementados com envelopes/paginação/erros no padrão existente;
+- `name`/`description`/`compatibility`/`procedure` respeitam os limites já congelados no Feature Contract §12.8 (`procedure`: 1..65536 caracteres Unicode após normalização de newline, sem trim destrutivo do conteúdo persistido), comprovado por teste de boundary (limite exato aceito, limite+1 rejeitado);
 - criação concorrente com `name` colidente resulta em exatamente um sucesso e um `409`, comprovado por teste real PostgreSQL;
 - rollback de `current_revision` é comprovado por teste (criar revisão 2, apontar de volta para 1, revisão 2 permanece intacta e legível);
 - safe replay de conteúdo idêntico devolve `200`/revisão existente e nunca altera `current_revision_id`, comprovado por teste;
@@ -226,9 +227,10 @@ Implementar:
 
 ## Import
 
-- `POST /skills/import`: `name` inexistente → cria nova Skill + revisão 1 (equivalente a `POST /skills`); `name` já existente (qualquer status) → `409`/`INVALID_REQUEST`, nunca upsert;
-- `POST /skills/{skill_uuid}/revisions/import`: cria nova SkillRevision na Skill alvo; frontmatter `name` divergente do `Skill.name` alvo → `422`/`INVALID_REQUEST`, nunca renomeação/redirecionamento implícito;
-- conteúdo idêntico (mesmo `content_sha256`, via a função canônica do SM-701) → safe replay (Feature Contract §9.1): `200`, revisão existente, `current_revision_id` inalterado — mesma regra e mesmo código usados por `POST .../revisions` estruturado (SM-702), não uma segunda implementação.
+As duas rotas têm semânticas de idempotência diferentes — implementar cada uma sem vazar a lógica da outra:
+
+- `POST /skills/import`: `name` inexistente → cria nova Skill + revisão 1 (equivalente a `POST /skills`); `name` já existente (qualquer status) → **sempre** `409`/`INVALID_REQUEST`, nunca upsert, nunca safe replay, nunca cria revisão implicitamente — `content_sha256` nunca é consultado para decidir o resultado desta rota;
+- `POST /skills/{skill_uuid}/revisions/import`: cria nova SkillRevision na Skill alvo já identificada por `skill_uuid`; frontmatter `name` divergente do `Skill.name` alvo → `422`/`INVALID_REQUEST`, nunca renomeação/redirecionamento implícito; conteúdo idêntico (mesmo `content_sha256`, via a função canônica do SM-701) a uma revisão já existente **dessa Skill** → safe replay (Feature Contract §9.1): `200`, revisão existente, `current_revision_id` inalterado — mesma regra e mesmo código usados por `POST .../revisions` estruturado (SM-702), não uma segunda implementação.
 
 ## Export
 
@@ -247,9 +249,10 @@ Implementar:
 A task só encerra quando:
 
 - import via `POST /skills/import` de um `SKILL.md` novo cria Skill + revisão 1, comprovado por teste;
+- import via `POST /skills/import` com `name` já existente devolve **sempre** `409`, mesmo quando o conteúdo é semanticamente idêntico ao de uma Skill já existente — nunca safe replay, nunca upsert, nunca cria revisão implicitamente, comprovado por teste (incluindo um caso explícito de conteúdo idêntico para provar que `content_sha256` não influencia esta rota);
 - import via `POST /skills/{skill_uuid}/revisions/import` para uma Skill existente cria revisão explícita, nunca upsert, comprovado por teste;
 - import de revisão com `name` divergente do frontmatter é rejeitado com `422`, comprovado por teste;
-- reimportação idêntica (mesmo `content_sha256`) resolve como safe replay (`200`, revisão existente, `current_revision_id` inalterado), comprovado por teste, em ambas as rotas de import;
+- reimportação idêntica (mesmo `content_sha256`) via `POST .../revisions/import` resolve como safe replay (`200`, revisão existente, `current_revision_id` inalterado), comprovado por teste — esta regra aplica-se **somente** a esta rota, nunca a `POST /skills/import`;
 - export é semanticamente determinístico: `export(import(x))` produz o mesmo conteúdo canônico que `x` representa, para o subset portable — sem exigir igualdade de bytes com `x`, comprovado por teste;
 - `allowed-tools` ↔ `declared_tools` e `tags` ↔ `metadata["sofias-memory.tags"]` fazem round-trip corretamente e deterministicamente, comprovado por teste;
 - `allowed-tools`/`declared_tools` importado nunca é interpretado como autorização em nenhum caminho de código, comprovado por teste;
@@ -316,7 +319,7 @@ Provar que Skills coexistem corretamente com Dataset, Session, Forget, Dataset D
 - nenhum nó/relacionamento Skill aparece em Neo4j após qualquer operação de Skill, comprovado por teste real Neo4j;
 - Session e SessionEntry permanecem sem qualquer coluna ou referência a Skill;
 - archive de Skill remove de `resolve` mas preserva `GET`/`GET revisions`/`PATCH current_revision`/criar nova revisão/`export`, comprovado por teste — incluindo criar uma nova revisão *enquanto* a Skill está `archived` e confirmar que ela permanece `archived` e ainda excluída de `resolve`;
-- restore de Skill archived reabilita `resolve` preservando exatamente o `current_revision_id` que a Skill tinha antes do archive (restore nunca reseta o ponteiro), comprovado por teste;
+- nem `archive` nem `restore` modificam `current_revision_id` por si mesmos — comprovado por teste cobrindo o cenário completo: `current=2` → `archive` (permanece `current=2`) → criar revision 3 enquanto `archived` (passa a `current=3`, Skill continua `archived`) → `restore` (permanece `current=3`, nunca "volta" para 2) — restore preserva o ponteiro no instante do restore, nunca reconstrói o ponteiro de antes do archive;
 - archive/restore são idempotentes, comprovado por teste;
 - concorrência de criação de Skill com `name` colidente sob carga real (não apenas unit) converge para um único vencedor;
 - matriz completa de concorrência por-Skill (Feature Contract §6) sob carga real: (a) duas criações de revisão com conteúdo diferente → dois ordinais distintos, o último committed é `current`; (b) duas criações de revisão com conteúdo idêntico → uma única revisão persistida, a segunda resolve como safe replay; (c) nova revisão concorrente com rollback explícito, nas duas ordens de intercalação → resultado determinístico sem lost update, conforme Feature Contract §6.5.

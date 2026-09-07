@@ -507,7 +507,23 @@ POST /api/v1/skills/{skill_uuid}/revisions/import
        implícita, nunca redirecionamento para outra Skill.
 ```
 
-Ambas seguem a regra de safe replay de §9.1: conteúdo semanticamente idêntico (mesmo `content_sha256`) a uma revisão já existente da Skill resolve como replay seguro (`200`, revisão existente, `current_revision_id` inalterado), nunca cria duplicata.
+As duas rotas têm semânticas de idempotência **diferentes** — não confundir uma com a outra:
+
+```text
+POST /api/v1/skills/import
+    -- name já existente → SEMPRE 409 INVALID_REQUEST, independentemente do
+       conteúdo/hash. content_sha256 nunca é consultado para decidir o
+       resultado desta rota. Nunca safe replay, nunca upsert, nunca cria
+       revisão implicitamente, nunca resolve para a Skill existente.
+
+POST /api/v1/skills/{skill_uuid}/revisions/import
+    -- segue a regra de safe replay de §9.1: conteúdo semanticamente idêntico
+       (mesmo content_sha256) a uma revisão já existente DESSA Skill resolve
+       como replay seguro (200, revisão existente, current_revision_id
+       inalterado). Conteúdo novo → 201, nova revisão.
+```
+
+Safe replay por `content_sha256` é uma propriedade de **criação de revisão em uma Skill já identificada por `skill_uuid`** (`POST .../revisions` estruturado e `POST .../revisions/import`), nunca de **criação de Skill** (`POST /skills` e `POST /skills/import`). A identidade de Skill é decidida exclusivamente por `name`; hash de conteúdo nunca participa dessa decisão.
 
 ## 12.5 Export
 
@@ -561,18 +577,45 @@ SKILL.md importado
     → persistência da revisão estruturada
 ```
 
-O hash é calculado sobre uma representação canônica independente de formatação YAML — recomendação:
+O hash é calculado sobre uma representação canônica independente de formatação YAML:
 
 ```text
 JSON UTF-8 canônico
-chaves de objeto ordenadas
+sort_keys=true
 separadores estáveis
-procedure normalizado para LF (sem CRLF)
+procedure normalizado para LF (CRLF/CR → LF)
 ```
 
-incluindo todos os campos semanticamente versionados: `name`, `description`, `procedure`, `license`, `compatibility`, `metadata` (já canônico como mapa ordenado string→string), `tags` (ordenado, §12.6), `declared_tools` (ordenado, §12.2).
+## 12.7.1 Objeto canônico (congelado)
 
-Ausência de um campo opcional e presença explícita de valor vazio/null têm semântica congelada e consistente (a ser fixada em uma única regra no SM-701 — por exemplo, ambos tratados como "campo ausente" no canônico — mas nunca ambígua ou dependente da ordem de serialização).
+O objeto canônico usado para `content_sha256` contém sempre exatamente estas oito chaves, nesta forma:
+
+```text
+name             string
+description      string
+procedure        string (após normalização de newline)
+license          string | null
+compatibility    string | null
+metadata         object (map<string,string>, chaves ordenadas)
+tags             array[string] (ordenado, deduplicado — §12.6)
+declared_tools   array[string] (ordenado — §12.2)
+```
+
+## 12.7.2 Normalização de campo ausente/opcional
+
+Um campo opcional ausente e seu estado neutro equivalente produzem sempre a mesma representação canônica — nenhum caller/import path pode inventar uma representação diferente:
+
+```text
+license omitido ou null                → null
+compatibility omitido ou null          → null
+metadata omitido ou null               → {}
+tags omitido ou null                   → []
+declared_tools omitido ou null         → []
+```
+
+`name`, `description` e `procedure` são sempre required (§8, §12.1, §12.8) — nunca ausentes no objeto canônico.
+
+Para campos presentes, aplicam-se as validações/normalizações já congeladas em outras seções (§3.1 para `name`, §12.6 para `tags`, §12.2 para `declared_tools`, §12.8 para limites de tamanho).
 
 Garantia:
 
@@ -595,12 +638,18 @@ Import → export é **semanticamente equivalente**, não necessariamente textua
 ## 12.8 Limites de validação
 
 ```text
-name           1..64   (subset portable, §3.1)
+name           1..64      (subset portable, §3.1)
 description    1..1024
-compatibility  1..500  (quando presente)
-procedure      non-empty; limite máximo explícito definido no SM-701/702
-               (não depender apenas do limite global de request body)
+compatibility  1..500     (quando presente)
+procedure      1..65536   (Unicode chars, após normalização CRLF/CR → LF;
+                            mínimo é ao menos 1 caractere não-whitespace)
 ```
+
+Este limite de `procedure` é validado independentemente do limite global de tamanho de request body — nenhum ticket de implementação decide esse número, ele já está congelado aqui.
+
+A validação aplica-se ao texto já normalizado para LF. Nenhum trim destrutivo é aplicado ao conteúdo persistido apenas para fins de validação — whitespace significativo do Markdown (indentação de listas, blocos de código, etc.) é preservado no `procedure` armazenado.
+
+A recomendação externa do Agent Skills format de `procedure` com menos de 500 linhas (§12.1) continua sendo apenas recomendação de origem, nunca um hard limit de validação desta API.
 
 ## 12.9 Fora de escopo do v0.4.0
 
@@ -684,7 +733,18 @@ POST .../restore
 
 Criar uma nova revisão em uma Skill `archived` funciona normalmente: `current_revision_id` é atualizado, a Skill permanece `archived`, e `resolve` continua excluindo-a até um `restore` explícito.
 
-`restore` reativa a mesma Skill, com o mesmo histórico e a mesma `current_revision_id` que tinha antes do archive (restore nunca reseta o ponteiro) — apenas volta a ser elegível para `resolve`.
+`archive` e `restore` nunca modificam `current_revision_id` por si mesmos — nenhum dos dois é uma operação que muta o ponteiro. `restore` reativa a mesma Skill, com o mesmo histórico, preservando exatamente o `current_revision_id` que a Skill possui **no instante do restore** — que pode ser diferente do que era no instante do archive, se uma nova revisão foi criada (ou um rollback via `PATCH` foi feito) enquanto a Skill estava `archived` (§5.1). `restore` não busca nem reconstrói um ponteiro histórico anterior ao archive; ele simplesmente não toca o ponteiro.
+
+Exemplo normativo:
+
+```text
+Skill active, current_revision_id → revision 2
+archive                            → current_revision_id ainda → revision 2 (archive não move o ponteiro)
+create revision 3 (enquanto archived) → current_revision_id → revision 3 (management continua mutando o ponteiro normalmente)
+restore                            → current_revision_id ainda → revision 3 (restore não move o ponteiro)
+```
+
+`restore` apenas volta a tornar a Skill elegível para `resolve`.
 
 Archive e restore são ambos idempotentes (§5.1, §5.2).
 
@@ -827,7 +887,7 @@ Explicitamente fora deste release:
 11. Discovery/list/resolve nunca devolvem `procedure` completo.
 12. Skill archive é discovery filter — toda operação de management (`GET`, criar revisão, `PATCH current_revision`, `export`) permanece disponível em uma Skill archived; apenas `resolve` a exclui.
 13. `declared_tools`/`allowed-tools` nunca autorizam execução; `declared_tools` é sempre `list[string]` na API pública; `metadata` é sempre `map<string,string>` na API pública e no mapeamento SKILL.md.
-14. Import com `name` existente nunca faz upsert silencioso — sempre cria revisão explícita (ou resolve como safe replay se o conteúdo for idêntico).
+14. `POST /skills/import` com `name` já existente é sempre `409`, nunca safe replay, nunca upsert, nunca cria revisão implicitamente — hash de conteúdo nunca decide identidade de Skill. `POST .../revisions/import` para uma Skill já identificada por `skill_uuid` cria revisão explícita, ou resolve como safe replay se o conteúdo for semanticamente idêntico a uma revisão já existente dessa Skill.
 15. Import de revisão exige correspondência exata de `name` entre frontmatter e Skill alvo.
 16. `content_sha256` é calculado sobre uma representação canônica do conteúdo semântico, nunca sobre os bytes originais importados; export é deterministicamente equivalente ao conteúdo persistido, nunca uma promessa de bytes originais preservados.
 17. Skills nunca são projetadas para Neo4j.

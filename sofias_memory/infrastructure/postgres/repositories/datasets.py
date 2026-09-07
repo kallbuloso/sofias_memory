@@ -8,6 +8,7 @@ from uuid import UUID
 
 from sqlalchemy import Select, exists, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -74,6 +75,24 @@ class DatasetRepository:
         re-read returns the winner's already-committed row. Never used to
         update an existing dataset; a slug that already exists is returned
         unchanged, even if ``candidate``'s other fields differ.
+
+        SM-606 hardening: ``datasets`` also carries an independent
+        ``uq_datasets_name`` unique constraint that the ``ON CONFLICT
+        (slug)`` arbiter above does not target. Two concurrent transactions
+        inserting the exact same ``(slug, name)`` pair can have PostgreSQL
+        report the conflict against ``uq_datasets_name`` instead of the
+        targeted slug index -- an equally valid, but untargeted, way for the
+        *same* race to manifest. That ``IntegrityError`` is absorbed inside
+        a SAVEPOINT (so it never poisons the caller's outer submission
+        transaction) and recovery re-reads by ``slug`` only, never by
+        ``name``: if a row now exists for ``candidate.slug`` it is the
+        winner of the very same equivalent-candidate race, and is returned
+        unchanged. If no row exists for ``candidate.slug`` even after that,
+        the conflict was a genuine, unrelated identity collision (e.g. a
+        different slug sharing ``candidate.name``) -- the original
+        ``IntegrityError`` is re-raised unchanged rather than silently
+        resolving to the wrong Dataset, dropping the candidate, or masking
+        the inconsistency behind an assertion.
         """
 
         statement = (
@@ -88,8 +107,15 @@ class DatasetRepository:
             )
             .on_conflict_do_nothing(index_elements=["slug"])
         )
-        await self._session.execute(statement)
-        await self._session.flush()
+        try:
+            async with self._session.begin_nested():
+                await self._session.execute(statement)
+                await self._session.flush()
+        except IntegrityError:
+            resolved = await self.get_by_slug(candidate.slug)
+            if resolved is not None:
+                return resolved
+            raise
         resolved = await self.get_by_slug(candidate.slug)
         assert resolved is not None  # noqa: S101 - just inserted or already existed
         return resolved

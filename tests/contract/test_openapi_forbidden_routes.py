@@ -192,6 +192,55 @@ def test_recall_session_context_surface_is_present() -> None:
     assert "SessionContextProvenanceItem" in schemas
 
 
+def test_remember_and_runs_session_uuid_surface_is_additive_only() -> None:
+    """SM-605/SM-606: `session_uuid` on RememberTextResult/RunSummaryResult
+    and the `session_uuid` filter on `GET /runs` are purely additive --
+    nullable/optional, never a new requirement for a legacy caller."""
+
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    remember_result = schemas["RememberTextResult"]
+    assert isinstance(remember_result, dict)
+    assert "session_uuid" in remember_result["properties"]
+    assert "session_uuid" not in remember_result.get("required", [])
+
+    run_summary = schemas["RunSummaryResult"]
+    assert isinstance(run_summary, dict)
+    assert "session_uuid" in run_summary["properties"]
+    assert "session_uuid" not in run_summary.get("required", [])
+
+    run_list_params = paths["/api/v1/runs"]["get"]["parameters"]
+    session_uuid_params = [p for p in run_list_params if p["name"] == "session_uuid"]
+    assert len(session_uuid_params) == 1
+    assert session_uuid_params[0]["required"] is False
+
+    # Public API filters by the structural session_uuid FK, never by the
+    # textual session_id used on write endpoints.
+    assert "session_id" not in {p["name"] for p in run_list_params}
+
+
+def test_no_session_hard_delete_or_purge_surface_exists() -> None:
+    """SM-606 SS 43: Sessions never gained a hard-delete/purge API, and
+    Forget EVERYTHING is not, and never becomes, an alias for one."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert "delete" not in paths.get("/api/v1/sessions/{session_uuid}", {})
+    assert "/api/v1/sessions/{session_uuid}/purge" not in paths
+    assert "/api/v1/sessions/{session_uuid}/entries/{entry_id}" not in paths
+    for path, operations in paths.items():
+        if path.startswith("/api/v1/sessions"):
+            assert "delete" not in operations, path
+
+
 def test_private_routes_require_api_key_security() -> None:
     schema = openapi_schema()
     paths = schema["paths"]

@@ -984,6 +984,18 @@ Forget não remove:
 
 Não significa purge integral de histórico contextual, auditoria ou operação da instância.
 
+Especificamente, Forget no scope `everything` (SM-606 SS 18, congelado):
+
+```text
+Forget EVERYTHING
+    = all semantic/knowledge memory within Forget's authority
+    ≠ purge Sessions
+    ≠ purge SessionEntries
+    ≠ purge Query audit
+    ≠ purge Feedback
+    ≠ purge PipelineRun audit
+```
+
 Dataset Delete também não remove Sessions ou seu histórico.
 
 Referências históricas a conhecimento removido podem passar a ser retornadas como indisponíveis pela provenance existente.

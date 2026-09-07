@@ -43,8 +43,16 @@ from sofias_memory.infrastructure.postgres.models import (
     Document,
     Entity,
     EntityMention,
+    Feedback,
     PipelineRun,
+    Query,
     Source,
+)
+from sofias_memory.infrastructure.postgres.models import (
+    Session as SessionModel,
+)
+from sofias_memory.infrastructure.postgres.models import (
+    SessionEntry as SessionEntryModel,
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -56,9 +64,13 @@ from sofias_memory.pipelines.steps.forget import (
     AuthoritativeMutationStep,
     ForgetPipelineResources,
 )
+from sofias_memory.schemas.session_entries import SessionEntryCreateRequest
+from sofias_memory.schemas.sessions import SessionCreateRequest
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from sofias_memory.services.session_entries import SessionEntryService
+from sofias_memory.services.sessions import SessionService
 from tests.unit._app_factory import create_app
 
 FORGET_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_FORGET_POSTGRES_TESTS"
@@ -109,6 +121,8 @@ _FORGET_TEST_TABLES = (
     "pipeline_runs",
     "feedback",
     "queries",
+    "session_entries",
+    "sessions",
     "memory_entries",
     "summaries",
     "relation_evidence",
@@ -1088,3 +1102,277 @@ async def test_storage_deletion_failure_never_leaks_path_through_logs_or_public_
     finally:
         clear_log_context()
         httpx_logger.setLevel(previous_httpx_level)
+
+
+# --- Session/SessionEntry/Query/Feedback compatibility (SM-606 SS 16/17) ----
+#
+# Forget operates on semantic/knowledge memory and PipelineRun audit
+# (ADR-0012 "Forget and Dataset deletion"). It must never remove or mutate
+# Session, SessionEntry, Query, or Feedback history, and must never touch
+# Session.status/archived_at/updated_at as a side effect.
+
+
+class _SessionHistory:
+    def __init__(
+        self,
+        *,
+        session_uuid: UUID,
+        session_status: str,
+        session_updated_at: object,
+        session_archived_at: object,
+        entry_id: UUID,
+        query_id: UUID,
+        query_dataset_ids: list[UUID],
+        feedback_id: UUID,
+    ) -> None:
+        self.session_uuid = session_uuid
+        self.session_status = session_status
+        self.session_updated_at = session_updated_at
+        self.session_archived_at = session_archived_at
+        self.entry_id = entry_id
+        self.query_id = query_id
+        self.query_dataset_ids = query_dataset_ids
+        self.feedback_id = feedback_id
+
+
+async def seed_session_history(
+    session_factory: AsyncSessionFactory, *, dataset_id: UUID, session_key: str
+) -> _SessionHistory:
+    session_service = SessionService(session_factory=session_factory)
+    created = await session_service.create_session(SessionCreateRequest(session_id=session_key))
+    entry = await SessionEntryService(session_factory=session_factory).append_entry(
+        created.session_uuid,
+        SessionEntryCreateRequest(role="user", content="Forget compatibility probe."),
+    )
+    query_id = uuid4()
+    async with PostgresUnitOfWork(session_factory) as uow:
+        await uow.queries.add(
+            Query(
+                id=query_id,
+                query_text="What survives Forget?",
+                dataset_ids=[dataset_id],
+                mode="chunks",
+                answer=None,
+                references={"items": []},
+                timings={"total": 1},
+                model=None,
+                session_id=created.session_uuid,
+                session_context_entry_ids=[],
+            )
+        )
+        await uow.commit()
+    feedback_id = uuid4()
+    async with session_factory() as raw_session:
+        raw_session.add(
+            Feedback(
+                id=feedback_id,
+                query_id=query_id,
+                target_type="answer",
+                target_id=None,
+                score=1,
+                comment="preserved through Forget",
+            )
+        )
+        await raw_session.commit()
+    return _SessionHistory(
+        session_uuid=created.session_uuid,
+        session_status=created.status.value,
+        session_updated_at=created.updated_at,
+        session_archived_at=None,
+        entry_id=entry.entry_id,
+        query_id=query_id,
+        query_dataset_ids=[dataset_id],
+        feedback_id=feedback_id,
+    )
+
+
+async def assert_session_history_survives_unchanged(
+    session_factory: AsyncSessionFactory, history: _SessionHistory
+) -> None:
+    async with session_factory() as raw_session:
+        session_row = await raw_session.get(SessionModel, history.session_uuid)
+        entry_row = await raw_session.get(SessionEntryModel, history.entry_id)
+        query_row = await raw_session.get(Query, history.query_id)
+        feedback_row = await raw_session.get(Feedback, history.feedback_id)
+
+    assert session_row is not None
+    assert entry_row is not None
+    assert query_row is not None
+    assert feedback_row is not None
+
+    assert session_row.status.value == history.session_status
+    assert session_row.updated_at == history.session_updated_at
+    assert session_row.archived_at == history.session_archived_at
+    assert query_row.session_id == history.session_uuid
+    assert list(query_row.dataset_ids) == history.query_dataset_ids
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_source_forget_preserves_session_history(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-session-source-{uuid4()}")
+    source, _entity = await seed_source_with_content(
+        session_factory, tmp_path, dataset_id=dataset.id
+    )
+    history = await seed_session_history(
+        session_factory, dataset_id=dataset.id, session_key=f"sm606-source-{uuid4().hex}"
+    )
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(
+            app, {"dataset": dataset.slug, "source_id": str(source.id), "wait": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        persisted_source = await get_source(session_factory, source.id)
+        assert persisted_source is not None
+        assert persisted_source.status == SourceStatus.DELETED
+
+        await assert_session_history_survives_unchanged(session_factory, history)
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_source_forget_makes_knowledge_reference_unavailable_but_keeps_session_provenance(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """SM-606 SS 19: Forget making a knowledge reference unavailable is a
+    KNOWLEDGE provenance concern -- it must never be confused with, or
+    degrade, the same Query's SESSION provenance (session_uuid stays
+    correct throughout)."""
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-provenance-{uuid4()}")
+    source, _entity = await seed_source_with_content(
+        session_factory, tmp_path, dataset_id=dataset.id
+    )
+    async with PostgresUnitOfWork(session_factory) as uow:
+        chunks = await uow.chunks.list_for_source_generation(
+            source_id=source.id, generation=0, active_only=True
+        )
+        assert chunks
+        chunk_id = chunks[0].id
+        chunk_document_id = chunks[0].document_id
+        chunk_ordinal = chunks[0].ordinal
+        await uow.commit()
+
+    session_service = SessionService(session_factory=session_factory)
+    created = await session_service.create_session(
+        SessionCreateRequest(session_id=f"sm606-provenance-{uuid4().hex}")
+    )
+    query_id = uuid4()
+    async with PostgresUnitOfWork(session_factory) as uow:
+        await uow.queries.add(
+            Query(
+                id=query_id,
+                query_text="What did the source say?",
+                dataset_ids=[dataset.id],
+                mode="chunks",
+                answer=None,
+                references={
+                    "items": [
+                        {
+                            "source_id": str(source.id),
+                            "document_id": str(chunk_document_id),
+                            "chunk_id": str(chunk_id),
+                            "chunk_ordinal": chunk_ordinal,
+                            "score": 0.9,
+                        }
+                    ]
+                },
+                timings={"total": 1},
+                model=None,
+                session_id=created.session_uuid,
+                session_context_entry_ids=[],
+            )
+        )
+        await uow.commit()
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        forget_response = await post_forget(
+            app, {"dataset": dataset.slug, "source_id": str(source.id), "wait": True}
+        )
+        assert forget_response.status_code == 200
+        assert forget_response.json()["data"]["status"] == "succeeded"
+
+        async with build_client(app) as client:
+            provenance_response = await client.get(
+                f"/api/v1/provenance/query/{query_id}",
+                headers={API_KEY_HEADER: EXPECTED_API_KEY},
+            )
+        assert provenance_response.status_code == 200
+        data = provenance_response.json()["data"]
+
+        # Knowledge provenance: the reference is now unavailable because
+        # its chunk was deactivated by Forget.
+        assert data["references"][0]["available"] is False
+
+        # Session provenance: entirely independent of that outcome.
+        assert data["session_uuid"] == str(created.session_uuid)
+        assert data["session_context"] == []
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_forget_preserves_session_history(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-session-dataset-{uuid4()}")
+    await seed_source_with_content(session_factory, tmp_path, dataset_id=dataset.id)
+    history = await seed_session_history(
+        session_factory, dataset_id=dataset.id, session_key=f"sm606-dataset-{uuid4().hex}"
+    )
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(app, {"dataset": dataset.slug, "wait": True})
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        persisted_dataset = await get_dataset(session_factory, dataset.id)
+        assert persisted_dataset is not None
+        assert persisted_dataset.status == DatasetStatus.ACTIVE
+
+        await assert_session_history_survives_unchanged(session_factory, history)
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_everything_forget_preserves_session_history(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-session-everything-{uuid4()}")
+    await seed_source_with_content(session_factory, tmp_path, dataset_id=dataset.id)
+    history = await seed_session_history(
+        session_factory, dataset_id=dataset.id, session_key=f"sm606-everything-{uuid4().hex}"
+    )
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(
+            app, {"everything": True, "confirm": "DELETE EVERYTHING", "wait": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        await assert_session_history_survives_unchanged(session_factory, history)
+    finally:
+        await coordinator.stop()

@@ -40,7 +40,9 @@ from sofias_memory.domain import (
     SourceStatus,
 )
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
-from sofias_memory.infrastructure.postgres.models import Dataset, Source
+from sofias_memory.infrastructure.postgres.models import Dataset, Feedback, Query, Source
+from sofias_memory.infrastructure.postgres.models import Session as SessionModel
+from sofias_memory.infrastructure.postgres.models import SessionEntry as SessionEntryModel
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.pipelines.registry import PipelineRegistry, build_default_pipeline_registry
@@ -49,8 +51,12 @@ from sofias_memory.pipelines.steps.dataset_delete import (
     DatasetDeletePipelineResources,
 )
 from sofias_memory.pipelines.steps.forget import FORGET_RESOURCES_RESOURCE, ForgetPipelineResources
+from sofias_memory.schemas.session_entries import SessionEntryCreateRequest
+from sofias_memory.schemas.sessions import SessionCreateRequest
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from sofias_memory.services.session_entries import SessionEntryService
+from sofias_memory.services.sessions import SessionService
 from tests.unit._app_factory import create_app
 
 DATASET_DELETE_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_DATASET_DELETE_POSTGRES_TESTS"
@@ -101,6 +107,8 @@ _TEST_TABLES = (
     "pipeline_runs",
     "feedback",
     "queries",
+    "session_entries",
+    "sessions",
     "memory_entries",
     "summaries",
     "relation_evidence",
@@ -1741,5 +1749,116 @@ async def test_end_to_end_dataset_delete_converges_with_stale_relation_upsert_pe
             statuses = await uow.graph_outbox.list_status_by_ids(relevant_outbox_ids)
         assert len(statuses) == len(relevant_outbox_ids)
         assert all(status == GraphOutboxStatus.DONE for status, _attempt in statuses.values())
+    finally:
+        await app.state.pipeline_worker.stop()
+
+
+# --- Session/SessionEntry/Query/Feedback compatibility (SM-606 SS 20/21/22) --
+#
+# Administrative Dataset Delete permanently retires a Dataset namespace, but
+# per ADR-0012 it must never remove Sessions, SessionEntries, or historical
+# Query/Feedback audit -- and Query.dataset_ids is historical audit, never
+# rewritten to pretend a Query never used the deleted Dataset.
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_delete_preserves_session_history_and_query_dataset_ids(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _ = build_harness(postgres_engine, tmp_path)
+    await app.state.pipeline_worker.start()
+    try:
+        dataset_id = await seed_dataset(session_factory, slug=f"delete-session-{uuid4()}")
+        source_id = await seed_source_with_storage(
+            session_factory, dataset_id=dataset_id, tmp_path=tmp_path
+        )
+
+        session_service = SessionService(session_factory=session_factory)
+        created = await session_service.create_session(
+            SessionCreateRequest(session_id=f"sm606-delete-{uuid4().hex}")
+        )
+        entry = await SessionEntryService(session_factory=session_factory).append_entry(
+            created.session_uuid,
+            SessionEntryCreateRequest(role="user", content="Dataset Delete compatibility probe."),
+        )
+        query_id = uuid4()
+        async with PostgresUnitOfWork(session_factory) as uow:
+            await uow.queries.add(
+                Query(
+                    id=query_id,
+                    query_text="Historical query over the doomed dataset.",
+                    dataset_ids=[dataset_id],
+                    mode="chunks",
+                    answer=None,
+                    references={
+                        "items": [
+                            {
+                                "source_id": str(source_id),
+                                "document_id": str(uuid4()),
+                                "chunk_id": str(uuid4()),
+                                "chunk_ordinal": 0,
+                                "score": 0.5,
+                            }
+                        ]
+                    },
+                    timings={"total": 1},
+                    model=None,
+                    session_id=created.session_uuid,
+                    session_context_entry_ids=[],
+                )
+            )
+            await uow.commit()
+        feedback_id = uuid4()
+        async with session_factory() as raw_session:
+            raw_session.add(
+                Feedback(
+                    id=feedback_id,
+                    query_id=query_id,
+                    target_type="answer",
+                    target_id=None,
+                    score=1,
+                    comment="preserved through Dataset Delete",
+                )
+            )
+            await raw_session.commit()
+
+        response = await delete_dataset(app, dataset_id)
+        assert response.status_code == 202
+        run_id = UUID(response.json()["data"]["run_id"])
+        await wait_for_status(session_factory, run_id, {PipelineRunStatus.SUCCEEDED})
+        await wait_for_dataset_status(session_factory, dataset_id, {DatasetStatus.DELETED})
+
+        async with session_factory() as raw_session:
+            session_row = await raw_session.get(SessionModel, created.session_uuid)
+            entry_row = await raw_session.get(SessionEntryModel, entry.entry_id)
+            query_row = await raw_session.get(Query, query_id)
+            feedback_row = await raw_session.get(Feedback, feedback_id)
+
+        assert session_row is not None
+        assert session_row.status.value == "active"
+        assert session_row.updated_at == created.updated_at
+        assert session_row.archived_at is None
+        assert entry_row is not None
+        assert query_row is not None
+        # Historical audit: the Query still records it targeted the
+        # now-deleted Dataset -- Dataset Delete never rewrites this array.
+        assert list(query_row.dataset_ids) == [dataset_id]
+        assert query_row.session_id == created.session_uuid
+        assert feedback_row is not None
+
+        # Knowledge provenance may now report the reference as unavailable
+        # (the dataset/source no longer resolve), but Session provenance is
+        # independent of that outcome.
+        async with build_client(app) as client:
+            provenance_response = await client.get(
+                f"/api/v1/provenance/query/{query_id}",
+                headers={API_KEY_HEADER: EXPECTED_API_KEY},
+            )
+        assert provenance_response.status_code == 200
+        provenance_data = provenance_response.json()["data"]
+        assert provenance_data["references"][0]["available"] is False
+        assert provenance_data["session_uuid"] == str(created.session_uuid)
+        assert provenance_data["session_context"] == []
     finally:
         await app.state.pipeline_worker.stop()

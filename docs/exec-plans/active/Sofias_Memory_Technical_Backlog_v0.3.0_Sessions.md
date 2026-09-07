@@ -939,6 +939,16 @@ Validar startup config dos limites de Session Context:
 - configuração é imutável em runtime;
 - nenhuma dependência opcional nova foi introduzida.
 
+### Dataset lazy-creation race (finding herdado do SM-605)
+
+`DatasetRepository.get_or_create_by_slug()` usava `ON CONFLICT (slug) DO
+NOTHING`, mas `datasets` também possui `uq_datasets_name` independente;
+concorrência real podia reportar a violação de `name` em vez da de `slug`.
+
+Corrigido neste ticket com SAVEPOINT + re-read por `slug` (nunca por
+`name`); um conflito de `name` genuinamente não relacionado ainda propaga
+`IntegrityError` normalmente. Nenhuma migration foi necessária.
+
 ## Gate SM-606
 
 Executar suites unit/integration relevantes e adicionar testes específicos suficientes para provar todos os casos acima.

@@ -14,7 +14,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -25,7 +25,7 @@ from sqlalchemy.exc import ArgumentError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.api.errors import SofiasMemoryError
-from sofias_memory.domain import PipelineRunStatus, PipelineType
+from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
 from sofias_memory.infrastructure.postgres.models import Dataset
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
@@ -848,3 +848,209 @@ def test_worker_disabled_error_helper_is_stable() -> None:
     error = worker_disabled_error()
     assert error.status_code == 503
     assert error.code.value == "WORKER_DISABLED"
+
+
+# --- K. Dataset.get_or_create_by_slug race hardening (SM-606) ----------------
+#
+# DatasetRepository.get_or_create_by_slug's `ON CONFLICT (slug) DO NOTHING`
+# only targets the `slug` unique index. `datasets` also carries an
+# independent `uq_datasets_name` constraint, so two concurrent transactions
+# inserting the exact same (slug, name) pair can have PostgreSQL report the
+# conflict against `uq_datasets_name` instead -- a race first observed
+# during SM-605's Remember lazy-Session-creation concurrency tests. These
+# tests prove the SAVEPOINT-based recovery added in SM-606 both (a) still
+# converges equivalent concurrent candidates to exactly one row, and (b)
+# never masks a genuine, unrelated name collision as a false success.
+
+
+async def get_or_create_by_slug_via_repository(
+    engine: AsyncEngine, *, dataset_id: UUID, slug: str, name: str
+) -> Dataset:
+    session_factory = create_session_factory(engine)
+    async with PostgresUnitOfWork(session_factory) as uow:
+        resolved = await uow.datasets.get_or_create_by_slug(
+            Dataset(
+                id=dataset_id,
+                name=name,
+                slug=slug,
+                description=None,
+                status=DatasetStatus.ACTIVE,
+                active_generation=0,
+            )
+        )
+        await uow.commit()
+        return resolved
+
+
+async def dataset_row_count_for_slug(engine: AsyncEngine, slug: str) -> int:
+    async with engine.connect() as connection:
+        result = await connection.scalar(
+            text("SELECT count(*) FROM datasets WHERE slug = :slug"), {"slug": slug}
+        )
+        return int(result or 0)
+
+
+async def cleanup_datasets_by_slug(engine: AsyncEngine, slugs: list[str]) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("DELETE FROM datasets WHERE slug = ANY(:slugs)"), {"slugs": slugs}
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_equivalent_candidates_converge_to_one_dataset(
+    postgres_engine: AsyncEngine,
+) -> None:
+    """SM-606 SS 7: 5 concurrent UnitsOfWork racing the exact same
+    candidate.slug/candidate.name must all resolve successfully to the same
+    Dataset.id, with exactly one row ever persisted and zero uncaught
+    IntegrityError -- repeated across several independent slugs so a single
+    accidental pass (the arbiter happening to land on `slug` every time)
+    cannot be mistaken for the fix actually working."""
+
+    created_slugs: list[str] = []
+    try:
+        for _ in range(3):
+            unique = uuid4().hex
+            slug = f"race-equiv-{unique}"
+            name = f"Race Equivalent {unique}"
+            created_slugs.append(slug)
+
+            results = await asyncio.gather(
+                *(
+                    get_or_create_by_slug_via_repository(
+                        postgres_engine, dataset_id=uuid4(), slug=slug, name=name
+                    )
+                    for _ in range(5)
+                ),
+                return_exceptions=True,
+            )
+
+            errors = [r for r in results if isinstance(r, BaseException)]
+            assert errors == []
+            resolved_ids = {cast(Dataset, r).id for r in results}
+            assert len(resolved_ids) == 1
+            assert await dataset_row_count_for_slug(postgres_engine, slug) == 1
+    finally:
+        await cleanup_datasets_by_slug(postgres_engine, created_slugs)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unrelated_name_collision_on_different_slug_still_fails_coherently(
+    postgres_engine: AsyncEngine,
+) -> None:
+    """SM-606 SS 6/7: a genuinely different slug that happens to collide on
+    `candidate.name` is NOT an equivalent-candidate race. The fix must
+    never resolve it to the existing (wrong) Dataset, silently drop the
+    candidate, or hide the inconsistency behind an assertion -- it must
+    surface the same coherent `IntegrityError` a caller would have seen
+    before this hardening, and neither dataset row may be confused for the
+    other."""
+
+    unique = uuid4().hex
+    existing_slug = f"race-existing-{unique}"
+    colliding_slug = f"race-colliding-{unique}"
+    shared_name = f"Shared Name {unique}"
+
+    existing = await get_or_create_by_slug_via_repository(
+        postgres_engine, dataset_id=uuid4(), slug=existing_slug, name=shared_name
+    )
+    try:
+        with pytest.raises(IntegrityError):
+            await get_or_create_by_slug_via_repository(
+                postgres_engine, dataset_id=uuid4(), slug=colliding_slug, name=shared_name
+            )
+
+        # The existing Dataset is untouched, and the colliding slug was
+        # never materialized as a side effect of the failed attempt.
+        async with postgres_engine.connect() as connection:
+            existing_row = await connection.execute(
+                text("SELECT id, name FROM datasets WHERE slug = :slug"),
+                {"slug": existing_slug},
+            )
+            existing_row_data = existing_row.one()
+        assert existing_row_data.id == existing.id
+        assert existing_row_data.name == shared_name
+        assert await dataset_row_count_for_slug(postgres_engine, colliding_slug) == 0
+    finally:
+        await cleanup_datasets_by_slug(postgres_engine, [existing_slug, colliding_slug])
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outer_unit_of_work_remains_usable_after_unrelated_name_collision(
+    postgres_engine: AsyncEngine,
+) -> None:
+    """SM-606 final audit item 2: the SAVEPOINT that absorbs the failed
+    INSERT is already rolled back by the time `get_or_create_by_slug`'s
+    `except IntegrityError:` re-reads and re-raises -- proving that
+    recovery happens with a valid (not aborted) transaction, and that the
+    caller's OUTER UnitOfWork/session remains fully usable afterward, in
+    the very same `async with` block: for further reads, for a genuinely
+    new unrelated write, and for a normal commit. No PendingRollbackError,
+    no transaction-aborted state, and no global `session.rollback()` of the
+    outer transaction is ever needed or used."""
+
+    session_factory = create_session_factory(postgres_engine)
+    unique = uuid4().hex
+    existing_slug = f"race-outer-existing-{unique}"
+    colliding_slug = f"race-outer-colliding-{unique}"
+    other_slug = f"race-outer-other-{unique}"
+    shared_name = f"Outer Shared Name {unique}"
+
+    async with PostgresUnitOfWork(session_factory) as uow:
+        existing = await uow.datasets.get_or_create_by_slug(
+            Dataset(
+                id=uuid4(),
+                name=shared_name,
+                slug=existing_slug,
+                description=None,
+                status=DatasetStatus.ACTIVE,
+                active_generation=0,
+            )
+        )
+        await uow.commit()
+
+    try:
+        async with PostgresUnitOfWork(session_factory) as uow:
+            with pytest.raises(IntegrityError):
+                await uow.datasets.get_or_create_by_slug(
+                    Dataset(
+                        id=uuid4(),
+                        name=shared_name,
+                        slug=colliding_slug,
+                        description=None,
+                        status=DatasetStatus.ACTIVE,
+                        active_generation=0,
+                    )
+                )
+
+            # Still inside the SAME `async with` block, immediately after
+            # the caught IntegrityError: a plain read against the SAME
+            # session must succeed -- this would raise PendingRollbackError
+            # if the SAVEPOINT recovery had left the outer transaction
+            # aborted.
+            still_readable = await uow.datasets.get_by_slug(existing_slug)
+            assert still_readable is not None
+            assert still_readable.id == existing.id
+
+            # And the outer transaction can still perform a genuinely new,
+            # unrelated write and commit successfully -- proving it was
+            # never poisoned by the earlier nested failure.
+            other = await uow.datasets.get_or_create_by_slug(
+                Dataset(
+                    id=uuid4(),
+                    name=f"Outer Other Name {unique}",
+                    slug=other_slug,
+                    description=None,
+                    status=DatasetStatus.ACTIVE,
+                    active_generation=0,
+                )
+            )
+            await uow.commit()
+        assert other.slug == other_slug
+        assert await dataset_row_count_for_slug(postgres_engine, other_slug) == 1
+    finally:
+        await cleanup_datasets_by_slug(postgres_engine, [existing_slug, colliding_slug, other_slug])

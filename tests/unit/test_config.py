@@ -418,7 +418,9 @@ def test_chunk_min_greater_than_max_is_rejected() -> None:
         ("recall_max_top_k", 0),
         ("recall_rrf_k", 0),
         ("session_context_max_entries", 0),
+        ("session_context_max_entries", -1),
         ("session_context_max_chars", 0),
+        ("session_context_max_chars", -100),
         ("worker_poll_interval_ms", 0),
         ("worker_stale_after_seconds", 0),
         ("worker_max_concurrent_datasets", 0),
@@ -617,6 +619,19 @@ def test_settings_are_immutable() -> None:
 
     with pytest.raises(ValidationError):
         settings.app_name = "Changed"
+
+
+def test_session_context_limits_are_immutable_at_runtime() -> None:
+    """SM-606 SS 33: Session Context limits are ordinary frozen Settings
+    fields -- no dynamic settings store, no reload endpoint, no runtime
+    mutation path exists for them specifically or for Settings in general."""
+
+    settings = make_settings()
+
+    with pytest.raises(ValidationError):
+        settings.session_context_max_entries = 999
+    with pytest.raises(ValidationError):
+        settings.session_context_max_chars = 999
 
 
 def test_same_functional_configuration_has_same_fingerprint() -> None:

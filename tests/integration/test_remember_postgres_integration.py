@@ -972,37 +972,24 @@ async def test_remember_vs_archive_linearizes_and_never_corrupts(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_concurrent_first_remembers_with_new_session_converge_to_one_session(
+async def test_concurrent_first_remembers_with_new_dataset_and_new_session_converge(
     postgres_engine: AsyncEngine, tmp_path: Path
 ) -> None:
-    """SM-605 SS 25: concurrent Remembers that are each the first-ever
-    caller for a brand-new session_id (no shared Idempotency-Key, so each
-    creates a genuinely independent Run) must race-safely resolve to
-    exactly one Session row, with every Run associated to it."""
+    """SM-605 SS 25 / SM-606 SS 8: concurrent Remembers that are each the
+    first-ever caller for BOTH a not-yet-existing "main" Dataset AND a
+    brand-new session_id (no shared Idempotency-Key, so each creates a
+    genuinely independent Run, mode=ingest so no provider is ever called)
+    must race-safely resolve to exactly one Dataset row and exactly one
+    Session row, with every Run associated to both. This is the real
+    regression proof for the SM-606 Dataset.get_or_create_by_slug race
+    hardening -- "main" is deliberately left unseeded (the SM-605 pre-seed
+    workaround that avoided this exact race has been removed)."""
 
     app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
     coordinator = app.state.pipeline_worker
     await coordinator.start()
     session_key = f"remember-lazy-race-{uuid4().hex}"
     try:
-        # Pre-seed "main" so this race exercises only Session lazy-creation
-        # concurrency -- three concurrent brand-new "main" Dataset creations
-        # would independently hit a pre-existing, out-of-scope race in
-        # DatasetRepository.get_or_create_by_slug (its ON CONFLICT targets
-        # only the slug unique index, not the separate uq_datasets_name
-        # constraint), which is not what this test is about.
-        async with PostgresUnitOfWork(session_factory) as uow:
-            await uow.datasets.add(
-                Dataset(
-                    id=uuid4(),
-                    name="main",
-                    slug="main",
-                    status=DatasetStatus.ACTIVE,
-                    active_generation=0,
-                )
-            )
-            await uow.commit()
-
         responses = await asyncio.gather(
             *(
                 post_remember(
@@ -1011,27 +998,34 @@ async def test_concurrent_first_remembers_with_new_session_converge_to_one_sessi
                     {
                         "dataset": "main",
                         "content": f"concurrent lazy {i}",
+                        "mode": "ingest",
                         "wait": True,
                         "session_id": session_key,
                     },
                 )
-                for i in range(3)
+                for i in range(5)
             )
         )
         for response in responses:
             assert response.status_code == 200
         session_uuids = {response.json()["data"]["session_uuid"] for response in responses}
         assert len(session_uuids) == 1
+        dataset_ids = {response.json()["data"]["dataset_id"] for response in responses}
+        assert len(dataset_ids) == 1
 
         async with postgres_engine.connect() as connection:
             session_count = await connection.scalar(
                 text("SELECT count(*) FROM sessions WHERE key = :key"), {"key": session_key}
             )
+            dataset_count = await connection.scalar(
+                text("SELECT count(*) FROM datasets WHERE slug = 'main'")
+            )
         assert session_count == 1
+        assert dataset_count == 1
         run_count = await count_pipeline_runs_for_session(
             session_factory, UUID(next(iter(session_uuids)))
         )
-        assert run_count == 3
+        assert run_count == 5
     finally:
         await coordinator.stop()
 
@@ -1051,20 +1045,6 @@ async def test_concurrent_same_idempotency_key_and_new_session_converges_to_one(
     await coordinator.start()
     session_key = f"remember-lazy-key-race-{uuid4().hex}"
     try:
-        # Pre-seed "main" for the same reason as the sibling lazy-creation
-        # race test above -- isolate this test to Session concurrency only.
-        async with PostgresUnitOfWork(session_factory) as uow:
-            await uow.datasets.add(
-                Dataset(
-                    id=uuid4(),
-                    name="main",
-                    slug="main",
-                    status=DatasetStatus.ACTIVE,
-                    active_generation=0,
-                )
-            )
-            await uow.commit()
-
         responses = await asyncio.gather(
             *(
                 post_remember(

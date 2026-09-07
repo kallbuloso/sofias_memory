@@ -103,3 +103,10 @@ class SessionStatus(StrEnum):
 
     ACTIVE = "active"
     ARCHIVED = "archived"
+
+
+class SkillStatus(StrEnum):
+    """Lifecycle status for first-class durable procedural Skills."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"

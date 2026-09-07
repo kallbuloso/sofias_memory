@@ -21,6 +21,10 @@ from sofias_memory.infrastructure.postgres.repositories.session_entries import (
     SessionEntryRepository,
 )
 from sofias_memory.infrastructure.postgres.repositories.sessions import SessionRepository
+from sofias_memory.infrastructure.postgres.repositories.skill_revisions import (
+    SkillRevisionRepository,
+)
+from sofias_memory.infrastructure.postgres.repositories.skills import SkillRepository
 from sofias_memory.infrastructure.postgres.repositories.sources import SourceRepository
 from sofias_memory.infrastructure.postgres.repositories.summaries import SummaryRepository
 
@@ -40,6 +44,8 @@ __all__ = [
     "RelationRepository",
     "SessionEntryRepository",
     "SessionRepository",
+    "SkillRepository",
+    "SkillRevisionRepository",
     "SourceRepository",
     "SummaryRepository",
 ]

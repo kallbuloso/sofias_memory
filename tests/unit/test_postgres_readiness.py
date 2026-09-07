@@ -173,7 +173,22 @@ def test_embedding_type_rejects_wrong_vector_dimension() -> None:
 
 
 def test_code_heads_loader_reads_current_alembic_head_without_shelling_out() -> None:
-    assert load_code_heads() == frozenset({"0013"})
+    assert load_code_heads() == frozenset({"0014"})
+
+
+class FakeMappingResult:
+    """Mirrors real SQLAlchemy's ``MappingResult``: supports both iteration
+    (the old ``for row in result.mappings():`` usage elsewhere in this file)
+    and ``.first()`` (used by the per-embedding-column query)."""
+
+    def __init__(self, rows: tuple[dict[str, object], ...]) -> None:
+        self._rows = rows
+
+    def __iter__(self) -> object:
+        return iter(self._rows)
+
+    def first(self) -> dict[str, object] | None:
+        return self._rows[0] if self._rows else None
 
 
 class FakeResult:
@@ -194,8 +209,8 @@ class FakeResult:
     def first(self) -> dict[str, object] | None:
         return self._rows[0] if self._rows else None
 
-    def mappings(self) -> tuple[dict[str, object], ...]:
-        return self._rows
+    def mappings(self) -> FakeMappingResult:
+        return FakeMappingResult(self._rows)
 
 
 class FakeConnection:
@@ -218,16 +233,15 @@ class FakeConnection:
                 rows=tuple({"extname": extension} for extension in REQUIRED_EXTENSIONS)
             )
         if "pg_catalog.pg_class" in sql:
-            return FakeResult(
-                rows=tuple(
-                    {
-                        "table_name": table_name,
-                        "column_name": column_name,
-                        "formatted_type": "vector(3072)",
-                    }
-                    for table_name, column_name in EMBEDDING_COLUMNS
-                )
-            )
+            # One query per EMBEDDING_COLUMNS entry, filtered by bound
+            # params -- mirrors the real per-column query issued by
+            # _embedding_column_types.
+            assert isinstance(params, dict)
+            table_name = params["table_name"]
+            column_name = params["column_name"]
+            if (table_name, column_name) in EMBEDDING_COLUMNS:
+                return FakeResult(rows=({"formatted_type": "vector(3072)"},))
+            return FakeResult(rows=())
         raise AssertionError(f"unexpected SQL: {sql}")
 
 

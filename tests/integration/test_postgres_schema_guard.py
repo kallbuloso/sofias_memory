@@ -46,6 +46,8 @@ REQUIRED_TABLES = frozenset(
         "graph_outbox",
         "sessions",
         "session_entries",
+        "skills",
+        "skill_revisions",
     }
 )
 
@@ -190,6 +192,8 @@ def test_schema_guard_policy_constants_are_exact() -> None:
                 "graph_outbox",
                 "sessions",
                 "session_entries",
+                "skills",
+                "skill_revisions",
             }
         )
         == REQUIRED_TABLES

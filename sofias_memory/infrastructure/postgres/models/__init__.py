@@ -15,6 +15,8 @@ from sofias_memory.infrastructure.postgres.models.relation import Relation
 from sofias_memory.infrastructure.postgres.models.relation_evidence import RelationEvidence
 from sofias_memory.infrastructure.postgres.models.session import Session
 from sofias_memory.infrastructure.postgres.models.session_entry import SessionEntry
+from sofias_memory.infrastructure.postgres.models.skill import Skill
+from sofias_memory.infrastructure.postgres.models.skill_revision import SkillRevision
 from sofias_memory.infrastructure.postgres.models.source import Source
 from sofias_memory.infrastructure.postgres.models.summary import Summary
 
@@ -34,6 +36,8 @@ __all__ = [
     "RelationEvidence",
     "Session",
     "SessionEntry",
+    "Skill",
+    "SkillRevision",
     "Source",
     "Summary",
 ]

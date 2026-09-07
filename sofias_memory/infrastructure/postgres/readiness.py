@@ -28,6 +28,7 @@ EMBEDDING_COLUMNS = (
     ("entities", "embedding"),
     ("relations", "embedding"),
     ("summaries", "embedding"),
+    ("skill_revisions", "resolution_embedding"),
 )
 VECTOR_TYPE_PATTERN = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_$]*\.)?vector\((\d+)\)$")
 
@@ -191,42 +192,39 @@ async def _embedding_column_types(
     *,
     schema: str,
 ) -> dict[tuple[str, str], str | None]:
-    result = await connection.execute(
-        text(
-            """
-            SELECT
-                c.relname AS table_name,
-                a.attname AS column_name,
-                pg_catalog.format_type(a.atttypid, a.atttypmod) AS formatted_type
-            FROM pg_catalog.pg_class AS c
-            JOIN pg_catalog.pg_namespace AS n
-              ON n.oid = c.relnamespace
-            LEFT JOIN pg_catalog.pg_attribute AS a
-              ON a.attrelid = c.oid
-             AND a.attname = 'embedding'
-             AND a.attnum > 0
-             AND NOT a.attisdropped
-            WHERE n.nspname = :schema
-              AND c.relkind = 'r'
-              AND c.relname IN ('chunks', 'entities', 'relations', 'summaries')
-            """
-        ),
-        {"schema": schema},
-    )
+    """One query per :data:`EMBEDDING_COLUMNS` entry -- unlike the four
+    original tracked columns, not every embedding column shares the same
+    name (``skill_revisions.resolution_embedding`` vs. ``chunks.embedding``
+    etc.), so the column name can no longer be a single shared JOIN
+    condition. A missing table/column (``LEFT JOIN``) reports ``None``
+    rather than being silently omitted."""
+
     column_types: dict[tuple[str, str], str | None] = {}
-    for row in result.mappings():
-        mapping = row
-        column_types[
-            (
-                _required_string(mapping, "table_name"),
-                _optional_string(mapping, "column_name") or "embedding",
-            )
-        ] = _optional_string(mapping, "formatted_type")
+    for table_name, column_name in EMBEDDING_COLUMNS:
+        result = await connection.execute(
+            text(
+                """
+                SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) AS formatted_type
+                FROM pg_catalog.pg_class AS c
+                JOIN pg_catalog.pg_namespace AS n
+                  ON n.oid = c.relnamespace
+                LEFT JOIN pg_catalog.pg_attribute AS a
+                  ON a.attrelid = c.oid
+                 AND a.attname = :column_name
+                 AND a.attnum > 0
+                 AND NOT a.attisdropped
+                WHERE n.nspname = :schema
+                  AND c.relkind = 'r'
+                  AND c.relname = :table_name
+                """
+            ),
+            {"schema": schema, "table_name": table_name, "column_name": column_name},
+        )
+        row = result.mappings().first()
+        column_types[(table_name, column_name)] = (
+            _optional_string(row, "formatted_type") if row is not None else None
+        )
     return column_types
-
-
-def _required_string(mapping: RowMapping, key: str) -> str:
-    return str(mapping[key])
 
 
 def _optional_string(mapping: RowMapping, key: str) -> str | None:

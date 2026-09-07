@@ -132,7 +132,7 @@ jobs:
       # because this is a separate `docker run`, not a step running
       # directly on the runner -- it cannot resolve the service container
       # by its service name the way the runner's own steps can.
-      - name: Migrate every database from the built image (0001 -> 0013)
+      - name: Migrate every database from the built image (0001 -> 0014)
         run: |
           set -e
           for db in \
@@ -165,12 +165,12 @@ jobs:
               sofias-memory:ci run --no-sync alembic upgrade head
           done
 
-      - name: Confirm alembic current == 0013 on the main database
+      - name: Confirm alembic current == 0014 on the main database
         run: |
           set -e
           CURRENT=$(psql -tAc "SELECT version_num FROM alembic_version")
           echo "alembic current: $CURRENT"
-          test "$CURRENT" = "0013"
+          test "$CURRENT" = "0014"
 
       # CI-compatible integration modules only -- see docs/development.md
       # and the REL-004 report for the full per-module inventory and the
@@ -246,6 +246,10 @@ jobs:
           SOFIAS_MEMORY_RUN_RECALL_SESSION_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_SESSIONS_COMPAT_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_SESSIONS_COMPAT_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_sessions_compat_test
+          # Skills (v0.4.0, SM-701) -- foundation-only suite shares the job's
+          # main `sofias_memory` database (DATABASE_URL above), no dedicated
+          # database declared yet.
+          SOFIAS_MEMORY_RUN_POSTGRES_SKILLS_TESTS: "1"
 
       - name: Diagnostics on failure
         if: failure()

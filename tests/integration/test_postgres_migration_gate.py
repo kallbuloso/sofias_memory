@@ -472,8 +472,12 @@ async def assert_complete_b2_schema(
     assert indexes["ix_chunks_lexical"]["method"] == "gin"
     assert indexes["ix_chunks_embedding_halfvec_hnsw"]["method"] == "hnsw"
     assert indexes["ix_summaries_embedding_halfvec_hnsw"]["method"] == "hnsw"
+    assert indexes["ix_skill_revisions_resolution_embedding_halfvec_hnsw"]["method"] == "hnsw"
     assert_hnsw_halfvec_index(indexes["ix_chunks_embedding_halfvec_hnsw"]["definition"])
     assert_hnsw_halfvec_index(indexes["ix_summaries_embedding_halfvec_hnsw"]["definition"])
+    assert_hnsw_halfvec_index(
+        indexes["ix_skill_revisions_resolution_embedding_halfvec_hnsw"]["definition"]
+    )
     assert_partial_unique_active_entity_index(
         indexes["uq_entities_dataset_id_canonical_key_active"]["definition"]
     )
@@ -488,6 +492,7 @@ async def assert_complete_b2_schema(
         ("entities", "embedding"): "vector(3072)",
         ("relations", "embedding"): "vector(3072)",
         ("summaries", "embedding"): "vector(3072)",
+        ("skill_revisions", "resolution_embedding"): "vector(3072)",
     }
 
 
@@ -503,10 +508,13 @@ async def assert_last_migration_downgraded(
         constraints = await constraints_by_name(connection, schema=schema)
 
     assert revisions == frozenset({expected_revision})
-    # 0013 (SM-603) is a single additive check constraint on top of an
-    # already-existing table: downgrading it removes only that constraint,
-    # never any table (0012's Sessions foundation, or anything earlier).
-    assert "ck_session_entries_external_id_trimmed" not in constraints
+    # 0014 (SM-701) is purely additive (skills, skill_revisions): downgrading
+    # it removes exactly those two tables (and their skill_status enum, not
+    # directly observable via constraints_by_name), never any earlier table
+    # or constraint (0012's Sessions foundation, 0013's SM-603 constraint, or
+    # anything earlier).
+    assert "skills" not in tables
+    assert "skill_revisions" not in tables
     assert {
         "sessions",
         "session_entries",
@@ -517,9 +525,10 @@ async def assert_last_migration_downgraded(
         "pipeline_steps",
         "graph_outbox",
     } <= tables
-    # The other 0012 session_entries checks/index must survive a 0013-only
-    # downgrade -- this proves the downgrade removed exactly one constraint,
-    # not the whole table's constraint set.
+    # 0013's own additive constraint must survive a 0014-only downgrade --
+    # this proves the downgrade removed exactly the 0014 objects, not
+    # anything from an earlier migration.
+    assert "ck_session_entries_external_id_trimmed" in constraints
     assert "ck_session_entries_external_id_not_blank" in constraints
     assert "ck_session_entries_external_id_max_length" in constraints
 
@@ -745,12 +754,12 @@ async def embedding_column_types(
               ON n.oid = c.relnamespace
             JOIN pg_catalog.pg_attribute AS a
               ON a.attrelid = c.oid
-             AND a.attname = 'embedding'
+             AND a.attname IN ('embedding', 'resolution_embedding')
              AND a.attnum > 0
              AND NOT a.attisdropped
             WHERE n.nspname = :schema
               AND c.relkind = 'r'
-              AND c.relname IN ('chunks', 'entities', 'relations', 'summaries')
+              AND c.relname IN ('chunks', 'entities', 'relations', 'summaries', 'skill_revisions')
             """
         ),
         {"schema": schema},
@@ -1417,4 +1426,4 @@ def test_schema_guard_policy_reused_by_migration_gate() -> None:
     )
     assert frozenset({"owner_id", "tenant_id"}) == FORBIDDEN_COLUMNS
     assert frozenset({"vector", "pg_trgm", "citext"}) == REQUIRED_EXTENSIONS
-    assert len(REQUIRED_TABLES) == 17
+    assert len(REQUIRED_TABLES) == 19

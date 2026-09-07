@@ -100,7 +100,8 @@ Implementar:
 - migration criando `skill_revisions` — `id` UUID PK interno (nunca exposto em URL pública, sempre endereçada por `{skill_uuid}/revisions/{revision}` — Feature Contract §3.3), FK para `skills`, `ON DELETE` policy consistente com "sem hard delete público de Skill" (nunca deve ser exercitada em operação normal, mas deve ter uma política explícita e testada, mesma disciplina de ADR-0007);
 - unique constraint `(skill_id, revision)`;
 - coluna pgvector para `resolution_embedding`, com dimensão compatível com `EMBEDDING_DIMENSIONS` (mesma disciplina já usada para chunks);
-- `content_sha256` coluna + índice para detecção de reimportação/reenvio idêntico (Feature Contract §12.7 — hash do conteúdo semântico canônico, não dos bytes originais; SM-702/703 consomem isso para safe replay, mas a coluna e a função de canonicalização nascem aqui).
+- `content_sha256` coluna + índice para detecção de reimportação/reenvio idêntico (Feature Contract §12.7 — hash do conteúdo semântico canônico, não dos bytes originais; SM-702/703 consomem isso para safe replay, mas a coluna e a função de canonicalização nascem aqui);
+- `CHECK` em `skill_revisions.metadata` rejeitando a chave reservada `sofias-memory.tags` (`SOFIAS_MEMORY_TAGS_METADATA_KEY`, Feature Contract §12.6) — defesa PostgreSQL authoritative, complementar à rejeição já feita por `validate_metadata` no domínio; nenhum caminho de escrita, presente ou futuro (SM-702 estruturado, SM-703 import), pode persistir a chave dentro de `metadata`.
 
 ### Domínio
 
@@ -126,7 +127,8 @@ A task só encerra quando:
 - nenhuma Skill committed com `current_revision_id = NULL` é observável, comprovado por teste de invariante (incluindo o caminho de falha do embedding provider, simulado nesta camada de domínio);
 - criação concorrente de revisão para a mesma Skill produz ordinais únicos e coerentes sob o lock por-Skill, comprovado por teste, cobrindo tanto conteúdo diferente (dois ordinais) quanto conteúdo idêntico (uma única revisão, replay detectável via `content_sha256`);
 - a função de canonicalização produz o mesmo `content_sha256` para conteúdo semanticamente idêntico com formatação diferente (ordem de chaves, whitespace, CRLF vs LF, ordem de `tags`/`declared_tools`), comprovado por teste;
-- `ON DELETE` policies estão cobertas por teste;
+- `ON DELETE` policies estão cobertas por teste, incluindo a prova real PostgreSQL de que (a) deletar diretamente a `SkillRevision` apontada por `current_revision_id` é rejeitada pela FK composta `ON DELETE RESTRICT`, e (b) deletar o aggregate `Skill` inteiro sucede e cascateia corretamente suas `SkillRevisions` — a FK composta nunca bloqueia esse segundo cenário porque `RESTRICT`/`CASCADE` operam em direções opostas do ciclo (RESTRICT protege contra apagar uma revisão referenciada; CASCADE, na FK oposta `skill_revisions.skill_id → skills.id`, remove as revisões quando a própria Skill é removida); nenhuma mudança na referential action foi necessária;
+- `metadata["sofias-memory.tags"]` é rejeitada tanto pelo domínio quanto pelo `CHECK` PostgreSQL, comprovado por teste de domínio e por teste real PostgreSQL de insert direto;
 - normalização compartilhada de `name` possui testes de boundary (subset portable, hyphen leading/trailing, `--`, uppercase, limites de tamanho);
 - nenhuma tabela ou coluna nova introduz `dataset_id`/`session_id`/`agent_id`/`owner_id`/`tenant_id`/`user_id`;
 - suite existente permanece verde após atualização deliberada dos schema tests.
@@ -220,7 +222,7 @@ Implementar:
 
 - parsing do subset portable (`name`/`description`/`license`/`compatibility`/`metadata`/corpo Markdown), com os limites de §12.8;
 - mapping determinístico `allowed-tools` (string separada por espaço) ↔ `declared_tools` (`list[string]`), Feature Contract §12.2 — reutilizar a mesma lógica de import/export em ambas as direções, sem caminho de código separado por rota;
-- mapping determinístico `tags` ↔ `metadata["sofias-memory.tags"]` (JSON array serializado como string), Feature Contract §12.6;
+- mapping determinístico `tags` ↔ `metadata["sofias-memory.tags"]` (JSON array serializado como string), Feature Contract §12.6 — no import, a chave reservada é **consumida e removida** antes de chegar a `validate_metadata` (SM-701), nunca persistida como parte de `metadata`; no export, é sintetizada somente no documento externo, sem tocar o `metadata` persistido; reutilizar a constante `SOFIAS_MEMORY_TAGS_METADATA_KEY` do SM-701, não redeclarar a string;
 - preservação de `allowed-tools` como metadata descritiva, nunca autorização (Feature Contract §12.2);
 - reutilização da função de canonicalização/`content_sha256` do SM-701 (não reimplementar);
 - serialização determinística de export dentro do `SuccessEnvelope` padrão (`format`/`content`/`content_sha256`, Feature Contract §12.5) — nunca uma resposta raw fora do envelope.
@@ -231,6 +233,7 @@ As duas rotas têm semânticas de idempotência diferentes — implementar cada 
 
 - `POST /skills/import`: `name` inexistente → cria nova Skill + revisão 1 (equivalente a `POST /skills`); `name` já existente (qualquer status) → **sempre** `409`/`INVALID_REQUEST`, nunca upsert, nunca safe replay, nunca cria revisão implicitamente — `content_sha256` nunca é consultado para decidir o resultado desta rota;
 - `POST /skills/{skill_uuid}/revisions/import`: cria nova SkillRevision na Skill alvo já identificada por `skill_uuid`; frontmatter `name` divergente do `Skill.name` alvo → `422`/`INVALID_REQUEST`, nunca renomeação/redirecionamento implícito; conteúdo idêntico (mesmo `content_sha256`, via a função canônica do SM-701) a uma revisão já existente **dessa Skill** → safe replay (Feature Contract §9.1): `200`, revisão existente, `current_revision_id` inalterado — mesma regra e mesmo código usados por `POST .../revisions` estruturado (SM-702), não uma segunda implementação.
+- Em ambas as rotas de import: se o frontmatter parseado contiver `metadata["sofias-memory.tags"]`, o parser extrai `tags` dela e **remove a chave** do dict de `metadata` antes de chamar as primitives do SM-701 — nunca chamar `validate_metadata` com a chave ainda presente (ela seria rejeitada, corretamente, mas isso indicaria que o parser não fez seu trabalho).
 
 ## Export
 
@@ -255,6 +258,8 @@ A task só encerra quando:
 - reimportação idêntica (mesmo `content_sha256`) via `POST .../revisions/import` resolve como safe replay (`200`, revisão existente, `current_revision_id` inalterado), comprovado por teste — esta regra aplica-se **somente** a esta rota, nunca a `POST /skills/import`;
 - export é semanticamente determinístico: `export(import(x))` produz o mesmo conteúdo canônico que `x` representa, para o subset portable — sem exigir igualdade de bytes com `x`, comprovado por teste;
 - `allowed-tools` ↔ `declared_tools` e `tags` ↔ `metadata["sofias-memory.tags"]` fazem round-trip corretamente e deterministicamente, comprovado por teste;
+- **prova de hash cross-surface** (Feature Contract §12.6/§12.7.1): a representação estruturada `metadata={}`/`tags=["pdf"]` e a representação **já normalizada** de uma importação de `metadata={"sofias-memory.tags":"[\"pdf\"]"}` (após a chave reservada ser consumida e removida pelo parser) produzem `metadata={}`/`tags=["pdf"]` idênticos e, portanto, o mesmo `content_sha256` — comprovado por teste real de import, não apenas reafirmando o teste de domínio já existente do SM-701;
+- `metadata["sofias-memory.tags"]` nunca sobrevive à normalização de import — nenhuma SkillRevision persistida, em nenhum teste, tem essa chave dentro de `metadata`, comprovado por teste real PostgreSQL (o `CHECK` do SM-701 é a defesa de último recurso; o parser nunca deve depender dele para funcionar corretamente);
 - `allowed-tools`/`declared_tools` importado nunca é interpretado como autorização em nenhum caminho de código, comprovado por teste;
 - `metadata` permanece `map<string,string>` em toda a superfície pública, comprovado por teste de shape;
 - suite existente permanece verde.

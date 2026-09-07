@@ -491,6 +491,8 @@ O subset portable do Agent Skills format define `metadata` como um mapa string�
 
 Sofias Memory pode armazenar `metadata` internamente em uma coluna JSONB, mas a forma pública/interoperável (request/response da API, e o mapeamento de/para frontmatter YAML) é sempre `dict[str, str]`. Nenhum valor de `metadata` é um objeto ou array aninhado na superfície pública.
 
+`metadata` persistida nunca contém a chave reservada `sofias-memory.tags` (§12.6) — rejeitada em toda superfície de escrita, estruturada ou futura-import.
+
 ## 12.4 Import
 
 Duas rotas distintas, congeladas nesta task:
@@ -549,20 +551,25 @@ Garantia de determinismo: exportar a mesma `revision` repetidamente produz sempr
 
 `tags` não é um campo top-level do subset portable do Agent Skills format. É uma extensão do Sofias Memory usada para discovery/filtering.
 
-Round-trip via `SKILL.md` usa uma chave reservada e namespaced dentro de `metadata` (que é `map<string,string>`, §12.3):
+`SkillRevision.tags` é a **única fonte de verdade semântica** para tags. A chave reservada abaixo é **somente representação de transporte SKILL.md** — ela nunca faz parte do `metadata` semântico persistido de uma SkillRevision, e as duas nunca coexistem como fontes concorrentes.
+
+Round-trip via `SKILL.md` usa uma chave reservada e namespaced (constante `SOFIAS_MEMORY_TAGS_METADATA_KEY = "sofias-memory.tags"`), presente apenas no documento `SKILL.md` externo (que é `map<string,string>`, §12.3):
 
 ```text
 metadata:
   sofias-memory.tags: '["pdf","forms"]'
 ```
 
-O valor é uma string contendo um array JSON serializado de tags (para caber no tipo `map<string,string>`).
+O valor é uma string contendo um array JSON serializado de tags (para caber no tipo `map<string,string>` do documento externo).
 
-- Import: se `metadata["sofias-memory.tags"]` estiver presente, é parseado como a lista de `tags` da Skill; a chave permanece também em `metadata` como está (nenhuma remoção silenciosa).
-- Export: `tags` é serializado de volta para essa mesma chave reservada dentro de `metadata`.
+- **Import** (SM-703): se `metadata["sofias-memory.tags"]` estiver presente no `SKILL.md` importado, ela é **parseada como a lista de `tags`** e então **consumida e removida** — a chave nunca chega à `metadata` semântica persistida. Essa remoção não é silenciosa: é o comportamento explicitamente documentado e testado desta chave reservada, não um efeito colateral acidental. `tags` e `metadata` persistidos, a partir desse ponto, nunca contêm a mesma informação duas vezes.
+- **Export** (SM-703): `metadata` persistida e `tags` persistida são combinadas apenas na hora de sintetizar o `SKILL.md` exportado — `metadata["sofias-memory.tags"]` é gerada nesse momento, exclusivamente no documento externo. O `metadata` persistido nunca é modificado por export.
+- **API estruturada** (SM-702): o caller usa `tags=[...]` diretamente. Um payload estruturado cujo `metadata` contenha a chave `sofias-memory.tags` é rejeitado como metadata inválida (`INVALID_REQUEST`) — a chave é reservada e nunca pode ser usada como um canal alternativo para `tags` na API estruturada.
 - Nenhum campo YAML top-level não-portable chamado `tags` é criado no `SKILL.md` exportado.
 
 Determinismo de `tags`: a lista é deduplicada e ordenada lexicograficamente na escrita (mesma disciplina de `declared_tools`, §12.2), tanto para a representação persistida/retornada quanto para o cálculo de `content_sha256`.
+
+Defesa em duas camadas (já implementada na foundation, SM-701): a rejeição de `metadata["sofias-memory.tags"]` é aplicada tanto pela validação de domínio (`validate_metadata`) quanto, de forma authoritative, por um `CHECK` PostgreSQL em `skill_revisions.metadata` — nenhum caminho de escrita, estruturado ou futuro-import, pode persistir a chave reservada dentro de `metadata`.
 
 ## 12.7 Canonicalização e `content_sha256`
 
@@ -600,6 +607,8 @@ metadata         object (map<string,string>, chaves ordenadas)
 tags             array[string] (ordenado, deduplicado — §12.6)
 declared_tools   array[string] (ordenado — §12.2)
 ```
+
+`metadata`, dentro do objeto canônico, **nunca contém a chave `sofias-memory.tags`** — essa chave existe somente no documento `SKILL.md` externo (transporte), nunca na `metadata` semântica persistida ou hasheada. `tags` é a única representação canônica de tags; `metadata` e `tags` nunca duplicam a mesma informação dentro do objeto canônico. Consequência direta: a representação estruturada (`metadata={}`, `tags=[...]`) e a representação já normalizada de uma importação futura (mesmo `tags`, `metadata` sem a chave reservada) produzem exatamente o mesmo objeto canônico e o mesmo `content_sha256` — comprovado por teste (SM-701).
 
 ## 12.7.2 Normalização de campo ausente/opcional
 
@@ -894,6 +903,7 @@ Explicitamente fora deste release:
 18. Forget e Dataset Delete nunca removem Skill/SkillRevision.
 19. Nenhuma transação PostgreSQL longa permanece aberta durante chamada ao embedding provider, em escrita ou em `resolve`.
 20. Skill não é authorization boundary.
+21. `metadata` semântica persistida nunca contém a chave reservada `sofias-memory.tags` — `tags` é a única fonte de verdade para tags; a chave existe apenas como representação de transporte no documento `SKILL.md` externo, consumida e removida no import, sintetizada apenas no export, e rejeitada (domínio + `CHECK` PostgreSQL) em qualquer tentativa de persisti-la.
 
 ---
 

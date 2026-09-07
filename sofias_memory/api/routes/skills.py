@@ -20,6 +20,8 @@ from sofias_memory.schemas.skills import (
     SKILL_REVISION_PAGE_DEFAULT_LIMIT,
     SKILL_REVISION_PAGE_MAX_LIMIT,
     SkillCreateRequest,
+    SkillExportResult,
+    SkillImportRequest,
     SkillListResult,
     SkillResult,
     SkillRevisionCreateRequest,
@@ -48,6 +50,14 @@ _SKILL_ROLLBACK_TARGET_422 = error_response(
 _SKILL_DEPENDENCY_UNAVAILABLE_503 = error_response(
     "The embedding provider is unavailable, or returned an unexpected "
     "vector dimension. ErrorEnvelope with error.code=DEPENDENCY_UNAVAILABLE."
+)
+_SKILL_MD_INVALID_422 = error_response(
+    "The SKILL.md document is structurally invalid or fails the portable "
+    "subset's field validation. ErrorEnvelope with error.code=INVALID_REQUEST."
+)
+_SKILL_MD_NAME_MISMATCH_422 = error_response(
+    "The SKILL.md frontmatter name does not match the target Skill's name. "
+    "ErrorEnvelope with error.code=INVALID_REQUEST."
 )
 
 router = APIRouter(tags=["skills"])
@@ -84,6 +94,38 @@ async def create_skill(
 ) -> SuccessEnvelope[SkillResult]:
     service = _skill_service(request)
     result = await service.create_skill(payload)
+    return SuccessEnvelope[SkillResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.post(
+    "/skills/import",
+    response_model=SuccessEnvelope[SkillResult],
+    status_code=HTTPStatus.CREATED,
+    summary="Import a standalone SKILL.md as a new Skill",
+    description=(
+        "Parse a standalone SKILL.md document and create a new Skill and "
+        "its first SkillRevision atomically -- equivalent to `POST "
+        "/skills`, sourced from SKILL.md instead of structured fields. "
+        "`name` already existing, in any status, is always a conflict, "
+        "even when the content is semantically identical to an existing "
+        "Skill: this route never resolves by content hash, never safe "
+        "replays, and never creates a revision implicitly."
+    ),
+    responses={
+        HTTPStatus.UNPROCESSABLE_ENTITY: _SKILL_MD_INVALID_422,
+        HTTPStatus.CONFLICT: _SKILL_CREATE_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: _SKILL_DEPENDENCY_UNAVAILABLE_503,
+    },
+)
+async def import_skill(
+    payload: SkillImportRequest,
+    request: Request,
+) -> SuccessEnvelope[SkillResult]:
+    service = _skill_service(request)
+    result = await service.import_skill(payload.content)
     return SuccessEnvelope[SkillResult](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
@@ -252,6 +294,48 @@ async def create_skill_revision(
     )
 
 
+@router.post(
+    "/skills/{skill_uuid}/revisions/import",
+    response_model=SuccessEnvelope[SkillRevisionResult],
+    summary="Import a standalone SKILL.md as a new SkillRevision",
+    description=(
+        "Parse a standalone SKILL.md document and create a new "
+        "SkillRevision on the identified Skill -- equivalent to `POST "
+        ".../revisions`, sourced from SKILL.md instead of structured "
+        "fields, and following the exact same safe-replay rule: `201` for "
+        "semantically new content, `200` with the existing revision "
+        "(current_revision unchanged) for content identical by canonical "
+        "hash to a revision this Skill already has. The frontmatter `name` "
+        "must equal the target Skill's name exactly; a mismatch is `422`, "
+        "never an implicit rename or redirect. Permitted even when the "
+        "Skill is archived."
+    ),
+    responses={
+        HTTPStatus.OK: error_response(
+            "Safe replay: semantically identical content already exists as "
+            "a revision of this Skill. Returns 200 with that existing "
+            "revision -- current_revision is not modified."
+        ),
+        HTTPStatus.UNPROCESSABLE_ENTITY: _SKILL_MD_NAME_MISMATCH_422,
+        HTTPStatus.NOT_FOUND: _SKILL_NOT_FOUND_404,
+        HTTPStatus.SERVICE_UNAVAILABLE: _SKILL_DEPENDENCY_UNAVAILABLE_503,
+    },
+)
+async def import_skill_revision(
+    skill_uuid: UUID,
+    payload: SkillImportRequest,
+    request: Request,
+    response: Response,
+) -> SuccessEnvelope[SkillRevisionResult]:
+    service = _skill_service(request)
+    result, created = await service.import_revision(skill_uuid, payload.content)
+    response.status_code = HTTPStatus.CREATED if created else HTTPStatus.OK
+    return SuccessEnvelope[SkillRevisionResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
 @router.get(
     "/skills/{skill_uuid}/revisions",
     response_model=SuccessEnvelope[SkillRevisionListResult],
@@ -298,6 +382,35 @@ async def get_skill_revision(
     service = _skill_service(request)
     result = await service.get_revision(skill_uuid, revision)
     return SuccessEnvelope[SkillRevisionResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.get(
+    "/skills/{skill_uuid}/revisions/{revision}/export",
+    response_model=SuccessEnvelope[SkillExportResult],
+    summary="Export a SkillRevision as standalone SKILL.md",
+    description=(
+        "Serialize one specific revision's persisted semantic content as a "
+        "standalone SKILL.md document, inside the standard SuccessEnvelope. "
+        "Deterministic over the persisted content: the same revision "
+        "always produces the same `content`/`content_sha256` -- never a "
+        "promise of byte-identity with whatever SKILL.md was originally "
+        "imported. `content_sha256` is the persisted SkillRevision's own "
+        "semantic hash, not a digest of the exported bytes. Allowed for "
+        "both active and archived Skills."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _SKILL_REVISION_NOT_FOUND_404},
+)
+async def export_skill_revision(
+    skill_uuid: UUID,
+    revision: int,
+    request: Request,
+) -> SuccessEnvelope[SkillExportResult]:
+    service = _skill_service(request)
+    result = await service.export_revision(skill_uuid, revision)
+    return SuccessEnvelope[SkillExportResult](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
     )

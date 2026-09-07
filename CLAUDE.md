@@ -549,9 +549,13 @@ Somente as famílias definidas no PRD:
 - graph
 - provenance
 - skills management: create/get/list, PATCH (rollback), archive/restore,
-  revisions create/get/list (v0.4.0, ADR-0013, SM-702). Import/export
-  (SKILL.md) e resolve semântico ainda não existem -- não assuma sua presença
-  até SM-703/SM-704.
+  revisions create/get/list (v0.4.0, ADR-0013, SM-702);
+- skills standalone SKILL.md import/export: `POST /skills/import`,
+  `POST /skills/{skill_uuid}/revisions/import`,
+  `GET /skills/{skill_uuid}/revisions/{revision}/export` (v0.4.0, ADR-0013,
+  SM-703) -- bundled skill packages (`scripts/`/`references/`/`assets/`),
+  semantic resolve e SkillRun/runtime de Agent ainda não existem -- não
+  assuma sua presença até SM-704/SM-705.
 
 Não invente aliases/endpoints de conveniência.
 

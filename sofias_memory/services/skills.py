@@ -37,9 +37,16 @@ from sofias_memory.domain import (
 from sofias_memory.infrastructure.postgres.models import Skill, SkillRevision
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
+from sofias_memory.interoperability.skill_md import (
+    InvalidSkillMarkdownError,
+    ParsedSkillDocument,
+    parse_skill_markdown,
+    serialize_skill_markdown,
+)
 from sofias_memory.schemas.common import ErrorCode, utc_now
 from sofias_memory.schemas.skills import (
     SkillCreateRequest,
+    SkillExportResult,
     SkillListResult,
     SkillResult,
     SkillRevisionCreateRequest,
@@ -436,6 +443,108 @@ class SkillService:
                 raise skill_revision_not_found_error(skill_uuid, revision)
             return revision_result(skill.id, found)
 
+    async def import_skill(self, raw_content: str) -> SkillResult:
+        """``POST /skills/import`` (SM-703, Feature Contract SS 12.4): a
+        standalone ``SKILL.md`` document, parsed into the same
+        :class:`~sofias_memory.domain.SkillRevisionContent`
+        :meth:`create_skill` persists from a structured request, then
+        handed to the exact same aggregate-creation primitive. ``name``
+        already existing (any status) is **always** ``409`` -- never safe
+        replay, never upsert; ``content_sha256`` never decides this route's
+        outcome (unlike :meth:`import_revision`)."""
+
+        parsed = _parse_skill_markdown_or_422(raw_content)
+        resolution_text = build_skill_resolution_text(
+            name=parsed.name, description=parsed.content.description, tags=parsed.content.tags
+        )
+        embedding = await self._resolution_embedding(resolution_text)
+
+        async with self._unit_of_work_factory() as uow:
+            try:
+                skill = await create_skill_aggregate(
+                    uow,
+                    name=parsed.name,
+                    content=parsed.content,
+                    resolution_embedding=embedding,
+                )
+            except SkillNameAlreadyExistsError as exc:
+                raise skill_name_conflict_error(exc.name) from exc
+            result = skill_result_from_content(skill, current_revision=1, content=parsed.content)
+            await uow.commit()
+            return result
+
+    async def import_revision(
+        self, skill_uuid: UUID, raw_content: str
+    ) -> tuple[SkillRevisionResult, bool]:
+        """``POST /skills/{skill_uuid}/revisions/import`` (SM-703, Feature
+        Contract SS 12.4): parses a standalone ``SKILL.md`` document and
+        creates a new revision on an already-identified Skill through the
+        exact same primitive :meth:`create_revision` uses, so safe replay
+        (``200``, existing revision, ``current_revision_id`` unchanged) is
+        one implementation, never a second one for the import path. The
+        frontmatter ``name`` must equal the target Skill's ``name`` exactly
+        -- a mismatch is ``422``, checked before any provider I/O, never
+        reinterpreted as a rename or a redirect to another Skill."""
+
+        parsed = _parse_skill_markdown_or_422(raw_content)
+
+        async with self._unit_of_work_factory() as uow:
+            skill = await uow.skills.get_by_id(skill_uuid)
+            if skill is None:
+                raise skill_not_found_error(skill_uuid)
+            name = skill.name
+
+        if parsed.name != name:
+            raise skill_import_name_mismatch_error(skill_uuid, expected=name, actual=parsed.name)
+
+        resolution_text = build_skill_resolution_text(
+            name=name, description=parsed.content.description, tags=parsed.content.tags
+        )
+        embedding = await self._resolution_embedding(resolution_text)
+
+        async with self._unit_of_work_factory() as uow:
+            try:
+                outcome = await create_skill_revision(
+                    uow,
+                    skill_id=skill_uuid,
+                    name=name,
+                    content=parsed.content,
+                    resolution_embedding=embedding,
+                )
+            except SkillNotFoundError as exc:
+                raise skill_not_found_error(skill_uuid) from exc
+            result = revision_result(skill_uuid, outcome.revision)
+            await uow.commit()
+            return result, outcome.created
+
+    async def export_revision(self, skill_uuid: UUID, revision: int) -> SkillExportResult:
+        """``GET /skills/{skill_uuid}/revisions/{revision}/export`` (SM-703,
+        Feature Contract SS 12.5): deterministic over the **persisted
+        semantic content**, never a promise of byte-identity with whatever
+        ``SKILL.md`` was originally imported. Permitted on an archived
+        Skill -- archive is a discovery filter only."""
+
+        async with self._unit_of_work_factory() as uow:
+            skill = await require_skill(uow, skill_uuid)
+            found = await uow.skill_revisions.get_by_skill_and_revision(skill.id, revision)
+            if found is None:
+                raise skill_revision_not_found_error(skill_uuid, revision)
+            content = SkillRevisionContent(
+                description=found.description,
+                procedure=found.procedure,
+                license=found.license,
+                compatibility=found.compatibility,
+                metadata=found.metadata_,
+                tags=found.tags,
+                declared_tools=found.declared_tools,
+            )
+            markdown = serialize_skill_markdown(name=skill.name, content=content)
+            return SkillExportResult(
+                format="skill_md",
+                content=markdown,
+                content_sha256=found.content_sha256,
+            )
+
     async def _resolution_embedding(self, text: str) -> list[float]:
         try:
             embeddings = await self._embedding_client.embed_texts([text])
@@ -448,6 +557,22 @@ class SkillService:
                 "Embedding provider returned an unexpected vector dimension."
             )
         return embeddings[0]
+
+
+def _parse_skill_markdown_or_422(raw_content: str) -> ParsedSkillDocument:
+    """Translates :class:`InvalidSkillMarkdownError` into the same
+    ``422 INVALID_REQUEST`` shape every other Skill validation failure
+    uses -- the route/HTTP layer never sees a raw parser exception."""
+
+    try:
+        return parse_skill_markdown(raw_content)
+    except InvalidSkillMarkdownError as exc:
+        raise SofiasMemoryError(
+            code=ErrorCode.INVALID_REQUEST,
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            message="SKILL.md document is invalid.",
+            details={"reason": exc.reason},
+        ) from exc
 
 
 def _content_from_request(
@@ -589,6 +714,17 @@ def skill_revision_not_found_error(skill_uuid: UUID, revision: int) -> SofiasMem
         status_code=HTTPStatus.NOT_FOUND,
         message="SkillRevision does not exist.",
         details={"skill_uuid": str(skill_uuid), "revision": revision},
+    )
+
+
+def skill_import_name_mismatch_error(
+    skill_uuid: UUID, *, expected: str, actual: str
+) -> SofiasMemoryError:
+    return SofiasMemoryError(
+        code=ErrorCode.INVALID_REQUEST,
+        status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+        message="SKILL.md frontmatter name does not match the target Skill's name.",
+        details={"skill_uuid": str(skill_uuid), "expected_name": expected, "actual_name": actual},
     )
 
 

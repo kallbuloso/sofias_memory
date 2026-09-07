@@ -10,6 +10,7 @@ remains the semantically authoritative check.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -218,3 +219,30 @@ class SkillRevisionListResult(BaseModel):
     limit: int
     offset: int
     total: int
+
+
+class SkillImportRequest(BaseModel):
+    """Standalone ``SKILL.md`` import payload (Feature Contract SS 12.4).
+    ``content`` is parsed by
+    :func:`sofias_memory.interoperability.skill_md.parse_skill_markdown`,
+    which converges to the exact same domain validation the structured
+    create/create-revision requests use -- no separate limits are declared
+    here. No multipart upload, filesystem path, URL import, zip, or format
+    autodetection: standalone ``SKILL.md`` text is the only accepted shape."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, description="Standalone SKILL.md document text.")
+
+
+class SkillExportResult(BaseModel):
+    """Standalone ``SKILL.md`` export payload (Feature Contract SS 12.5).
+    ``content_sha256`` is the persisted ``SkillRevision``'s semantic
+    content hash -- it is **not** a digest of ``content``'s bytes; the two
+    are never asserted equal (Feature Contract SS 12.7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: Literal["skill_md"]
+    content: str
+    content_sha256: str

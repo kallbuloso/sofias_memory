@@ -242,9 +242,9 @@ def test_no_session_hard_delete_or_purge_surface_exists() -> None:
 
 def test_skill_management_routes_present_with_exact_methods() -> None:
     """SM-702 scope: Skill management + immutable SkillRevision create/read,
-    archive/restore, and current_revision rollback. No import/export/resolve
-    surface, and SkillRevision itself gains no PATCH/DELETE (SM-701/SS 4.2:
-    a revision is immutable once created)."""
+    archive/restore, and current_revision rollback. SkillRevision itself
+    gains no PATCH/DELETE (SM-701/SS 4.2: a revision is immutable once
+    created) -- including the SM-703 import/export surface added below."""
 
     schema = openapi_schema()
     paths = schema["paths"]
@@ -265,18 +265,24 @@ def test_skill_management_routes_present_with_exact_methods() -> None:
             assert "put" not in operations, path
 
 
-def test_skill_import_export_resolve_surface_is_absent() -> None:
-    """SM-702 explicitly does not implement SM-703 (SKILL.md import/export)
-    or SM-704 (semantic resolve)."""
+def test_skill_import_export_surface_present_resolve_still_absent() -> None:
+    """SM-703 scope: standalone SKILL.md import/export, exactly the three
+    routes the Feature Contract froze -- no bundled package, no fourth
+    import/export route. SM-704 (semantic resolve) is still not
+    implemented."""
 
     schema = openapi_schema()
     paths = schema["paths"]
     assert isinstance(paths, dict)
 
-    assert "/api/v1/skills/import" not in paths
-    assert "/api/v1/skills/{skill_uuid}/revisions/import" not in paths
-    assert "/api/v1/skills/{skill_uuid}/revisions/{revision}/export" not in paths
+    assert set(paths["/api/v1/skills/import"]) == {"post"}
+    assert set(paths["/api/v1/skills/{skill_uuid}/revisions/import"]) == {"post"}
+    assert set(paths["/api/v1/skills/{skill_uuid}/revisions/{revision}/export"]) == {"get"}
+
     assert "/api/v1/skills/resolve" not in paths
+    assert "/api/v1/skills/export" not in paths
+    assert "/api/v1/skills/{skill_uuid}/export" not in paths
+    assert "/api/v1/skills/{skill_uuid}/import" not in paths
 
 
 def test_skill_result_shape_never_exposes_procedure_or_internal_ids() -> None:

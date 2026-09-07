@@ -265,11 +265,12 @@ def test_skill_management_routes_present_with_exact_methods() -> None:
             assert "put" not in operations, path
 
 
-def test_skill_import_export_surface_present_resolve_still_absent() -> None:
+def test_skill_import_export_resolve_surface_present_no_extra_routes() -> None:
     """SM-703 scope: standalone SKILL.md import/export, exactly the three
     routes the Feature Contract froze -- no bundled package, no fourth
-    import/export route. SM-704 (semantic resolve) is still not
-    implemented."""
+    import/export route. SM-704 scope: exactly one new operation,
+    `POST /skills/resolve` -- no bundled/tool-execution surface added
+    alongside it."""
 
     schema = openapi_schema()
     paths = schema["paths"]
@@ -278,11 +279,12 @@ def test_skill_import_export_surface_present_resolve_still_absent() -> None:
     assert set(paths["/api/v1/skills/import"]) == {"post"}
     assert set(paths["/api/v1/skills/{skill_uuid}/revisions/import"]) == {"post"}
     assert set(paths["/api/v1/skills/{skill_uuid}/revisions/{revision}/export"]) == {"get"}
+    assert set(paths["/api/v1/skills/resolve"]) == {"post"}
 
-    assert "/api/v1/skills/resolve" not in paths
     assert "/api/v1/skills/export" not in paths
     assert "/api/v1/skills/{skill_uuid}/export" not in paths
     assert "/api/v1/skills/{skill_uuid}/import" not in paths
+    assert "/api/v1/skills/{skill_uuid}/resolve" not in paths
 
 
 def test_skill_result_shape_never_exposes_procedure_or_internal_ids() -> None:
@@ -317,6 +319,28 @@ def test_skill_result_shape_never_exposes_procedure_or_internal_ids() -> None:
     skill_update_request = schemas["SkillUpdateRequest"]
     assert isinstance(skill_update_request, dict)
     assert set(skill_update_request["properties"]) == {"current_revision"}
+
+    skill_resolve_match = schemas["SkillResolveMatch"]
+    assert isinstance(skill_resolve_match, dict)
+    resolve_properties = skill_resolve_match["properties"]
+    assert set(resolve_properties) == {
+        "skill_uuid",
+        "name",
+        "description",
+        "current_revision",
+        "tags",
+        "declared_tools",
+        "compatibility",
+        "score",
+    }
+    assert "procedure" not in resolve_properties
+    assert "metadata" not in resolve_properties
+    assert "license" not in resolve_properties
+    assert "content_sha256" not in resolve_properties
+    assert "resolution_embedding" not in resolve_properties
+    assert "archived_at" not in resolve_properties
+    assert "created_at" not in resolve_properties
+    assert "updated_at" not in resolve_properties
 
 
 def test_private_routes_require_api_key_security() -> None:

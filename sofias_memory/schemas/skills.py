@@ -33,6 +33,8 @@ SKILL_PAGE_DEFAULT_LIMIT = 50
 SKILL_PAGE_MAX_LIMIT = 100
 SKILL_REVISION_PAGE_DEFAULT_LIMIT = 50
 SKILL_REVISION_PAGE_MAX_LIMIT = 100
+SKILL_RESOLVE_DEFAULT_TOP_K = 5
+SKILL_RESOLVE_MAX_TOP_K = 20
 
 
 class _SkillRevisionContentFields(BaseModel):
@@ -246,3 +248,57 @@ class SkillExportResult(BaseModel):
     format: Literal["skill_md"]
     content: str
     content_sha256: str
+
+
+class SkillResolveRequest(BaseModel):
+    """``POST /skills/resolve`` request (Feature Contract SS 10). Discovery
+    only -- the caller decides which, if any, of the ranked matches to act
+    on; this request never selects a Skill on the caller's behalf."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, description="Natural-language discovery query.")
+    top_k: int = Field(
+        default=SKILL_RESOLVE_DEFAULT_TOP_K,
+        ge=1,
+        le=SKILL_RESOLVE_MAX_TOP_K,
+        description="Maximum number of ranked matches to return.",
+    )
+
+    @field_validator("query")
+    @classmethod
+    def reject_whitespace_only_query(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("query must not be empty or whitespace-only")
+        return value
+
+
+class SkillResolveMatch(BaseModel):
+    """One ranked candidate -- progressive-disclosure metadata only (Feature
+    Contract SS 11). Never includes ``procedure``, ``metadata``,
+    ``license``, ``content_sha256``, ``resolution_embedding``, or any
+    timestamp -- a caller who wants the procedure must read
+    ``GET .../revisions/{revision}`` explicitly."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill_uuid: UUID
+    name: str
+    description: str
+    current_revision: int
+    tags: list[str]
+    declared_tools: list[str]
+    compatibility: str | None
+    score: float = Field(
+        description="1.0 - cosine_distance. Higher is more similar. No hidden "
+        "threshold: every candidate up to top_k is returned regardless of score."
+    )
+
+
+class SkillResolveResult(BaseModel):
+    """Ranked ``resolve`` result, descending by ``score``. ``matches`` is
+    ``[]`` when no active Skill exists -- never ``404``/an error."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    matches: list[SkillResolveMatch]

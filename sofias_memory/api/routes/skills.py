@@ -23,6 +23,8 @@ from sofias_memory.schemas.skills import (
     SkillExportResult,
     SkillImportRequest,
     SkillListResult,
+    SkillResolveRequest,
+    SkillResolveResult,
     SkillResult,
     SkillRevisionCreateRequest,
     SkillRevisionListResult,
@@ -132,6 +134,34 @@ async def import_skill(
     )
 
 
+@router.post(
+    "/skills/resolve",
+    response_model=SuccessEnvelope[SkillResolveResult],
+    summary="Semantically resolve Skills for a discovery query",
+    description=(
+        "Rank `active` Skills' current revision by cosine similarity to "
+        "`query`. Discovery only -- never selects a Skill on the caller's "
+        "behalf, never fetches `procedure`, never executes a tool. No "
+        "hidden score threshold: every candidate up to `top_k` is "
+        "returned; `matches=[]` when none are eligible, never `404`. "
+        "Archived Skills never appear."
+    ),
+    responses={
+        HTTPStatus.SERVICE_UNAVAILABLE: _SKILL_DEPENDENCY_UNAVAILABLE_503,
+    },
+)
+async def resolve_skills(
+    payload: SkillResolveRequest,
+    request: Request,
+) -> SuccessEnvelope[SkillResolveResult]:
+    service = _skill_service(request)
+    result = await service.resolve(payload)
+    return SuccessEnvelope[SkillResolveResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
 @router.get(
     "/skills",
     response_model=SuccessEnvelope[SkillListResult],
@@ -212,11 +242,10 @@ async def update_skill(
     summary="Archive a Skill",
     description=(
         "Idempotent discovery filter, not an admission barrier: active -> "
-        "archived, archived -> archived (no-op). A future semantic resolve "
-        "endpoint will never return an archived Skill, but every "
-        "management operation (`GET`, create revision, `PATCH "
-        "current_revision`) remains available. Never touches "
-        "`current_revision`."
+        "archived, archived -> archived (no-op). `POST /skills/resolve` "
+        "never returns an archived Skill, but every management operation "
+        "(`GET`, create revision, `PATCH current_revision`) remains "
+        "available. Never touches `current_revision`."
     ),
     responses={HTTPStatus.NOT_FOUND: _SKILL_NOT_FOUND_404},
 )

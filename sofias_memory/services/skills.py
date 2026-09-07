@@ -48,6 +48,9 @@ from sofias_memory.schemas.skills import (
     SkillCreateRequest,
     SkillExportResult,
     SkillListResult,
+    SkillResolveMatch,
+    SkillResolveRequest,
+    SkillResolveResult,
     SkillResult,
     SkillRevisionCreateRequest,
     SkillRevisionListItem,
@@ -543,6 +546,40 @@ class SkillService:
                 format="skill_md",
                 content=markdown,
                 content_sha256=found.content_sha256,
+            )
+
+    async def resolve(self, request: SkillResolveRequest) -> SkillResolveResult:
+        """``POST /skills/resolve`` (Feature Contract SS 10): discovery
+        only -- ranks ``active`` Skills' *current* revision by cosine
+        similarity to ``request.query``, embedded exactly as given (never
+        run through :func:`build_skill_resolution_text`, which composes
+        *document* text for a Skill's own resolution embedding, not a
+        caller's query). No PostgreSQL transaction/lock is held across the
+        embedding call; the ranking query itself is read-only and never
+        creates a Skill, SkillRevision, SessionEntry, Query, or
+        PipelineRun. No hidden threshold -- ``matches`` is simply every
+        ranked candidate up to ``top_k``, or ``[]`` when none exist."""
+
+        embedding = await self._resolution_embedding(request.query)
+
+        async with self._unit_of_work_factory() as uow:
+            candidates = await uow.skills.resolve_active_current(
+                query_embedding=embedding, top_k=request.top_k
+            )
+            return SkillResolveResult(
+                matches=[
+                    SkillResolveMatch(
+                        skill_uuid=candidate.skill_uuid,
+                        name=candidate.name,
+                        description=candidate.description,
+                        current_revision=candidate.current_revision,
+                        tags=candidate.tags,
+                        declared_tools=candidate.declared_tools,
+                        compatibility=candidate.compatibility,
+                        score=candidate.score,
+                    )
+                    for candidate in candidates
+                ]
             )
 
     async def _resolution_embedding(self, text: str) -> list[float]:

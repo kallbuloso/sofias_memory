@@ -568,9 +568,14 @@ Somente as famílias definidas no PRD:
 - skills standalone SKILL.md import/export: `POST /skills/import`,
   `POST /skills/{skill_uuid}/revisions/import`,
   `GET /skills/{skill_uuid}/revisions/{revision}/export` (v0.4.0, ADR-0013,
-  SM-703) -- bundled skill packages (`scripts/`/`references/`/`assets/`),
-  semantic resolve e SkillRun/runtime de Agent ainda não existem -- não
-  assuma sua presença até SM-704/SM-705.
+  SM-703);
+- skills semantic resolve: `POST /skills/resolve` (v0.4.0, ADR-0013,
+  SM-704) -- discovery/ranking apenas: nunca escolhe uma Skill em nome do
+  caller, nunca carrega `procedure`, nunca executa uma tool. Bundled skill
+  packages (`scripts/`/`references/`/`assets/`), execução de Skill e
+  `SkillRun` continuam fora do MVP -- não assuma sua presença até
+  SM-705/SM-706. `SkillRun` e qualquer runtime de Agent permanecem
+  proibidos.
 
 Não invente aliases/endpoints de conveniência.
 

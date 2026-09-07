@@ -2,7 +2,7 @@
 
 This is the proven, canonical guide for deploying Sofias Memory on Easypanel
 from the exact release image
-`ghcr.io/kallbuloso/sofias-memory:0.2.0` — no build, no source checkout, no
+`ghcr.io/kallbuloso/sofias-memory:0.3.0` — no build, no source checkout, no
 `Dockerfile` is required on the Easypanel host. The Compose definition used is
 [`deploy/easypanel/compose.yaml`](../../deploy/easypanel/compose.yaml), a
 deployment-only variant of the root [`compose.yaml`](../../compose.yaml) with
@@ -11,12 +11,12 @@ environment contract — the only differences are `image:` instead of `build:`,
 and no host port published for `sofias-memory` (Easypanel routes its domain
 directly to the container's internal port instead).
 
-For maximum reproducibility, the published `0.2.0` image may optionally be
+For maximum reproducibility, the published `0.3.0` image may optionally be
 pinned by its GHCR digest instead of tag after publication. The canonical
 `deploy/easypanel/compose.yaml` itself uses the exact version tag, not a digest;
 see `docs/operations.md` §D for the general version/digest pinning policy.
 Historical validation evidence below remains explicitly tied to the version that
-was actually exercised and is not rewritten as if it had been run on `0.2.0`.
+was actually exercised and is not rewritten as if it had been run on `0.3.0`.
 
 This guide does not repeat the general operational contract (migration
 policy, backup/restore, rollback) — see [`docs/operations.md`](../operations.md)
@@ -54,7 +54,7 @@ build path:    /
 compose file:  deploy/easypanel/compose.yaml
 ```
 
-A specific stable tag (e.g. `v0.2.0`) may be used instead of `main` for a
+A specific stable tag (e.g. `v0.3.0`) may be used instead of `main` for a
 pinned, reproducible source reference.
 
 **Option B — Inline Compose.** Select Easypanel's **Inline**/**paste Compose
@@ -140,7 +140,7 @@ should still follow that document's backup-first procedure.
    alembic upgrade head
    ```
 
-4. Confirm the result, both should report `0011 (head)`:
+4. Confirm the result, both should report `0013 (head)`:
 
    ```bash
    alembic current

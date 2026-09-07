@@ -120,6 +120,7 @@ jobs:
             sofias_memory_runs_test \
             sofias_memory_submission_test \
             sofias_memory_process_kill_test \
+            sofias_memory_sessions_compat_test \
           ; do
             psql -c "CREATE DATABASE ${db}"
           done
@@ -131,7 +132,7 @@ jobs:
       # because this is a separate `docker run`, not a step running
       # directly on the runner -- it cannot resolve the service container
       # by its service name the way the runner's own steps can.
-      - name: Migrate every database from the built image (0001 -> 0011)
+      - name: Migrate every database from the built image (0001 -> 0013)
         run: |
           set -e
           for db in \
@@ -153,6 +154,7 @@ jobs:
             sofias_memory_runs_test \
             sofias_memory_submission_test \
             sofias_memory_process_kill_test \
+            sofias_memory_sessions_compat_test \
           ; do
             docker run --rm --network host \
               -e DATABASE_URL="postgresql+asyncpg://sofias_memory:ci-disposable-password@127.0.0.1:5432/${db}" \
@@ -163,12 +165,12 @@ jobs:
               sofias-memory:ci run --no-sync alembic upgrade head
           done
 
-      - name: Confirm alembic current == 0011 on the main database
+      - name: Confirm alembic current == 0013 on the main database
         run: |
           set -e
           CURRENT=$(psql -tAc "SELECT version_num FROM alembic_version")
           echo "alembic current: $CURRENT"
-          test "$CURRENT" = "0011"
+          test "$CURRENT" = "0013"
 
       # CI-compatible integration modules only -- see docs/development.md
       # and the REL-004 report for the full per-module inventory and the
@@ -233,6 +235,17 @@ jobs:
           SOFIAS_MEMORY_PIPELINE_WORKER_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_pipeline_worker_test
           SOFIAS_MEMORY_RUN_PROCESS_KILL_RECOVERY_TESTS: "1"
           SOFIAS_MEMORY_PROCESS_KILL_RECOVERY_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_process_kill_test
+          # Sessions (v0.3.0, SM-601..SM-606) -- the four foundation/feature
+          # suites share the job's main `sofias_memory` database (DATABASE_URL
+          # above, per their own opt-in contract, no dedicated URL declared);
+          # only the cross-feature compatibility suite has its own dedicated
+          # database.
+          SOFIAS_MEMORY_RUN_POSTGRES_SESSIONS_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SESSION_MANAGEMENT_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SESSION_ENTRY_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_RECALL_SESSION_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SESSIONS_COMPAT_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_SESSIONS_COMPAT_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_sessions_compat_test
 
       - name: Diagnostics on failure
         if: failure()

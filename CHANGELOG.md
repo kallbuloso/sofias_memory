@@ -2,6 +2,75 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.3.0]
+
+Minor release adding first-class durable Sessions: a persistent temporal
+context boundary that Recall and Remember can associate with, entirely
+additive to the existing public API.
+
+### First-class Sessions
+
+- New `Session` resource: `POST /sessions`, `GET /sessions`,
+  `GET /sessions/{session_uuid}`, `PATCH /sessions/{session_uuid}`.
+- Caller-facing `session_id` (external key, case-sensitive, immutable) and
+  structural `session_uuid` (internal/public UUID identity).
+- Lifecycle: `active <-> archived` via `POST /sessions/{session_uuid}/archive`
+  and `POST /sessions/{session_uuid}/restore`. Archive is an admission
+  barrier — it blocks new SessionEntry/Recall/Remember activity but never
+  blocks safe replay, manual retry, reads, or administrative `PATCH`.
+
+### SessionEntries
+
+- Append-only contextual history: `POST` / `GET /sessions/{session_uuid}/entries`.
+- Optional caller-supplied `external_id`, unique per Session: the same id
+  with the same semantic payload safely replays (`201`, no duplicate); the
+  same id with a different payload is `409 IDEMPOTENCY_CONFLICT`. Replay
+  remains observable after archive.
+
+### Recall
+
+- Recall accepts `session_id`; the resulting Query is associated with the
+  resolved/lazily-created Session (`RecallResult.session_uuid`).
+- New opt-in `include_session_context` (default `false`): injects a bounded,
+  deterministic window of recent SessionEntries into RAG generation only —
+  retrieval itself is unchanged, and no query rewriting occurs.
+- `GET /provenance/query/{query_id}` now exposes `session_uuid` and
+  `session_context`, the exact SessionEntries used, independent of knowledge
+  provenance.
+
+### Remember / Runs
+
+- Remember (text/URL/file) accepts `session_id`; `PipelineRun.session_id` is
+  the authoritative association. `RememberTextResult.session_uuid` and
+  `RunSummaryResult`/`RunDetailResult.session_uuid` expose it.
+- `GET /runs` accepts an optional `session_uuid` filter.
+- Manual retry preserves the original run's Session association verbatim —
+  it is never re-resolved by external key, and remains permitted even if
+  that Session is now archived.
+
+### Compatibility
+
+- No backfill: pre-v0.3.0 textual `session_id` carriers (`MemoryEntry`,
+  `Document.metadata`, historical `PipelineRun.input`) are never converted
+  into a first-class Session association.
+- Forget and administrative Dataset Delete preserve Sessions, SessionEntries,
+  and Query/Feedback audit history unchanged; `DELETE EVERYTHING` removes
+  semantic memory, never Session/history state.
+- A Session may span multiple Datasets; it never acquires Dataset ownership.
+- Sessions and SessionEntries exist only in PostgreSQL — no Neo4j projection,
+  no new `graph_outbox` event category.
+
+### Database/upgrade
+
+- Adds migrations `0012` and `0013`. Upgrading from `0.2.0` requires
+  `alembic upgrade head` (current head: `0013`) before starting the new
+  version — see `docs/operations.md`.
+
+### Configuration
+
+- `SESSION_CONTEXT_MAX_ENTRIES` (default `20`)
+- `SESSION_CONTEXT_MAX_CHARS` (default `16000`)
+
 ## [0.2.0]
 
 Minor release adding durable S3-compatible storage for Source originals while

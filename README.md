@@ -14,10 +14,12 @@ retry/cancel are all implemented and durable, running through a single internal
 worker with PostgreSQL as the queue and source of truth. **v0.1.0** was the
 first stable MVP release; **v0.1.1** improved Swagger/OpenAPI documentation
 and developer UX; **v0.1.2** fixed a `graph_outbox` UPSERT/DELETE ordering and
-cross-row claim-race defect; **v0.2.0** adds durable S3-compatible storage for
+cross-row claim-race defect; **v0.2.0** added durable S3-compatible storage for
 Source originals, startup filesystem→S3 convergence/recovery, and validated
 MinIO/Wasabi interoperability while keeping `filesystem` as the default
-backend (see `CHANGELOG.md`) — see
+backend; **v0.3.0** adds first-class durable Sessions, append-only
+SessionEntries, Session-aware Recall provenance/context, and Remember/Run
+association (see `CHANGELOG.md`) — see
 `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.
 
@@ -39,14 +41,18 @@ original release discovery/backlog.
   administratively and durably delete a dataset namespace (distinct from Forget).
 - **Runs** — every write is a durable, observable `PipelineRun` you can list,
   inspect, retry, or cancel.
+- **Sessions** — a first-class, durable temporal context boundary: create,
+  archive, and restore a Session; append-only SessionEntries for contextual
+  history; Recall and Remember associate their Query/PipelineRun with a
+  Session and can opt into bounded Session Context for RAG generation.
 
 ## Architecture
 
 - One FastAPI application; the pipeline worker runs **inside the same process**
   (no separate worker deployment, no external queue broker).
 - **PostgreSQL + pgvector is the authoritative source of truth** for all
-  datasets, sources, chunks, entities, relations, pipeline run/step state, and the
-  outbox that drives graph projection.
+  datasets, sources, chunks, entities, relations, pipeline run/step state,
+  Sessions/SessionEntries, and the outbox that drives graph projection.
 - **Neo4j is a reconstructible projection**, never authoritative — it can always
   be rebuilt from PostgreSQL (`scripts/rebuild_graph.py`).
 - Source originals are stored on a local filesystem volume by default, or
@@ -179,6 +185,7 @@ grouped by area:
 | LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS` |
 | Embeddings | `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` |
 | Chunking/retrieval | `CHUNK_MAX_TOKENS`, `RECALL_DEFAULT_TOP_K`, `RECALL_RRF_K` |
+| Session context | `SESSION_CONTEXT_MAX_ENTRIES`, `SESSION_CONTEXT_MAX_CHARS` |
 | Graph/provenance | `GRAPH_SUBGRAPH_MAX_DEPTH`, `PROVENANCE_MAX_EVIDENCE` |
 | Improve | `ENTITY_DEDUP_SIMILARITY_THRESHOLD`, `ENTITY_MERGE_SIMILARITY_THRESHOLD` |
 | Worker | `WORKER_ENABLED`, `WORKER_POLL_INTERVAL_MS`, `WORKER_MAX_CONCURRENT_DATASETS` |
@@ -225,7 +232,8 @@ uv run python scripts/generate_api_key.py
 See [`docs/api.md`](docs/api.md) for the full semantic guide — response envelope,
 `ErrorCode` values, `Idempotency-Key` semantics, `wait=true/false`, the
 `PipelineRun` lifecycle, and worked examples for every endpoint family (Remember,
-Recall, Cognify, Improve, Forget, Dataset management, Dataset delete, Runs).
+Recall, Cognify, Improve, Forget, Dataset management, Dataset delete, Sessions,
+Runs).
 The formal schema is served by the running application at `/openapi.json`,
 browsable via Swagger UI at `/docs` — but **only when `APP_ENV=dev` or
 `APP_ENV=development`**; in every other environment (including the

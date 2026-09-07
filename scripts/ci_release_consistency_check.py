@@ -1,4 +1,4 @@
-"""CI-only release consistency guardrail (REL-004).
+"""CI-only release consistency guardrail (REL-004, hardened SM-607 SS 6).
 
 Verifies two things that must never silently drift, using only the Python
 standard library plus `docker compose config` (no new runtime dependency,
@@ -12,8 +12,15 @@ no PyYAML):
    diff).
 2. Version consistency -- `pyproject.toml`'s canonical version must match
    the default `APP_VERSION` value in `.env.example`, in the rendered
-   `sofias-memory` environment/build args, and in the local Compose image
-   tag. `Settings.CANONICAL_APP_VERSION` must also match `pyproject.toml`.
+   `sofias-memory` environment/build args, in the local Compose image tag,
+   in the `Dockerfile`'s own `ARG APP_VERSION` default, and in
+   `deploy/easypanel/compose.yaml`'s image tag and `APP_VERSION` default.
+   `Settings.CANONICAL_APP_VERSION` must also match `pyproject.toml`. SM-607
+   SS 6 added the `Dockerfile`/EasyPanel checks specifically because a prior
+   bump (v0.2.0 -> did not happen automatically) updated the root Compose
+   file and could have silently left those two surfaces behind -- this is a
+   plain-text/regex read of each file, deliberately not a generic YAML
+   parser, to avoid a PyYAML dependency for two single-line extractions.
 
 Not a runtime feature: this script is never imported by `sofias_memory`,
 only invoked directly by `ci.yml` and, optionally, by a developer locally.
@@ -23,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -98,6 +106,36 @@ def load_env_example_app_version() -> str:
         if line.strip().startswith("APP_VERSION="):
             return line.strip().split("=", 1)[1]
     raise SystemExit("FAIL: APP_VERSION not found in .env.example")
+
+
+def load_dockerfile_arg_version() -> str:
+    text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    match = re.search(r"^ARG APP_VERSION=(\S+)$", text, flags=re.MULTILINE)
+    if match is None:
+        raise SystemExit("FAIL: 'ARG APP_VERSION=' not found in Dockerfile")
+    return match.group(1)
+
+
+def load_easypanel_image_version() -> str:
+    text = (REPO_ROOT / "deploy" / "easypanel" / "compose.yaml").read_text(encoding="utf-8")
+    match = re.search(r"image:\s*ghcr\.io/kallbuloso/sofias-memory:(\S+)", text)
+    if match is None:
+        raise SystemExit(
+            "FAIL: 'image: ghcr.io/kallbuloso/sofias-memory:...' not found in "
+            "deploy/easypanel/compose.yaml"
+        )
+    return match.group(1)
+
+
+def load_easypanel_app_version_default() -> str:
+    text = (REPO_ROOT / "deploy" / "easypanel" / "compose.yaml").read_text(encoding="utf-8")
+    match = re.search(r"APP_VERSION:\s*\"\$\{APP_VERSION:-([^}]+)\}\"", text)
+    if match is None:
+        raise SystemExit(
+            "FAIL: 'APP_VERSION: \"${APP_VERSION:-...}\"' not found in "
+            "deploy/easypanel/compose.yaml"
+        )
+    return match.group(1)
 
 
 def render_compose_config() -> dict[str, Any]:
@@ -180,6 +218,25 @@ def main() -> int:
         failures.append(
             f"Compose local image tag version ({image_version!r}) != "
             f"pyproject.toml version ({canonical!r})"
+        )
+
+    dockerfile_version = load_dockerfile_arg_version()
+    if dockerfile_version != canonical:
+        failures.append(
+            f"Dockerfile ARG APP_VERSION default ({dockerfile_version!r}) != "
+            f"pyproject.toml version ({canonical!r})"
+        )
+    easypanel_image_version = load_easypanel_image_version()
+    if easypanel_image_version != canonical:
+        failures.append(
+            f"deploy/easypanel/compose.yaml image tag version "
+            f"({easypanel_image_version!r}) != pyproject.toml version ({canonical!r})"
+        )
+    easypanel_app_version = load_easypanel_app_version_default()
+    if easypanel_app_version != canonical:
+        failures.append(
+            f"deploy/easypanel/compose.yaml APP_VERSION default "
+            f"({easypanel_app_version!r}) != pyproject.toml version ({canonical!r})"
         )
 
     if failures:

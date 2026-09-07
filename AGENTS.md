@@ -159,6 +159,13 @@ Schema previsto:
 - pipeline_runs
 - pipeline_steps
 - graph_outbox
+- sessions (v0.3.0, ADR-0012)
+- session_entries (v0.3.0, ADR-0012)
+
+`queries.session_id` e `pipeline_runs.session_id` são associações
+first-class (FK nullable, `ON DELETE SET NULL`) com `sessions.id` — nunca
+inferidas de texto legado (`MemoryEntry.session_id`, `Document.metadata`,
+`PipelineRun.input`). Sessions não recebem hard delete público.
 
 ### Neo4j
 
@@ -173,6 +180,9 @@ Escritas devem ser:
 - acionadas pela outbox;
 - recuperáveis;
 - reconstruíveis.
+
+Session e SessionEntry são **exclusivamente PostgreSQL** — nunca projetadas
+para Neo4j, nunca lidas de lá para gestão/histórico de Session (ADR-0012).
 
 APOC e GDS podem existir no ambiente local, mas o core do MVP não deve depender deles
 sem ADR explícito. Prefira Cypher padrão e o driver oficial.
@@ -214,6 +224,7 @@ sofias-memory/
 │   │       ├── improve.py
 │   │       ├── forget.py
 │   │       ├── runs.py
+│   │       ├── sessions.py
 │   │       └── graph.py
 │   ├── domain/
 │   │   ├── datasets/
@@ -551,6 +562,7 @@ Somente as famílias definidas no PRD:
 - runs/retry/cancel
 - graph
 - provenance
+- sessions/entries/queries (v0.3.0, ADR-0012)
 
 Não invente aliases/endpoints de conveniência.
 

@@ -1,8 +1,8 @@
 # Sofias Memory — Backlog Técnico Executável v0.3.0 Sessions
 
-**Release:** v0.3.0  
-**Feature:** First-class Durable Sessions  
-**Status:** Proposed  
+**Release:** v0.3.0\
+**Feature:** First-class Durable Sessions\
+**Status:** DONE — local release gate CONDITIONALLY PASSED; GATE-v0.3.0 PENDING REMOTE RELEASE VALIDATION\
 **Sequência:** SM-601..SM-607  
 **Regra de execução:** executar uma task por vez; não antecipar dependências ou escopo de tickets posteriores.
 
@@ -72,15 +72,15 @@ Durante SM-601..SM-607:
 
 # 4. Sequência
 
-| Ticket | Entrega principal | Depende de |
-|---|---|---|
-| SM-601 | Schema, domínio e persistence foundation | — |
-| SM-602 | Session Management API | SM-601 |
-| SM-603 | SessionEntry API + admission barrier | SM-602 |
-| SM-604 | Recall + Query + Session Context provenance | SM-603 |
-| SM-605 | Remember + PipelineRun + retry integration | SM-601, SM-602 |
-| SM-606 | Cross-feature hardening e compatibility | SM-603, SM-604, SM-605 |
-| SM-607 | Docs, smoke e release gate v0.3.0 | SM-606 |
+| Ticket | Entrega principal | Depende de | Status |
+|---|---|---|---|
+| SM-601 | Schema, domínio e persistence foundation | — | DONE |
+| SM-602 | Session Management API | SM-601 | DONE |
+| SM-603 | SessionEntry API + admission barrier | SM-602 | DONE |
+| SM-604 | Recall + Query + Session Context provenance | SM-603 | DONE |
+| SM-605 | Remember + PipelineRun + retry integration | SM-601, SM-602 | DONE |
+| SM-606 | Cross-feature hardening e compatibility | SM-603, SM-604, SM-605 | DONE |
+| SM-607 | Docs, smoke e release gate v0.3.0 | SM-606 | DONE — local gate CONDITIONALLY PASSED; GATE-v0.3.0 PENDING REMOTE VALIDATION |
 
 SM-604 e SM-605 podem ser implementadas em qualquer ordem depois de suas dependências, mas não devem ser misturadas na mesma task.
 
@@ -1074,5 +1074,27 @@ O release somente pode ser marcado como concluído quando:
 - documentação de v0.3.0 estiver atualizada.
 
 Após esse gate, nenhum trabalho de Skills ou Agent Management deve ser incluído retroativamente no v0.3.0.
+
+## SM-607 — DONE; GATE-v0.3.0 — PENDING REMOTE RELEASE VALIDATION
+
+SM-607 (implementation/local non-Docker gates) is DONE. Every criterion above that does
+**not** require Docker was verified: 1916 unit/contract/security tests green, 422
+integration tests green (1 pre-existing skip, unrelated to Sessions, due to
+Docker/Testcontainers being unavailable in this local environment), migration
+`0001 → 0013` proved against a real disposable database (fresh-install and
+upgrade-with-legacy-fixture), a real end-to-end smoke over the public API covering
+Session/SessionEntry/Recall/Remember/Forget/Dataset Delete/Neo4j/graph_outbox, and
+documentation (README, AGENTS.md, docs/api.md, docs/operations.md, docs/development.md,
+docs/deployment/easypanel.md, CHANGELOG.md) updated. Runtime-only `pip-audit`, `mypy
+sofias_memory scripts`, and the Bandit HIGH-severity blocking gate all pass locally.
+
+**GATE-v0.3.0 itself is not yet PASSED as a release fact.** The following remain
+genuinely pending and require Docker/CI, not something this local environment can
+execute or fabricate: Docker image build, OCI label validation, the image-contained
+migration gate, the full `ci_release_consistency_check.py` (its `docker compose config`
+step), post-push normal CI, and the manual Integration workflow. GATE-v0.3.0 is marked
+PASSED only after those remote checks are green and a final audit is run — at that
+point, and not before, the release may be tagged `v0.3.0`. No commit/push/tag was made
+as part of this SM-607 closeout.
 
 O próximo release funcional planejado permanece separado.

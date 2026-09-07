@@ -1,6 +1,6 @@
 # Sofias Memory — Feature Contract v0.3.0: Sessions
 
-**Status:** Proposed  
+**Status:** Implemented\
 **Target release:** v0.3.0  
 **Feature:** First-class durable Sessions
 

@@ -114,6 +114,7 @@ The stable, closed set of error codes you may see:
 | `MAIN_DATASET_DELETE_FORBIDDEN` | Attempted administrative delete of the `main` dataset. |
 | `DATASET_DELETING` | Operation rejected because the target dataset has an in-flight administrative delete. |
 | `DATASET_DELETED` | Operation rejected because the target dataset is already a tombstone. |
+| `SESSION_ARCHIVED` | New Session activity (SessionEntry append, Recall, Remember) rejected because the Session is archived. Safe replay, manual retry, reads, restore, and `PATCH` are never blocked by this. |
 
 Example — missing key:
 
@@ -193,8 +194,12 @@ through the equivalent per-step lifecycle independently.
 ## 7. Runs: list, detail, retry, cancel
 
 ```bash
-# List runs (optionally filter by dataset/status/type — see /openapi.json)
+# List runs (optionally filter by dataset/status/type/session_uuid — see /openapi.json)
 curl -sS "$SOFIAS_MEMORY_URL/api/v1/runs" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Filter by the Session a run is associated with
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/runs?session_uuid=$SESSION_UUID" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
 
 # Get one run, including its steps
 curl -sS "$SOFIAS_MEMORY_URL/api/v1/runs/$RUN_ID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
@@ -217,6 +222,13 @@ run just shows you the existing retry), or `202` if they just triggered a new
 state transition you should poll for (`RUNNING → CANCELLING`, or a
 newly-created retry run that is itself still non-terminal). Retrying a run
 that isn't in a retryable terminal state returns `409 RUN_NOT_RETRYABLE`.
+
+`RunSummaryResult`/`RunDetailResult.session_uuid` exposes the Session a run
+is first-class associated with (`null` if none). This FK is always the
+authority: a legacy, pre-v0.3.0 run's `input` may happen to contain a
+textual `session_id`, but that is never inferred into `session_uuid` — it
+stays `null`. Manual retry preserves the original run's `session_uuid`
+verbatim, including when that Session is now archived.
 
 ## 8. Remember: text, file, URL
 
@@ -250,6 +262,14 @@ curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/remember/url" \
 
 `dataset` is the dataset **slug** (default `"main"`), not its UUID.
 
+All three accept an optional `session_id` (the caller-facing external
+Session key). When present, the Session is resolved or lazily created
+(rejected with `409 SESSION_ARCHIVED` if it exists and is archived) inside
+the same durable submission as the run, and `PipelineRun.session_id` is the
+resulting first-class association — surfaced back as
+`RememberTextResult.session_uuid` (and, once the run reaches a terminal
+state, on `GET /api/v1/runs/{run_id}` too).
+
 ## 9. Remember modes: `ingest` vs `full`
 
 - `mode=ingest` (the field default) — persists the normalized source durably
@@ -281,6 +301,112 @@ curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/recall" \
 Every returned context item and reference carries the `source_id`/
 `chunk_id`/`document_id` it came from — that is the provenance chain back to
 the original ingested content.
+
+### Session and Session Context
+
+Recall also accepts an optional `session_id` (the caller-facing external
+Session key). When present, the Session is resolved/lazily created (rejected
+with `409 SESSION_ARCHIVED` if archived) and the resulting Query is
+associated with it — surfaced back as `RecallResult.session_uuid`.
+
+`include_session_context` (default `false`) opts into injecting a bounded,
+deterministic window of the Session's most recent SessionEntries into RAG
+generation. It is only valid when `session_id` is set, `mode=rag`, and
+`only_context=false` — any other combination is `400 INVALID_REQUEST`,
+never silently ignored:
+
+```bash
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/recall" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "datasets": ["main"],
+    "query": "What did we discuss about Ada Lovelace?",
+    "mode": "rag",
+    "session_id": "conversation:42",
+    "include_session_context": true
+  }'
+```
+
+Session Context affects generation only — it never rewrites the retrieval
+query, never performs coreference resolution, and never changes which
+chunks/entities/relations are retrieved. Even with zero knowledge hits, a
+non-empty selected Session Context is itself valid generation input: the RAG
+answer is still generated from that context alone (an empty `context`/
+`references` array in the response, but a real answer) — this does not
+create new semantic memory; it is generation input only, not a Remember.
+
+## 10a. Provenance
+
+```bash
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/provenance/source/$SOURCE_ID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/provenance/relation/$RELATION_ID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/provenance/query/$QUERY_ID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+```
+
+`GET /api/v1/provenance/query/{query_id}` now also includes `session_uuid`
+and `session_context` — the exact, ordered SessionEntries that were used in
+that Query's RAG generation (empty when none were), each re-hydrated and
+validated against the Query's own Session (an id can never leak content
+from a different Session). Knowledge provenance (`references`) and Session
+provenance are independent: a knowledge reference can become
+`available=false` after Forget/Dataset Delete removes the underlying
+content, while `session_uuid`/`session_context` remain valid and unaffected.
+
+## 11a. Sessions
+
+```bash
+# Create (session_id omitted -> server generates one)
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/sessions" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"session_id": "conversation:42"}'
+
+# List / get
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/sessions" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/sessions/$SESSION_UUID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Rename / update metadata
+curl -sS -X PATCH "$SOFIAS_MEMORY_URL/api/v1/sessions/$SESSION_UUID" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "Support ticket #42"}'
+
+# Archive / restore
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/sessions/$SESSION_UUID/archive" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/sessions/$SESSION_UUID/restore" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Append a SessionEntry (external_id optional, unique per Session)
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/sessions/$SESSION_UUID/entries" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"role": "user", "content": "Who worked with Charles Babbage?", "external_id": "turn-1"}'
+
+# List SessionEntries / Queries associated with this Session
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/sessions/$SESSION_UUID/entries" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/sessions/$SESSION_UUID/queries" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+```
+
+`session_id` is the caller-supplied external key (case-sensitive,
+immutable, globally unique); `session_uuid` is the internal/public
+structural identity everything else (Recall, Remember, Runs, provenance)
+associates against.
+
+**Archive is an admission barrier, not a lock on everything.** It blocks
+*new* activity — a new SessionEntry append, a new Recall, a new Remember —
+with `409 SESSION_ARCHIVED`. It does **not** block: safe SessionEntry
+replay (same `external_id` + same payload), Remember's own idempotent
+replay of an already-admitted run, manual retry (preserves the original
+run's Session even if archived), plain reads, administrative `PATCH`
+(rename/metadata), or `restore`.
+
+**SessionEntry `external_id`** (optional, unique per Session): the same
+`external_id` with the same semantic payload safely replays — `201`, same
+`entry_id`, no duplicate row, observable even after the Session is later
+archived. The same `external_id` with a *different* payload is
+`409 IDEMPOTENCY_CONFLICT`.
+
+`GET /api/v1/sessions/{session_uuid}/queries` and the Run/Query provenance
+endpoints only ever return rows first-class associated by the persisted FK
+— never a row that merely happens to contain matching text.
 
 ## 11. Cognify
 

@@ -61,7 +61,6 @@ def test_forbidden_route_prefixes_still_absent_with_dataset_delete() -> None:
         "/slack",
         "/integrations",
         "/agents",
-        "/skills",
         "/proposals",
     )
     for path in paths:

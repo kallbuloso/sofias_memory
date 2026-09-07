@@ -548,6 +548,10 @@ Somente as famílias definidas no PRD:
 - runs/retry/cancel
 - graph
 - provenance
+- skills management: create/get/list, PATCH (rollback), archive/restore,
+  revisions create/get/list (v0.4.0, ADR-0013, SM-702). Import/export
+  (SKILL.md) e resolve semântico ainda não existem -- não assuma sua presença
+  até SM-703/SM-704.
 
 Não invente aliases/endpoints de conveniência.
 
@@ -569,9 +573,12 @@ O teste de OpenAPI deve falhar se aparecer:
 /slack
 /integrations
 /agents
-/skills
 /proposals
 ```
+
+`/skills` (management) existe desde v0.4.0/SM-702 e não é mais proibido.
+`SkillRun`/execução de Skill e qualquer runtime de Agent continuam fora do
+MVP (ADR-0013, docs/adr/0013-first-class-durable-procedural-skills.md).
 
 ## 13. Pydantic schemas
 

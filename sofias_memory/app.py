@@ -48,6 +48,7 @@ from sofias_memory.api.routes.recall import router as recall_router
 from sofias_memory.api.routes.remember import router as remember_router
 from sofias_memory.api.routes.runs import router as runs_router
 from sofias_memory.api.routes.sessions import router as sessions_router
+from sofias_memory.api.routes.skills import router as skills_router
 from sofias_memory.config import Settings, load_settings
 from sofias_memory.infrastructure.embeddings import OpenAIEmbeddingClient
 from sofias_memory.infrastructure.llm import (
@@ -173,6 +174,14 @@ TAG_METADATA: list[dict[str, str]] = [
     {
         "name": "sessions",
         "description": "Create, inspect, update, archive, and restore durable Sessions.",
+    },
+    {
+        "name": "skills",
+        "description": (
+            "Create, inspect, and manage durable procedural Skills and their "
+            "immutable revisions; archive and restore; roll back the current "
+            "revision."
+        ),
     },
 ]
 
@@ -384,6 +393,7 @@ def create_app(
     application.include_router(provenance_router, prefix="/api/v1")
     application.include_router(runs_router, prefix="/api/v1")
     application.include_router(sessions_router, prefix="/api/v1")
+    application.include_router(skills_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

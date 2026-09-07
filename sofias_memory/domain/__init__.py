@@ -48,6 +48,7 @@ from sofias_memory.domain.skill_name import (
     InvalidSkillNameError,
     validate_skill_name,
 )
+from sofias_memory.domain.skill_resolution_text import build_skill_resolution_text
 from sofias_memory.domain.skill_revision_content import (
     COMPATIBILITY_MAX_LENGTH,
     CONTENT_SHA256_PATTERN,
@@ -103,6 +104,7 @@ __all__ = [
     "SourceStatus",
     "SummaryTargetType",
     "build_canonical_object",
+    "build_skill_resolution_text",
     "canonicalize_tags",
     "compute_content_sha256",
     "normalize_newlines",

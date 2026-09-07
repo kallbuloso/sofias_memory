@@ -38,7 +38,6 @@ FORBIDDEN_PATH_PREFIXES = (
     "/slack",
     "/integrations",
     "/agents",
-    "/skills",
     "/proposals",
     "/api/v1/metrics",
     "/debug/metrics",
@@ -239,6 +238,79 @@ def test_no_session_hard_delete_or_purge_surface_exists() -> None:
     for path, operations in paths.items():
         if path.startswith("/api/v1/sessions"):
             assert "delete" not in operations, path
+
+
+def test_skill_management_routes_present_with_exact_methods() -> None:
+    """SM-702 scope: Skill management + immutable SkillRevision create/read,
+    archive/restore, and current_revision rollback. No import/export/resolve
+    surface, and SkillRevision itself gains no PATCH/DELETE (SM-701/SS 4.2:
+    a revision is immutable once created)."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert set(paths["/api/v1/skills"]) == {"get", "post"}
+    assert set(paths["/api/v1/skills/{skill_uuid}"]) == {"get", "patch"}
+    assert "delete" not in paths["/api/v1/skills/{skill_uuid}"]
+    assert set(paths["/api/v1/skills/{skill_uuid}/archive"]) == {"post"}
+    assert set(paths["/api/v1/skills/{skill_uuid}/restore"]) == {"post"}
+    assert set(paths["/api/v1/skills/{skill_uuid}/revisions"]) == {"get", "post"}
+    assert set(paths["/api/v1/skills/{skill_uuid}/revisions/{revision}"]) == {"get"}
+
+    for path, operations in paths.items():
+        if path.startswith("/api/v1/skills/{skill_uuid}/revisions"):
+            assert "patch" not in operations, path
+            assert "delete" not in operations, path
+            assert "put" not in operations, path
+
+
+def test_skill_import_export_resolve_surface_is_absent() -> None:
+    """SM-702 explicitly does not implement SM-703 (SKILL.md import/export)
+    or SM-704 (semantic resolve)."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert "/api/v1/skills/import" not in paths
+    assert "/api/v1/skills/{skill_uuid}/revisions/import" not in paths
+    assert "/api/v1/skills/{skill_uuid}/revisions/{revision}/export" not in paths
+    assert "/api/v1/skills/resolve" not in paths
+
+
+def test_skill_result_shape_never_exposes_procedure_or_internal_ids() -> None:
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+
+    skill_result = schemas["SkillResult"]
+    assert isinstance(skill_result, dict)
+    skill_properties = skill_result["properties"]
+    assert "procedure" not in skill_properties
+    assert "resolution_embedding" not in skill_properties
+    assert "content_sha256" not in skill_properties
+
+    revision_list_item = schemas["SkillRevisionListItem"]
+    assert isinstance(revision_list_item, dict)
+    revision_list_properties = revision_list_item["properties"]
+    assert "procedure" not in revision_list_properties
+    assert "metadata" not in revision_list_properties
+
+    revision_result = schemas["SkillRevisionResult"]
+    assert isinstance(revision_result, dict)
+    assert "procedure" in revision_result["properties"]
+    assert "resolution_embedding" not in revision_result["properties"]
+
+    skill_create_request = schemas["SkillCreateRequest"]
+    assert isinstance(skill_create_request, dict)
+    assert "procedure" in skill_create_request["properties"]
+
+    skill_update_request = schemas["SkillUpdateRequest"]
+    assert isinstance(skill_update_request, dict)
+    assert set(skill_update_request["properties"]) == {"current_revision"}
 
 
 def test_private_routes_require_api_key_security() -> None:

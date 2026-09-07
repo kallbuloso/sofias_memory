@@ -25,6 +25,11 @@ class SkillRevisionRepository:
         await self._session.flush()
         return revision
 
+    async def get_by_id(self, revision_id: UUID) -> SkillRevision | None:
+        statement = select(SkillRevision).where(SkillRevision.id == revision_id)
+        result = await self._session.scalar(statement)
+        return cast(SkillRevision | None, result)
+
     async def get_by_skill_and_revision(
         self, skill_id: UUID, revision: int
     ) -> SkillRevision | None:
@@ -57,6 +62,15 @@ class SkillRevisionRepository:
         )
         result = await self._session.scalars(statement)
         return list(result)
+
+    async def count_for_skill(self, skill_id: UUID) -> int:
+        statement = (
+            select(func.count())
+            .select_from(SkillRevision)
+            .where(SkillRevision.skill_id == skill_id)
+        )
+        total = await self._session.scalar(statement)
+        return int(total or 0)
 
     async def next_revision_number(self, skill_id: UUID) -> int:
         """The next monotonic ``revision`` ordinal for this Skill.

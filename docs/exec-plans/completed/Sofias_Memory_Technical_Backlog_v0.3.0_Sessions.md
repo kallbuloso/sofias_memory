@@ -2,7 +2,7 @@
 
 **Release:** v0.3.0\
 **Feature:** First-class Durable Sessions\
-**Status:** DONE — local release gate CONDITIONALLY PASSED; GATE-v0.3.0 PENDING REMOTE RELEASE VALIDATION\
+**Status:** DONE — GATE-v0.3.0 PASSED; v0.3.0 RELEASED\
 **Sequência:** SM-601..SM-607  
 **Regra de execução:** executar uma task por vez; não antecipar dependências ou escopo de tickets posteriores.
 
@@ -80,7 +80,7 @@ Durante SM-601..SM-607:
 | SM-604 | Recall + Query + Session Context provenance | SM-603 | DONE |
 | SM-605 | Remember + PipelineRun + retry integration | SM-601, SM-602 | DONE |
 | SM-606 | Cross-feature hardening e compatibility | SM-603, SM-604, SM-605 | DONE |
-| SM-607 | Docs, smoke e release gate v0.3.0 | SM-606 | DONE — local gate CONDITIONALLY PASSED; GATE-v0.3.0 PENDING REMOTE VALIDATION |
+| SM-607 | Docs, smoke e release gate v0.3.0 | SM-606 | DONE — GATE-v0.3.0 PASSED |
 
 SM-604 e SM-605 podem ser implementadas em qualquer ordem depois de suas dependências, mas não devem ser misturadas na mesma task.
 
@@ -1075,26 +1075,89 @@ O release somente pode ser marcado como concluído quando:
 
 Após esse gate, nenhum trabalho de Skills ou Agent Management deve ser incluído retroativamente no v0.3.0.
 
-## SM-607 — DONE; GATE-v0.3.0 — PENDING REMOTE RELEASE VALIDATION
+## GATE-v0.3.0 — PASSED
 
-SM-607 (implementation/local non-Docker gates) is DONE. Every criterion above that does
-**not** require Docker was verified: 1916 unit/contract/security tests green, 422
-integration tests green (1 pre-existing skip, unrelated to Sessions, due to
-Docker/Testcontainers being unavailable in this local environment), migration
-`0001 → 0013` proved against a real disposable database (fresh-install and
+SM-607 (implementation/local non-Docker gates) was DONE first: 1916 unit/contract/security
+tests green, 422 integration tests green (1 pre-existing skip, unrelated to Sessions),
+migration `0001 → 0013` proved against a real disposable database (fresh-install and
 upgrade-with-legacy-fixture), a real end-to-end smoke over the public API covering
 Session/SessionEntry/Recall/Remember/Forget/Dataset Delete/Neo4j/graph_outbox, and
 documentation (README, AGENTS.md, docs/api.md, docs/operations.md, docs/development.md,
 docs/deployment/easypanel.md, CHANGELOG.md) updated. Runtime-only `pip-audit`, `mypy
-sofias_memory scripts`, and the Bandit HIGH-severity blocking gate all pass locally.
+sofias_memory scripts`, and the Bandit HIGH-severity blocking gate all passed locally.
 
-**GATE-v0.3.0 itself is not yet PASSED as a release fact.** The following remain
-genuinely pending and require Docker/CI, not something this local environment can
-execute or fabricate: Docker image build, OCI label validation, the image-contained
-migration gate, the full `ci_release_consistency_check.py` (its `docker compose config`
-step), post-push normal CI, and the manual Integration workflow. GATE-v0.3.0 is marked
-PASSED only after those remote checks are green and a final audit is run — at that
-point, and not before, the release may be tagged `v0.3.0`. No commit/push/tag was made
-as part of this SM-607 closeout.
+**Historical note (Docker limitation, preserved for the record):** the local execution
+environment at that point had no Docker/Testcontainers available, so Docker image build,
+OCI label validation, the image-contained migration gate, and the `docker compose config`
+step of `ci_release_consistency_check.py` could not be exercised locally and were
+explicitly reported as pending rather than fabricated. Those gates were subsequently
+executed successfully in GitHub Actions against the exact release commit before/as part
+of finalizing publication — see the remote evidence below.
 
-O próximo release funcional planejado permanece separado.
+### Remote evidence
+
+**Normal CI** — workflow `CI`, run `34081927149`, commit `ea7ab4a` (`chore(release):
+prepare 0.3.0`), conclusion **success**. Covered ruff, ruff format, mypy, unit/contract/
+security, runtime `pip-audit`, Bandit, release consistency, Docker build, and the OCI
+label check.
+
+**Integration (manual)** — workflow `Integration (real PostgreSQL + Neo4j)`, run
+`34082330486`, `workflow_dispatch`, commit `ea7ab4a`, conclusion **success**. Proved,
+among other things: release image build, dedicated databases, image migration
+`0001 → 0013`, `alembic current == 0013`, the real PostgreSQL suite, the real Neo4j
+suite, and all Sessions suites enabled and green.
+
+**Release** — workflow `Release`, run `34082659879`, tag `v0.3.0`, commit `ea7ab4a`,
+conclusion **success**. Jobs: "Validate tag against canonical version" (PASS) and
+"Build, publish to GHCR, create GitHub Release" (PASS). Proved: tag belongs to `main`;
+the exact commit's CI was already green; canonical version == tag; the CHANGELOG release
+section; Settings/env/Compose consistency; release image build; OCI labels; GHCR
+publish; GitHub Release creation.
+
+One earlier tag-triggered `Release` run failed closed because it started before that
+exact commit's CI push run had completed — an operational sequencing detail, not a
+functional failure of the release. CI then completed successfully, manual Integration
+completed successfully, and a subsequent `Release` run completed successfully.
+
+**Published release** — `Sofias Memory v0.3.0`, tag `v0.3.0`, `prerelease: false`,
+`draft: false`, immutable, published at `2026-09-07T04:21:09Z`, GitHub Release ID
+`383826614`.
+
+### Release flow (what actually happened)
+
+```text
+local SM-607 gate passed
+↓
+release commit pushed
+↓
+normal CI passed
+↓
+manual Integration passed
+↓
+v0.3.0 tag validated
+↓
+release image built and OCI-validated
+↓
+GHCR image published
+↓
+GitHub Release published
+```
+
+### Final state
+
+```text
+SM-601 ✅ PASSED
+SM-602 ✅ PASSED
+SM-603 ✅ PASSED
+SM-604 ✅ PASSED
+SM-605 ✅ PASSED
+SM-606 ✅ PASSED
+SM-607 ✅ PASSED
+
+GATE-v0.3.0 ✅ PASSED
+v0.3.0 ✅ RELEASED
+```
+
+The `v0.3.0` tag is immutable and must not be moved.
+
+The next functional release remains v0.4.0 — Skills.

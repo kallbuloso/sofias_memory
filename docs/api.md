@@ -532,3 +532,120 @@ curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/feedback" \
   -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
   -d '{"query_id":"'"$QUERY_ID"'","target_type":"answer","score":1}'
 ```
+
+## 18. Skills
+
+First-class, durable **procedural memory**: Sofias Memory stores, versions,
+and semantically resolves Skills. It never executes one, never selects one
+on the caller's behalf, and never authorizes tool use — the caller decides
+what to do with a resolved Skill.
+
+```bash
+# Create a Skill and its first SkillRevision atomically.
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/skills" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "deploy-app", "description": "Deploys the app to production.",
+       "procedure": "1. Run tests.\n2. Build.\n3. Deploy.", "tags": ["deploy"]}'
+
+# List / get / list revisions / get one revision (never leaks `procedure`
+# except the single-revision-detail endpoint).
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/skills" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID/revisions" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID/revisions/1" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Create a new revision (201 new content, 200 safe replay of identical content).
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID/revisions" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"description": "Deploys the app to production (v2).", "procedure": "1. Run tests.\n2. Build.\n3. Deploy.\n4. Smoke test."}'
+
+# Roll back current_revision (never creates a revision, never re-embeds).
+curl -sS -X PATCH "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"current_revision": 1}'
+
+# Archive / restore (discovery filter only, never a write barrier).
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID/archive" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID/restore" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Standalone SKILL.md import (new Skill) / revision import / export.
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/skills/import" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"content": "---\nname: deploy-app-2\ndescription: Deploys the app.\n---\nDo the thing."}'
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID/revisions/import" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"content": "---\nname: deploy-app\ndescription: Deploys the app to production.\n---\n1. Run tests.\n2. Build.\n3. Deploy."}'
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/skills/$SKILL_UUID/revisions/1/export" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Semantic resolve — discovery/ranking only.
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/skills/resolve" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"query": "how do I deploy the app?", "top_k": 5}'
+```
+
+`skill_uuid` is the structural identity; `name` (portable, lowercase
+`a-z0-9-`, 1..64 chars) is the immutable logical identity a `SKILL.md`
+frontmatter round-trips through. A `SkillRevision` is immutable and
+addressed by its per-Skill integer `revision`, never by an internal id.
+
+**Identity/idempotency status codes:**
+
+| Route | New/different | Duplicate/identical |
+|---|---|---|
+| `POST /skills` | `201` | `409 INVALID_REQUEST` (name already exists, any status) |
+| `POST /skills/import` | `201` | `409 INVALID_REQUEST` — **always**, even when the content is byte-for-byte identical to an existing Skill; `content_sha256` never decides this route's outcome |
+| `POST .../revisions` | `201` | `200` safe replay (same `content_sha256` within this Skill) — `current_revision` unchanged |
+| `POST .../revisions/import` | `201` | `200` safe replay, same rule as above; frontmatter `name` must equal the target Skill's `name` exactly, or `422` |
+
+**Archive is a discovery filter, not a write barrier.** An archived Skill
+still answers `GET`, creates new revisions, accepts `PATCH current_revision`,
+and exports — every one of those returns its ordinary status code. The only
+thing archive changes is `POST /skills/resolve`: an archived Skill is never
+a candidate, regardless of similarity score. `restore` preserves whatever
+`current_revision` the Skill has *at the moment of restore* (e.g. a revision
+created while archived) — it never reconstructs the pointer from before the
+archive.
+
+**Progressive disclosure.** `GET /skills`, `GET /skills/{skill_uuid}`,
+`GET .../revisions` (list), and `POST /skills/resolve` never include
+`procedure` — only `skill_uuid`, `name`, `description`, `current_revision`,
+`tags`, `declared_tools`, `compatibility`, and (resolve only) `score`. The
+full `procedure` is available from exactly one place:
+`GET /skills/{skill_uuid}/revisions/{revision}`.
+
+**`declared_tools` / `allowed-tools` is descriptive metadata only** — never
+an authorization grant, a permission, a runtime guarantee, or a check that
+the named tool is actually installed. The caller alone decides what it is
+allowed to execute; declaring a tool name here has no effect on that
+decision.
+
+**Semantic resolve.** `POST /skills/resolve` ranks `active`-status Skills'
+*current* revision by cosine similarity against `query`, returning up to
+`top_k` (default 5, max 20) matches ordered by `score` descending — higher
+`score` always means more similar, and there is no hidden similarity
+threshold: every ranked candidate up to `top_k` is returned, and
+`matches: []` (never `404`) when no active Skill exists. `resolve` never
+fetches `procedure`, never creates a SessionEntry/Query/PipelineRun, and
+never picks a Skill on the caller's behalf.
+
+**Standalone `SKILL.md` interoperability.** Import/export cover the portable
+subset only — frontmatter `name`, `description`, `license`, `compatibility`,
+`metadata` (a flat `map<string,string>`), and `allowed-tools` (a
+space-separated string), with the Markdown body as `procedure`. Bundled
+packages (`scripts/`, `references/`, `assets/`), zip/package import, a
+filesystem watcher, and a remote registry are explicitly out of scope.
+`tags` is a Sofias Memory extension with no portable frontmatter field of
+its own: it round-trips through the reserved transport key
+`metadata["sofias-memory.tags"]` (a JSON-array-encoded string) — on import
+that key is parsed into `tags`, then removed before the rest of `metadata`
+is validated, so it is never persisted as semantic metadata; on export it is
+re-synthesized into the document from the persisted `tags`, without ever
+touching the persisted `metadata`.
+
+**`content_sha256` is a semantic hash, not a file digest.** It is the SHA-256
+of a canonical JSON representation of the revision's eight semantic fields
+(`name`, `description`, `procedure`, `license`, `compatibility`, `metadata`,
+`tags`, `declared_tools`) — never the SHA-256 of the original or exported
+`SKILL.md` bytes. This is exactly why re-importing an export of the same
+content (whatever its YAML key order, quoting, or line endings) safe-replays
+instead of creating a new revision.

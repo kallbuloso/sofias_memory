@@ -1,6 +1,6 @@
 # Sofias Memory — Feature Contract v0.4.0: Skills
 
-**Status:** Proposed\
+**Status:** Implemented\
 **Target release:** v0.4.0\
 **Feature:** First-class durable procedural Skills
 

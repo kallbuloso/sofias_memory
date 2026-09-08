@@ -2,7 +2,7 @@
 
 This is the proven, canonical guide for deploying Sofias Memory on Easypanel
 from the exact release image
-`ghcr.io/kallbuloso/sofias-memory:0.3.0` — no build, no source checkout, no
+`ghcr.io/kallbuloso/sofias-memory:0.4.0` — no build, no source checkout, no
 `Dockerfile` is required on the Easypanel host. The Compose definition used is
 [`deploy/easypanel/compose.yaml`](../../deploy/easypanel/compose.yaml), a
 deployment-only variant of the root [`compose.yaml`](../../compose.yaml) with
@@ -11,7 +11,7 @@ environment contract — the only differences are `image:` instead of `build:`,
 and no host port published for `sofias-memory` (Easypanel routes its domain
 directly to the container's internal port instead).
 
-For maximum reproducibility, the published `0.3.0` image may optionally be
+For maximum reproducibility, the published `0.4.0` image may optionally be
 pinned by its GHCR digest instead of tag after publication. The canonical
 `deploy/easypanel/compose.yaml` itself uses the exact version tag, not a digest;
 see `docs/operations.md` §D for the general version/digest pinning policy.
@@ -54,7 +54,7 @@ build path:    /
 compose file:  deploy/easypanel/compose.yaml
 ```
 
-A specific stable tag (e.g. `v0.3.0`) may be used instead of `main` for a
+A specific stable tag (e.g. `v0.4.0`) may be used instead of `main` for a
 pinned, reproducible source reference.
 
 **Option B — Inline Compose.** Select Easypanel's **Inline**/**paste Compose
@@ -140,7 +140,7 @@ should still follow that document's backup-first procedure.
    alembic upgrade head
    ```
 
-4. Confirm the result, both should report `0013 (head)`:
+4. Confirm the result, both should report `0014 (head)`:
 
    ```bash
    alembic current
@@ -167,6 +167,29 @@ should still follow that document's backup-first procedure.
 >   migrations (check its `CHANGELOG.md` entry) — not on every version bump.
 > - `alembic current` and `alembic heads` are read-only verification
 >   commands; they never modify the schema and are always safe to run.
+
+### Upgrading an existing Easypanel deployment to v0.4.0
+
+v0.4.0 adds migration `0014` (first-class durable procedural Skills). An
+earlier release advanced the image without applying its migration first,
+leaving the API fail-closed (`/health/ready` reporting `not_ready`) until the
+schema caught up — do not repeat that here. For an **already-running**
+Easypanel deployment (not a first install — skip §1-§3 above), upgrading to
+v0.4.0 is:
+
+1. Update the service's image to `ghcr.io/kallbuloso/sofias-memory:0.4.0` (or
+   the pinned digest) — do **not** restart/redeploy the service yet.
+2. Open the running (still-old-image) `sofias-memory` container's console and
+   run `alembic upgrade head`, then confirm both `alembic current` and
+   `alembic heads` report `0014 (head)`.
+3. Redeploy/restart the `sofias-memory` service so it picks up the new image.
+4. Confirm `/health/ready` reports `"status": "ready"` (step 5 below) before
+   considering the upgrade complete.
+
+This is the same general contract as `docs/operations.md` §4 (backup-first
+upgrade procedure) — that document remains the authoritative, full
+walkthrough; the four steps above are the Easypanel-specific shorthand for
+this one release's migration.
 
 ## 5. Confirm health, then configure the domain
 

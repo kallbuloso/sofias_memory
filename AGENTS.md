@@ -225,7 +225,10 @@ sofias-memory/
 │   │       ├── forget.py
 │   │       ├── runs.py
 │   │       ├── sessions.py
+│   │       ├── skills.py
 │   │       └── graph.py
+│   ├── interoperability/
+│   │   └── skill_md.py
 │   ├── domain/
 │   │   ├── datasets/
 │   │   ├── sources/
@@ -563,19 +566,23 @@ Somente as famílias definidas no PRD:
 - graph
 - provenance
 - sessions/entries/queries (v0.3.0, ADR-0012)
-- skills management: create/get/list, PATCH (rollback), archive/restore,
-  revisions create/get/list (v0.4.0, ADR-0013, SM-702);
-- skills standalone SKILL.md import/export: `POST /skills/import`,
-  `POST /skills/{skill_uuid}/revisions/import`,
-  `GET /skills/{skill_uuid}/revisions/{revision}/export` (v0.4.0, ADR-0013,
-  SM-703);
-- skills semantic resolve: `POST /skills/resolve` (v0.4.0, ADR-0013,
-  SM-704) -- discovery/ranking apenas: nunca escolhe uma Skill em nome do
-  caller, nunca carrega `procedure`, nunca executa uma tool. Bundled skill
-  packages (`scripts/`/`references/`/`assets/`), execução de Skill e
-  `SkillRun` continuam fora do MVP -- não assuma sua presença até
-  SM-705/SM-706. `SkillRun` e qualquer runtime de Agent permanecem
-  proibidos.
+- skills (first-class durable procedural memory, v0.4.0, ADR-0013)
+  **implemented em sua totalidade**:
+  - management: create/get/list, PATCH (rollback), archive/restore,
+    revisions create/get/list (SM-702);
+  - standalone SKILL.md import/export: `POST /skills/import`,
+    `POST /skills/{skill_uuid}/revisions/import`,
+    `GET /skills/{skill_uuid}/revisions/{revision}/export` (SM-703);
+  - semantic resolve: `POST /skills/resolve` (SM-704) -- discovery/ranking
+    apenas: nunca escolhe uma Skill em nome do caller, nunca carrega
+    `procedure`, nunca executa uma tool;
+  - cross-feature isolation comprovada (SM-705): Forget, Dataset Delete,
+    Session e graph_outbox/Neo4j nunca são afetados por Skills e nunca
+    afetam Skills.
+
+  Fora de escopo permanentemente (não "ainda não implementado" -- não
+  planejado para v0.4.0): bundled skill packages (`scripts/`/`references/`/
+  `assets/`), execução de Skill, `SkillRun`, e qualquer runtime de Agent.
 
 Não invente aliases/endpoints de conveniência.
 

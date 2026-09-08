@@ -36,6 +36,34 @@ before running them, rather than exporting variables blindly. A test marked
 prerequisites are not set, so a plain `uv run pytest` is always safe to run without
 any real infrastructure — the unit suite alone runs no external I/O.
 
+### Skills integration tests
+
+Every Skills integration file gates on its own opt-in flag plus the plain
+`DATABASE_URL` environment variable (a real, migrated-to-head, discardable
+PostgreSQL database — none of these files enforce a dedicated database
+*name* the way `test_forget_postgres_integration.py`/
+`test_dataset_delete_postgres_integration.py` do). Only the embedding
+provider is faked in every one of these files; PostgreSQL (and, for the one
+file below that needs it, Neo4j) is always real.
+
+| Test file | Opt-in flag |
+|---|---|
+| `test_skills_postgres_integration.py` | `SOFIAS_MEMORY_RUN_POSTGRES_SKILLS_TESTS` |
+| `test_skills_service_postgres_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_MANAGEMENT_POSTGRES_TESTS` |
+| `test_skills_http_postgres_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_HTTP_POSTGRES_TESTS` |
+| `test_skills_import_export_http_postgres_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_IMPORT_EXPORT_POSTGRES_TESTS` |
+| `test_skills_resolve_postgres_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_RESOLVE_POSTGRES_TESTS`, plus optional `SOFIAS_MEMORY_SKILLS_RESOLVE_TEST_DATABASE_URL` (dedicated database, truncated before every test — required whenever this file's database is shared with other Skill-creating tests, since one test asserts zero *total* active-Skill candidates; omit it for a local run against a database only this file touches) |
+| `test_skills_resolve_http_postgres_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_RESOLVE_HTTP_POSTGRES_TESTS` |
+| `test_skills_cross_feature_postgres_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_CROSS_FEATURE_POSTGRES_TESTS` |
+| `test_skills_concurrency_hardening_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_CONCURRENCY_POSTGRES_TESTS` |
+| `test_skills_cross_feature_neo4j_integration.py` | `SOFIAS_MEMORY_RUN_SKILLS_NEO4J_TESTS` **and** `SOFIAS_MEMORY_RUN_SKILLS_CROSS_FEATURE_POSTGRES_TESTS` (real Neo4j, reachable at `NEO4J_URI`/`NEO4J_PASSWORD`, plus real PostgreSQL) |
+
+The Skills cross-feature preservation tests for Forget and Dataset Delete
+live inside those two features' own existing suites
+(`test_forget_postgres_integration.py`, `test_dataset_delete_postgres_integration.py`)
+rather than a separate Skills-specific file, reusing their existing
+dedicated-database harness.
+
 ## Running the application on the host
 
 ```bash
@@ -120,7 +148,7 @@ neo4j:7687
 These scripts run from a source checkout via `uv run python scripts/...` as
 shown below. They are also packaged inside the release image itself (see
 `docs/operations.md`), so the same scripts run there too, with no source
-checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.3.0
+checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.4.0
 run --no-sync python scripts/rebuild_graph.py --all --confirm-all`.
 
 ```bash

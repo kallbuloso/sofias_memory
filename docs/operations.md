@@ -123,6 +123,14 @@ docker compose run --rm sofias-memory alembic current
 docker compose run --rm sofias-memory alembic heads
 ```
 
+**v0.4.0 note:** this release introduces migration `0014` (Skills:
+`skills`/`skill_revisions`, including the pgvector HNSW index used by
+semantic resolve). Upgrading from a pre-v0.4.0 deployment therefore falls
+under "Upgrading to a release with one or more new migrations" above — run
+`alembic upgrade head` once, following §4, before starting the new image.
+Skills persistence is PostgreSQL/pgvector only; there is no Neo4j
+projection for Skills, so this migration and upgrade never touch Neo4j.
+
 ## 4. Upgrade
 
 **First, check whether the target release adds any migration at all** — read
@@ -337,7 +345,7 @@ docker compose run --rm sofias-memory alembic current
 docker run --rm --network <compose-network> \
   -e DATABASE_URL=... -e NEO4J_URI=... -e NEO4J_PASSWORD=... \
   -e API_KEY=... -e LLM_API_KEY=... \
-  sofias-memory:0.3.0 uv run --no-sync python scripts/rebuild_graph.py \
+  sofias-memory:0.4.0 uv run --no-sync python scripts/rebuild_graph.py \
   --all --confirm-all
 
 # 8. Start the application.
@@ -492,7 +500,7 @@ procedure — only how the image gets onto the host differs.
 ### B. First production start
 
 Follow §2 (First start) exactly, substituting the target image (built or
-pulled per §A) for `sofias-memory:0.3.0`. Do not skip the migration step
+pulled per §A) for `sofias-memory:0.4.0`. Do not skip the migration step
 (§3) or the readiness check — a deployment is not "up" until
 `/health/ready` reports `ready` and a production smoke run (§H) has passed.
 
@@ -502,7 +510,7 @@ Stable releases (REL-005's release workflow) are published to GHCR at the
 exact version tag. The current stable image is available at:
 
 ```text
-ghcr.io/kallbuloso/sofias-memory:0.3.0
+ghcr.io/kallbuloso/sofias-memory:0.4.0
 ```
 
 **For a release candidate** (used only to validate this very procedure, never
@@ -540,7 +548,7 @@ externally rather than the repository maintaining a second Compose file.
 Production deployments must reference an exact, immutable identity — never a
 floating tag:
 
-- Prefer an exact version tag: `ghcr.io/kallbuloso/sofias-memory:0.3.0`.
+- Prefer an exact version tag: `ghcr.io/kallbuloso/sofias-memory:0.4.0`.
 - For maximum reproducibility (e.g. verifying exactly what was validated
   before a rollout), pin by digest instead:
   `ghcr.io/kallbuloso/sofias-memory@sha256:...`.

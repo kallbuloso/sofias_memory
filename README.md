@@ -19,7 +19,10 @@ Source originals, startup filesystem→S3 convergence/recovery, and validated
 MinIO/Wasabi interoperability while keeping `filesystem` as the default
 backend; **v0.3.0** adds first-class durable Sessions, append-only
 SessionEntries, Session-aware Recall provenance/context, and Remember/Run
-association (see `CHANGELOG.md`) — see
+association; **v0.4.0** adds first-class durable procedural **Skills** —
+management, immutable revisions, archive/restore, standalone `SKILL.md`
+interoperability, and semantic resolve over pgvector (see `CHANGELOG.md`) —
+see
 `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.
 
@@ -45,6 +48,16 @@ original release discovery/backlog.
   archive, and restore a Session; append-only SessionEntries for contextual
   history; Recall and Remember associate their Query/PipelineRun with a
   Session and can opt into bounded Session Context for RAG generation.
+- **Skills** — first-class, durable procedural memory: Sofias Memory stores,
+  versions, and semantically resolves Skills; the caller decides what to do
+  with a resolved Skill and executes it themselves — Sofias Memory never
+  invokes a Skill, selects one automatically, or authorizes tool use.
+  Immutable revisions with safe replay, `current_revision` rollback,
+  archive/restore (a discovery filter, not a write barrier), standalone
+  `SKILL.md` import/export, and `POST /api/v1/skills/resolve` (progressive
+  disclosure — metadata and a similarity `score`, never the full
+  `procedure`) are all implemented; see `docs/api.md` and the
+  [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.4.0_Skills.md).
 
 ## Architecture
 

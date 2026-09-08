@@ -22,6 +22,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from pgvector.sqlalchemy import HALFVEC
+from pydantic import SecretStr
 from sqlalchemy import cast as sql_cast
 from sqlalchemy import delete, func, select, text
 
@@ -52,6 +53,18 @@ from sofias_memory.schemas.skills import (
 from sofias_memory.services.skills import SkillService
 
 POSTGRES_SKILLS_RESOLVE_ENV = "SOFIAS_MEMORY_RUN_SKILLS_RESOLVE_POSTGRES_TESTS"
+SKILLS_RESOLVE_TEST_DATABASE_URL_ENV = "SOFIAS_MEMORY_SKILLS_RESOLVE_TEST_DATABASE_URL"
+"""Optional. ``test_resolve_no_candidates_returns_empty_matches`` asserts
+zero *total* active-Skill candidates -- a genuine global-isolation
+requirement no other test in this file has (every other test scopes its
+own assertions to the Skill ids it created). When set, this points at a
+dedicated database that gets its ``skills``/``skill_revisions`` tables
+truncated before every test, exactly like
+``test_forget_postgres_integration.py``'s own dedicated-database pattern.
+When unset, this fixture falls back to the plain ``DATABASE_URL`` used by
+every other Skills integration file, with no truncation -- the correct
+choice for local ad hoc runs against a database only this session's own
+Skills tests are touching."""
 
 EMBEDDING_DIMENSIONS = 3072
 
@@ -129,9 +142,15 @@ async def postgres_session_factory() -> AsyncIterator[AsyncSessionFactory]:
     if os.environ.get(POSTGRES_SKILLS_RESOLVE_ENV) != "1":
         pytest.skip(f"set {POSTGRES_SKILLS_RESOLVE_ENV}=1 to run Skill resolve PostgreSQL tests")
 
+    dedicated_url = os.environ.get(SKILLS_RESOLVE_TEST_DATABASE_URL_ENV, "").strip()
     settings = load_settings()
+    if dedicated_url:
+        settings = settings.model_copy(update={"database_url": SecretStr(dedicated_url)})
     engine = create_async_engine_from_settings(settings)
     try:
+        if dedicated_url:
+            async with engine.begin() as connection:
+                await connection.execute(text('TRUNCATE TABLE "skill_revisions", "skills" CASCADE'))
         yield create_session_factory(engine)
     finally:
         await dispose_async_engine(engine)

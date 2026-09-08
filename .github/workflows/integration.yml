@@ -121,6 +121,7 @@ jobs:
             sofias_memory_submission_test \
             sofias_memory_process_kill_test \
             sofias_memory_sessions_compat_test \
+            sofias_memory_skills_resolve_test \
           ; do
             psql -c "CREATE DATABASE ${db}"
           done
@@ -155,6 +156,7 @@ jobs:
             sofias_memory_submission_test \
             sofias_memory_process_kill_test \
             sofias_memory_sessions_compat_test \
+            sofias_memory_skills_resolve_test \
           ; do
             docker run --rm --network host \
               -e DATABASE_URL="postgresql+asyncpg://sofias_memory:ci-disposable-password@127.0.0.1:5432/${db}" \
@@ -180,6 +182,9 @@ jobs:
       #     containers instead and does not reconfigure that gate.
       #   - Nothing here calls a real LLM/embedding provider: every
       #     included module uses in-process fake LLM/embedding clients.
+      #   - Skills (v0.4.0, SM-701..705): every Skills integration file is
+      #     CI-compatible and none is deselected here -- see the dedicated
+      #     env block below.
       - name: Run CI-compatible integration suite
         timeout-minutes: 45
         run: uv run pytest tests/integration -q --deselect tests/integration/test_b3_neo4j_gate.py
@@ -246,10 +251,26 @@ jobs:
           SOFIAS_MEMORY_RUN_RECALL_SESSION_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_SESSIONS_COMPAT_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_SESSIONS_COMPAT_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_sessions_compat_test
-          # Skills (v0.4.0, SM-701) -- foundation-only suite shares the job's
-          # main `sofias_memory` database (DATABASE_URL above), no dedicated
-          # database declared yet.
+          # Skills (v0.4.0, SM-701..705). Every file below shares the job's
+          # main `sofias_memory` database (DATABASE_URL above) except the
+          # resolve-service suite, which gets its own dedicated database:
+          # one of its tests asserts zero *total* active-Skill candidates,
+          # a genuine global-isolation requirement no other Skills suite
+          # has (every other test scopes its assertions to the Skill ids
+          # it created itself, so sharing the main database is safe for
+          # them). Nothing here calls a real embedding provider or Neo4j
+          # except the dedicated cross-feature Neo4j file, which uses the
+          # job's real Neo4j service container.
           SOFIAS_MEMORY_RUN_POSTGRES_SKILLS_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SKILLS_MANAGEMENT_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SKILLS_HTTP_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SKILLS_IMPORT_EXPORT_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SKILLS_RESOLVE_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_SKILLS_RESOLVE_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_skills_resolve_test
+          SOFIAS_MEMORY_RUN_SKILLS_RESOLVE_HTTP_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SKILLS_CROSS_FEATURE_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SKILLS_CONCURRENCY_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_SKILLS_NEO4J_TESTS: "1"
 
       - name: Diagnostics on failure
         if: failure()

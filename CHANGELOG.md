@@ -2,6 +2,108 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.4.0]
+
+Minor release adding first-class durable procedural **Skills**: Sofias
+Memory stores, versions, and semantically resolves Skills; the caller
+decides what to do with a resolved Skill and executes it themselves —
+Sofias Memory never invokes a Skill, selects one automatically, or
+authorizes tool use. Entirely additive to the existing public API.
+
+### Skill management and immutable revisions
+
+- New `Skill`/`SkillRevision` resources: `POST /skills`, `GET /skills`,
+  `GET /skills/{skill_uuid}`, `PATCH /skills/{skill_uuid}` (strictly
+  `current_revision` rollback — never content, never `name`).
+- `name` (portable, lowercase `a-z0-9-`, 1..64 chars) is the immutable
+  logical identity; `skill_uuid` is the structural identity. `name` already
+  existing, in any status, is always `409 INVALID_REQUEST` — creation never
+  upserts and never resolves by content hash.
+- `POST/GET /skills/{skill_uuid}/revisions`,
+  `GET /skills/{skill_uuid}/revisions/{revision}`: a `SkillRevision` is
+  immutable once created (no `PATCH`/`DELETE`), addressed by its per-Skill
+  integer `revision`, never an internal id. Creating a revision with content
+  semantically identical (`content_sha256`) to an existing revision of that
+  Skill is a safe replay (`200`, existing revision, `current_revision`
+  unchanged) instead of a duplicate (`201` for genuinely new content).
+- Lifecycle: `active <-> archived` via `POST /skills/{skill_uuid}/archive`
+  and `.../restore`. Unlike Session archive, this is a **discovery filter,
+  not a write admission barrier** — every management operation (`GET`,
+  create revision, `PATCH current_revision`, export) remains available on an
+  archived Skill; only `POST /skills/resolve` excludes it. `restore`
+  preserves whatever `current_revision` the Skill has *at the moment of
+  restore*, never reconstructing the pointer from before the archive.
+
+### Standalone `SKILL.md` interoperability
+
+- `POST /skills/import` (new Skill from a standalone `SKILL.md` document;
+  an existing `name` is always `409`, never safe replay, never upsert),
+  `POST /skills/{skill_uuid}/revisions/import` (new revision on an
+  already-identified Skill, following the same safe-replay rule as the
+  structured revision-create route), and
+  `GET /skills/{skill_uuid}/revisions/{revision}/export`.
+- Covers the portable frontmatter subset only (`name`, `description`,
+  `license`, `compatibility`, `metadata`, `allowed-tools`) plus the Markdown
+  body as `procedure`; bundled packages (`scripts/`/`references/`/
+  `assets/`), zip import, a filesystem watcher, and a remote registry are
+  explicitly out of scope.
+- `tags` is a Sofias Memory extension with no portable frontmatter field: it
+  round-trips through the reserved transport key
+  `metadata["sofias-memory.tags"]`, consumed and removed on import (never
+  persisted as semantic metadata) and re-synthesized on export.
+- `content_sha256` is the SHA-256 of the revision's canonical semantic JSON
+  representation, never a digest of the original or exported `SKILL.md`
+  bytes — export is deterministic over persisted content, not a promise of
+  byte-identity with whatever was originally imported.
+
+### Semantic resolve
+
+- `POST /skills/resolve` (`query`, `top_k`, default 5, max 20) ranks
+  `active`-status Skills' *current* revision by cosine similarity over
+  pgvector (HNSW `halfvec_cosine_ops`, ADR-0006), returning up to `top_k`
+  matches ordered by `score` descending (higher = more similar) with no
+  hidden similarity threshold; `matches: []` (never `404`) when none are
+  eligible.
+- Progressive disclosure: `resolve`, `GET /skills`, `GET /skills/{skill_uuid}`,
+  and the revision list never include `procedure` — only `skill_uuid`,
+  `name`, `description`, `current_revision`, `tags`, `declared_tools`,
+  `compatibility`, and (resolve only) `score`. `resolve` never selects a
+  Skill on the caller's behalf, never fetches `procedure`, and never
+  executes a tool.
+- `declared_tools`/`allowed-tools` is descriptive metadata only — never an
+  authorization grant, a permission, or an installed-tool guarantee.
+
+### Compatibility
+
+- Forget (source/dataset/everything scope) and administrative Dataset
+  Delete never affect any Skill or SkillRevision, including their
+  `current_revision` pointer and content hashes — proven against real
+  PostgreSQL, including the most sensitive case, `DELETE EVERYTHING`.
+- Session and SessionEntry carry no column or reference to Skills, and
+  neither feature's lifecycle affects the other.
+- Skills are global (no Dataset/Session ownership), exist only in
+  PostgreSQL/pgvector, and are never projected to Neo4j — no Skill node,
+  relationship, or `graph_outbox` event is ever created by any Skill
+  operation.
+- Concurrency hardened under real load: colliding `name` creation converges
+  to exactly one winner; concurrent revision creation with different
+  content gets distinct monotonic ordinals; concurrent identical content
+  converges to one persisted revision; `current_revision` rollback and new
+  revision creation are linearized per-Skill with no lost update; different
+  Skills never serialize against each other.
+
+### Database/upgrade
+
+- Adds migration `0014` (`skills`, `skill_revisions`, including the pgvector
+  HNSW expression index used by semantic resolve). Upgrading from `0.3.0`
+  requires `alembic upgrade head` (current head: `0014`) before starting the
+  new version — see `docs/operations.md`.
+
+### Configuration
+
+- No new required settings. Skills reuse the existing OpenAI-compatible
+  embedding provider configuration (`EMBEDDING_*`) already used elsewhere.
+
 ## [0.3.0]
 
 Minor release adding first-class durable Sessions: a persistent temporal

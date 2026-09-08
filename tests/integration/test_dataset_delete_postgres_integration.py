@@ -24,7 +24,8 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import delete as sql_delete
+from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -40,7 +41,14 @@ from sofias_memory.domain import (
     SourceStatus,
 )
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
-from sofias_memory.infrastructure.postgres.models import Dataset, Feedback, Query, Source
+from sofias_memory.infrastructure.postgres.models import (
+    Dataset,
+    Feedback,
+    Query,
+    Skill,
+    SkillRevision,
+    Source,
+)
 from sofias_memory.infrastructure.postgres.models import Session as SessionModel
 from sofias_memory.infrastructure.postgres.models import SessionEntry as SessionEntryModel
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
@@ -53,10 +61,16 @@ from sofias_memory.pipelines.steps.dataset_delete import (
 from sofias_memory.pipelines.steps.forget import FORGET_RESOURCES_RESOURCE, ForgetPipelineResources
 from sofias_memory.schemas.session_entries import SessionEntryCreateRequest
 from sofias_memory.schemas.sessions import SessionCreateRequest
+from sofias_memory.schemas.skills import (
+    SkillCreateRequest,
+    SkillRevisionCreateRequest,
+    SkillUpdateRequest,
+)
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.session_entries import SessionEntryService
 from sofias_memory.services.sessions import SessionService
+from sofias_memory.services.skills import SkillService
 from tests.unit._app_factory import create_app
 
 DATASET_DELETE_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_DATASET_DELETE_POSTGRES_TESTS"
@@ -1862,3 +1876,101 @@ async def test_dataset_delete_preserves_session_history_and_query_dataset_ids(
         assert provenance_data["session_context"] == []
     finally:
         await app.state.pipeline_worker.stop()
+
+
+# --- SM-705: Dataset Delete must never affect Skills/SkillRevisions ---------
+
+_SKILL_EMBEDDING_DIMENSIONS = 3072
+
+
+class _DatasetDeleteFakeEmbeddingClient:
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return [[0.125] * _SKILL_EMBEDDING_DIMENSIONS for _ in texts]
+
+
+def _dataset_delete_skill_service(session_factory: AsyncSessionFactory) -> SkillService:
+    return SkillService(
+        Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            api_key=EXPECTED_API_KEY,
+            database_url="postgresql+asyncpg://unused:unused@localhost:5432/unused",
+            neo4j_password=NEO4J_PASSWORD_FALLBACK,
+            llm_api_key=LLM_API_KEY,
+            app_env="test",
+        ),
+        embedding_client=_DatasetDeleteFakeEmbeddingClient(),
+        session_factory=session_factory,
+    )
+
+
+async def _skill_snapshot_for_dataset_delete(
+    session_factory: AsyncSessionFactory, skill_id: UUID
+) -> tuple[object, list[object]]:
+    async with session_factory() as session:
+        skill = await session.get(Skill, skill_id)
+        assert skill is not None
+        skill_fields = (
+            skill.id,
+            skill.name,
+            skill.status,
+            skill.current_revision_id,
+            skill.created_at,
+            skill.updated_at,
+            skill.archived_at,
+        )
+        result = await session.execute(
+            select(SkillRevision)
+            .where(SkillRevision.skill_id == skill_id)
+            .order_by(SkillRevision.revision)
+        )
+        revisions = [
+            (r.id, r.revision, r.description, r.procedure, r.content_sha256, r.created_at)
+            for r in result.scalars().all()
+        ]
+        return skill_fields, revisions
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_delete_preserves_skills_and_current_revision(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _ = build_harness(postgres_engine, tmp_path)
+    await app.state.pipeline_worker.start()
+    skill_id: UUID | None = None
+    try:
+        dataset_id = await seed_dataset(session_factory, slug=f"skills-preserve-{uuid4()}")
+
+        resolver = _dataset_delete_skill_service(session_factory)
+        created = await resolver.create_skill(
+            SkillCreateRequest(
+                name=f"dataset-delete-skill-{uuid4().hex}", description="d1", procedure="p1"
+            )  # type: ignore[call-arg]
+        )
+        skill_id = created.skill_uuid
+        await resolver.create_revision(
+            skill_id, SkillRevisionCreateRequest(description="d2", procedure="p2")
+        )  # type: ignore[call-arg]
+        await resolver.update_skill(skill_id, SkillUpdateRequest(current_revision=1))
+        before = await _skill_snapshot_for_dataset_delete(session_factory, skill_id)
+
+        response = await delete_dataset(app, dataset_id)
+        assert response.status_code == 202
+        run_id = UUID(response.json()["data"]["run_id"])
+        await wait_for_status(session_factory, run_id, {PipelineRunStatus.SUCCEEDED})
+        dataset_status = await wait_for_dataset_status(
+            session_factory, dataset_id, {DatasetStatus.DELETED}
+        )
+        assert dataset_status == DatasetStatus.DELETED
+
+        after = await _skill_snapshot_for_dataset_delete(session_factory, skill_id)
+        assert before == after
+
+        fetched = await resolver.get_skill(skill_id)
+        assert fetched.current_revision == 1
+    finally:
+        await app.state.pipeline_worker.stop()
+        if skill_id is not None:
+            async with session_factory() as session:
+                await session.execute(sql_delete(Skill).where(Skill.id == skill_id))
+                await session.commit()

@@ -27,7 +27,8 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import delete as sql_delete
+from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -46,6 +47,8 @@ from sofias_memory.infrastructure.postgres.models import (
     Feedback,
     PipelineRun,
     Query,
+    Skill,
+    SkillRevision,
     Source,
 )
 from sofias_memory.infrastructure.postgres.models import (
@@ -66,11 +69,18 @@ from sofias_memory.pipelines.steps.forget import (
 )
 from sofias_memory.schemas.session_entries import SessionEntryCreateRequest
 from sofias_memory.schemas.sessions import SessionCreateRequest
+from sofias_memory.schemas.skills import (
+    SkillCreateRequest,
+    SkillResolveRequest,
+    SkillRevisionCreateRequest,
+    SkillUpdateRequest,
+)
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.session_entries import SessionEntryService
 from sofias_memory.services.sessions import SessionService
+from sofias_memory.services.skills import SkillService
 from tests.unit._app_factory import create_app
 
 FORGET_POSTGRES_TESTS_ENV = "SOFIAS_MEMORY_RUN_FORGET_POSTGRES_TESTS"
@@ -704,6 +714,196 @@ async def test_everything_forget_with_zero_datasets_succeeds_with_zero_counts(
         assert response.json()["data"]["datasets_affected"] >= 0
     finally:
         await coordinator.stop()
+
+
+# --- SM-705: Forget must never affect Skills/SkillRevisions -----------------
+
+
+class _ForgetFakeEmbeddingClient:
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return [[0.125] * EMBEDDING_DIMENSIONS for _ in texts]
+
+
+def _forget_skill_service(session_factory: AsyncSessionFactory) -> SkillService:
+    return SkillService(
+        Settings(
+            _env_file=None,  # type: ignore[call-arg]
+            api_key=EXPECTED_API_KEY,
+            database_url="postgresql+asyncpg://unused:unused@localhost:5432/unused",
+            neo4j_password=NEO4J_PASSWORD_FALLBACK,
+            llm_api_key=LLM_API_KEY,
+            app_env="test",
+        ),
+        embedding_client=_ForgetFakeEmbeddingClient(),
+        session_factory=session_factory,
+    )
+
+
+async def _seed_skill_with_two_revisions(
+    session_factory: AsyncSessionFactory, *, name: str, archive: bool = False
+) -> UUID:
+    """Skill with current_revision explicitly pointed at revision 1 (not the
+    latest), so Forget-preservation is checked against a non-trivial
+    pointer, matching the SM-705 snapshot discipline."""
+
+    resolver = _forget_skill_service(session_factory)
+    created = await resolver.create_skill(
+        SkillCreateRequest(name=name, description="d1", procedure="p1")  # type: ignore[call-arg]
+    )
+    await resolver.create_revision(
+        created.skill_uuid, SkillRevisionCreateRequest(description="d2", procedure="p2")
+    )  # type: ignore[call-arg]
+    await resolver.update_skill(created.skill_uuid, SkillUpdateRequest(current_revision=1))
+    if archive:
+        await resolver.archive_skill(created.skill_uuid)
+    return created.skill_uuid
+
+
+async def _skill_snapshot(
+    session_factory: AsyncSessionFactory, skill_id: UUID
+) -> tuple[object, list[object]]:
+    async with session_factory() as session:
+        skill = await session.get(Skill, skill_id)
+        assert skill is not None
+        skill_fields = (
+            skill.id,
+            skill.name,
+            skill.status,
+            skill.current_revision_id,
+            skill.created_at,
+            skill.updated_at,
+            skill.archived_at,
+        )
+        result = await session.execute(
+            select(SkillRevision)
+            .where(SkillRevision.skill_id == skill_id)
+            .order_by(SkillRevision.revision)
+        )
+        revisions = [
+            (
+                r.id,
+                r.revision,
+                r.description,
+                r.procedure,
+                r.metadata_,
+                r.tags,
+                r.declared_tools,
+                r.content_sha256,
+                r.created_at,
+            )
+            for r in result.scalars().all()
+        ]
+        return skill_fields, revisions
+
+
+async def _cleanup_skill(session_factory: AsyncSessionFactory, skill_id: UUID) -> None:
+    async with session_factory() as session:
+        await session.execute(sql_delete(Skill).where(Skill.id == skill_id))
+        await session.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_source_scope_forget_preserves_skills(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-skills-source-{uuid4()}")
+    source, _entity = await seed_source_with_content(
+        session_factory, tmp_path, dataset_id=dataset.id
+    )
+    skill_id = await _seed_skill_with_two_revisions(
+        session_factory, name=f"forget-skills-source-{uuid4().hex}"
+    )
+    before = await _skill_snapshot(session_factory, skill_id)
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(
+            app, {"dataset": dataset.slug, "source_id": str(source.id), "wait": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        after = await _skill_snapshot(session_factory, skill_id)
+        assert before == after
+    finally:
+        await coordinator.stop()
+        await _cleanup_skill(session_factory, skill_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_scope_forget_preserves_skills(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-skills-dataset-{uuid4()}")
+    await seed_source_with_content(session_factory, tmp_path, dataset_id=dataset.id)
+    skill_id = await _seed_skill_with_two_revisions(
+        session_factory, name=f"forget-skills-dataset-{uuid4().hex}", archive=True
+    )
+    before = await _skill_snapshot(session_factory, skill_id)
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(app, {"dataset": dataset.slug, "wait": True})
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        after = await _skill_snapshot(session_factory, skill_id)
+        assert before == after
+    finally:
+        await coordinator.stop()
+        await _cleanup_skill(session_factory, skill_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_everything_scope_forget_preserves_skills_and_they_remain_fully_usable(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """The most sensitive SM-705 gate: EVERYTHING-scope Forget walks every
+    Dataset/Source in the database, yet a Skill row and its
+    ``resolution_embedding`` must never be touched -- proven not only by an
+    unchanged snapshot but by every read/discovery operation still working
+    immediately afterward."""
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-skills-everything-{uuid4()}")
+    await seed_source_with_content(session_factory, tmp_path, dataset_id=dataset.id)
+    skill_id = await _seed_skill_with_two_revisions(
+        session_factory, name=f"forget-skills-everything-{uuid4().hex}"
+    )
+    before = await _skill_snapshot(session_factory, skill_id)
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(
+            app, {"everything": True, "confirm": "DELETE EVERYTHING", "wait": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        after = await _skill_snapshot(session_factory, skill_id)
+        assert before == after
+
+        resolver = _forget_skill_service(session_factory)
+        get_result = await resolver.get_skill(skill_id)
+        assert get_result.skill_uuid == skill_id
+        revision_result = await resolver.get_revision(skill_id, 1)
+        assert revision_result.revision == 1
+        export_result = await resolver.export_revision(skill_id, 1)
+        assert export_result.format == "skill_md"
+
+        resolved = await resolver.resolve(SkillResolveRequest(query="anything", top_k=20))
+        assert skill_id in {match.skill_uuid for match in resolved.matches}
+    finally:
+        await coordinator.stop()
+        await _cleanup_skill(session_factory, skill_id)
 
 
 # --- B4 legacy rollout compatibility (SM-512 SS 62) --------------------------

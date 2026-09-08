@@ -2,7 +2,7 @@
 
 **Release:** v0.4.0\
 **Feature:** First-class durable procedural Skills\
-**Status:** Proposed\
+**Status:** DONE — GATE-v0.4.0 PASSED; v0.4.0 RELEASED\
 **Sequência:** SM-701..SM-706\
 **Regra de execução:** executar uma task por vez; não antecipar dependências ou escopo de tickets posteriores.
 
@@ -66,12 +66,12 @@ Durante SM-701..SM-706:
 
 | Ticket | Entrega principal | Depende de | Status |
 |---|---|---|---|
-| SM-701 | Skill schema, domínio e persistence foundation | — | Proposed |
-| SM-702 | Skill management + immutable revision API | SM-701 | Proposed |
-| SM-703 | SKILL.md standalone import/export | SM-702 | Proposed |
-| SM-704 | Semantic resolve + progressive disclosure | SM-701, SM-702 | Proposed |
-| SM-705 | Lifecycle, compatibility e cross-feature hardening | SM-702, SM-703, SM-704 | Proposed |
-| SM-706 | Docs, smoke e release gate v0.4.0 | SM-705 | Proposed |
+| SM-701 | Skill schema, domínio e persistence foundation | — | DONE |
+| SM-702 | Skill management + immutable revision API | SM-701 | DONE |
+| SM-703 | SKILL.md standalone import/export | SM-702 | DONE |
+| SM-704 | Semantic resolve + progressive disclosure | SM-701, SM-702 | DONE |
+| SM-705 | Lifecycle, compatibility e cross-feature hardening | SM-702, SM-703, SM-704 | DONE |
+| SM-706 | Docs, smoke e release gate v0.4.0 | SM-705 | DONE — GATE-v0.4.0 PASSED |
 
 SM-703 e SM-704 podem ser implementadas em qualquer ordem depois de suas dependências, mas não devem ser misturadas na mesma task.
 
@@ -399,3 +399,115 @@ O release somente pode ser marcado como concluído quando:
 Após esse gate, nenhum trabalho de Agent Management (v0.5) deve ser incluído retroativamente no v0.4.0.
 
 O próximo release funcional planejado permanece separado.
+
+## GATE-v0.4.0 — PASSED
+
+SM-706 (implementation/local non-Docker gates) was DONE first: ruff, ruff format,
+mypy, and the unit/contract/security suite green locally, the Skills schema
+migration validated against a real disposable database, a real end-to-end smoke
+over the public API covering Skill create/revision/rollback/archive/restore/resolve,
+SKILL.md import/export determinism, Forget/Dataset Delete non-interference, and a
+Neo4j check proving the absence of any Skill-related label or relationship type.
+Runtime-only `pip-audit` and the Bandit HIGH-severity blocking gate both passed
+locally. Documentation (README, AGENTS.md, docs/api.md, docs/development.md,
+CHANGELOG.md) was updated.
+
+**Historical note (Docker limitation, preserved for the record):** the local
+execution environment used for SM-706 had no Docker available, so Docker image
+build, OCI label validation, the image-contained migration gate, and the
+`docker compose config` step of `ci_release_consistency_check.py` could not be
+exercised locally and were explicitly reported as pending rather than fabricated.
+Those gates were subsequently executed successfully in GitHub Actions against the
+exact release commit before/as part of finalizing publication — see the remote
+evidence below.
+
+### Remote evidence
+
+**Normal CI** — workflow `CI`, run `34177922172` (run number `40`), commit
+`018ad64381d39588cfb3efff7ffc766dd896f4a8` (`chore(release): prepare 0.4.0`),
+conclusion **success**. Covered ruff, ruff format, mypy, unit/contract/security,
+runtime `pip-audit`, Bandit, release consistency, Docker build, and the OCI label
+validation.
+
+**Integration (manual)** — workflow `Integration (real PostgreSQL + Neo4j)`, run
+`34179114389` (run number `15`), `workflow_dispatch`, commit
+`018ad64381d39588cfb3efff7ffc766dd896f4a8`, conclusion **success**. Proved: the
+release image was built, dedicated databases were created, migrations were
+executed from the built image (`0001 → 0014`, `alembic current == 0014`), and the
+following Skills integration opt-in flags were all enabled:
+
+```text
+SOFIAS_MEMORY_RUN_POSTGRES_SKILLS_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_MANAGEMENT_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_HTTP_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_IMPORT_EXPORT_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_RESOLVE_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_RESOLVE_HTTP_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_CROSS_FEATURE_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_CONCURRENCY_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_SKILLS_NEO4J_TESTS=1
+```
+
+Authoritative remote result for this run: **503 passed, 3 deselected, 0
+failures**. (This is the remote CI number; it is distinct from an earlier local
+aggregation that summed separately-executed groups with category overlap and is
+not reported here.)
+
+**Release** — workflow `Release`, run `34179578249` (run number `10`), tag
+`v0.4.0`, commit `018ad64381d39588cfb3efff7ffc766dd896f4a8`, conclusion
+**success**. Job "Validate tag against canonical version" (PASS): tag commit
+belongs to `main`; the exact commit's CI was already green; `uv lock --check`;
+canonical release kind/version; the CHANGELOG canonical version section;
+Settings/`.env.example`/Compose parity; version consistency. Job "Build, publish
+to GHCR, create GitHub Release" (PASS): build release image; verify OCI labels
+before publishing; login to GHCR; check tag availability; push image to GHCR;
+extract release notes; create GitHub Release.
+
+**GHCR** — the workflow evidence proves `Push image to GHCR = success`. The
+configured/published tag is `ghcr.io/kallbuloso/sofias-memory:0.4.0`; no digest
+is recorded here since none was explicitly extracted from the logs/API.
+
+**Published release** — `Sofias Memory v0.4.0`, tag `v0.4.0`, GitHub Release ID
+`384406366`, `draft: false`, `prerelease: false`, immutable, published at
+`2026-09-08T02:18:57Z`. No binary asset is attached beyond the standard source
+tarball/zip; the container image is published separately to GHCR.
+
+### Release flow (what actually happened)
+
+```text
+SM-706 local gate
+↓
+release commit 018ad643 pushed
+↓
+CI #40 PASS
+↓
+Integration #15 workflow_dispatch PASS
+↓
+v0.4.0 tag pushed
+↓
+Release #10 validates exact SHA/tag
+↓
+release image built + OCI validated
+↓
+GHCR image published
+↓
+GitHub Release published
+```
+
+### Final state
+
+```text
+SM-701 ✅ PASSED
+SM-702 ✅ PASSED
+SM-703 ✅ PASSED
+SM-704 ✅ PASSED
+SM-705 ✅ PASSED
+SM-706 ✅ PASSED
+
+GATE-v0.4.0 ✅ PASSED
+v0.4.0 ✅ RELEASED
+```
+
+The `v0.4.0` tag is immutable and must not be moved.
+
+The next functional release remains v0.5.0 — Agent Management.

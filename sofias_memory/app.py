@@ -30,6 +30,7 @@ from sofias_memory.api.middleware import (
     RequestMetricsMiddleware,
     max_body_bytes_from_mebibytes,
 )
+from sofias_memory.api.routes.agents import router as agents_router
 from sofias_memory.api.routes.cognify import router as cognify_router
 from sofias_memory.api.routes.datasets import router as datasets_router
 from sofias_memory.api.routes.feedback import router as feedback_router
@@ -181,6 +182,14 @@ TAG_METADATA: list[dict[str, str]] = [
             "Create, inspect, and manage durable procedural Skills and their "
             "immutable revisions; archive and restore; roll back the current "
             "revision."
+        ),
+    },
+    {
+        "name": "agents",
+        "description": (
+            "Create, inspect, update, archive, and restore durable Agent "
+            "Profiles -- a management resource, never an agent runtime, "
+            "tool executor, or provider session manager."
         ),
     },
 ]
@@ -394,6 +403,7 @@ def create_app(
     application.include_router(runs_router, prefix="/api/v1")
     application.include_router(sessions_router, prefix="/api/v1")
     application.include_router(skills_router, prefix="/api/v1")
+    application.include_router(agents_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

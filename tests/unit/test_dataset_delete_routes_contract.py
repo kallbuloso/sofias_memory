@@ -44,7 +44,14 @@ def test_delete_dataset_route_declares_no_request_body() -> None:
 
 def test_forbidden_route_prefixes_still_absent_with_dataset_delete() -> None:
     """ADR-0010/AGENTS.md 12: SM-515 must not introduce any of the
-    permanently-forbidden route prefixes."""
+    permanently-forbidden route prefixes.
+
+    `/agents` was removed from this local list by SM-802/ADR-0014: Agent
+    management is now a permitted prefix (`tests/contract/
+    test_openapi_forbidden_routes.py` owns the current allowlist and the
+    narrow list of still-forbidden `/agents/**` runtime/association paths).
+    This test's own job stays unchanged -- Dataset Delete must not introduce
+    any of the prefixes that remain permanently forbidden below."""
 
     paths = openapi_paths()
     forbidden_prefixes = (
@@ -60,7 +67,6 @@ def test_forbidden_route_prefixes_still_absent_with_dataset_delete() -> None:
         "/push",
         "/slack",
         "/integrations",
-        "/agents",
         "/proposals",
     )
     for path in paths:

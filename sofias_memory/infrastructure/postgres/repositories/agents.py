@@ -1,13 +1,14 @@
-"""Agent-specific PostgreSQL repository (ADR-0014, SM-801)."""
+"""Agent-specific PostgreSQL repository (ADR-0014, SM-801/SM-802)."""
 
 from __future__ import annotations
 
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sofias_memory.domain import AgentStatus
 from sofias_memory.infrastructure.postgres.models import Agent
 
 
@@ -43,3 +44,27 @@ class AgentRepository:
         statement = select(Agent).where(Agent.id == agent_id).with_for_update()
         result = await self._session.scalar(statement)
         return cast(Agent | None, result)
+
+    async def list_paginated(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        status: AgentStatus,
+    ) -> tuple[list[Agent], int]:
+        """Deterministic order ``(created_at, id)`` -- the same tiebreak
+        convention Session/Skill listing already use. ``total`` reflects
+        ``status`` (SM-802, Feature Contract SS 9: ``GET /agents`` defaults
+        to ``active`` only, unlike Session/Skill's all-status default)."""
+
+        statement = (
+            select(Agent)
+            .where(Agent.status == status)
+            .order_by(Agent.created_at, Agent.id)
+            .limit(limit)
+            .offset(offset)
+        )
+        total_statement = select(func.count()).select_from(Agent).where(Agent.status == status)
+        result = await self._session.scalars(statement)
+        total = await self._session.scalar(total_statement)
+        return list(result), int(total or 0)

@@ -226,6 +226,7 @@ sofias-memory/
 │   │       ├── runs.py
 │   │       ├── sessions.py
 │   │       ├── skills.py
+│   │       ├── agents.py
 │   │       └── graph.py
 │   ├── interoperability/
 │   │   └── skill_md.py
@@ -583,6 +584,25 @@ Somente as famílias definidas no PRD:
   Fora de escopo permanentemente (não "ainda não implementado" -- não
   planejado para v0.4.0): bundled skill packages (`scripts/`/`references/`/
   `assets/`), execução de Skill, `SkillRun`, e qualquer runtime de Agent.
+- agents (durable Agent Profile management, v0.5.0, ADR-0014)
+  **implementado nesta release apenas como identity/profile management**:
+  - management: create/get/list, PATCH, archive/restore (SM-802);
+  - `GET /agents` sem filtro devolve somente `active` -- default deliberado,
+    diferente de Session/Skill (que devolvem todos os status por default);
+  - `instructions`/`metadata` nunca aparecem na listagem, apenas no detalhe
+    (progressive disclosure);
+  - archive é discovery/availability filter, nunca admission barrier --
+    toda operação de management permanece disponível em um Agent archived.
+
+  Um Agent é uma durable Agent Profile identity e management resource,
+  nunca um agent runtime: Sofias Memory nunca executa um Agent, nunca
+  seleciona provider/model em seu nome, nunca gerencia uma provider
+  session, e nunca faz um Agent "possuir" tools ou executar uma Skill.
+
+  Fora de escopo desta release: `agent_skills`/`agent_sessions`
+  (associações, SM-803/SM-804), `AgentRevision`, `AgentRun`, semantic
+  Agent resolve, e qualquer rota runtime-shaped (`/run`, `/execute`,
+  `/chat`, `/respond`, `/complete`, `/invoke`, `/tools`).
 
 Não invente aliases/endpoints de conveniência.
 
@@ -603,13 +623,16 @@ O teste de OpenAPI deve falhar se aparecer:
 /push
 /slack
 /integrations
-/agents
 /proposals
 ```
 
 `/skills` (management) existe desde v0.4.0/SM-702 e não é mais proibido.
-`SkillRun`/execução de Skill e qualquer runtime de Agent continuam fora do
-MVP (ADR-0013, docs/adr/0013-first-class-durable-procedural-skills.md).
+`/agents` (management) existe desde v0.5.0/SM-802 e não é mais proibido.
+`SkillRun`/execução de Skill, `AgentRun`/execução de Agent, tool
+authorization, provider session management, e qualquer runtime de Agent
+continuam fora do MVP (ADR-0013, docs/adr/0013-first-class-durable-
+procedural-skills.md; ADR-0014, docs/adr/0014-first-class-durable-agent-
+management.md).
 
 ## 13. Pydantic schemas
 

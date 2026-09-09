@@ -21,6 +21,12 @@ EXPECTED_GRAPH_PROVENANCE_PATHS = {
     "/api/v1/provenance/query/{query_id}",
 }
 
+# `/agents` was removed from this local list by SM-802/ADR-0014: Agent
+# management is now a permitted prefix (`tests/contract/
+# test_openapi_forbidden_routes.py` owns the current allowlist and the
+# narrow list of still-forbidden `/agents/**` runtime/association paths).
+# This test's own job stays unchanged -- the graph/provenance routes must
+# not introduce any of the prefixes that remain permanently forbidden below.
 FORBIDDEN_PREFIXES = (
     "/auth",
     "/users",
@@ -34,7 +40,6 @@ FORBIDDEN_PREFIXES = (
     "/push",
     "/slack",
     "/integrations",
-    "/agents",
     "/graph/cypher",
     "/graph/query",
     "/graph/entities",

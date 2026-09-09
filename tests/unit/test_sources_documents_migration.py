@@ -124,6 +124,7 @@ def test_sources_documents_revision_is_current_head() -> None:
         "0012_create_sessions_foundation.py",
         "0013_session_entry_external_id_trim_invariant.py",
         "0014_create_skills_foundation.py",
+        "0015_create_agents_foundation.py",
     ]
 
 

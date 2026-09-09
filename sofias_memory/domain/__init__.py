@@ -1,6 +1,21 @@
 """Domain-level contracts for Sofias Memory."""
 
+from sofias_memory.domain.agent_name import (
+    AGENT_NAME_MAX_LENGTH,
+    InvalidAgentNameError,
+    validate_agent_name,
+)
+from sofias_memory.domain.agent_profile import (
+    AGENT_DESCRIPTION_MAX_LENGTH,
+    AGENT_DISPLAY_NAME_MAX_LENGTH,
+    AGENT_INSTRUCTIONS_MAX_LENGTH,
+    InvalidAgentProfileError,
+    normalize_validate_agent_instructions,
+    validate_agent_description,
+    validate_agent_display_name,
+)
 from sofias_memory.domain.enums import (
+    AgentStatus,
     DatasetStatus,
     GraphOutboxOperation,
     GraphOutboxStatus,
@@ -69,6 +84,10 @@ from sofias_memory.domain.skill_revision_content import (
 )
 
 __all__ = [
+    "AGENT_DESCRIPTION_MAX_LENGTH",
+    "AGENT_DISPLAY_NAME_MAX_LENGTH",
+    "AGENT_INSTRUCTIONS_MAX_LENGTH",
+    "AGENT_NAME_MAX_LENGTH",
     "COMPATIBILITY_MAX_LENGTH",
     "CONTENT_SHA256_PATTERN",
     "DESCRIPTION_MAX_LENGTH",
@@ -81,9 +100,12 @@ __all__ = [
     "SOFIAS_MEMORY_TAGS_METADATA_KEY",
     "STEP_TRANSITIONS",
     "TERMINAL_RUN_STATUSES",
+    "AgentStatus",
     "DatasetStatus",
     "GraphOutboxOperation",
     "GraphOutboxStatus",
+    "InvalidAgentNameError",
+    "InvalidAgentProfileError",
     "InvalidSessionEntryExternalIdError",
     "InvalidSessionIdError",
     "InvalidSkillNameError",
@@ -110,9 +132,13 @@ __all__ = [
     "normalize_newlines",
     "normalize_session_entry_external_id",
     "normalize_session_id",
+    "normalize_validate_agent_instructions",
     "render_session_context_block",
     "render_session_context_entry",
     "select_session_context",
+    "validate_agent_description",
+    "validate_agent_display_name",
+    "validate_agent_name",
     "validate_compatibility",
     "validate_declared_tools",
     "validate_description",

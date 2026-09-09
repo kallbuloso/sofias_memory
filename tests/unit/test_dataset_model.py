@@ -154,6 +154,7 @@ def test_dataset_has_no_forbidden_ownership_or_soft_delete_columns() -> None:
 
 def test_base_metadata_contains_only_dataset_product_table_at_this_stage() -> None:
     assert set(Base.metadata.tables) == {
+        "agents",
         "chunks",
         "datasets",
         "documents",

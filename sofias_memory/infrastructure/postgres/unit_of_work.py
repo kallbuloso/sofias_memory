@@ -8,6 +8,7 @@ from typing import Self
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
 
 from sofias_memory.infrastructure.postgres.repositories import (
+    AgentRepository,
     ChunkRepository,
     DatasetRepository,
     DocumentRepository,
@@ -56,6 +57,7 @@ class PostgresUnitOfWork:
         self._session_entries: SessionEntryRepository | None = None
         self._skills: SkillRepository | None = None
         self._skill_revisions: SkillRevisionRepository | None = None
+        self._agents: AgentRepository | None = None
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -83,6 +85,7 @@ class PostgresUnitOfWork:
         self._session_entries = SessionEntryRepository(session)
         self._skills = SkillRepository(session)
         self._skill_revisions = SkillRevisionRepository(session)
+        self._agents = AgentRepository(session)
         return self
 
     async def __aexit__(
@@ -207,6 +210,12 @@ class PostgresUnitOfWork:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._skill_revisions
 
+    @property
+    def agents(self) -> AgentRepository:
+        if self._agents is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._agents
+
     def savepoint(self) -> AsyncSessionTransaction:
         """A nested transaction (SAVEPOINT) inside this unit of work.
 
@@ -265,3 +274,4 @@ class PostgresUnitOfWork:
         self._session_entries = None
         self._skills = None
         self._skill_revisions = None
+        self._agents = None

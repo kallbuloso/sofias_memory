@@ -1,5 +1,6 @@
 """PostgreSQL ORM models."""
 
+from sofias_memory.infrastructure.postgres.models.agent import Agent
 from sofias_memory.infrastructure.postgres.models.chunk import Chunk
 from sofias_memory.infrastructure.postgres.models.dataset import Dataset
 from sofias_memory.infrastructure.postgres.models.document import Document
@@ -21,6 +22,7 @@ from sofias_memory.infrastructure.postgres.models.source import Source
 from sofias_memory.infrastructure.postgres.models.summary import Summary
 
 __all__ = [
+    "Agent",
     "Chunk",
     "Dataset",
     "Document",

@@ -1,5 +1,6 @@
 """Concrete PostgreSQL repositories used by the Unit of Work."""
 
+from sofias_memory.infrastructure.postgres.repositories.agents import AgentRepository
 from sofias_memory.infrastructure.postgres.repositories.chunks import ChunkRepository
 from sofias_memory.infrastructure.postgres.repositories.datasets import DatasetRepository
 from sofias_memory.infrastructure.postgres.repositories.documents import DocumentRepository
@@ -29,6 +30,7 @@ from sofias_memory.infrastructure.postgres.repositories.sources import SourceRep
 from sofias_memory.infrastructure.postgres.repositories.summaries import SummaryRepository
 
 __all__ = [
+    "AgentRepository",
     "ChunkRepository",
     "DatasetRepository",
     "DocumentRepository",

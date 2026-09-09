@@ -110,3 +110,10 @@ class SkillStatus(StrEnum):
 
     ACTIVE = "active"
     ARCHIVED = "archived"
+
+
+class AgentStatus(StrEnum):
+    """Lifecycle status for first-class durable Agent Profiles."""
+
+    ACTIVE = "active"
+    ARCHIVED = "archived"

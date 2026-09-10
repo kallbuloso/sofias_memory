@@ -42,6 +42,9 @@ from sofias_memory.domain import (
 )
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
 from sofias_memory.infrastructure.postgres.models import (
+    Agent,
+    AgentSession,
+    AgentSkill,
     Dataset,
     Feedback,
     Query,
@@ -59,6 +62,8 @@ from sofias_memory.pipelines.steps.dataset_delete import (
     DatasetDeletePipelineResources,
 )
 from sofias_memory.pipelines.steps.forget import FORGET_RESOURCES_RESOURCE, ForgetPipelineResources
+from sofias_memory.schemas.agent_skills import AgentSkillSetRequest
+from sofias_memory.schemas.agents import AgentCreateRequest
 from sofias_memory.schemas.session_entries import SessionEntryCreateRequest
 from sofias_memory.schemas.sessions import SessionCreateRequest
 from sofias_memory.schemas.skills import (
@@ -66,6 +71,9 @@ from sofias_memory.schemas.skills import (
     SkillRevisionCreateRequest,
     SkillUpdateRequest,
 )
+from sofias_memory.services.agent_sessions import AgentSessionService
+from sofias_memory.services.agent_skills import AgentSkillService
+from sofias_memory.services.agents import AgentService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
 from sofias_memory.services.session_entries import SessionEntryService
@@ -1974,3 +1982,176 @@ async def test_dataset_delete_preserves_skills_and_current_revision(
             async with session_factory() as session:
                 await session.execute(sql_delete(Skill).where(Skill.id == skill_id))
                 await session.commit()
+
+
+# --- SM-805: Dataset Delete must never affect Agent/AgentSkill/AgentSession -
+
+
+def _dataset_delete_agent_service(session_factory: AsyncSessionFactory) -> AgentService:
+    return AgentService(session_factory=session_factory)
+
+
+def _dataset_delete_agent_skill_service(session_factory: AsyncSessionFactory) -> AgentSkillService:
+    return AgentSkillService(session_factory=session_factory)
+
+
+def _dataset_delete_agent_session_service(
+    session_factory: AsyncSessionFactory,
+) -> AgentSessionService:
+    return AgentSessionService(session_factory=session_factory)
+
+
+async def _seed_agent_family_for_dataset_delete(
+    session_factory: AsyncSessionFactory, *, name_prefix: str
+) -> tuple[UUID, UUID, UUID]:
+    """Agent A, associated (pinned) with Skill S and with Session X -- none of
+    the three is Dataset-owned (`agents`/`agent_skills`/`agent_sessions`
+    carry no `dataset_id` column), so Dataset Delete must never touch them
+    (SM-805, ADR-0014)."""
+
+    agent_service = _dataset_delete_agent_service(session_factory)
+    agent = await agent_service.create_agent(
+        AgentCreateRequest(
+            name=f"{name_prefix}-agent",
+            display_name="Dataset Delete Preservation Agent",
+            description="Agent used to prove Dataset Delete preservation.",
+            instructions="Do not delete me.",
+            metadata={"k": "v"},
+        )
+    )
+
+    resolver = _dataset_delete_skill_service(session_factory)
+    created_skill = await resolver.create_skill(
+        SkillCreateRequest(name=f"{name_prefix}-skill", description="d1", procedure="p1")  # type: ignore[call-arg]
+    )
+    skill_id = created_skill.skill_uuid
+    await resolver.create_revision(
+        skill_id, SkillRevisionCreateRequest(description="d2", procedure="p2")
+    )  # type: ignore[call-arg]
+
+    session_result = await SessionService(session_factory=session_factory).create_session(
+        SessionCreateRequest()
+    )
+
+    agent_skill_service = _dataset_delete_agent_skill_service(session_factory)
+    await agent_skill_service.set_skill(
+        agent.agent_uuid, skill_id, AgentSkillSetRequest(pinned_revision=1)
+    )
+
+    agent_session_service = _dataset_delete_agent_session_service(session_factory)
+    await agent_session_service.associate_session(agent.agent_uuid, session_result.session_uuid)
+
+    return agent.agent_uuid, skill_id, session_result.session_uuid
+
+
+async def _agent_family_snapshot_for_dataset_delete(
+    session_factory: AsyncSessionFactory,
+    *,
+    agent_id: UUID,
+    skill_id: UUID,
+    session_id: UUID,
+) -> tuple[object, object, object]:
+    async with session_factory() as session:
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None
+        agent_fields = (
+            agent.id,
+            agent.name,
+            agent.display_name,
+            agent.description,
+            agent.instructions,
+            agent.metadata_,
+            agent.status,
+            agent.created_at,
+            agent.updated_at,
+            agent.archived_at,
+        )
+
+        agent_skill = await session.get(AgentSkill, (agent_id, skill_id))
+        assert agent_skill is not None
+        agent_skill_fields = (
+            agent_skill.agent_id,
+            agent_skill.skill_id,
+            agent_skill.pinned_revision_id,
+            agent_skill.created_at,
+        )
+
+        agent_session = await session.get(AgentSession, (agent_id, session_id))
+        assert agent_session is not None
+        agent_session_fields = (
+            agent_session.agent_id,
+            agent_session.session_id,
+            agent_session.created_at,
+        )
+
+        return agent_fields, agent_skill_fields, agent_session_fields
+
+
+async def _cleanup_agent_family_for_dataset_delete(
+    session_factory: AsyncSessionFactory,
+    *,
+    agent_id: UUID,
+    skill_id: UUID,
+    session_id: UUID,
+) -> None:
+    async with session_factory() as session:
+        # Deleting the Agent cascades away its agent_skills/agent_sessions
+        # rows first, so the Skill's RESTRICT-protected FK from agent_skills
+        # is already clear by the time the Skill itself is deleted.
+        await session.execute(sql_delete(Agent).where(Agent.id == agent_id))
+        await session.execute(sql_delete(Skill).where(Skill.id == skill_id))
+        await session.execute(sql_delete(SessionModel).where(SessionModel.id == session_id))
+        await session.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_delete_preserves_agent_family(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _ = build_harness(postgres_engine, tmp_path)
+    await app.state.pipeline_worker.start()
+    agent_id: UUID | None = None
+    skill_id: UUID | None = None
+    session_id: UUID | None = None
+    try:
+        dataset_id = await seed_dataset(session_factory, slug=f"agents-preserve-{uuid4()}")
+        agent_id, skill_id, session_id = await _seed_agent_family_for_dataset_delete(
+            session_factory, name_prefix=f"dataset-delete-agent-{uuid4().hex[:8]}"
+        )
+        before = await _agent_family_snapshot_for_dataset_delete(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
+
+        response = await delete_dataset(app, dataset_id)
+        assert response.status_code == 202
+        run_id = UUID(response.json()["data"]["run_id"])
+        await wait_for_status(session_factory, run_id, {PipelineRunStatus.SUCCEEDED})
+        dataset_status = await wait_for_dataset_status(
+            session_factory, dataset_id, {DatasetStatus.DELETED}
+        )
+        assert dataset_status == DatasetStatus.DELETED
+
+        after = await _agent_family_snapshot_for_dataset_delete(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
+        assert before == after
+
+        agent_result = await _dataset_delete_agent_service(session_factory).get_agent(agent_id)
+        assert agent_result.agent_uuid == agent_id
+
+        listed_skills = await _dataset_delete_agent_skill_service(session_factory).list_skills(
+            agent_id
+        )
+        assert {item.skill_uuid for item in listed_skills.items} == {skill_id}
+
+        listed_sessions = await _dataset_delete_agent_session_service(
+            session_factory
+        ).list_sessions(agent_id)
+        assert {item.session_uuid for item in listed_sessions.items} == {session_id}
+    finally:
+        await app.state.pipeline_worker.stop()
+        if agent_id is not None and skill_id is not None and session_id is not None:
+            await _cleanup_agent_family_for_dataset_delete(
+                session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+            )

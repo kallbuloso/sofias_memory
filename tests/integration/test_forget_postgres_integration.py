@@ -39,6 +39,9 @@ from sofias_memory.domain import DatasetStatus, PipelineRunStatus, PipelineType,
 from sofias_memory.infrastructure.neo4j import Neo4jProjection, create_neo4j_resource_from_settings
 from sofias_memory.infrastructure.postgres import create_session_factory, dispose_async_engine
 from sofias_memory.infrastructure.postgres.models import (
+    Agent,
+    AgentSession,
+    AgentSkill,
     Chunk,
     Dataset,
     Document,
@@ -67,6 +70,8 @@ from sofias_memory.pipelines.steps.forget import (
     AuthoritativeMutationStep,
     ForgetPipelineResources,
 )
+from sofias_memory.schemas.agent_skills import AgentSkillSetRequest
+from sofias_memory.schemas.agents import AgentCreateRequest
 from sofias_memory.schemas.session_entries import SessionEntryCreateRequest
 from sofias_memory.schemas.sessions import SessionCreateRequest
 from sofias_memory.schemas.skills import (
@@ -75,6 +80,9 @@ from sofias_memory.schemas.skills import (
     SkillRevisionCreateRequest,
     SkillUpdateRequest,
 )
+from sofias_memory.services.agent_sessions import AgentSessionService
+from sofias_memory.services.agent_skills import AgentSkillService
+from sofias_memory.services.agents import AgentService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
@@ -904,6 +912,240 @@ async def test_everything_scope_forget_preserves_skills_and_they_remain_fully_us
     finally:
         await coordinator.stop()
         await _cleanup_skill(session_factory, skill_id)
+
+
+# --- SM-805: Forget must never affect Agent/AgentSkill/AgentSession ---------
+
+
+def _forget_agent_service(session_factory: AsyncSessionFactory) -> AgentService:
+    return AgentService(session_factory=session_factory)
+
+
+def _forget_agent_skill_service(session_factory: AsyncSessionFactory) -> AgentSkillService:
+    return AgentSkillService(session_factory=session_factory)
+
+
+def _forget_agent_session_service(session_factory: AsyncSessionFactory) -> AgentSessionService:
+    return AgentSessionService(session_factory=session_factory)
+
+
+async def _seed_agent_family(
+    session_factory: AsyncSessionFactory, *, name_prefix: str
+) -> tuple[UUID, UUID, UUID]:
+    """Agent with a populated profile, associated (pinned, non-trivial) with
+    a two-revision Skill, and associated with a Session -- all three
+    resources are instance-scoped management state that Forget must never
+    touch, regardless of scope (SM-805, ADR-0014)."""
+
+    agent_service = _forget_agent_service(session_factory)
+    agent = await agent_service.create_agent(
+        AgentCreateRequest(
+            name=f"{name_prefix}-agent",
+            display_name="Forget Preservation Agent",
+            description="Agent used to prove Forget preservation.",
+            instructions="Do not forget me.",
+            metadata={"k": "v"},
+        )
+    )
+
+    skill_id = await _seed_skill_with_two_revisions(session_factory, name=f"{name_prefix}-skill")
+
+    session_result = await SessionService(session_factory=session_factory).create_session(
+        SessionCreateRequest()
+    )
+
+    agent_skill_service = _forget_agent_skill_service(session_factory)
+    await agent_skill_service.set_skill(
+        agent.agent_uuid, skill_id, AgentSkillSetRequest(pinned_revision=1)
+    )
+
+    agent_session_service = _forget_agent_session_service(session_factory)
+    await agent_session_service.associate_session(agent.agent_uuid, session_result.session_uuid)
+
+    return agent.agent_uuid, skill_id, session_result.session_uuid
+
+
+async def _agent_family_snapshot(
+    session_factory: AsyncSessionFactory,
+    *,
+    agent_id: UUID,
+    skill_id: UUID,
+    session_id: UUID,
+) -> tuple[object, object, object]:
+    async with session_factory() as session:
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None
+        agent_fields = (
+            agent.id,
+            agent.name,
+            agent.display_name,
+            agent.description,
+            agent.instructions,
+            agent.metadata_,
+            agent.status,
+            agent.created_at,
+            agent.updated_at,
+            agent.archived_at,
+        )
+
+        agent_skill = await session.get(AgentSkill, (agent_id, skill_id))
+        assert agent_skill is not None
+        agent_skill_fields = (
+            agent_skill.agent_id,
+            agent_skill.skill_id,
+            agent_skill.pinned_revision_id,
+            agent_skill.created_at,
+        )
+
+        agent_session = await session.get(AgentSession, (agent_id, session_id))
+        assert agent_session is not None
+        agent_session_fields = (
+            agent_session.agent_id,
+            agent_session.session_id,
+            agent_session.created_at,
+        )
+
+        return agent_fields, agent_skill_fields, agent_session_fields
+
+
+async def _cleanup_agent_family(
+    session_factory: AsyncSessionFactory,
+    *,
+    agent_id: UUID,
+    skill_id: UUID,
+    session_id: UUID,
+) -> None:
+    async with session_factory() as session:
+        # Deleting the Agent cascades away its agent_skills/agent_sessions
+        # rows first, so the Skill's RESTRICT-protected FK from agent_skills
+        # is already clear by the time the Skill itself is deleted.
+        await session.execute(sql_delete(Agent).where(Agent.id == agent_id))
+        await session.execute(sql_delete(Skill).where(Skill.id == skill_id))
+        await session.execute(sql_delete(SessionModel).where(SessionModel.id == session_id))
+        await session.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_source_scope_forget_preserves_agent_family(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-agents-source-{uuid4()}")
+    source, _entity = await seed_source_with_content(
+        session_factory, tmp_path, dataset_id=dataset.id
+    )
+    agent_id, skill_id, session_id = await _seed_agent_family(
+        session_factory, name_prefix=f"forget-agents-source-{uuid4().hex[:8]}"
+    )
+    before = await _agent_family_snapshot(
+        session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+    )
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(
+            app, {"dataset": dataset.slug, "source_id": str(source.id), "wait": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        after = await _agent_family_snapshot(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
+        assert before == after
+    finally:
+        await coordinator.stop()
+        await _cleanup_agent_family(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_dataset_scope_forget_preserves_agent_family(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-agents-dataset-{uuid4()}")
+    await seed_source_with_content(session_factory, tmp_path, dataset_id=dataset.id)
+    agent_id, skill_id, session_id = await _seed_agent_family(
+        session_factory, name_prefix=f"forget-agents-dataset-{uuid4().hex[:8]}"
+    )
+    before = await _agent_family_snapshot(
+        session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+    )
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(app, {"dataset": dataset.slug, "wait": True})
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        after = await _agent_family_snapshot(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
+        assert before == after
+    finally:
+        await coordinator.stop()
+        await _cleanup_agent_family(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_everything_scope_forget_preserves_agent_family_and_it_remains_fully_usable(
+    postgres_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """The most sensitive gate: EVERYTHING-scope Forget walks every Dataset/
+    Source in the database, yet Agent/AgentSkill/AgentSession -- instance
+    management state, never Dataset-owned -- must never be touched, proven
+    not only by an unchanged snapshot but by the full association read
+    surface still working immediately afterward."""
+
+    app, session_factory, _, _ = build_harness(postgres_engine, tmp_path)
+    dataset = await seed_dataset(session_factory, slug=f"forget-agents-everything-{uuid4()}")
+    await seed_source_with_content(session_factory, tmp_path, dataset_id=dataset.id)
+    agent_id, skill_id, session_id = await _seed_agent_family(
+        session_factory, name_prefix=f"forget-agents-everything-{uuid4().hex[:8]}"
+    )
+    before = await _agent_family_snapshot(
+        session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+    )
+
+    coordinator = app.state.pipeline_worker
+    await coordinator.start()
+    try:
+        response = await post_forget(
+            app, {"everything": True, "confirm": "DELETE EVERYTHING", "wait": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "succeeded"
+
+        after = await _agent_family_snapshot(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
+        assert before == after
+
+        agent_result = await _forget_agent_service(session_factory).get_agent(agent_id)
+        assert agent_result.agent_uuid == agent_id
+
+        listed_skills = await _forget_agent_skill_service(session_factory).list_skills(agent_id)
+        assert {item.skill_uuid for item in listed_skills.items} == {skill_id}
+        assert listed_skills.items[0].pinned_revision == 1
+
+        listed_sessions = await _forget_agent_session_service(session_factory).list_sessions(
+            agent_id
+        )
+        assert {item.session_uuid for item in listed_sessions.items} == {session_id}
+    finally:
+        await coordinator.stop()
+        await _cleanup_agent_family(
+            session_factory, agent_id=agent_id, skill_id=skill_id, session_id=session_id
+        )
 
 
 # --- B4 legacy rollout compatibility (SM-512 SS 62) --------------------------

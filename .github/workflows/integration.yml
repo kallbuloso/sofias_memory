@@ -185,10 +185,14 @@ jobs:
       #   - Skills (v0.4.0, SM-701..705): every Skills integration file is
       #     CI-compatible and none is deselected here -- see the dedicated
       #     env block below.
-      #   - Agents (v0.5.0, SM-801..804): every Agent management and
-      #     Agent<->Skill/Agent<->Session association integration file is
+      #   - Agents (v0.5.0, SM-801..805): every Agent management,
+      #     Agent<->Skill/Agent<->Session association, and SM-805 lifecycle/
+      #     concurrency/cross-feature/Neo4j hardening integration file is
       #     CI-compatible and none is deselected here -- see the dedicated
-      #     env block below.
+      #     env block below. The SM-805 Forget/Dataset Delete Agent-family
+      #     preservation tests are added directly to the existing Forget/
+      #     Dataset Delete files and run under those files' own env flags
+      #     (no new flag needed for them).
       - name: Run CI-compatible integration suite
         timeout-minutes: 45
         run: uv run pytest tests/integration -q --deselect tests/integration/test_b3_neo4j_gate.py
@@ -292,6 +296,13 @@ jobs:
           SOFIAS_MEMORY_RUN_AGENT_SKILLS_HTTP_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_AGENT_SESSIONS_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_AGENT_SESSIONS_HTTP_POSTGRES_TESTS: "1"
+          # SM-805 lifecycle/concurrency/cross-feature/Neo4j hardening --
+          # same shared-main-database reasoning as the six flags above; the
+          # Neo4j flag below uses the job's real Neo4j service container,
+          # same as the Skills SM-705 equivalent.
+          SOFIAS_MEMORY_RUN_AGENTS_CONCURRENCY_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_AGENTS_CROSS_FEATURE_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_AGENTS_NEO4J_TESTS: "1"
 
       - name: Diagnostics on failure
         if: failure()

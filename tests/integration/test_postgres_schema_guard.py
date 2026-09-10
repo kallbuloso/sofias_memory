@@ -49,6 +49,7 @@ REQUIRED_TABLES = frozenset(
         "skills",
         "skill_revisions",
         "agents",
+        "agent_skills",
     }
 )
 
@@ -196,6 +197,7 @@ def test_schema_guard_policy_constants_are_exact() -> None:
                 "skills",
                 "skill_revisions",
                 "agents",
+                "agent_skills",
             }
         )
         == REQUIRED_TABLES

@@ -508,13 +508,13 @@ async def assert_last_migration_downgraded(
         constraints = await constraints_by_name(connection, schema=schema)
 
     assert revisions == frozenset({expected_revision})
-    # 0015 (SM-801) is purely additive (agents): downgrading it removes
-    # exactly that one table (and its agent_status enum, not directly
-    # observable via constraints_by_name), never any earlier table or
-    # constraint (0014's Skills foundation, 0013's SM-603 constraint, or
-    # anything earlier).
-    assert "agents" not in tables
+    # 0016 (SM-803) is purely additive (agent_skills): downgrading it removes
+    # exactly that one table, never any earlier table or constraint (0015's
+    # Agent foundation, 0014's Skills foundation, 0013's SM-603 constraint,
+    # or anything earlier).
+    assert "agent_skills" not in tables
     assert {
+        "agents",
         "skills",
         "skill_revisions",
         "sessions",
@@ -526,14 +526,16 @@ async def assert_last_migration_downgraded(
         "pipeline_steps",
         "graph_outbox",
     } <= tables
-    # 0014's own additive check constraints must survive a 0015-only
-    # downgrade -- this proves the downgrade removed exactly the 0015
-    # objects, not anything from an earlier migration.
+    # 0015's own table must survive a 0016-only downgrade -- proves the
+    # downgrade removed exactly the 0016 objects, not anything from 0015.
+    assert "ck_agents_name_portable_charset" in constraints
+    assert "ck_agents_instructions_not_blank" in constraints
+    # 0014's own additive check constraints must survive too.
     assert "ck_skill_revisions_metadata_excludes_reserved_tags_key" in constraints
     assert "ck_skill_revisions_procedure_not_blank" in constraints
     assert "ck_skill_revisions_content_sha256_hex" in constraints
     # 0013's own additive constraint must survive too, transitively proving
-    # no migration older than 0015 was touched.
+    # no migration older than 0016 was touched.
     assert "ck_session_entries_external_id_trimmed" in constraints
     assert "ck_session_entries_external_id_not_blank" in constraints
     assert "ck_session_entries_external_id_max_length" in constraints
@@ -1432,4 +1434,4 @@ def test_schema_guard_policy_reused_by_migration_gate() -> None:
     )
     assert frozenset({"owner_id", "tenant_id"}) == FORBIDDEN_COLUMNS
     assert frozenset({"vector", "pg_trgm", "citext"}) == REQUIRED_EXTENSIONS
-    assert len(REQUIRED_TABLES) == 20
+    assert len(REQUIRED_TABLES) == 21

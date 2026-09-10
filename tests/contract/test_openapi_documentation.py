@@ -354,7 +354,12 @@ def test_all_route_specific_error_responses_use_error_envelope() -> None:
     schema = openapi_schema()
     for method, path, operation in _operations(schema):
         for status, response in operation["responses"].items():
-            if status in ("200", "201", "202"):
+            # 204 (SM-803, DELETE /agents/{agent_uuid}/skills/{skill_uuid}) is
+            # a genuine no-body success status, same reasoning as 200/201/202
+            # -- HTTP forbids a body on 204, so it can never carry an
+            # ErrorEnvelope and was simply not anticipated in this list
+            # before this release's first 204 endpoint existed.
+            if status in ("200", "201", "202", "204"):
                 continue
             assert "content" in response, f"{method.upper()} {path} {status} has no content"
             _assert_error_envelope(response)

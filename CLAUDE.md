@@ -571,24 +571,34 @@ Somente as famílias definidas no PRD:
   planejado para v0.4.0): bundled skill packages (`scripts/`/`references/`/
   `assets/`), execução de Skill, `SkillRun`, e qualquer runtime de Agent.
 - agents (durable Agent Profile management, v0.5.0, ADR-0014)
-  **implementado nesta release apenas como identity/profile management**:
+  **implementado nesta release como identity/profile management +
+  associação explícita Agent↔Skill**:
   - management: create/get/list, PATCH, archive/restore (SM-802);
   - `GET /agents` sem filtro devolve somente `active` -- default deliberado,
     diferente de Session/Skill (que devolvem todos os status por default);
   - `instructions`/`metadata` nunca aparecem na listagem, apenas no detalhe
     (progressive disclosure);
   - archive é discovery/availability filter, nunca admission barrier --
-    toda operação de management permanece disponível em um Agent archived.
+    toda operação de management permanece disponível em um Agent archived;
+  - associação explícita Agent↔Skill (`GET`/`PUT`/`DELETE
+    /agents/{agent_uuid}/skills[/{skill_uuid}]`, SM-803), com pin opcional
+    de `SkillRevision` por número de revisão público (nunca UUID interno);
+    `pinned_revision` omitido/`null` segue `Skill.current_revision_id` ao
+    vivo; um FK composto (`skill_id`, `pinned_revision_id`) reutilizando a
+    candidate key de `skill_revisions(skill_id, id)` torna cross-Skill
+    pinning estruturalmente impossível e rejeita (nunca `SET NULL`) a
+    deleção de uma revisão pinada.
 
   Um Agent é uma durable Agent Profile identity e management resource,
   nunca um agent runtime: Sofias Memory nunca executa um Agent, nunca
   seleciona provider/model em seu nome, nunca gerencia uma provider
-  session, e nunca faz um Agent "possuir" tools ou executar uma Skill.
+  session, e a associação Agent↔Skill nunca é autorização, nunca executa
+  a Skill, e nunca carrega `procedure` automaticamente.
 
-  Fora de escopo desta release: `agent_skills`/`agent_sessions`
-  (associações, SM-803/SM-804), `AgentRevision`, `AgentRun`, semantic
-  Agent resolve, e qualquer rota runtime-shaped (`/run`, `/execute`,
-  `/chat`, `/respond`, `/complete`, `/invoke`, `/tools`).
+  Fora de escopo desta release: `agent_sessions` (associação, SM-804),
+  `AgentRevision`, `AgentRun`, semantic Agent resolve, Agent-scoped Skill
+  resolve, e qualquer rota runtime-shaped (`/run`, `/execute`, `/chat`,
+  `/respond`, `/complete`, `/invoke`, `/tools`).
 
 Não invente aliases/endpoints de conveniência.
 

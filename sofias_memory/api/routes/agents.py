@@ -1,8 +1,9 @@
-"""Agent management API routes (SM-802, ADR-0014).
+"""Agent management API routes (SM-802/SM-803, ADR-0014).
 
-Exactly six operations: create/list/get/update/archive/restore. No
-association endpoint (Skill/Session), no resolve, no execution-shaped route
-of any kind -- those remain permanently or deferredly out of scope (Feature
+Nine operations: create/list/get/update/archive/restore (SM-802) plus the
+explicit Agent<->Skill association -- list/set/remove (SM-803). No
+Agent<->Session endpoint (SM-804), no resolve, no execution-shaped route of
+any kind -- those remain permanently or deferredly out of scope (Feature
 Contract SS 18, 22, 38-39).
 """
 
@@ -18,6 +19,11 @@ from sofias_memory.api.errors import current_request_id
 from sofias_memory.api.openapi_responses import error_response
 from sofias_memory.domain import AgentStatus
 from sofias_memory.lifespan import app_postgres_session_factory
+from sofias_memory.schemas.agent_skills import (
+    AgentSkillListResult,
+    AgentSkillResult,
+    AgentSkillSetRequest,
+)
 from sofias_memory.schemas.agents import (
     AGENT_PAGE_DEFAULT_LIMIT,
     AGENT_PAGE_MAX_LIMIT,
@@ -27,6 +33,7 @@ from sofias_memory.schemas.agents import (
     AgentUpdateRequest,
 )
 from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
+from sofias_memory.services.agent_skills import AgentSkillService
 from sofias_memory.services.agents import AgentService
 
 _AGENT_NOT_FOUND_404 = error_response(
@@ -36,12 +43,24 @@ _AGENT_CREATE_CONFLICT_409 = error_response(
     "An Agent with this name already exists, in any status. Explicit create "
     "never upserts. ErrorEnvelope with error.code=INVALID_REQUEST."
 )
+_AGENT_OR_SKILL_NOT_FOUND_404 = error_response(
+    "The target Agent, or the target Skill, does not exist. ErrorEnvelope "
+    "with error.code=INVALID_REQUEST."
+)
+_INVALID_PINNED_REVISION_422 = error_response(
+    "pinned_revision does not reference an existing revision of this "
+    "Skill. ErrorEnvelope with error.code=INVALID_REQUEST."
+)
 
 router = APIRouter(tags=["agents"])
 
 
 def _agent_service(request: Request) -> AgentService:
     return AgentService(session_factory=app_postgres_session_factory(request.app))
+
+
+def _agent_skill_service(request: Request) -> AgentSkillService:
+    return AgentSkillService(session_factory=app_postgres_session_factory(request.app))
 
 
 @router.post(
@@ -190,3 +209,78 @@ async def restore_agent(
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
     )
+
+
+@router.get(
+    "/agents/{agent_uuid}/skills",
+    response_model=SuccessEnvelope[AgentSkillListResult],
+    summary="List an Agent's associated Skills",
+    description=(
+        "Management/disclosure list of Skills explicitly associated with "
+        "this Agent -- not semantic resolve, never chooses or loads a "
+        "`procedure`. Includes archived Skills. Permitted for both active "
+        "and archived Agents. Not paginated."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _AGENT_NOT_FOUND_404},
+)
+async def list_agent_skills(
+    agent_uuid: UUID,
+    request: Request,
+) -> SuccessEnvelope[AgentSkillListResult]:
+    service = _agent_skill_service(request)
+    result = await service.list_skills(agent_uuid)
+    return SuccessEnvelope[AgentSkillListResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.put(
+    "/agents/{agent_uuid}/skills/{skill_uuid}",
+    response_model=SuccessEnvelope[AgentSkillResult],
+    summary="Associate a Skill with an Agent, with an optional revision pin",
+    description=(
+        "Idempotent set/upsert. `pinned_revision` omitted or `null` means "
+        "the association follows the Skill's current revision live; an "
+        "integer pins it to exactly that revision of this Skill (never a "
+        "global revision number). Never authorization, never Skill "
+        "execution. Permitted for both active and archived Agents/Skills."
+    ),
+    responses={
+        HTTPStatus.NOT_FOUND: _AGENT_OR_SKILL_NOT_FOUND_404,
+        HTTPStatus.UNPROCESSABLE_ENTITY: _INVALID_PINNED_REVISION_422,
+    },
+)
+async def set_agent_skill(
+    agent_uuid: UUID,
+    skill_uuid: UUID,
+    payload: AgentSkillSetRequest,
+    request: Request,
+) -> SuccessEnvelope[AgentSkillResult]:
+    service = _agent_skill_service(request)
+    result = await service.set_skill(agent_uuid, skill_uuid, payload)
+    return SuccessEnvelope[AgentSkillResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.delete(
+    "/agents/{agent_uuid}/skills/{skill_uuid}",
+    status_code=HTTPStatus.NO_CONTENT,
+    summary="Remove an Agent<->Skill association",
+    description=(
+        "Idempotent: removing a non-existent association still succeeds. "
+        "The target Skill itself must exist -- the path addresses "
+        '`{skill_uuid}` as a resource, distinct from "no association '
+        'exists". Never modifies the Skill or any SkillRevision.'
+    ),
+    responses={HTTPStatus.NOT_FOUND: _AGENT_OR_SKILL_NOT_FOUND_404},
+)
+async def remove_agent_skill(
+    agent_uuid: UUID,
+    skill_uuid: UUID,
+    request: Request,
+) -> None:
+    service = _agent_skill_service(request)
+    await service.remove_skill(agent_uuid, skill_uuid)

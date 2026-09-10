@@ -46,7 +46,11 @@ FORBIDDEN_PATH_PREFIXES = (
 # forbidden -- see test_agent_management_routes_present_with_exact_methods
 # and test_agent_runtime_and_association_paths_explicitly_absent below,
 # which narrowly re-forbid every runtime-shaped or not-yet-implemented
-# `/agents/**` path instead of the whole prefix.
+# `/agents/**` path instead of the whole prefix. `/agents/{agent_uuid}/skills`
+# (SM-803, list/set/remove) is a legitimate management association surface
+# as of this release -- removed from this forbidden list accordingly; it is
+# proven present with exact methods by
+# test_agent_skill_association_routes_present_with_exact_methods below.
 
 AGENT_RUNTIME_AND_ASSOCIATION_FORBIDDEN_PATHS = (
     "/api/v1/agents/resolve",
@@ -57,14 +61,14 @@ AGENT_RUNTIME_AND_ASSOCIATION_FORBIDDEN_PATHS = (
     "/api/v1/agents/{agent_uuid}/complete",
     "/api/v1/agents/{agent_uuid}/invoke",
     "/api/v1/agents/{agent_uuid}/tools",
-    "/api/v1/agents/{agent_uuid}/skills",
     "/api/v1/agents/{agent_uuid}/skills/resolve",
     "/api/v1/agents/{agent_uuid}/sessions",
 )
-"""SM-802 scope: exactly six Agent management operations. `agent_skills`/
-`agent_sessions` associations belong to SM-803/SM-804; `/agents/resolve` and
-any execution/tool/runtime-shaped path are permanently out of scope
-(Feature Contract SS 17-18, 22, 38-39)."""
+"""SM-802/SM-803 scope: exactly nine Agent operations (six management +
+three Agent<->Skill association). `agent_sessions` belongs to SM-804;
+`/agents/resolve`, `/agents/{agent_uuid}/skills/resolve`, and any
+execution/tool/runtime-shaped path are permanently out of scope (Feature
+Contract SS 17-18, 22, 38-39)."""
 
 EXPECTED_RUN_ROUTES = (
     ("GET", "/api/v1/runs"),
@@ -367,8 +371,7 @@ def test_skill_result_shape_never_exposes_procedure_or_internal_ids() -> None:
 
 def test_agent_management_routes_present_with_exact_methods() -> None:
     """SM-802 scope: exactly six Agent management operations -- create/list/
-    get/PATCH/archive/restore. No association, resolve, or execution-shaped
-    route exists yet."""
+    get/PATCH/archive/restore. No resolve or execution-shaped route exists."""
 
     schema = openapi_schema()
     paths = schema["paths"]
@@ -380,15 +383,40 @@ def test_agent_management_routes_present_with_exact_methods() -> None:
     assert set(paths["/api/v1/agents/{agent_uuid}/archive"]) == {"post"}
     assert set(paths["/api/v1/agents/{agent_uuid}/restore"]) == {"post"}
 
+
+def test_agent_skill_association_routes_present_with_exact_methods() -> None:
+    """SM-803 scope: exactly three Agent<->Skill association operations --
+    list/set/remove. No resolve, no bulk/collection-level PUT or DELETE."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert set(paths["/api/v1/agents/{agent_uuid}/skills"]) == {"get"}
+    assert set(paths["/api/v1/agents/{agent_uuid}/skills/{skill_uuid}"]) == {"put", "delete"}
+    assert "post" not in paths["/api/v1/agents/{agent_uuid}/skills"]
+    assert "patch" not in paths["/api/v1/agents/{agent_uuid}/skills/{skill_uuid}"]
+
+
+def test_agent_total_operation_count_is_exactly_nine() -> None:
+    """SM-802 (6 management) + SM-803 (3 association) = 9. Not 6, not more
+    than 9 -- no association endpoint beyond Agent<->Skill exists yet."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
     agent_paths = {path for path in paths if path.startswith("/api/v1/agents")}
     assert agent_paths == {
         "/api/v1/agents",
         "/api/v1/agents/{agent_uuid}",
         "/api/v1/agents/{agent_uuid}/archive",
         "/api/v1/agents/{agent_uuid}/restore",
+        "/api/v1/agents/{agent_uuid}/skills",
+        "/api/v1/agents/{agent_uuid}/skills/{skill_uuid}",
     }
     operation_count = sum(len(paths[path]) for path in agent_paths)
-    assert operation_count == 6
+    assert operation_count == 9
 
 
 def test_agent_runtime_and_association_paths_explicitly_absent() -> None:
@@ -452,6 +480,41 @@ def test_agent_result_shape_never_exposes_name_or_status_in_patch() -> None:
     }
     assert "instructions" not in list_item_properties
     assert "metadata" not in list_item_properties
+
+
+def test_agent_skill_result_shape_never_exposes_procedure_or_internal_ids() -> None:
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+
+    agent_skill_result = schemas["AgentSkillResult"]
+    assert isinstance(agent_skill_result, dict)
+    result_properties = set(agent_skill_result["properties"])
+    assert result_properties == {
+        "skill_uuid",
+        "name",
+        "status",
+        "current_revision",
+        "pinned_revision",
+        "effective_revision",
+        "description",
+        "tags",
+        "declared_tools",
+        "compatibility",
+        "association_created_at",
+    }
+    assert "procedure" not in result_properties
+    assert "resolution_embedding" not in result_properties
+    assert "metadata" not in result_properties
+    assert "license" not in result_properties
+    assert "content_sha256" not in result_properties
+    assert "pinned_revision_id" not in result_properties
+
+    agent_skill_set_request = schemas["AgentSkillSetRequest"]
+    assert isinstance(agent_skill_set_request, dict)
+    assert set(agent_skill_set_request["properties"]) == {"pinned_revision"}
 
 
 def test_private_routes_require_api_key_security() -> None:

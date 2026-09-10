@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
 
 from sofias_memory.infrastructure.postgres.repositories import (
     AgentRepository,
+    AgentSessionRepository,
     AgentSkillRepository,
     ChunkRepository,
     DatasetRepository,
@@ -60,6 +61,7 @@ class PostgresUnitOfWork:
         self._skill_revisions: SkillRevisionRepository | None = None
         self._agents: AgentRepository | None = None
         self._agent_skills: AgentSkillRepository | None = None
+        self._agent_sessions: AgentSessionRepository | None = None
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -89,6 +91,7 @@ class PostgresUnitOfWork:
         self._skill_revisions = SkillRevisionRepository(session)
         self._agents = AgentRepository(session)
         self._agent_skills = AgentSkillRepository(session)
+        self._agent_sessions = AgentSessionRepository(session)
         return self
 
     async def __aexit__(
@@ -225,6 +228,12 @@ class PostgresUnitOfWork:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._agent_skills
 
+    @property
+    def agent_sessions(self) -> AgentSessionRepository:
+        if self._agent_sessions is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._agent_sessions
+
     def savepoint(self) -> AsyncSessionTransaction:
         """A nested transaction (SAVEPOINT) inside this unit of work.
 
@@ -285,3 +294,4 @@ class PostgresUnitOfWork:
         self._skill_revisions = None
         self._agents = None
         self._agent_skills = None
+        self._agent_sessions = None

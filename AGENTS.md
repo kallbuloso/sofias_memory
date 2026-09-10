@@ -586,7 +586,7 @@ Somente as famílias definidas no PRD:
   `assets/`), execução de Skill, `SkillRun`, e qualquer runtime de Agent.
 - agents (durable Agent Profile management, v0.5.0, ADR-0014)
   **implementado nesta release como identity/profile management +
-  associação explícita Agent↔Skill**:
+  associação explícita Agent↔Skill + associação explícita Agent↔Session**:
   - management: create/get/list, PATCH, archive/restore (SM-802);
   - `GET /agents` sem filtro devolve somente `active` -- default deliberado,
     diferente de Session/Skill (que devolvem todos os status por default);
@@ -601,18 +601,35 @@ Somente as famílias definidas no PRD:
     vivo; um FK composto (`skill_id`, `pinned_revision_id`) reutilizando a
     candidate key de `skill_revisions(skill_id, id)` torna cross-Skill
     pinning estruturalmente impossível e rejeita (nunca `SET NULL`) a
-    deleção de uma revisão pinada.
+    deleção de uma revisão pinada;
+  - associação explícita Agent↔Session (`GET`/`PUT`/`DELETE
+    /agents/{agent_uuid}/sessions[/{session_uuid}]`, SM-804, tabela
+    `agent_sessions`): **current explicit management association only** --
+    nunca provenance, nunca histórico de participação, nunca atribuição de
+    Query/PipelineRun a um Agent. `created_at` é exclusivamente "quando esta
+    linha de associação foi criada", nunca "primeira participação"; DELETE
+    remove a linha e a idempotência não é audit trail. Cardinalidade M:N
+    (Agent M:N Session, nunca ownership em qualquer direção); ambos os FKs
+    são `ON DELETE CASCADE` (nunca `RESTRICT`) -- correto justamente porque a
+    tabela não carrega peso de auditoria. `queries.session_id` e
+    `pipeline_runs.session_id` (ADR-0012) permanecem inalterados: nenhuma
+    coluna `agent_id` é adicionada a `queries`/`pipeline_runs`/
+    `session_entries`, e a atribuição de uma operação a um Agent específico
+    é estruturalmente impossível quando múltiplos Agents estão associados à
+    mesma Session (non-attribution invariant).
 
   Um Agent é uma durable Agent Profile identity e management resource,
   nunca um agent runtime: Sofias Memory nunca executa um Agent, nunca
   seleciona provider/model em seu nome, nunca gerencia uma provider
-  session, e a associação Agent↔Skill nunca é autorização, nunca executa
-  a Skill, e nunca carrega `procedure` automaticamente.
+  session, e as associações Agent↔Skill/Agent↔Session nunca são
+  autorização, nunca executam a Skill, nunca carregam `procedure`
+  automaticamente, e nunca criam SessionEntry/Query/PipelineRun.
 
-  Fora de escopo desta release: `agent_sessions` (associação, SM-804),
-  `AgentRevision`, `AgentRun`, semantic Agent resolve, Agent-scoped Skill
-  resolve, e qualquer rota runtime-shaped (`/run`, `/execute`, `/chat`,
-  `/respond`, `/complete`, `/invoke`, `/tools`).
+  Fora de escopo desta release: `AgentRevision`, `AgentRun`, semantic Agent
+  resolve, Agent-scoped Skill resolve, Agent-scoped Session resolve, listagem
+  reversa `/sessions/{session_uuid}/agents`, e qualquer rota runtime-shaped
+  (`/run`, `/execute`, `/chat`, `/respond`, `/complete`, `/invoke`,
+  `/tools`).
 
 Não invente aliases/endpoints de conveniência.
 

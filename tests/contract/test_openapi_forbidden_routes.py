@@ -47,10 +47,12 @@ FORBIDDEN_PATH_PREFIXES = (
 # and test_agent_runtime_and_association_paths_explicitly_absent below,
 # which narrowly re-forbid every runtime-shaped or not-yet-implemented
 # `/agents/**` path instead of the whole prefix. `/agents/{agent_uuid}/skills`
-# (SM-803, list/set/remove) is a legitimate management association surface
-# as of this release -- removed from this forbidden list accordingly; it is
+# (SM-803, list/set/remove) and `/agents/{agent_uuid}/sessions` (SM-804,
+# list/set/remove) are legitimate management association surfaces as of
+# this release -- removed from this forbidden list accordingly; they are
 # proven present with exact methods by
-# test_agent_skill_association_routes_present_with_exact_methods below.
+# test_agent_skill_association_routes_present_with_exact_methods and
+# test_agent_session_association_routes_present_with_exact_methods below.
 
 AGENT_RUNTIME_AND_ASSOCIATION_FORBIDDEN_PATHS = (
     "/api/v1/agents/resolve",
@@ -62,13 +64,16 @@ AGENT_RUNTIME_AND_ASSOCIATION_FORBIDDEN_PATHS = (
     "/api/v1/agents/{agent_uuid}/invoke",
     "/api/v1/agents/{agent_uuid}/tools",
     "/api/v1/agents/{agent_uuid}/skills/resolve",
-    "/api/v1/agents/{agent_uuid}/sessions",
+    "/api/v1/agents/{agent_uuid}/sessions/resolve",
+    "/api/v1/sessions/{session_uuid}/agents",
 )
-"""SM-802/SM-803 scope: exactly nine Agent operations (six management +
-three Agent<->Skill association). `agent_sessions` belongs to SM-804;
-`/agents/resolve`, `/agents/{agent_uuid}/skills/resolve`, and any
-execution/tool/runtime-shaped path are permanently out of scope (Feature
-Contract SS 17-18, 22, 38-39)."""
+"""SM-802/SM-803/SM-804 scope: exactly twelve Agent operations (six
+management + three Agent<->Skill association + three Agent<->Session
+association). `/agents/resolve`, `/agents/{agent_uuid}/skills/resolve`,
+`/agents/{agent_uuid}/sessions/resolve`, the reverse
+`/sessions/{session_uuid}/agents` listing, and any execution/tool/runtime-
+shaped path are permanently out of scope (Feature Contract SS 17-18, 22,
+38-39; ADR-0014 Agent<->Session SS)."""
 
 EXPECTED_RUN_ROUTES = (
     ("GET", "/api/v1/runs"),
@@ -398,9 +403,25 @@ def test_agent_skill_association_routes_present_with_exact_methods() -> None:
     assert "patch" not in paths["/api/v1/agents/{agent_uuid}/skills/{skill_uuid}"]
 
 
-def test_agent_total_operation_count_is_exactly_nine() -> None:
-    """SM-802 (6 management) + SM-803 (3 association) = 9. Not 6, not more
-    than 9 -- no association endpoint beyond Agent<->Skill exists yet."""
+def test_agent_session_association_routes_present_with_exact_methods() -> None:
+    """SM-804 scope: exactly three Agent<->Session association operations --
+    list/set/remove. No resolve, no bulk/collection-level PUT or DELETE, no
+    reverse `/sessions/{session_uuid}/agents` listing."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert set(paths["/api/v1/agents/{agent_uuid}/sessions"]) == {"get"}
+    assert set(paths["/api/v1/agents/{agent_uuid}/sessions/{session_uuid}"]) == {"put", "delete"}
+    assert "post" not in paths["/api/v1/agents/{agent_uuid}/sessions"]
+    assert "patch" not in paths["/api/v1/agents/{agent_uuid}/sessions/{session_uuid}"]
+
+
+def test_agent_total_operation_count_is_exactly_twelve() -> None:
+    """SM-802 (6 management) + SM-803 (3 Skill association) + SM-804 (3
+    Session association) = 12. Not 9, not more than 12 -- no association
+    endpoint beyond Agent<->Skill/Agent<->Session exists yet."""
 
     schema = openapi_schema()
     paths = schema["paths"]
@@ -414,9 +435,11 @@ def test_agent_total_operation_count_is_exactly_nine() -> None:
         "/api/v1/agents/{agent_uuid}/restore",
         "/api/v1/agents/{agent_uuid}/skills",
         "/api/v1/agents/{agent_uuid}/skills/{skill_uuid}",
+        "/api/v1/agents/{agent_uuid}/sessions",
+        "/api/v1/agents/{agent_uuid}/sessions/{session_uuid}",
     }
     operation_count = sum(len(paths[path]) for path in agent_paths)
-    assert operation_count == 9
+    assert operation_count == 12
 
 
 def test_agent_runtime_and_association_paths_explicitly_absent() -> None:
@@ -515,6 +538,49 @@ def test_agent_skill_result_shape_never_exposes_procedure_or_internal_ids() -> N
     agent_skill_set_request = schemas["AgentSkillSetRequest"]
     assert isinstance(agent_skill_set_request, dict)
     assert set(agent_skill_set_request["properties"]) == {"pinned_revision"}
+
+
+def test_agent_session_result_shape_never_exposes_transcript_or_content() -> None:
+    """`agent_sessions` is a current explicit management association only --
+    the response shape must never leak SessionEntry/Query/PipelineRun
+    content, any role, or any Session field beyond this association's own
+    disclosure set."""
+
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+
+    agent_session_result = schemas["AgentSessionResult"]
+    assert isinstance(agent_session_result, dict)
+    result_properties = set(agent_session_result["properties"])
+    assert result_properties == {
+        "session_uuid",
+        "session_id",
+        "name",
+        "status",
+        "association_created_at",
+    }
+    for forbidden in (
+        "entries",
+        "session_entries",
+        "content",
+        "role",
+        "queries",
+        "pipeline_runs",
+        "context",
+        "transcript",
+        "metadata",
+        "created_at",
+        "updated_at",
+        "archived_at",
+    ):
+        assert forbidden not in result_properties
+
+    agent_session_list_result = schemas["AgentSessionListResult"]
+    assert isinstance(agent_session_list_result, dict)
+    assert set(agent_session_list_result["properties"]) == {"items"}
 
 
 def test_private_routes_require_api_key_security() -> None:

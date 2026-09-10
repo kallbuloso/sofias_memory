@@ -7,7 +7,7 @@ from typing import Protocol
 from sqlalchemy import Column, ForeignKeyConstraint, PrimaryKeyConstraint
 
 MIGRATIONS_VERSIONS = Path(__file__).resolve().parents[2] / "migrations" / "versions"
-MIGRATION_0016 = MIGRATIONS_VERSIONS / "0016_create_agent_skills.py"
+MIGRATION_0017 = MIGRATIONS_VERSIONS / "0017_create_agent_sessions.py"
 
 
 class OperationSpy:
@@ -37,16 +37,16 @@ class MigrationModule(Protocol):
 
 
 def load_migration_module() -> MigrationModule:
-    spec = importlib.util.spec_from_file_location("test_sm803_migration", MIGRATION_0016)
+    spec = importlib.util.spec_from_file_location("test_sm804_migration", MIGRATION_0017)
     if spec is None or spec.loader is None:
-        raise RuntimeError("could not load SM-803 migration")
+        raise RuntimeError("could not load SM-804 migration")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module  # type: ignore[return-value]
 
 
 def migration_text() -> str:
-    return MIGRATION_0016.read_text(encoding="utf-8")
+    return MIGRATION_0017.read_text(encoding="utf-8")
 
 
 def upgrade_result() -> OperationSpy:
@@ -73,7 +73,7 @@ def primary_key_columns(objects: tuple[object, ...]) -> list[str]:
     return list(constraints[0]._pending_colargs)  # type: ignore[attr-defined]
 
 
-def test_sm803_revision_is_current_head() -> None:
+def test_sm804_revision_is_current_head() -> None:
     revision_files = sorted(path.name for path in MIGRATIONS_VERSIONS.glob("*.py"))
 
     assert revision_files == [
@@ -97,92 +97,81 @@ def test_sm803_revision_is_current_head() -> None:
     ]
 
 
-def test_sm803_revision_metadata_is_exact() -> None:
+def test_sm804_revision_metadata_is_exact() -> None:
     module = load_migration_module()
 
-    assert module.revision == "0016"
-    assert module.down_revision == "0015"
+    assert module.revision == "0017"
+    assert module.down_revision == "0016"
     assert module.branch_labels is None
     assert module.depends_on is None
 
 
-def test_upgrade_creates_exactly_agent_skills_table() -> None:
+def test_upgrade_creates_exactly_agent_sessions_table() -> None:
     operation_spy = upgrade_result()
 
-    assert set(operation_spy.created_tables) == {"agent_skills"}
+    assert set(operation_spy.created_tables) == {"agent_sessions"}
 
 
-def test_agent_skills_table_contract() -> None:
+def test_agent_sessions_table_contract() -> None:
     operation_spy = upgrade_result()
-    objects = operation_spy.created_tables["agent_skills"]
+    objects = operation_spy.created_tables["agent_sessions"]
     columns = table_columns(objects)
     fks = foreign_keys(objects)
 
-    assert list(columns) == ["agent_id", "skill_id", "pinned_revision_id", "created_at"]
+    assert list(columns) == ["agent_id", "session_id", "created_at"]
     assert columns["agent_id"].nullable is False
-    assert columns["skill_id"].nullable is False
-    assert columns["pinned_revision_id"].nullable is True
+    assert columns["session_id"].nullable is False
     assert columns["created_at"].nullable is False
     assert columns["created_at"].type.timezone is True
 
-    # No redundant/speculative columns.
+    # No redundant/speculative columns -- never a surrogate id, never
+    # anything shaped like provenance, participation, or a role/status.
     for forbidden in (
         "id",
         "updated_at",
         "status",
         "metadata",
-        "pinned_revision",
-        "effective_revision",
-        "current_revision",
-        "skill_name",
-        "agent_name",
+        "role",
+        "agent_revision_id",
+        "first_seen_at",
+        "last_seen_at",
+        "participated_at",
+        "query_id",
+        "pipeline_run_id",
+        "turn_id",
+        "conversation_id",
     ):
         assert forbidden not in columns
 
-    # Composite PK is exactly (agent_id, skill_id) -- no surrogate PK.
-    assert primary_key_columns(objects) == ["agent_id", "skill_id"]
+    # Composite PK is exactly (agent_id, session_id) -- no surrogate PK.
+    assert primary_key_columns(objects) == ["agent_id", "session_id"]
 
-    # Exactly three logical FK constraints: Agent simple, Skill simple,
-    # SkillRevision composite. No standalone FK on pinned_revision_id alone.
+    # Exactly two logical FK constraints, both CASCADE -- no reference to
+    # queries/pipeline_runs/session_entries/datasets/skills/skill_revisions.
     assert set(fks) == {
-        "fk_agent_skills_agent_id_agents",
-        "fk_agent_skills_skill_id_skills",
-        "fk_agent_skills_skill_id_pinned_revision_id_skill_revisions",
+        "fk_agent_sessions_agent_id_agents",
+        "fk_agent_sessions_session_id_sessions",
     }
 
-    agent_fk = fks["fk_agent_skills_agent_id_agents"]
+    agent_fk = fks["fk_agent_sessions_agent_id_agents"]
     assert list(agent_fk._pending_colargs) == ["agent_id"]  # type: ignore[attr-defined]
     assert agent_fk.elements[0].target_fullname == "agents.id"
     assert agent_fk.ondelete == "CASCADE"
 
-    skill_fk = fks["fk_agent_skills_skill_id_skills"]
-    assert list(skill_fk._pending_colargs) == ["skill_id"]  # type: ignore[attr-defined]
-    assert skill_fk.elements[0].target_fullname == "skills.id"
-    assert skill_fk.ondelete == "RESTRICT"
-
-    pinned_fk = fks["fk_agent_skills_skill_id_pinned_revision_id_skill_revisions"]
-    assert list(pinned_fk._pending_colargs) == [  # type: ignore[attr-defined]
-        "skill_id",
-        "pinned_revision_id",
-    ]
-    assert [element.target_fullname for element in pinned_fk.elements] == [
-        "skill_revisions.skill_id",
-        "skill_revisions.id",
-    ]
-    assert pinned_fk.ondelete == "RESTRICT"
-    # Never SET NULL -- deleting a pinned revision must be rejected outright,
-    # never silently converting a pinned association into follow-current.
-    assert pinned_fk.ondelete != "SET NULL"
+    session_fk = fks["fk_agent_sessions_session_id_sessions"]
+    assert list(session_fk._pending_colargs) == ["session_id"]  # type: ignore[attr-defined]
+    assert session_fk.elements[0].target_fullname == "sessions.id"
+    assert session_fk.ondelete == "CASCADE"
 
 
-def test_downgrade_removes_only_agent_skills() -> None:
+def test_downgrade_removes_only_agent_sessions() -> None:
     module = load_migration_module()
     operation_spy = OperationSpy()
     module.op = operation_spy
 
     module.downgrade()
 
-    assert operation_spy.dropped_tables == ["agent_skills"]
+    assert operation_spy.dropped_tables == ["agent_sessions"]
 
 
 def test_migration_does_not_touch_forbidden_schema() -> None:
@@ -195,14 +184,6 @@ def test_migration_does_not_touch_forbidden_schema() -> None:
     assert "OWNER_ID" not in text
     assert "TENANT_ID" not in text
     assert "USER_ID" not in text
-    # agent_sessions/Neo4j/graph_outbox non-involvement is proven structurally
-    # instead of by forbidden-substring matching (this migration's own
-    # docstring legitimately mentions "agent_sessions" in prose, explaining it
-    # belongs to SM-804, not here -- same precedent as 0014's own docstring
-    # mentioning "Neo4j"/"graph_outbox"): test_upgrade_creates_exactly_agent_skills_table
-    # already proves the exact created-table set is {"agent_skills"} -- nothing
-    # else is ever touched. "SET NULL" must never appear as an ondelete policy
-    # anywhere in the actual DDL emitted by this migration (the pinned-revision
-    # FK is RESTRICT) -- proven directly on the FK object in
-    # test_agent_skills_table_contract, not by substring search here (the
-    # docstring itself explains the "never SET NULL" invariant in prose).
+    # The exact created-table set is proven to be exactly {"agent_sessions"}
+    # in test_upgrade_creates_exactly_agent_sessions_table -- nothing else
+    # (queries/pipeline_runs/session_entries/agent_skills) is ever touched.

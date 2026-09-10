@@ -50,6 +50,7 @@ REQUIRED_TABLES = frozenset(
         "skill_revisions",
         "agents",
         "agent_skills",
+        "agent_sessions",
     }
 )
 
@@ -198,6 +199,7 @@ def test_schema_guard_policy_constants_are_exact() -> None:
                 "skill_revisions",
                 "agents",
                 "agent_skills",
+                "agent_sessions",
             }
         )
         == REQUIRED_TABLES
@@ -265,3 +267,67 @@ def test_schema_guard_uses_subset_semantics_and_allows_extra_objects() -> None:
     )
 
     assert schema_guard_failures(snapshot) == []
+
+
+# --- SM-804: non-attribution structural guard ----------------------------------
+
+
+NON_ATTRIBUTION_GUARDED_TABLES = ("queries", "pipeline_runs", "session_entries")
+"""ADR-0014 (SM-804): Agent<->Session is a management association, never a
+per-operation attribution mechanism. Query/PipelineRun/SessionEntry provenance
+(ADR-0012) is preserved unchanged and must never grow an `agent_id` column or
+an FK to `agents`/`agent_sessions` -- doing so would let a caller attribute a
+specific operation to a specific Agent, which the M:N Agent<->Session
+cardinality makes structurally impossible to do correctly."""
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_query_pipeline_run_session_entry_never_gain_agent_identity() -> None:
+    """Structural, real-PostgreSQL proof: `queries`, `pipeline_runs`, and
+    `session_entries` have no `agent_id` column and no foreign key of any
+    kind targeting `agents` or `agent_sessions`. This is checked directly
+    against information_schema/pg_catalog, not by convention, so it survives
+    future schema alterations that don't touch this test file."""
+
+    if os.environ.get(POSTGRES_SCHEMA_GUARD_ENV) != "1":
+        pytest.skip(f"set {POSTGRES_SCHEMA_GUARD_ENV}=1 to run the PostgreSQL schema guard")
+
+    settings = load_settings()
+    engine = create_async_engine_from_settings(settings)
+    try:
+        async with engine.connect() as connection:
+            for table_name in NON_ATTRIBUTION_GUARDED_TABLES:
+                column_result = await connection.execute(
+                    text(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = :table_name
+                          AND column_name = 'agent_id'
+                        """
+                    ),
+                    {"table_name": table_name},
+                )
+                assert column_result.first() is None, f"{table_name}.agent_id must not exist"
+
+                fk_result = await connection.execute(
+                    text(
+                        """
+                        SELECT con.conname
+                        FROM pg_catalog.pg_constraint AS con
+                        JOIN pg_catalog.pg_class AS rel ON rel.oid = con.conrelid
+                        JOIN pg_catalog.pg_class AS frel ON frel.oid = con.confrelid
+                        WHERE rel.relname = :table_name
+                          AND con.contype = 'f'
+                          AND frel.relname IN ('agents', 'agent_sessions')
+                        """
+                    ),
+                    {"table_name": table_name},
+                )
+                assert fk_result.first() is None, (
+                    f"{table_name} must have no FK to agents/agent_sessions"
+                )
+    finally:
+        await dispose_async_engine(engine)

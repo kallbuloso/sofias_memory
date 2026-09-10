@@ -1,10 +1,14 @@
-"""Agent management API routes (SM-802/SM-803, ADR-0014).
+"""Agent management API routes (SM-802/SM-803/SM-804, ADR-0014).
 
-Nine operations: create/list/get/update/archive/restore (SM-802) plus the
-explicit Agent<->Skill association -- list/set/remove (SM-803). No
-Agent<->Session endpoint (SM-804), no resolve, no execution-shaped route of
-any kind -- those remain permanently or deferredly out of scope (Feature
-Contract SS 18, 22, 38-39).
+Twelve operations: create/list/get/update/archive/restore (SM-802), the
+explicit Agent<->Skill association -- list/set/remove (SM-803), and the
+explicit Agent<->Session association -- list/set/remove (SM-804). No
+resolve, no execution-shaped route of any kind -- those remain permanently
+or deferredly out of scope (Feature Contract SS 18, 22, 38-39).
+
+The Agent<->Session association is a current explicit management
+association only -- never provenance, never a historical participation
+log, never a way to attribute a Query/PipelineRun to an Agent.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from sofias_memory.api.errors import current_request_id
 from sofias_memory.api.openapi_responses import error_response
 from sofias_memory.domain import AgentStatus
 from sofias_memory.lifespan import app_postgres_session_factory
+from sofias_memory.schemas.agent_sessions import AgentSessionListResult, AgentSessionResult
 from sofias_memory.schemas.agent_skills import (
     AgentSkillListResult,
     AgentSkillResult,
@@ -33,6 +38,7 @@ from sofias_memory.schemas.agents import (
     AgentUpdateRequest,
 )
 from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
+from sofias_memory.services.agent_sessions import AgentSessionService
 from sofias_memory.services.agent_skills import AgentSkillService
 from sofias_memory.services.agents import AgentService
 
@@ -51,6 +57,10 @@ _INVALID_PINNED_REVISION_422 = error_response(
     "pinned_revision does not reference an existing revision of this "
     "Skill. ErrorEnvelope with error.code=INVALID_REQUEST."
 )
+_AGENT_OR_SESSION_NOT_FOUND_404 = error_response(
+    "The target Agent, or the target Session, does not exist. ErrorEnvelope "
+    "with error.code=INVALID_REQUEST."
+)
 
 router = APIRouter(tags=["agents"])
 
@@ -61,6 +71,10 @@ def _agent_service(request: Request) -> AgentService:
 
 def _agent_skill_service(request: Request) -> AgentSkillService:
     return AgentSkillService(session_factory=app_postgres_session_factory(request.app))
+
+
+def _agent_session_service(request: Request) -> AgentSessionService:
+    return AgentSessionService(session_factory=app_postgres_session_factory(request.app))
 
 
 @router.post(
@@ -284,3 +298,81 @@ async def remove_agent_skill(
 ) -> None:
     service = _agent_skill_service(request)
     await service.remove_skill(agent_uuid, skill_uuid)
+
+
+@router.get(
+    "/agents/{agent_uuid}/sessions",
+    response_model=SuccessEnvelope[AgentSessionListResult],
+    summary="List an Agent's associated Sessions",
+    description=(
+        "Management/disclosure list of Sessions explicitly associated with "
+        "this Agent -- a current explicit management association only, "
+        "never provenance, never a historical participation log. Includes "
+        "archived Sessions. Permitted for both active and archived Agents. "
+        "Not paginated. Never includes SessionEntry/Query/PipelineRun "
+        "content or any transcript."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _AGENT_NOT_FOUND_404},
+)
+async def list_agent_sessions(
+    agent_uuid: UUID,
+    request: Request,
+) -> SuccessEnvelope[AgentSessionListResult]:
+    service = _agent_session_service(request)
+    result = await service.list_sessions(agent_uuid)
+    return SuccessEnvelope[AgentSessionListResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.put(
+    "/agents/{agent_uuid}/sessions/{session_uuid}",
+    response_model=SuccessEnvelope[AgentSessionResult],
+    summary="Associate a Session with an Agent",
+    description=(
+        "Idempotent ensure-association; no request body. Replaying this "
+        "call never changes `association_created_at` -- it identifies when "
+        "the current association row was created, never a first-ever "
+        "participation timestamp. Permitted for both active and archived "
+        "Agents, and for both active and archived Sessions: associating "
+        "with an archived Session is management metadata, never new "
+        "Session activity, and does not unarchive it or create a "
+        "SessionEntry/Query/PipelineRun."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _AGENT_OR_SESSION_NOT_FOUND_404},
+)
+async def set_agent_session(
+    agent_uuid: UUID,
+    session_uuid: UUID,
+    request: Request,
+) -> SuccessEnvelope[AgentSessionResult]:
+    service = _agent_session_service(request)
+    result = await service.associate_session(agent_uuid, session_uuid)
+    return SuccessEnvelope[AgentSessionResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.delete(
+    "/agents/{agent_uuid}/sessions/{session_uuid}",
+    status_code=HTTPStatus.NO_CONTENT,
+    summary="Remove an Agent<->Session association",
+    description=(
+        "Idempotent: removing a non-existent association still succeeds, "
+        "whether because it was never created or because `session_uuid` "
+        "does not reference anything at all -- the association's own "
+        "identity is `(agent_uuid, session_uuid)`. Only the target Agent "
+        "must exist. Never modifies the Session, and never deletes the "
+        "Session itself."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _AGENT_NOT_FOUND_404},
+)
+async def remove_agent_session(
+    agent_uuid: UUID,
+    session_uuid: UUID,
+    request: Request,
+) -> None:
+    service = _agent_session_service(request)
+    await service.remove_session(agent_uuid, session_uuid)

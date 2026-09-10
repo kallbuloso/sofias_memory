@@ -107,6 +107,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
         "0014_create_skills_foundation.py",
         "0015_create_agents_foundation.py",
         "0016_create_agent_skills.py",
+        "0017_create_agent_sessions.py",
     ]
 
 

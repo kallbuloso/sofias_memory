@@ -107,6 +107,7 @@ def test_sm801_revision_is_current_head() -> None:
         "0014_create_skills_foundation.py",
         "0015_create_agents_foundation.py",
         "0016_create_agent_skills.py",
+        "0017_create_agent_sessions.py",
     ]
 
 

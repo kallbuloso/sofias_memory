@@ -64,6 +64,32 @@ live inside those two features' own existing suites
 rather than a separate Skills-specific file, reusing their existing
 dedicated-database harness.
 
+### Agent Management integration tests
+
+Same discipline as Skills: every Agent Management integration file gates on
+its own opt-in flag plus the plain `DATABASE_URL` environment variable
+(none of these files enforce a dedicated database *name*). SM-801/SM-802
+are persistence/management; SM-803/SM-804 are the explicit Agent↔Skill and
+Agent↔Session associations; SM-805 is lifecycle/concurrency/cross-feature/
+Neo4j hardening — none of it adds a public endpoint.
+
+| Test file | Opt-in flag |
+|---|---|
+| `test_agents_postgres_integration.py` (SM-801) | `SOFIAS_MEMORY_RUN_POSTGRES_AGENTS_TESTS` |
+| `test_agents_management_postgres_integration.py` (SM-802) | `SOFIAS_MEMORY_RUN_AGENTS_MANAGEMENT_POSTGRES_TESTS` |
+| `test_agent_skills_postgres_integration.py` (SM-803) | `SOFIAS_MEMORY_RUN_AGENT_SKILLS_POSTGRES_TESTS` |
+| `test_agent_skills_http_postgres_integration.py` (SM-803) | `SOFIAS_MEMORY_RUN_AGENT_SKILLS_HTTP_POSTGRES_TESTS` |
+| `test_agent_sessions_postgres_integration.py` (SM-804) | `SOFIAS_MEMORY_RUN_AGENT_SESSIONS_POSTGRES_TESTS` |
+| `test_agent_sessions_http_postgres_integration.py` (SM-804) | `SOFIAS_MEMORY_RUN_AGENT_SESSIONS_HTTP_POSTGRES_TESTS` |
+| `test_agents_concurrency_hardening_integration.py` (SM-805) | `SOFIAS_MEMORY_RUN_AGENTS_CONCURRENCY_POSTGRES_TESTS` |
+| `test_agents_cross_feature_postgres_integration.py` (SM-805) | `SOFIAS_MEMORY_RUN_AGENTS_CROSS_FEATURE_POSTGRES_TESTS` |
+| `test_agents_neo4j_integration.py` (SM-805) | `SOFIAS_MEMORY_RUN_AGENTS_NEO4J_TESTS` **and** `SOFIAS_MEMORY_RUN_AGENTS_CROSS_FEATURE_POSTGRES_TESTS` (real Neo4j, reachable at `NEO4J_URI`/`NEO4J_PASSWORD`, plus real PostgreSQL) |
+
+Like Skills, the Agent-family (`agents`/`agent_skills`/`agent_sessions`)
+preservation tests for Forget and Dataset Delete live inside those two
+features' own existing suites, reusing their existing dedicated-database
+harness rather than a separate Agent-specific file.
+
 ## Running the application on the host
 
 ```bash
@@ -148,7 +174,7 @@ neo4j:7687
 These scripts run from a source checkout via `uv run python scripts/...` as
 shown below. They are also packaged inside the release image itself (see
 `docs/operations.md`), so the same scripts run there too, with no source
-checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.4.0
+checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.5.0
 run --no-sync python scripts/rebuild_graph.py --all --confirm-all`.
 
 ```bash

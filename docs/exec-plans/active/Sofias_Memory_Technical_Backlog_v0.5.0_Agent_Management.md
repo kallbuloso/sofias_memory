@@ -63,12 +63,12 @@ Durante SM-801..SM-806:
 
 | Ticket | Entrega principal | Depende de | Migration | Status |
 |---|---|---|---|---|
-| SM-801 | Agent persistence/domain foundation | — | 0015 | Proposed |
-| SM-802 | Agent management API | SM-801 | — | Proposed |
-| SM-803 | Agent ↔ Skill association | SM-802 | 0016 | Proposed |
-| SM-804 | Agent ↔ Session explicit association | SM-802 | 0017 | Proposed |
-| SM-805 | Lifecycle, concurrency e cross-feature hardening | SM-802, SM-803, SM-804 | — | Proposed |
-| SM-806 | Docs, smoke e release gate v0.5.0 | SM-805 | — | Proposed |
+| SM-801 | Agent persistence/domain foundation | — | 0015 | DONE |
+| SM-802 | Agent management API | SM-801 | — | DONE |
+| SM-803 | Agent ↔ Skill association | SM-802 | 0016 | DONE |
+| SM-804 | Agent ↔ Session explicit association | SM-802 | 0017 | DONE |
+| SM-805 | Lifecycle, concurrency e cross-feature hardening | SM-802, SM-803, SM-804 | — | DONE |
+| SM-806 | Docs, smoke e release gate v0.5.0 | SM-805 | — | local GATE passed / release preparation complete |
 
 ---
 

@@ -1,6 +1,6 @@
 # Sofias Memory — Feature Contract v0.5.0: Agent Management
 
-**Status:** Proposed\
+**Status:** Implemented\
 **Target release:** v0.5.0\
 **Feature:** First-class durable Agent Management
 

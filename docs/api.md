@@ -649,3 +649,160 @@ of a canonical JSON representation of the revision's eight semantic fields
 `SKILL.md` bytes. This is exactly why re-importing an export of the same
 content (whatever its YAML key order, quoting, or line endings) safe-replays
 instead of creating a new revision.
+
+## 19. Agents
+
+First-class, durable **Agent profile management** (ADR-0014): Sofias Memory
+stores and manages Agent identity/configuration and two explicit
+associations. It never executes an Agent, never selects a provider/model on
+its behalf, and never manages a provider session. Exactly **12 operations**
+total: 6 Agent management + 3 Agent↔Skill + 3 Agent↔Session — no more, no
+runtime-shaped route of any kind.
+
+```bash
+# Create an Agent. `name` is portable (lowercase a-z0-9-, 1..64 chars) and
+# immutable; already existing (in any status) is a 409, never an upsert.
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/agents" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "release-bot", "display_name": "Release Bot",
+       "description": "Drives the release checklist.", "instructions": "Follow docs/operations.md."}'
+
+# List (default: active only) / get full detail (includes instructions/metadata).
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/agents" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/agents?status=archived" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# PATCH the profile -- wholesale metadata replacement, not a deep merge;
+# permitted even when the Agent is archived (archive is a discovery filter,
+# never a management barrier).
+curl -sS -X PATCH "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"description": "Drives the v0.5.0 release checklist.", "metadata": {"team": "platform"}}'
+
+# Archive / restore -- idempotent, no timestamp churn on replay.
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/archive" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/restore" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Associate a Skill -- omitted/null pinned_revision follows the Skill's
+# current revision live; an integer pins that exact revision.
+curl -sS -X PUT "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/skills/$SKILL_UUID" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" -d '{}'
+curl -sS -X PUT "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/skills/$SKILL_UUID" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"pinned_revision": 1}'
+
+# List this Agent's associated Skills.
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/skills" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Associate a Session -- no request body.
+curl -sS -X PUT "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/sessions/$SESSION_UUID" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# List this Agent's associated Sessions.
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/sessions" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Remove either association (idempotent -- a non-existent association still
+# returns 204; only the Agent itself must exist).
+curl -sS -X DELETE "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/skills/$SKILL_UUID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS -X DELETE "$SOFIAS_MEMORY_URL/api/v1/agents/$AGENT_UUID/sessions/$SESSION_UUID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+```
+
+### 19.1 Agent management semantics
+
+- `name` is immutable and portable: lowercase `a-z0-9-`, 1..64 chars,
+  validated the same way `Skill.name` is. `PATCH` never accepts `name`.
+- `GET /agents` with no `status` filter returns **only `active`** Agents —
+  deliberately different from Session/Skill listings, which default to
+  every status. `?status=archived` (or `?status=active`) is explicit.
+- Archived Agents remain fully manageable: `GET` detail, `PATCH`, and both
+  association families all keep working — archive is a discovery/
+  availability filter over the default list, never an admission barrier
+  over management (mirrors Skill archive semantics).
+- `PATCH` replaces `display_name`/`description`/`instructions`/`metadata`
+  individually per field actually sent; `metadata` is a **wholesale
+  replacement**, never a deep merge, and an explicit `metadata: null` is
+  rejected (`422`) — omit the field instead to leave it unchanged.
+- `archive`/`restore` are idempotent: replaying either against an Agent
+  already in that state is a no-op with unchanged `updated_at`/
+  `archived_at`.
+- **Identity/idempotency status codes:**
+
+| Route | New/different | Duplicate/identical |
+|---|---|---|
+| `POST /agents` | `201` | `409 INVALID_REQUEST` (name already exists, any status) |
+| `GET /agents/{agent_uuid}`, `PATCH`, `.../archive`, `.../restore` on a missing Agent | — | `404 INVALID_REQUEST` |
+
+- **Progressive disclosure.** `GET /agents` (list) never includes
+  `instructions` or `metadata` — only `agent_uuid`, `name`, `display_name`,
+  `description`, `status`, `created_at`, `updated_at`, `archived_at`.
+  `GET /agents/{agent_uuid}` (detail) includes both.
+
+### 19.2 Agent↔Skill semantics
+
+- `pinned_revision` omitted or explicit `null` means "follow `Skill.
+  current_revision` live" — the association always reflects whatever the
+  Skill's current revision is at read time, including after a later
+  rollback. A positive integer pins the association to exactly that
+  revision, and a Skill `current_revision` rollback afterward does **not**
+  move the pin — `effective_revision` keeps returning the pinned number
+  until the association is explicitly re-set.
+- `GET` discloses `current_revision` (the Skill's own live pointer),
+  `pinned_revision` (this association's pin, or `null`), and
+  `effective_revision` (the revision actually in effect: the pin if set,
+  otherwise `current_revision`) side by side, plus the *effective*
+  revision's own `description`/`tags`/`declared_tools`/`compatibility`.
+- Never returned on any of the 3 Agent↔Skill endpoints: `procedure`,
+  `resolution_embedding`, `content_sha256`, `metadata`, `license`, the
+  internal `pinned_revision_id`, or any `SkillRevision.id` — `pinned_revision`
+  is always the same 1-based public revision integer every other Skill
+  endpoint uses, never an internal UUID.
+- `PUT` is a full idempotent upsert: replaying an identical payload is a
+  `200` no-op; a different `pinned_revision` on the same pair re-pins in
+  place (same association, same `association_created_at`) rather than
+  creating a second row.
+- An archived Skill's association is unaffected and remains fully visible/
+  manageable: `GET`/`PUT`/`DELETE` all keep working, `effective_revision`
+  and `pinned_revision` are unchanged, and `association_created_at` never
+  changes on its account.
+- `invalid_pinned_revision` (a number with no matching `SkillRevision` for
+  that Skill) is `422 INVALID_REQUEST`; a missing Agent or Skill on `PUT`/
+  `GET`/`DELETE` is `404 INVALID_REQUEST`.
+
+**`declared_tools` is descriptive metadata only** — exactly the same
+non-guarantee as `docs/api.md` §18 already states for Skills directly, and
+it does not change when a Skill is associated with an Agent. It is never an
+authorization grant, a permission, a runtime guarantee, or a check that the
+named tool is actually installed — Sofias Memory does not execute an Agent
+or a Skill, so there is no execution path for it to gate in the first
+place. The caller alone decides what it is allowed to execute.
+
+### 19.3 Agent↔Session semantics
+
+Agent↔Session is **M:N** and records the **current explicit management
+association only** — never ownership in either direction, never historical
+participation, and never exact per-operation provenance.
+
+- `PUT` has **no request body**. It is an idempotent ensure-association:
+  the first `PUT` creates the row and sets `association_created_at`; a
+  replay `PUT` is a `200` no-op that leaves `association_created_at`
+  unchanged. `DELETE` removes the row outright — this is not an audit log,
+  so there is nothing left to inspect afterward. Re-`PUT`-ing the same pair
+  after a `DELETE` creates a **new** row with a **new**
+  `association_created_at`, strictly later than the one that was deleted.
+- `GET` discloses exactly `session_uuid`, `session_id`, `name`, `status`,
+  and `association_created_at` — never `SessionEntry`/`Query`/
+  `PipelineRun` content, never a transcript.
+- Associating with an archived Session is permitted (`200`) and is
+  management metadata only — it never creates a `SessionEntry`/`Query`/
+  `PipelineRun`, never unarchives the Session, and never touches
+  `Session.updated_at`/`archived_at`.
+- Because the association is M:N, a Session with two associated Agents has
+  **no per-operation discriminator**: a `Query`/`PipelineRun` linked to
+  that Session (via the existing `session_id` provenance, ADR-0012) cannot
+  be attributed to one specific Agent from `agent_sessions` alone — neither
+  `queries` nor `pipeline_runs` nor `session_entries` carries an `agent_id`
+  column, and none ever will as part of this association.
+- A missing Agent or Session on `PUT`/`GET`/`DELETE` is `404
+  INVALID_REQUEST`; `DELETE` needs only the Agent to exist (removing a
+  non-existent association, or one whose `session_uuid` never referenced
+  anything at all, is still `204`).

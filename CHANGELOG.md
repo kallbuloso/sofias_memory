@@ -2,6 +2,115 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.5.0]
+
+Minor release adding first-class durable **Agent** profiles (ADR-0014):
+Sofias Memory stores and manages Agent identity/configuration and two
+explicit associations. Sofias Memory never executes an Agent, selects a
+provider/model on its behalf, or manages a provider session. Entirely
+additive to the existing public API.
+
+### Agent management
+
+- New `Agent` resource: `POST /agents`, `GET /agents`,
+  `GET /agents/{agent_uuid}`, `PATCH /agents/{agent_uuid}`.
+- `name` (portable, lowercase `a-z0-9-`, 1..64 chars) is the immutable
+  logical identity; `agent_uuid` is the structural identity. `name` already
+  existing, in any status, is always `409 INVALID_REQUEST` — creation never
+  upserts.
+- Profile fields: `display_name`, `description`, `instructions`,
+  `metadata` — `PATCH` replaces each field actually sent, and `metadata` is
+  a wholesale replacement, never a deep merge.
+- Lifecycle: `active <-> archived` via `POST /agents/{agent_uuid}/archive`
+  and `.../restore`, idempotent with no timestamp churn on replay. Like
+  Skill archive, this is a **discovery filter, not a management admission
+  barrier** — every management and association operation remains available
+  on an archived Agent; only the default `GET /agents` listing (no
+  `status` filter) excludes it, defaulting to `active` only.
+
+### Agent ↔ Skill associations
+
+- `GET /agents/{agent_uuid}/skills`,
+  `PUT /agents/{agent_uuid}/skills/{skill_uuid}`,
+  `DELETE /agents/{agent_uuid}/skills/{skill_uuid}` — an explicit,
+  idempotent association between an Agent and a Skill.
+- `pinned_revision` omitted/`null` follows the Skill's `current_revision`
+  live; an explicit integer pins the association to exactly that revision,
+  and a later Skill rollback does not move the pin. `GET` discloses
+  `current_revision`, `pinned_revision`, and `effective_revision` side by
+  side, plus the effective revision's own `description`/`tags`/
+  `declared_tools`/`compatibility` — never `procedure`,
+  `resolution_embedding`, or any internal `SkillRevision.id`.
+- An archived Skill's association remains fully visible and manageable —
+  `GET`/`PUT`/`DELETE` all keep working, pin state and
+  `association_created_at` unchanged.
+- Pin integrity is protected structurally by PostgreSQL: a composite
+  foreign key ties the pin to `(skill_id, pinned_revision_id)`, so a pin
+  can never reference another Skill's revision, and deleting a pinned,
+  non-current revision is rejected outright rather than silently clearing
+  the pin.
+
+### Agent ↔ Session associations
+
+- `GET /agents/{agent_uuid}/sessions`,
+  `PUT /agents/{agent_uuid}/sessions/{session_uuid}` (no request body),
+  `DELETE /agents/{agent_uuid}/sessions/{session_uuid}` — an explicit,
+  **M:N** association between an Agent and a Session.
+- Records the **current explicit management association only** — **not
+  historical Agent provenance**. `DELETE` removes the fact outright;
+  re-associating afterward creates a new row with a new
+  `association_created_at`, strictly later than the deleted one. A Session
+  associated with more than one Agent has no per-operation Agent
+  discriminator: a `Query`/`PipelineRun` linked to that Session can never
+  be attributed to one specific Agent from this association alone.
+- Associating with an archived Session is permitted (`200`) and is
+  management metadata only — it never creates a `SessionEntry`/`Query`/
+  `PipelineRun` and never touches `Session.updated_at`/`archived_at`.
+
+### Compatibility
+
+- Forget (source/dataset/everything scope) and administrative Dataset
+  Delete never affect `Agent`, `agent_skills`, or `agent_sessions` — proven
+  against real PostgreSQL, including the most sensitive case,
+  `DELETE EVERYTHING`.
+- Agent operations create zero `graph_outbox` events and are never
+  projected to Neo4j — no Agent node, relationship, or property, proven
+  against real PostgreSQL and real Neo4j.
+- `AgentSkill`'s `declared_tools` disclosure does not authorize tool use —
+  the same non-guarantee Skills already document; Sofias Memory has no
+  Agent/Skill execution path to gate in the first place.
+- `AgentSession` association creates no Session activity of any kind —
+  proven with real before/after row-count deltas on `SessionEntry`/`Query`/
+  `PipelineRun`.
+- `queries`, `pipeline_runs`, and `session_entries` gain no `agent_id`
+  column — per-operation Agent attribution is structurally impossible by
+  design, not merely unimplemented.
+
+### Lifecycle/concurrency
+
+- `PATCH` racing `archive`/`restore` on the same Agent is linearizable via
+  single-row `FOR UPDATE` locking, with no lost update, under real
+  concurrent load — proven both ways (whichever operation is serialized
+  first, the composed final state is always correct).
+- Duplicate `agent_skills`/`agent_sessions` association attempts converge
+  to exactly one row via composite-primary-key upsert; concurrent
+  different-pin `PUT`s on the same Agent↔Skill pair converge to the last
+  serialized winner, never a duplicate.
+- Different Agents never serialize against each other — per-Agent, not
+  global, locking.
+
+### Database/upgrade
+
+- Adds migrations `0015` (`agents`), `0016` (`agent_skills`), `0017`
+  (`agent_sessions`). Upgrading from `0.4.0` requires `alembic upgrade
+  head` (current head: `0017`) before starting the new version — applies
+  `0014 -> 0015 -> 0016 -> 0017` in one pass — see `docs/operations.md`.
+
+### Configuration
+
+- No new required settings. Agent Management introduces no new runtime
+  configuration surface.
+
 ## [0.4.0]
 
 Minor release adding first-class durable procedural **Skills**: Sofias

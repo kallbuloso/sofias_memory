@@ -21,8 +21,10 @@ backend; **v0.3.0** adds first-class durable Sessions, append-only
 SessionEntries, Session-aware Recall provenance/context, and Remember/Run
 association; **v0.4.0** adds first-class durable procedural **Skills** —
 management, immutable revisions, archive/restore, standalone `SKILL.md`
-interoperability, and semantic resolve over pgvector (see `CHANGELOG.md`) —
-see
+interoperability, and semantic resolve over pgvector; **v0.5.0** adds
+first-class durable **Agent** profiles — management, active/archive
+lifecycle, and explicit Agent↔Skill and Agent↔Session associations (see
+`CHANGELOG.md`) — see
 `docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.
 
@@ -58,6 +60,18 @@ original release discovery/backlog.
   disclosure — metadata and a similarity `score`, never the full
   `procedure`) are all implemented; see `docs/api.md` and the
   [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.4.0_Skills.md).
+- **Agents** — first-class, durable Agent profiles: Sofias Memory stores and
+  manages Agent identity/configuration; it never executes an Agent, selects
+  a provider/model on its behalf, or manages a provider session. Create/get/
+  list/update, active/archive/restore lifecycle (archive is a discovery
+  filter, not a management barrier), an explicit Agent↔Skill association
+  with an optional exact-revision pin (or follow-current), and an explicit,
+  **M:N** Agent↔Session association are all implemented. Agent↔Session
+  records only the *current* management association — it is not historical
+  provenance: it never records who caused a given Query/PipelineRun, and a
+  Session with multiple associated Agents has no per-operation Agent
+  discriminator of any kind. See `docs/api.md` and the
+  [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.5.0_Agent_Management.md).
 
 ## Architecture
 

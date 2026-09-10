@@ -133,7 +133,7 @@ jobs:
       # because this is a separate `docker run`, not a step running
       # directly on the runner -- it cannot resolve the service container
       # by its service name the way the runner's own steps can.
-      - name: Migrate every database from the built image (0001 -> 0014)
+      - name: Migrate every database from the built image (0001 -> 0017)
         run: |
           set -e
           for db in \
@@ -167,12 +167,12 @@ jobs:
               sofias-memory:ci run --no-sync alembic upgrade head
           done
 
-      - name: Confirm alembic current == 0014 on the main database
+      - name: Confirm alembic current == 0017 on the main database
         run: |
           set -e
           CURRENT=$(psql -tAc "SELECT version_num FROM alembic_version")
           echo "alembic current: $CURRENT"
-          test "$CURRENT" = "0014"
+          test "$CURRENT" = "0017"
 
       # CI-compatible integration modules only -- see docs/development.md
       # and the REL-004 report for the full per-module inventory and the
@@ -183,6 +183,10 @@ jobs:
       #   - Nothing here calls a real LLM/embedding provider: every
       #     included module uses in-process fake LLM/embedding clients.
       #   - Skills (v0.4.0, SM-701..705): every Skills integration file is
+      #     CI-compatible and none is deselected here -- see the dedicated
+      #     env block below.
+      #   - Agents (v0.5.0, SM-801..804): every Agent management and
+      #     Agent<->Skill/Agent<->Session association integration file is
       #     CI-compatible and none is deselected here -- see the dedicated
       #     env block below.
       - name: Run CI-compatible integration suite
@@ -271,6 +275,23 @@ jobs:
           SOFIAS_MEMORY_RUN_SKILLS_CROSS_FEATURE_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_SKILLS_CONCURRENCY_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_SKILLS_NEO4J_TESTS: "1"
+          # Agents (v0.5.0, SM-801..804). Every file below reads DATABASE_URL
+          # directly (via the standard Settings loader or straight from the
+          # environment) and declares no dedicated `*_TEST_DATABASE_URL` of
+          # its own, so all six share the job's main `sofias_memory`
+          # database. Each test creates and scopes its assertions to the
+          # Agent/Skill/Session ids it created itself (membership or a
+          # per-Agent association list, never a global/unfiltered count), so
+          # sharing the main database with the rest of this job's concurrent
+          # test data is safe -- none of these suites has the kind of
+          # global-isolation requirement that forced the Skills resolve
+          # suite above into its own dedicated database.
+          SOFIAS_MEMORY_RUN_POSTGRES_AGENTS_TESTS: "1"
+          SOFIAS_MEMORY_RUN_AGENTS_MANAGEMENT_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_AGENT_SKILLS_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_AGENT_SKILLS_HTTP_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_AGENT_SESSIONS_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_AGENT_SESSIONS_HTTP_POSTGRES_TESTS: "1"
 
       - name: Diagnostics on failure
         if: failure()

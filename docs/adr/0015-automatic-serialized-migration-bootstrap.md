@@ -41,13 +41,13 @@ This is chosen over the alternative architectures for one decisive reason: **`li
 
 The bootstrap invokes migration by spawning `alembic upgrade head` (the executable already installed in the release image's own virtualenv — `alembic` is a `[project.dependencies]` runtime dependency, not a dev-only tool) as a real OS subprocess (e.g. `asyncio.create_subprocess_exec`), awaited non-blockingly from within the existing bootstrap coroutine. It does **not** call `alembic.command.upgrade(...)` directly in-process.
 
-This is a concrete technical requirement, not a style preference: `migrations/env.py`'s `run_migrations_online()` calls `asyncio.run(run_async_migrations_online())`. If invoked in-process from a coroutine already running under `uvicorn`'s own event loop — which every `lifespan()` background task by definition is — this raises `RuntimeError: asyncio.run() cannot be called from a running event loop`. Subprocess invocation sidesteps this entirely (a new OS process gets its own fresh event loop) and requires **zero changes to `migrations/env.py`** — the exact same code path the operator's manual CLI invocation already exercises today runs unmodified. It also keeps the actual schema-DDL-privileged code execution in a distinct process from the long-lived server process that goes on to serve HTTP/worker traffic, a smaller privilege/blast-radius footprint than importing Alembic's mutation machinery directly into the server's own interpreter.
+This is a concrete technical requirement, not a style preference: `migrations/env.py`'s `run_migrations_online()` calls `asyncio.run(run_async_migrations_online())`. If invoked in-process from a coroutine already running under `uvicorn`'s own event loop — which every `lifespan()` background task by definition is — this raises `RuntimeError: asyncio.run() cannot be called from a running event loop`. Subprocess invocation sidesteps this entirely (a new OS process gets its own fresh event loop) and requires **zero changes to `migrations/env.py`** — the exact same code path the operator's manual CLI invocation already exercises today runs unmodified. The subprocess runs in the same OS/container context, with the same `DATABASE_URL` and the same PostgreSQL role as the long-lived server process — this is **not** a database-privilege-separation mechanism, and this ADR does not claim it is one (see Security and privileges below). Its actual advantage is process/execution isolation and event-loop isolation: the schema-DDL execution happens in a distinct process with its own event loop, reusing the existing, unmodified Alembic CLI execution path, rather than mutating the long-lived server's own interpreter state in place.
 
 ### Migration mode: two states, `auto` default
 
 A single configuration setting controls the bootstrap's behavior. Its exact public spelling (the Settings field alias, following this project's existing `SCREAMING_SNAKE` env-var convention — e.g. `DATABASE_MIGRATION_MODE`) must be confirmed against `sofias_memory/config.py`'s established naming conventions at implementation time; this ADR freezes only the **semantics** of the two states below, using `DATABASE_MIGRATION_MODE=auto|verify_only` as the working name.
 
-- **`auto` (default).** The bootstrap may migrate a database whose current revision is a genuine ancestor of the application's Alembic head, including an empty/unversioned database, forward to exactly that head, under the lock and verification discipline defined below.
+- **`auto` (default).** The bootstrap may migrate a database whose current revision is a genuine ancestor of the application's Alembic head, including a pristine fresh database (see Schema classification below for the precise definition — never an unversioned-but-non-empty database, which always fails closed), forward to exactly that head, under the lock and verification discipline defined below.
 - **`verify_only`.** Reproduces today's pre-ADR-0015 contract exactly: the bootstrap performs the same read-only schema check it already performs today, never invokes Alembic under any circumstance, and remains fail-closed in `BOOTSTRAP_MAINTENANCE` for anything other than an exact head match.
 
 ### Restore safeguard
@@ -77,7 +77,7 @@ bootstrap B: (blocked waiting for the same key while A holds it)
              -> release lock
 ```
 
-Every bootstrap attempt re-derives its classification from PostgreSQL **after** acquiring the lock, never from an in-memory snapshot captured before waiting began — the same "always re-read authoritative state, never trust a stale snapshot" discipline `lifespan.py`'s own storage-convergence fixed-point loop (ADR-0011 D7) already applies. No duplicate `alembic upgrade` invocation ever runs concurrently against the database.
+Every bootstrap attempt re-derives its classification from PostgreSQL **after** acquiring the lock, never from an in-memory snapshot captured before waiting began — the same "always re-read authoritative state, never trust a stale snapshot" discipline `lifespan.py`'s own storage-convergence fixed-point loop (ADR-0011 D7) already applies. **No two ADR-0015 automatic bootstrap migration executions may run concurrently against the same database.** This guarantee is scoped precisely to this ADR's own cooperative bootstrap path: the advisory lock serializes only participants that acquire it, and the raw, administrative `alembic upgrade head` CLI (preserved below) does not automatically participate in it. This ADR does not claim, and cannot enforce, that no concurrent invocation of the raw CLI could ever race the automatic bootstrap — that is an operational discipline, not a locking guarantee (see the operational rule below).
 
 ### Lock acquisition timeout: bounded, non-fatal, retried by the existing outer loop
 
@@ -94,13 +94,56 @@ This is classified as a **pre-migration transient failure** (see the dedicated f
 
 ### Migration execution timeout: none
 
-Once a migration subprocess has actually started, this ADR freezes **no generic automatic wall-clock timeout** that kills it. Killing DDL mid-execution because an arbitrary timer elapsed is less safe than allowing it to finish — an interrupted DDL statement can leave objects in an inconsistent state that is harder to reason about than "still running." `/health/live` remains reachable and `/health/ready` remains `NOT_READY` for the entire duration (D33, unchanged) — a long migration is observable as "still bootstrapping," not indistinguishable from a hung process, the same guarantee D33 already gives storage convergence. Explicit operator-initiated cancellation/shutdown during an in-flight migration is a distinct concern from an automatic timeout and must be addressed deliberately by the future implementation, not assumed away by this ADR.
+Once a migration subprocess has actually started, this ADR freezes **no generic automatic wall-clock timeout** that kills it. Killing DDL mid-execution because an arbitrary timer elapsed is less safe than allowing it to finish — an interrupted DDL statement can leave objects in an inconsistent state that is harder to reason about than "still running." `/health/live` remains reachable and `/health/ready` remains `NOT_READY` for the entire duration (D33, unchanged) — a long migration is observable as "still bootstrapping," not indistinguishable from a hung process, the same guarantee D33 already gives storage convergence. Explicit operator-initiated cancellation/shutdown during an in-flight migration is a distinct concern from an automatic timeout, frozen normatively in the next subsection, not assumed away by this ADR.
+
+### Graceful shutdown during an in-flight migration: the migration critical section
+
+Today, `lifespan()`'s shutdown path cancels `bootstrap_task` unconditionally and awaits it with `return_exceptions=True`. ADR-0015 adds a real Alembic child process to that task, so this ADR must freeze what cancellation means once that child exists — cancelling the awaiting coroutine must never silently abandon a live child process or release the advisory lock out from under it.
+
+**Once the Alembic subprocess has been spawned, the migration subprocess and the advisory-lock ownership form one migration critical section.** For as long as this critical section is open, a **graceful application shutdown** MUST NOT:
+
+```text
+abandon the child process
+release the advisory lock while the child is still alive
+complete graceful shutdown while the migration child is still alive
+```
+
+If shutdown/cancellation is requested while a migration is executing, the required sequence is:
+
+```text
+shutdown becomes pending (not immediate)
+migration supervision continues
+the bootstrap keeps the advisory-lock connection alive
+the application waits for the Alembic child to terminate naturally
+the child's result (exit code) is observed and classified normally
+  (success -> verify; failure -> sticky migration-execution-failure, per
+  the Failure and retry semantics subsection, unchanged by shutdown being
+  in progress)
+only then is the advisory lock released
+only then may graceful shutdown complete
+```
+
+This ADR does not freeze which specific Python primitive implements this (cancellation shielding, a supervising task awaited outside the cancelled scope, or an equivalent mechanism) — that is an implementation choice, made deliberately, not left ambiguous by omission. It does **not** introduce a generic migration timeout to bound how long graceful shutdown may wait: killing DDL merely because shutdown began would violate the same "never interrupt DDL mid-execution" reasoning the previous subsection already froze for the non-shutdown case, and would defeat the entire purpose of this critical-section rule.
+
+**Hard termination is explicitly a different case, not a shutdown-path bug.** `SIGKILL`, a container hard kill, or a process crash are **not** graceful shutdown, and this ADR makes no attempt to give them graceful semantics:
+
+```text
+process/connections terminate immediately, including the child and the
+  advisory-lock connection
+PostgreSQL eventually releases the session-level advisory lock on its own
+  (the lock's own crash-safety property, already frozen above)
+the next application process attempt re-classifies authoritative database
+  state from scratch, exactly as every other restart already does
+```
+
+No completion guarantee is made or implied for a migration interrupted by hard termination — only that the lock does not leak, and that the next attempt starts from a fresh, authoritative read of the database, never from an assumption about what the killed attempt might have finished.
 
 ### Schema classification (Alembic's own DAG is the authority)
 
 | State | Behavior |
 |---|---|
-| Empty/unversioned database | `auto`: migrate to head. `verify_only`: remain not-ready. |
+| **Pristine fresh schema** — `alembic_version` table absent **and** no user/application base tables exist in the current application schema | `auto`: migrate to head. `verify_only`: remain not-ready. |
+| **Unversioned non-empty schema** — `alembic_version` table absent **and** one or more application base tables already exist | **fail closed (both modes)** |
 | Exact application head | proceed / no-op (both modes) |
 | Single known ancestor of head | `auto`: migrate to head. `verify_only`: remain not-ready. |
 | Multiple Alembic heads in the application's own code | fail closed (both modes) |
@@ -108,6 +151,8 @@ Once a migration subprocess has actually started, this ADR freezes **no generic 
 | Unknown/unrecognized revision | fail closed (both modes) |
 | Divergent revision (not an ancestor of head) | fail closed (both modes) |
 | Database revision newer than this application's head | fail closed (both modes) — this is exactly the application-rollback scenario: an operator starting an older image against an already-migrated-forward database must never attempt `alembic downgrade`, `stamp`, or any other automatic "repair." Application rollback and schema rollback remain two different operations; only the former is ever implied by starting an older image. |
+
+**Pristine fresh schema is a distinct, narrower state than "empty/unversioned," and the two must never be collapsed into one auto-migrable category.** Extensions, types, functions, or other objects that exist outside the application schema do not by themselves make a database non-pristine — only application base tables count. The absence of `alembic_version` alone does **not** prove a database is a genuine fresh install: it can equally mean damaged migration metadata, a partial/legacy/manually-created schema, an incomplete restore, or a foreign/unmanaged schema state that merely happens to lack this one bookkeeping table. Only when `alembic_version` is absent **and** the application schema itself is genuinely empty is auto-migration safe. An unversioned schema that already contains application tables is always **fail closed**, in both `auto` and `verify_only` — the bootstrap never runs `alembic stamp`, never infers a revision from which tables happen to exist, and never attempts any other automatic "repair" of that state. An operator facing this state must resolve it manually (inspect the schema, `stamp` deliberately if that is genuinely correct, or restore from a known-good backup) exactly as they would today.
 
 Ancestry (whether the database's current revision is a genuine ancestor of the code's head, as opposed to diverged/unrelated/newer) is determined using Alembic's **own official revision-graph API** — `alembic.script.ScriptDirectory`'s `get_heads()`, `get_revision()`/`get_revisions()`, and `iterate_revisions()` (or the equivalent current API for the installed Alembic version) — never by manually parsing revision filenames or `down_revision` strings. This is the same graph-walking mechanism `alembic upgrade head` itself already relies on internally; reusing it directly is both more robust and less code than reimplementing DAG ancestry.
 
@@ -184,6 +229,8 @@ Concretely: a transactional migration step should rely on PostgreSQL's own trans
 
 `alembic upgrade head`, `alembic current`, and `alembic heads` remain available as administrative tools inside the release image, unchanged. Automatic bootstrap is an operational convenience and guard rail layered on top of Alembic, never a replacement for it, and never hides it. No HTTP endpoint for migration (`POST /migrate` or equivalent) is introduced; migration remains reachable only through the existing CLI/subprocess path, never through the public API.
 
+**Operational rule — manual mutation must never race an in-flight automatic bootstrap.** A raw/manual Alembic mutation command (`alembic upgrade`, `downgrade`, `stamp`, etc.) MUST NOT be run concurrently with an automatic migration bootstrap whose own Alembic subprocess is in flight — the advisory lock protects cooperative bootstrap participants from each other, not the database from an operator manually racing it from outside that mechanism. Manual migration remains straightforwardly safe to use whenever, for example: the application process is stopped; `DATABASE_MIGRATION_MODE=verify_only` is in effect (the bootstrap never invokes Alembic at all in that mode); or the running process is already in the sticky migration-failed/read-only state (§ Failure and retry semantics) and is therefore only performing read-only probes, never spawning a new Alembic subprocess on its own. This ADR does not define a new wrapper command or a new API to enforce this rule mechanically — it remains an operator/documentation discipline, the same way it already is today for two operators who might otherwise both run `alembic upgrade head` by hand at the same time.
+
 ### Business/worker gating is unchanged
 
 While the migration bootstrap phase is in progress, the process remains `BOOTSTRAP_MAINTENANCE` exactly as it does today for the equivalent read-only check: normal business API requests remain fail-closed, worker claims remain disabled, Neo4j bootstrap has not started, and storage convergence has not started. `/health/live` remains available; `/health/ready` remains `NOT_READY`. None of ADR-0011's existing gating logic changes shape — only the specific mechanism that decides "is the schema current" gains the ability to act, not merely observe.
@@ -245,8 +292,8 @@ new public HTTP endpoint = 0     (no POST /migrate, no migration admin API)
 
 This ADR does not implement tests, but freezes the minimum gates a future implementation must satisfy:
 
-- **Unit:** schema classification for every state in the table above, under both `auto` and `verify_only`; code-side multi-head detection; database-side multi-revision detection; the sticky migration-execution-failure rule (a failed attempt is not retried within the same process).
-- **Real PostgreSQL (Integration):** empty database → head; known ancestor → head; exact head → no-op; two concurrent bootstraps against the same database → exactly one migration execution, the other observes the already-migrated result after re-reading state; lock-wait timeout and its non-fatal retry; successful unlock; lock release on connection loss/crash; a genuine migration failure, followed by proof that it is not automatically retried on the existing 5-second interval; a subsequent manual operator fix, followed by proof that the existing read-only probe alone (no restart) carries the process to `OPERATIONAL`.
+- **Unit:** schema classification for every state in the table above, under both `auto` and `verify_only`, **including pristine-fresh vs. unversioned-non-empty as two distinct states, never collapsed into one**; code-side multi-head detection; database-side multi-revision detection; the sticky migration-execution-failure rule (a failed attempt is not retried within the same process).
+- **Real PostgreSQL (Integration):** a fresh, genuinely pristine database → automatically migrates to head; an unversioned database that already contains application tables → fails closed with **zero** Alembic invocation (proven directly, not merely inferred from the end state); known ancestor → head; exact head → no-op; two concurrent bootstraps against the same database → exactly one migration execution, the other observes the already-migrated result after re-reading state; lock-wait timeout and its non-fatal retry; successful unlock; lock release on connection loss/crash; a genuine migration failure, followed by proof that it is not automatically retried on the existing 5-second interval; a subsequent manual operator fix, followed by proof that the existing read-only probe alone (no restart) carries the process to `OPERATIONAL`; **graceful shutdown requested while the Alembic subprocess is running → the advisory lock remains held until the child exits, a second bootstrap attempting to start during that window cannot begin a migration, and only after the child terminates is the lock released and shutdown allowed to complete.**
 - **Deployment/static:** `tests/unit/test_deployment_compose.py::test_compose_files_never_auto_run_alembic` must be **replaced**, not deleted, by an invariant with equivalent intent: Compose must never invoke raw/unserialized Alembic migration directly as a `command:`/`entrypoint:`; automatic migration is permitted only through this ADR's sanctioned, locked, verified bootstrap path.
 - **CI placement:** unit/static checks run in the normal CI workflow; real-PostgreSQL concurrency/failure scenarios run in the Integration workflow, following this project's existing dedicated-disposable-database discipline; a release-image migration smoke (fresh database and a previously-released database, each migrating automatically to become ready with no manual Alembic step) runs as part of the Integration and/or Release gate, mirroring how this project already validates release images today.
 

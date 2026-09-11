@@ -169,5 +169,5 @@ The pgvector SQL extension, not the Python adapter package, governs SQL behavior
 - `AGENTS.md`, sections 5, 14, and 22.
 - `docs/product/Sofias_Memory_PRD_SPECS.md`, sections 10, 12.4, 17, and deployment
   dependencies.
-- `docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B0_B2.md`, SM-201.
+- `docs/exec-plans/completed/Sofias_Memory_Technical_Backlog_B0_B2.md`, SM-201.
 - ADR-0002, PostgreSQL Source of Truth and Neo4j Rebuildable Projection.

@@ -2,7 +2,7 @@
 
 **Documento:** Backlog técnico inicial  
 **Escopo:** B0 Repository Foundation + B1 Application Foundation + B2 PostgreSQL Foundation  
-**Status:** Pronto para execução pelo Codex  
+**Status:** GATE-B2 PASSED
 **Pré-requisitos:** `AGENTS.md` e `docs/product/Sofias_Memory_PRD_SPECS.md` no repositório  
 **Regra:** executar uma task por vez, respeitando dependências e gates.
 

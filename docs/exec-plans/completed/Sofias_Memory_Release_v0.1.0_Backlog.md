@@ -4,7 +4,7 @@
 **Escopo:** Determinar o que falta entre o MVP funcional aprovado (GATE-B5) e uma
 release v0.1.0 reproduzível, documentada e suportável. Este documento NÃO implementa
 features de produto e NÃO é SM-517/B6.
-**Status:** EM EXECUÇÃO — ver tabela de status abaixo.
+**Status:** DONE — GATE-R1 PASSED; v0.1.0 RELEASED — ver tabela de status abaixo.
 **Baseline original do discovery:** `01d6b1b2e0d40439e82657dee51dff4d62062c17` —
 `docs: close B5 operational async runtime milestone`.
 

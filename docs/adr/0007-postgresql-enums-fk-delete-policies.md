@@ -308,4 +308,4 @@ Future schema and migration tasks must:
 - `docs/adr/0002-postgresql-source-of-truth-neo4j-projection.md`
 - `docs/adr/0003-single-static-api-key.md`
 - `docs/adr/0006-pgvector-3072-halfvec-ann.md`
-- `docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B0_B2.md` SM-202
+- `docs/exec-plans/completed/Sofias_Memory_Technical_Backlog_B0_B2.md` SM-202

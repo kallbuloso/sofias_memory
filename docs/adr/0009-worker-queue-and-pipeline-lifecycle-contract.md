@@ -24,7 +24,7 @@ B4 proved the Core Memory functional synchronous path (`GATE-B4 PASSED`). It reu
 B5's job is to turn this bookkeeping into a durable, restart-safe runtime without
 introducing an external queue, a second worker process, or a second synchronous
 engine living alongside the async one. This ADR is the architecture gate required by
-`docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B5.md` (SM-501) before any
+`docs/exec-plans/completed/Sofias_Memory_Technical_Backlog_B5.md` (SM-501) before any
 B5 code is written. It freezes the 19 decisions already approved in that backlog
 (section 5) and gives them concrete, testable mechanisms.
 

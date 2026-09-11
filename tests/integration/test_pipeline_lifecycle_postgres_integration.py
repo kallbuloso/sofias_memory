@@ -247,7 +247,7 @@ async def test_retry_of_run_id_self_fk_set_null_on_delete(postgres_engine: Async
 # that insert before the app's own check ever runs. Tests for this constraint
 # belong to the follow-up migration that activates it once the last
 # direct-RUNNING B4 writer is migrated to the B5 runtime (tracked in
-# docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B5.md, SM-502/SM-513,
+# docs/exec-plans/completed/Sofias_Memory_Technical_Backlog_B5.md, SM-502/SM-513,
 # verified at GATE-B5) -- not here, while the index does not exist yet.
 
 

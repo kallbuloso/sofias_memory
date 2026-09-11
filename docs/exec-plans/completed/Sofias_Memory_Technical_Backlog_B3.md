@@ -2,7 +2,7 @@
 
 **Documento:** Backlog técnico — B3 Neo4j Foundation  
 **Escopo:** B3 Neo4j Foundation  
-**Status:** Pronto para execução pelo Codex  
+**Status:** GATE-B3 PASSED
 **Pré-requisitos:** GATE-B2 aprovado + ADR-0008 accepted/revisado; `AGENTS.md`; `docs/product/Sofias_Memory_PRD_SPECS.md`; ADRs aceitos  
 **Regra:** executar uma task por vez, respeitando dependências e gates.  
 **Base de elaboração:** estado do repositório após GATE-B2, com `main` em `aaf4436` antes da execução de SM-301.

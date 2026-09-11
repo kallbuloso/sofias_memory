@@ -63,7 +63,7 @@ def upgrade() -> None:
     # final invariant: the constraint is added by a follow-up migration once
     # the last direct-RUNNING B4 writer is migrated to the B5 runtime
     # (tracked as a required cutover step after SM-513, verified at GATE-B5).
-    # See docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B5.md SM-502
+    # See docs/exec-plans/completed/Sofias_Memory_Technical_Backlog_B5.md SM-502
     # and SM-513 for the recorded decision.
 
     # ADR-0009 SS B: PipelineStep is one row per (run_id, ordinal). The

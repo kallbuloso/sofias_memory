@@ -8,7 +8,7 @@ graph-grounded, LLM-generated answers with provenance back to the original sourc
 ## Status
 
 The MVP operational async runtime passed its functional/integration/recovery gate
-(`GATE-B5`, see `docs/exec-plans/active/Sofias_Memory_Technical_Backlog_B5.md`).
+(`GATE-B5`, see `docs/exec-plans/completed/Sofias_Memory_Technical_Backlog_B5.md`).
 Remember, Cognify, Recall, Improve, Forget, Dataset lifecycle, and Run
 retry/cancel are all implemented and durable, running through a single internal
 worker with PostgreSQL as the queue and source of truth. **v0.1.0** was the
@@ -25,7 +25,7 @@ interoperability, and semantic resolve over pgvector; **v0.5.0** adds
 first-class durable **Agent** profiles — management, active/archive
 lifecycle, and explicit Agent↔Skill and Agent↔Session associations (see
 `CHANGELOG.md`) — see
-`docs/exec-plans/active/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
+`docs/exec-plans/completed/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.
 
 ## Principal capabilities

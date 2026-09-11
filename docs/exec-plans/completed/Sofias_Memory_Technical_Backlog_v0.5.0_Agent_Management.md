@@ -2,7 +2,7 @@
 
 **Release:** v0.5.0\
 **Feature:** First-class durable Agent Management\
-**Status:** Proposed\
+**Status:** DONE — GATE-v0.5.0 PASSED; v0.5.0 RELEASED\
 **Sequência:** SM-801..SM-806\
 **Regra de execução:** executar uma task por vez; não antecipar dependências ou escopo de tickets posteriores.
 
@@ -68,7 +68,7 @@ Durante SM-801..SM-806:
 | SM-803 | Agent ↔ Skill association | SM-802 | 0016 | DONE |
 | SM-804 | Agent ↔ Session explicit association | SM-802 | 0017 | DONE |
 | SM-805 | Lifecycle, concurrency e cross-feature hardening | SM-802, SM-803, SM-804 | — | DONE |
-| SM-806 | Docs, smoke e release gate v0.5.0 | SM-805 | — | local GATE passed / release preparation complete |
+| SM-806 | Docs, smoke e release gate v0.5.0 | SM-805 | — | DONE — GATE-v0.5.0 PASSED |
 
 ---
 
@@ -445,3 +445,126 @@ O release somente pode ser marcado como concluído quando:
 Após esse gate, nenhum trabalho de `AgentRevision`, semantic Agent resolve, Agent-scoped Skill resolve, ou atribuição exata por operação deve ser incluído retroativamente no v0.5.0 — esses itens permanecem non-goals explícitos (Feature Contract §14/§22) até um requisito futuro separadamente escopado.
 
 O próximo release funcional planejado permanece separado.
+
+## GATE-v0.5.0 — PASSED
+
+SM-806 (implementation/local non-Docker gates) was DONE first: ruff, ruff format,
+mypy, and the unit/contract/security suite green locally, the Agent Management
+schema migrations (`0015`/`0016`/`0017`) validated against a real disposable
+database in both directions (fresh-install `empty → 0017` and upgrade
+`0014 → 0017`), a real end-to-end smoke over the public API covering the full
+12-operation Agent surface (management create/get/list/PATCH/archive/restore,
+Agent↔Skill associate/pin/rollback-does-not-follow/disclosure, Agent↔Session
+associate/list/zero-activity/M:N-non-attribution), Forget/Dataset Delete
+non-interference with the Agent/AgentSkill/AgentSession family, and a real
+Neo4j check proving the absence of any Agent-related label, relationship
+type, or projected node. Runtime-only `pip-audit` and the Bandit
+HIGH-severity blocking gate both passed locally. Documentation (README,
+AGENTS.md, CLAUDE.md, docs/api.md, docs/development.md, docs/operations.md,
+CHANGELOG.md) was updated, and every functional version surface was bumped
+to `0.5.0`.
+
+**Historical note (Docker limitation, preserved for the record):** the local
+execution environment used for SM-806 had no Docker available, so Docker
+image build, OCI label validation, the image-contained migration gate, and
+the `docker compose config` step of `ci_release_consistency_check.py` could
+not be exercised locally and were explicitly reported as pending rather than
+fabricated (the same limitation SM-706 recorded for v0.4.0). Those gates
+were subsequently executed successfully in GitHub Actions against the exact
+release commit as part of finalizing publication — see the remote evidence
+below. This finding is now resolved and is no longer a release blocker.
+
+### Remote evidence
+
+**Normal CI** — workflow `CI`, run `34546267233` (run number `51`), commit
+`49f6deee8c6d2c70161c7ac8a99ac3185e4c25e2` (`chore(release): prepare 0.5.0`),
+conclusion **success**. Covered ruff, ruff format, mypy, unit/contract/security,
+runtime `pip-audit`, Bandit, release consistency, Docker build, and the OCI
+label validation.
+
+**Integration** — workflow `Integration (real PostgreSQL + Neo4j)`, run
+`34546512116` (run number `23`), commit
+`49f6deee8c6d2c70161c7ac8a99ac3185e4c25e2` (same exact commit as CI above),
+conclusion **success**. Proved: the release image was built, dedicated
+databases were created, migrations were executed from the built image
+(`0001 → 0017`, `alembic current == 0017`), and the following Agent
+integration opt-in flags were all enabled, alongside the pre-existing
+Sessions and Skills integration flags:
+
+```text
+SOFIAS_MEMORY_RUN_POSTGRES_AGENTS_TESTS=1
+SOFIAS_MEMORY_RUN_AGENTS_MANAGEMENT_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_AGENT_SKILLS_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_AGENT_SKILLS_HTTP_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_AGENT_SESSIONS_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_AGENT_SESSIONS_HTTP_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_AGENTS_CONCURRENCY_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_AGENTS_CROSS_FEATURE_POSTGRES_TESTS=1
+SOFIAS_MEMORY_RUN_AGENTS_NEO4J_TESTS=1
+```
+
+**Release** — workflow `Release`, run `34547199940` (run number `11`), tag
+`v0.5.0`, commit `49f6deee8c6d2c70161c7ac8a99ac3185e4c25e2`, conclusion
+**success**. Job "Validate tag against canonical version" (PASS): tag commit
+belongs to `main`; the exact commit's CI was already green; `uv lock --check`;
+canonical release kind/version; the CHANGELOG `[0.5.0]` section; Settings/
+`.env.example`/Compose parity; version consistency. Job "Build, publish to
+GHCR, create GitHub Release" (PASS): build release image; verify OCI labels
+before publishing; login to GHCR; check tag availability; push image to
+GHCR; extract release notes; create GitHub Release.
+
+**GHCR** — the workflow evidence proves `Push image to GHCR = success`. The
+configured/published tag is `ghcr.io/kallbuloso/sofias-memory:0.5.0`; no
+GitHub Release ID or digest is recorded here since neither was explicitly
+extracted from the evidence inspected.
+
+**Published release** — `Sofias Memory v0.5.0`, tag `v0.5.0`, stable,
+`prerelease: false`, immutable.
+
+### Release flow (what actually happened)
+
+```text
+SM-806 local gate
+↓
+release commit 49f6deee pushed
+↓
+CI #51 PASS
+↓
+Integration #23 PASS
+↓
+v0.5.0 tag pushed
+↓
+Release #11 validates exact SHA/tag
+↓
+release image built + OCI validated
+↓
+GHCR image published
+↓
+GitHub Release published
+```
+
+### Release boundaries preserved
+
+v0.5.0 does **not** include, and none of it was added retroactively:
+`AgentRevision`, `AgentRun`, Agent execution, tool execution, tool
+authorization, semantic Agent resolve, Agent-scoped Skill resolve, or exact
+per-operation Agent attribution. These remain explicit non-goals (Feature
+Contract §14/§22) until a future, separately scoped requirement.
+
+### Final state
+
+```text
+SM-801 ✅ PASSED
+SM-802 ✅ PASSED
+SM-803 ✅ PASSED
+SM-804 ✅ PASSED
+SM-805 ✅ PASSED
+SM-806 ✅ PASSED
+
+GATE-v0.5.0 ✅ PASSED
+v0.5.0 ✅ RELEASED
+```
+
+The `v0.5.0` tag is immutable and must not be moved.
+
+The next functional release remains separately scoped.

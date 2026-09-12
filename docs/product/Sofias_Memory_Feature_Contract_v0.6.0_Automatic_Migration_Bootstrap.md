@@ -62,33 +62,94 @@ Reproduz exatamente o contrato pré-ADR-0015: o bootstrap executa o mesmo check 
 
 ---
 
-# 4. Schema classification — Alembic DAG é a autoridade
+# 4. Schema classification — estados observáveis pela imagem atual
 
-| Estado | `auto` | `verify_only` |
+**Erratum pré-SM-901 (2026-09-11):** a versão anterior deste contrato listava "revision do banco mais novo que o head da aplicação" como um estado diretamente detectável pelo classificador. Uma investigação read-only feita ao preparar SM-901, usando a versão instalada do Alembic contra o `ScriptDirectory` real deste projeto, provou que isso é impossível sem violar a proibição de comparação lexical/numérica de revision IDs já congelada por este contrato (§4.9/ADR-0015). A tabela abaixo foi corrigida para descrever exclusivamente **estados que a imagem em execução consegue observar usando apenas seu próprio `ScriptDirectory` + PostgreSQL** — nunca uma ordenação global hipotética através de todas as versões de aplicação possíveis. A política de rollback (§16) não muda; apenas a classificação observável muda.
+
+| Estado observável | `auto` | `verify_only` |
 |---|---|---|
-| **Pristine fresh schema** (§4.1) | migra para head | permanece not-ready |
-| **Unversioned non-empty schema** (§4.2) | **fail closed** | **fail closed** |
-| Exact application head | no-op | no-op |
-| Ancestral único conhecido do head | migra para head | permanece not-ready |
-| Múltiplos heads no código Alembic da aplicação | fail closed | fail closed |
-| Múltiplos revisions registrados no banco | fail closed | fail closed |
-| Revision desconhecido/não reconhecido | fail closed | fail closed |
-| Revision divergente (não ancestral do head) | fail closed | fail closed |
-| Revision do banco mais novo que o head da aplicação (rollback scenario) | fail closed — nunca `downgrade`/`stamp`/repair automático | fail closed |
+| **PRISTINE_FRESH_SCHEMA** (§4.1) | elegível a migrar | permanece not-ready |
+| **UNVERSIONED_NON_EMPTY_SCHEMA** (§4.2) | **fail closed** | **fail closed** |
+| **EXACT_HEAD** (§4.3) | no-op | no-op |
+| **KNOWN_ANCESTOR** (§4.4) | elegível a migrar | permanece not-ready |
+| **CODE_MULTIPLE_HEADS** (§4.5) | fail closed | fail closed |
+| **VERSION_TABLE_EMPTY** (§4.6) | fail closed | fail closed |
+| **DATABASE_MULTIPLE_REVISIONS** (§4.7) | fail closed | fail closed |
+| **KNOWN_NON_ANCESTOR** (§4.8) | fail closed | fail closed |
+| **UNRECOGNIZED_REVISION** (§4.9) | fail closed | fail closed |
 
-## 4.1 Pristine fresh schema
+Nomes Python finais podem seguir o style real do código a partir de SM-901; a semântica acima é o que está congelado.
 
-Definição exata, nunca aproximada: `alembic_version` **ausente** **e** nenhuma application base table existe no schema atual da aplicação. Extensões, tipos ou funções fora do escopo de tabela de aplicação não tornam um banco não-pristine — apenas application base tables contam.
+## 4.1 PRISTINE_FRESH_SCHEMA
+
+Definição exata, nunca aproximada: `alembic_version` **ausente** **e** nenhuma application base table existe no schema atual da aplicação. Extensões, tipos ou funções fora do escopo de tabela de aplicação não tornam um banco não-pristine — apenas application base tables contam. Nenhuma lista hardcoded de nomes de tabela do Sofias Memory é exigida; a regra conservadora "qualquer base table pré-existente no application schema → schema não é pristine" é suficiente e preferida.
 
 Pristine fresh schema é um estado **distinto e mais estreito** que "vazio/unversioned" em geral, e os dois nunca são colapsados em uma única categoria auto-migrável. A ausência de `alembic_version` sozinha não prova instalação genuinamente nova — pode significar metadata de migration danificada, schema legado/parcial, restore incompleto, ou schema estranho/não gerenciado que apenas não tem essa tabela de bookkeeping.
 
-## 4.2 Unversioned non-empty schema — sempre fail-closed
+## 4.2 UNVERSIONED_NON_EMPTY_SCHEMA — sempre fail-closed
 
 `alembic_version` ausente **e** uma ou mais application base tables já existem. **Sempre fail closed, em ambos os modos.** O bootstrap nunca executa `alembic stamp`, nunca infere revision a partir de quais tabelas existem, e nunca tenta qualquer outro "repair" automático. Resolução é exclusivamente manual: inspeção do schema, `stamp` deliberado quando genuinamente correto, ou restore de backup conhecido — exatamente como hoje.
 
-## 4.3 Ancestralidade — autoridade
+## 4.3 EXACT_HEAD
+
+Exatamente um head no código e exatamente uma revision no banco, e são iguais. Comportamento: no-op, em ambos os modos.
+
+## 4.4 KNOWN_ANCESTOR
+
+Exatamente uma revision no banco que o `ScriptDirectory` corrente reconhece **e** prova ser um ancestral genuíno do único head da aplicação (§4.10). `auto`: elegível a migrar para head. `verify_only`: permanece not-ready.
+
+## 4.5 CODE_MULTIPLE_HEADS
+
+O `ScriptDirectory` da aplicação corrente expõe mais de um head efetivo. Fail closed, em ambos os modos.
+
+## 4.6 VERSION_TABLE_EMPTY
+
+`alembic_version` existe como base table, mas contém zero linhas de revision. **Isto não é pristine** — é metadata de migration danificada/inválida. Fail closed, em ambos os modos. Nunca tratado como fresh install; nunca `stamp` automático.
+
+Este estado é distinto de PRISTINE_FRESH_SCHEMA (§4.1) precisamente porque a tabela `alembic_version` existe fisicamente — algo já tentou versionar este banco e falhou ou foi corrompido no processo, o que é evidência ativa de um problema, não de uma instalação nova.
+
+## 4.7 DATABASE_MULTIPLE_REVISIONS
+
+`alembic_version` existe e contém mais de uma linha de revision corrente para este contrato de aplicação. Fail closed, em ambos os modos.
+
+## 4.8 KNOWN_NON_ANCESTOR
+
+A revision do banco é resolvível pelo `ScriptDirectory` corrente, mas não pode ser provada como ancestral do único head da aplicação corrente (revision divergente/de outro branch). Fail closed, em ambos os modos. Nenhuma tentativa de upgrade é feita.
+
+## 4.9 UNRECOGNIZED_REVISION
+
+O banco contém exatamente um identificador de revision, mas o `ScriptDirectory` corrente não consegue resolvê-lo (`get_revision()`/`get_revisions()`/`iterate_revisions()` levantam erro de resolução — confirmado programaticamente contra a versão instalada do Alembic neste projeto). Esta categoria inclui deliberadamente múltiplas realidades possíveis, indistinguíveis pela imagem em execução:
+
+```text
+revision futura/mais nova produzida por uma imagem de aplicação mais nova
+revision estrangeira/não relacionada
+identificador de revision danificado/manual
+qualquer outra revision ausente do grafo desta imagem
+```
+
+A imagem em execução não consegue, com segurança, distinguir esses casos usando apenas seu próprio `ScriptDirectory` — fazer isso exigiria comparação lexical/numérica de revision IDs (proibida, ver §4.10) ou uma nova fonte externa de lineage metadata (fora de escopo desta release). Fail closed, em ambos os modos. Nenhuma ordenação é inferida a partir da string da revision.
+
+Este estado **subsume** o cenário de política "banco mais novo que o head da aplicação" (rollback scenario, §16) — ele não é um estado observável separado, precisamente porque a imagem corrente não consegue prová-lo separadamente de uma revision estrangeira/não relacionada. Ambas as realidades levam ao mesmo resultado: fail closed.
+
+## 4.10 Ancestralidade — autoridade
 
 Determinada exclusivamente pela API oficial de revision-graph do Alembic (`alembic.script.ScriptDirectory` — `get_heads()`, `get_revision()`/`get_revisions()`, `iterate_revisions()` ou equivalente da versão instalada), **nunca** por parsing manual de nomes de arquivo ou strings `down_revision`. Migration nunca executa antes da classificação estar completa.
+
+Esta determinação de ancestralidade só se aplica a uma revision que o `ScriptDirectory` consegue resolver em primeiro lugar (KNOWN_ANCESTOR §4.4 vs. KNOWN_NON_ANCESTOR §4.8). Uma revision que o `ScriptDirectory` não consegue resolver de forma alguma é UNRECOGNIZED_REVISION (§4.9) — nunca inferida como "provavelmente ancestral" ou "provavelmente posterior" por qualquer heurística, incluindo comparação de string.
+
+## 4.11 Distinguibilidade obrigatória do snapshot
+
+A classificação exige informação suficiente para distinguir "tabela `alembic_version` ausente" de "tabela `alembic_version` presente com zero linhas de revision" — colapsar os dois em um único conjunto vazio de revisions tornaria VERSION_TABLE_EMPTY (§4.6) indistinguível de PRISTINE_FRESH_SCHEMA/UNVERSIONED_NON_EMPTY_SCHEMA (§4.1/§4.2), o que este contrato proíbe.
+
+Conceitualmente, o snapshot de classificação precisa de, no mínimo:
+
+```text
+alembic_version_table_present: bool
+database_revisions: frozenset[str]
+application_base_tables_present: bool
+```
+
+ou representação imutável equivalente. Este contrato congela a informação exigida, não uma forma de implementação específica (dataclass, campos exatos) — essa é uma decisão de SM-901.
 
 ---
 
@@ -188,7 +249,7 @@ Um estado "ancestral conhecido" (§4) e "uma execução de migration já falhou 
 
 ## 10.3 Schema-invalid / classification failure
 
-Múltiplos heads, revision divergente, banco à frente da aplicação, ou qualquer outro estado que a tabela de classificação (§4) marca "fail closed". Nenhuma migration é tentada para esses estados. Comportamento inalterado do `revision_mismatch`-shaped fail-closed retry já existente hoje.
+CODE_MULTIPLE_HEADS, VERSION_TABLE_EMPTY, DATABASE_MULTIPLE_REVISIONS, KNOWN_NON_ANCESTOR, UNRECOGNIZED_REVISION (§4.5–§4.9), ou qualquer outro estado que a tabela de classificação (§4) marca "fail closed". Nenhuma migration é tentada para esses estados. Comportamento inalterado do `revision_mismatch`-shaped fail-closed retry já existente hoje.
 
 ---
 
@@ -222,18 +283,46 @@ Este contrato não congela qual primitiva Python específica implementa isso (ca
 
 # 12. Hard termination — caso distinto, não bug do shutdown path
 
-`SIGKILL`, hard kill de container, ou crash de processo **não são** graceful shutdown, e nenhuma semântica graceful é tentada para eles:
+`SIGKILL`, hard kill de container, ou crash de processo **não são** graceful shutdown, e nenhuma semântica graceful é tentada para eles.
+
+**Erratum (amendment de hard-termination serialization, pré-SM-903):** a versão anterior deste contrato afirmava que hard termination causa "processo/conexões terminam imediatamente, incluindo o child" — implicando que o child Alembic necessariamente morre junto com o processo pai/supervisor. Essa implicação não é garantida pela semântica de processos POSIX: matar (ou o crash de) um processo pai não mata, por si só, um child já spawnado — um child cujo pai desaparece fica órfão e é re-parented, não necessariamente terminado, e pode continuar rodando e continuar mutando o banco. A política de rollback e toda outra decisão deste contrato permanecem inalteradas; apenas esta suposição específica, forte demais, foi corrigida.
+
+Este contrato congela portanto um invariante normativo, independente do mecanismo concreto que uma implementação futura escolher para satisfazê-lo:
 
 ```text
-processo/conexões terminam imediatamente, incluindo o child e a conexão
-  do advisory lock
-PostgreSQL eventualmente libera o advisory lock session-level sozinho
-  (propriedade de crash-safety do próprio lock)
-a próxima tentativa de processo de aplicação re-classifica o estado
-  autoritativo do banco do zero, exatamente como todo outro restart já faz
+Uma execução de migration Alembic NUNCA PODE permanecer capaz de mutar o
+banco depois que a proteção de serialização daquela execução tiver sido
+liberada.
 ```
 
-**Nenhuma garantia de completion é feita ou implicada** para uma migration interrompida por hard termination — apenas que o lock não vaza, e que a próxima tentativa parte de uma leitura autoritativa fresca do banco, nunca de uma suposição sobre o que o attempt morto pode ter terminado.
+Equivalentemente: o lifetime do child de migration NÃO PODE sobreviver à proteção que serializa aquela migration contra futuras migrations automáticas de bootstrap. Este invariante se aplica uniformemente a graceful shutdown, crash do processo pai, `SIGKILL` do supervisor da aplicação, e qualquer outra terminação inesperada do supervisor.
+
+Uma implementação correta DEVE garantir pelo menos uma destas duas propriedades equivalentes. Este contrato deliberadamente **não** escolhe entre elas — essa escolha pertence à implementação, feita com conhecimento do runtime Docker de release, execução local/source, comportamento de subprocess do `asyncio`, a fronteira de suporte cross-platform do projeto, e testabilidade:
+
+```text
+A. a árvore de processo/child de migration não pode sobreviver ao
+   supervisor dono do lock; ou
+
+B. se o child de migration pode sobreviver ao supervisor da aplicação, a
+   ownership de serialização em si deve permanecer viva e mantida até que
+   aquele processo de migration tenha terminado.
+```
+
+O que hard termination continua garantindo, inalterado por este erratum:
+
+```text
+PostgreSQL eventualmente libera o advisory lock session-level sozinho
+  quando sua sessão de banco dona termina (propriedade de crash-safety do
+  próprio lock, já congelada acima)
+a próxima tentativa de processo de aplicação re-classifica o estado
+  autoritativo do banco do zero, exatamente como todo outro restart já faz
+  -- e somente depois de ter legitimamente adquirido a proteção de
+  serialização, nunca antes ou como substituto dela
+```
+
+Liberação automática do lock previne um lock vazado/stale; por si só, ela **não** prova que um child Alembic rodando independentemente também terminou. "O lock não vaza" e "uma execução de migration não pode sobreviver ao dono do lock" são duas propriedades distintas, e este contrato exige ambas.
+
+**Nenhuma garantia de completion é feita ou implicada** para uma migration interrompida por hard termination — a implementação garante em vez disso o invariante de orphan-safety acima, de modo que em nenhum momento uma migration antiga e desprotegida pode continuar mutando o banco concorrentemente com um novo bootstrap automático que tenha ele mesmo adquirido legitimamente a proteção de serialização e iniciado uma segunda migration.
 
 ---
 
@@ -285,7 +374,13 @@ Consequência explicitamente documentada: com `auto` como default, iniciar uma i
 
 # 16. Rollback contract — sempre fail-closed, nunca automático
 
-Um banco com revision mais novo que o head da aplicação corrente (cenário de application rollback: operador inicia uma imagem mais antiga contra um banco já migrado para frente) é **sempre fail closed**, em ambos os modos (§4, última linha). O bootstrap **nunca** tenta `alembic downgrade`, `stamp`, ou qualquer outro "repair" automático nesse cenário. Application rollback e schema rollback permanecem duas operações distintas; apenas a primeira é implicada por iniciar uma imagem mais antiga.
+**Política (inalterada por este erratum):** um banco com revision produzida por uma imagem de aplicação mais nova que a corrente (cenário de application rollback: operador inicia uma imagem mais antiga contra um banco já migrado para frente) é **sempre fail closed**, em ambos os modos. O bootstrap **nunca** tenta `alembic downgrade`, `stamp`, ou qualquer outro "repair" automático nesse cenário. Application rollback e schema rollback permanecem duas operações distintas; apenas a primeira é implicada por iniciar uma imagem mais antiga.
+
+**Comportamento runtime observável (corrigido):** "banco mais novo que o head da aplicação" é um **cenário de política**, não um estado de classificador que a imagem corrente consegue provar positivamente sozinha. Se a revision mais nova estiver ausente do `ScriptDirectory` da imagem em execução — o caso normal de um rollback genuíno — ela é classificada como **UNRECOGNIZED_REVISION** (§4.9), a mesma categoria que também cobre uma revision estrangeira/não relacionada ou um identificador danificado. A imagem corrente não consegue, usando exclusivamente sua própria API oficial de revision-graph, provar que aquele identificador é um "genuine future descendant" em vez de uma revision não relacionada — essa distinção exigiria comparação lexical/numérica de revision IDs (proibida) ou uma nova fonte externa de lineage metadata (fora de escopo desta release).
+
+Isso não enfraquece a política de rollback: **todas as realidades possíveis dentro de UNRECOGNIZED_REVISION levam a fail closed**, exatamente como "banco mais novo" já exigia isoladamente na versão anterior deste contrato. Apenas a justificativa interna mudou — de "o classificador prova que este banco está à frente" para "o classificador não consegue resolver esta revision, e toda revision não resolvível falha fechada" — o que subsume corretamente e de forma conservadora o caso de rollback sem precisar prová-lo especificamente.
+
+> **Pergunta de revisão:** uma imagem antiga consegue distinguir de forma confiável uma revision futura desconhecida de uma revision arbitrária não relacionada, usando somente seu próprio `ScriptDirectory`? **Não.** O que acontece em ambos os casos? **Fail closed** (UNRECOGNIZED_REVISION, §4.9). E o application rollback pode automaticamente fazer downgrade do banco? **Não** — nunca, em nenhum caso, dentro ou fora de UNRECOGNIZED_REVISION.
 
 ---
 
@@ -430,6 +525,13 @@ pristine fresh schema e unversioned non-empty schema nunca são colapsados
 unversioned non-empty schema é sempre fail-closed, em ambos os modos
 ancestralidade é sempre determinada pela API oficial de revision-graph
   do Alembic -- nunca por parsing manual
+uma revision não resolvível pelo ScriptDirectory (UNRECOGNIZED_REVISION,
+  incluindo um cenário de rollback genuíno) é sempre fail-closed -- nunca
+  inferida como futura/anterior/estrangeira por ordenação lexical/numérica
+  ou qualquer outra heurística de string
+alembic_version ausente e alembic_version presente-com-zero-linhas
+  (VERSION_TABLE_EMPTY) são sempre distinguíveis no snapshot de
+  classificação -- nunca colapsados no mesmo conjunto vazio
 nenhuma migration executa antes da classificação estar completa
 no máximo uma execução de migration automática roda por vez contra o
   mesmo banco (advisory lock)
@@ -438,6 +540,11 @@ falha de execução de migration é sticky por lifetime de processo --
 graceful shutdown nunca libera o advisory lock enquanto o child Alembic
   está vivo
 hard termination nunca garante completion de migration -- o lock nunca vaza
+uma execução de migration Alembic nunca permanece capaz de mutar o banco
+  depois que sua proteção de serialização foi liberada -- o lifetime do
+  child nunca sobrevive à proteção que o serializa, mesmo sob crash do
+  supervisor/SIGKILL ("lock não vaza" e "migration não sobrevive ao dono
+  do lock" são propriedades distintas, ambas exigidas)
 rollback de schema nunca é automático
 a CLI Alembic manual permanece totalmente suportada e nunca é substituída
 `/health/live` permanece alcançável durante toda a duração do bootstrap
@@ -454,10 +561,11 @@ a correção nunca depende de mecanismo específico de orquestrador
 O v0.6.0 estará pronto para release apenas quando (ver backlog técnico, GATE-v0.6.0):
 
 - `DATABASE_MIGRATION_MODE=auto|verify_only` estiver implementado, com `auto` como default, exatamente como especificado neste contrato;
-- toda linha da tabela de classificação (§4) estiver comprovada por teste, incluindo a distinção pristine vs. unversioned-non-empty;
+- todos os nove estados observáveis da tabela de classificação (§4) estiverem comprovados por teste, incluindo PRISTINE_FRESH_SCHEMA vs. UNVERSIONED_NON_EMPTY_SCHEMA e a distinção entre `alembic_version` ausente vs. presente-com-zero-linhas (VERSION_TABLE_EMPTY, §4.11);
 - o advisory lock (§5–§6) estiver comprovado com PostgreSQL real, incluindo exatamente uma execução de migration entre dois bootstraps concorrentes;
 - a sticky failure semantics (§10.2) estiver comprovada — uma falha de migration não é retentada no intervalo de 5 segundos já existente;
 - a migration critical section de graceful shutdown (§11) estiver comprovada;
+- o invariante de orphan-safety de hard termination (§12) estiver comprovado — nenhuma migration desprotegida pode continuar mutando o banco concorrentemente com um novo bootstrap que adquiriu serialização legitimamente;
 - `tests/unit/test_deployment_compose.py` tiver sido substituído por um invariante equivalente (§24);
 - toda a documentação listada em §23 tiver sido atualizada;
 - nenhum endpoint público novo, nenhuma tabela nova para este feature, e nenhuma mudança em Neo4j/`graph_outbox` existirem;

@@ -71,9 +71,9 @@ Durante SM-901..SM-906:
 |---|---|---|---|---|
 | SM-901 | Schema classification model (sem executar Alembic) | — | — | TODO |
 | SM-902 | Advisory lock + subprocess bootstrap | SM-901 | — | TODO |
-| SM-903 | Sticky failure + graceful shutdown critical section | SM-902 | — | TODO |
+| SM-903 | Sticky failure + graceful shutdown critical section + hard-termination orphan safety | SM-902 | — | TODO |
 | SM-904 | Operational/deployment documentation integration + Compose deployment/static invariant | SM-903 | — | TODO |
-| SM-905 | Real-PostgreSQL hardening matrix + release-image smoke | SM-903, SM-904 | — | TODO |
+| SM-905 | Real-PostgreSQL hardening matrix + release-image smoke + orphan-safety scenario | SM-903, SM-904 | — | TODO |
 | SM-906 | Release prep — quality gates, version bump, GATE-v0.6.0 | SM-905 | — | TODO |
 
 ---
@@ -86,14 +86,17 @@ Construir o modelo puro de classificação de schema state (§4 do Feature Contr
 
 ## Escopo
 
+**Nota (erratum pré-implementação):** o Feature Contract §4 foi corrigido antes desta task começar — o antigo estado "revision do banco mais novo que o head" nunca foi diretamente detectável pelo `ScriptDirectory` (uma revision ausente do grafo da imagem corrente levanta erro de resolução em `get_revision()`/`get_revisions()`/`iterate_revisions()`, seja ela uma revision futura genuína ou uma revision estrangeira não relacionada — indistinguíveis sem comparação lexical/numérica de IDs, que é proibida). Os 9 estados abaixo são os estados **observáveis pela imagem atual**, já corrigidos; esta task implementa exatamente eles, não a versão anterior da tabela.
+
 Implementar:
 
-- função/módulo que classifica o estado do banco em exatamente os 9 estados da tabela do Feature Contract §4, usando exclusivamente a API oficial de revision-graph do Alembic (`alembic.script.ScriptDirectory.get_heads()`, `get_revision()`/`get_revisions()`, `iterate_revisions()` ou equivalente da versão instalada) — nunca parsing manual de nomes de arquivo ou `down_revision`;
-- distinção explícita e nunca colapsada entre pristine fresh schema (`alembic_version` ausente **e** nenhuma application base table) e unversioned non-empty schema (`alembic_version` ausente **e** uma ou mais application base tables existem);
-- detecção de múltiplos heads no código Alembic da aplicação (code-side);
-- detecção de múltiplos revisions registrados no banco (database-side);
-- detecção de revision desconhecido/não reconhecido pelo grafo da aplicação;
-- detecção de revision divergente (não ancestral do head) e de revision mais novo que o head da aplicação (rollback scenario);
+- função/módulo que classifica o estado do banco em exatamente os 9 estados observáveis do Feature Contract §4 — `PRISTINE_FRESH_SCHEMA`, `UNVERSIONED_NON_EMPTY_SCHEMA`, `EXACT_HEAD`, `KNOWN_ANCESTOR`, `CODE_MULTIPLE_HEADS`, `VERSION_TABLE_EMPTY`, `DATABASE_MULTIPLE_REVISIONS`, `KNOWN_NON_ANCESTOR`, `UNRECOGNIZED_REVISION` — usando exclusivamente a API oficial de revision-graph do Alembic (`alembic.script.ScriptDirectory.get_heads()`, `get_revision()`/`get_revisions()`, `iterate_revisions()` ou equivalente da versão instalada) — nunca parsing manual de nomes de arquivo ou `down_revision`, nunca comparação lexical/numérica de revision IDs;
+- distinção explícita e nunca colapsada entre `PRISTINE_FRESH_SCHEMA` (`alembic_version` ausente **e** nenhuma application base table) e `UNVERSIONED_NON_EMPTY_SCHEMA` (`alembic_version` ausente **e** uma ou mais application base tables existem);
+- snapshot de classificação que retém explicitamente `alembic_version_table_present: bool` (ou representação imutável equivalente), nunca apenas um `frozenset[str]` de revisions que colapsaria "tabela ausente" e "tabela presente com zero linhas" no mesmo valor vazio — essa distinção é o que separa `VERSION_TABLE_EMPTY` (§4.6) de `PRISTINE_FRESH_SCHEMA`/`UNVERSIONED_NON_EMPTY_SCHEMA` (Feature Contract §4.11); a forma exata (dataclass/campos) é escolha desta task, a informação retida não é;
+- detecção de `CODE_MULTIPLE_HEADS` (múltiplos heads no código Alembic da aplicação, code-side);
+- detecção de `DATABASE_MULTIPLE_REVISIONS` (múltiplas linhas de revision registradas no banco, database-side);
+- detecção de `VERSION_TABLE_EMPTY` (`alembic_version` existe como base table, mas zero linhas de revision) como estado distinto de `PRISTINE_FRESH_SCHEMA` — nunca tratado como fresh install;
+- detecção de `KNOWN_NON_ANCESTOR` (revision resolvível pelo `ScriptDirectory`, mas não provável como ancestral do head) e de `UNRECOGNIZED_REVISION` (revision não resolvível pelo `ScriptDirectory` — categoria que subsume tanto uma revision estrangeira/não relacionada quanto um rollback genuíno de imagem, sem tentar distingui-los);
 - leitura da configuração `database_migration_mode: Literal["auto", "verify_only"]` em `sofias_memory/config.py`, com `alias="DATABASE_MIGRATION_MODE"` e `default="auto"`, seguindo o template já existente de `storage_backend`.
 
 ## Não fazer
@@ -102,15 +105,31 @@ Implementar:
 - não tocar `lifespan.py`/`_attempt_bootstrap` nesta task;
 - não implementar advisory lock nesta task (SM-902);
 - não implementar graceful shutdown handling nesta task (SM-903);
-- não atualizar nenhuma documentação operacional nesta task (SM-904).
+- não atualizar nenhuma documentação operacional nesta task (SM-904);
+- não tentar distinguir, dentro de `UNRECOGNIZED_REVISION`, se a revision é futura/mais nova, estrangeira, ou danificada — nenhuma heurística de string, nenhuma comparação lexical/numérica (`"0018" > "0017"` e equivalentes são explicitamente proibidos).
 
 ## Gate SM-901
 
-A task só encerra quando:
+A task só encerra quando houver teste unitário dedicado provando cada um dos nove estados observáveis, especificamente:
 
-- cada uma das 9 linhas da tabela de classificação (Feature Contract §4) tem um teste unitário dedicado, cobrindo `auto` e `verify_only` onde a coluna difere;
-- pristine fresh schema e unversioned non-empty schema são comprovadamente tratados como estados distintos por teste (nunca o mesmo branch de código);
-- a detecção de ancestralidade é comprovada usando a API oficial do Alembic, nunca uma implementação paralela de parsing;
+```text
+alembic_version ausente + zero base tables       -> PRISTINE_FRESH_SCHEMA
+alembic_version ausente + >=1 base table          -> UNVERSIONED_NON_EMPTY_SCHEMA
+alembic_version presente + zero linhas de revision -> VERSION_TABLE_EMPTY
+alembic_version presente + >1 linha de revision    -> DATABASE_MULTIPLE_REVISIONS
+uma revision, ancestral conhecido do head          -> KNOWN_ANCESTOR
+uma revision, igual ao único head conhecido        -> EXACT_HEAD
+uma revision, resolvível mas não-ancestral do head -> KNOWN_NON_ANCESTOR
+uma revision, não resolvível pelo ScriptDirectory  -> UNRECOGNIZED_REVISION
+múltiplos heads no código da aplicação             -> CODE_MULTIPLE_HEADS
+```
+
+cobrindo `auto` e `verify_only` onde o comportamento difere; e além disso:
+
+- `PRISTINE_FRESH_SCHEMA` e `UNVERSIONED_NON_EMPTY_SCHEMA` são comprovadamente tratados como estados distintos por teste (nunca o mesmo branch de código);
+- `VERSION_TABLE_EMPTY` é comprovadamente distinto de `PRISTINE_FRESH_SCHEMA`/`UNVERSIONED_NON_EMPTY_SCHEMA` por teste — o snapshot de classificação nunca colapsa "tabela ausente" e "tabela presente com zero linhas" no mesmo valor;
+- um teste prova explicitamente que `UNRECOGNIZED_REVISION` **não** tenta inferir futuro/anterior/estrangeiro a partir da string da revision (nenhuma comparação lexical/numérica em nenhum ponto do código de classificação, comprovado por revisão do diff além do teste);
+- a detecção de ancestralidade (`KNOWN_ANCESTOR` vs. `KNOWN_NON_ANCESTOR`) é comprovada usando a API oficial do Alembic, nunca uma implementação paralela de parsing;
 - `database_migration_mode` está presente em `Settings` com o `Literal[...]`/alias/default congelados acima, comprovado por teste de config;
 - nenhum subprocess Alembic é invocado em nenhum teste desta task;
 - suite existente permanece verde.
@@ -157,11 +176,11 @@ A task só encerra quando:
 
 ---
 
-# SM-903 — Sticky failure + graceful shutdown critical section
+# SM-903 — Sticky failure + graceful shutdown critical section + hard-termination orphan safety
 
 ## Objetivo
 
-Provar formalmente as duas semânticas mais sensíveis do ADR-0015: sticky migration-execution-failure (nunca um retry loop de DDL a cada 5 segundos) e a migration critical section durante graceful shutdown (o advisory lock nunca é liberado com o child Alembic ainda vivo).
+Provar formalmente as três semânticas mais sensíveis do ADR-0015: sticky migration-execution-failure (nunca um retry loop de DDL a cada 5 segundos), a migration critical section durante graceful shutdown (o advisory lock nunca é liberado com o child Alembic ainda vivo), e o invariante de orphan-safety sob hard termination (Feature Contract §12, erratum) — uma migration Alembic nunca permanece capaz de mutar o banco depois que sua proteção de serialização foi liberada, mesmo quando o supervisor da aplicação morre sem aviso.
 
 ## Escopo
 
@@ -172,17 +191,26 @@ Provar formalmente as duas semânticas mais sensíveis do ADR-0015: sticky migra
 - prova de que, se o probe read-only subsequentemente observa exact head (operador corrigiu manualmente, out-of-band), o processo prossegue para `OPERATIONAL` **sem restart**;
 - prova de que um restart de processo re-classifica do zero e, se o banco ainda for um estado ancestral válido, um novo lifetime de processo pode fazer nova tentativa automática.
 
-### Graceful shutdown — migration critical section (Feature Contract §11–§12)
+### Graceful shutdown — migration critical section (Feature Contract §11)
 
 - implementação da migration critical section: uma vez spawned, o subprocess e a ownership do advisory lock formam uma unidade; shutdown/cancellation fica pendente, a supervisão continua, a conexão do lock permanece viva, a aplicação espera o child terminar naturalmente, o resultado é classificado normalmente, só então o lock é liberado e só então o shutdown completa;
-- prova de que uma segunda tentativa de bootstrap iniciando durante essa janela de espera não consegue começar uma nova migration (bloqueada no lock);
-- separação explícita de hard termination (SIGKILL/crash): nenhuma tentativa de dar semântica graceful a esse caso; prova de que PostgreSQL libera o advisory lock por conta própria e que o próximo processo re-classifica do zero.
+- prova de que uma segunda tentativa de bootstrap iniciando durante essa janela de espera não consegue começar uma nova migration (bloqueada no lock).
+
+### Hard termination — orphan-safety invariant (Feature Contract §12, erratum)
+
+Este subitem implementa o invariant normativo do erratum de hard-termination serialization: uma execução de migration Alembic nunca permanece capaz de mutar o banco depois que sua proteção de serialização foi liberada — o lifetime do child de migration nunca sobrevive à proteção que o serializa, sob graceful shutdown, crash do processo pai, `SIGKILL` do supervisor, ou qualquer outra terminação inesperada do supervisor.
+
+- escolher e implementar um mecanismo concreto que satisfaça pelo menos uma das duas propriedades equivalentes congeladas pelo erratum: (A) a árvore de processo/child de migration não pode sobreviver ao supervisor dono do lock; ou (B) se o child pode sobreviver ao supervisor, a ownership de serialização em si permanece viva e mantida até o child terminar. Esta task escolhe o mecanismo (ex.: process-group supervision, parent-death signalling, container/process-tree lifecycle enforcement, guardian dedicado, ou outro equivalente) avaliando runtime Docker de release, execução local/source, comportamento de subprocess do `asyncio`, fronteira de suporte cross-platform e testabilidade — o Feature Contract não escolhe por ela;
+- separação explícita de hard termination (SIGKILL/crash) do caminho graceful: nenhuma tentativa de dar semântica graceful a esse caso;
+- prova de que PostgreSQL libera o advisory lock por conta própria quando sua sessão dona termina, mas que essa liberação de lock, isoladamente, **não** é tratada como prova de que o child de migration também terminou;
+- prova de que, quando o processo seguinte adquire legitimamente o advisory lock (porque o lock foi liberado e a migration anterior está de fato terminada ou permanece protegida), ele sempre re-lê o estado autoritativo do PostgreSQL do zero, nunca assumindo completion do attempt anterior.
 
 ## Não fazer
 
 - não introduzir tabela/coluna `migration_failure` durável;
 - não introduzir timeout genérico de graceful shutdown;
-- não alterar a classificação do SM-901 nem o fluxo de acquisition do SM-902 além do necessário para observar/reagir ao resultado do child.
+- não alterar a classificação do SM-901 nem o fluxo de acquisition do SM-902 além do necessário para observar/reagir ao resultado do child;
+- não escolher previamente entre as propriedades A/B do orphan-safety invariant fora desta task — essa escolha é desta task, não de uma decisão anterior do backlog.
 
 ## Gate SM-903
 
@@ -192,7 +220,9 @@ A task só encerra quando:
 - a recuperação sem restart via probe read-only após fix manual out-of-band é comprovada por teste real;
 - graceful shutdown requisitado enquanto o subprocess Alembic está rodando é comprovado a: manter o advisory lock até o child terminar, classificar o resultado do child normalmente, e só então liberar o lock e completar shutdown — por teste real PostgreSQL;
 - uma segunda tentativa de bootstrap durante essa janela de shutdown-pendente-com-migration-em-voo é comprovada incapaz de iniciar uma nova migration;
-- hard termination (kill do processo) é comprovada a não deixar o advisory lock vazado (o próximo processo consegue adquiri-lo) e o próximo processo é comprovado a re-classificar do zero, nunca assumindo completion do attempt anterior;
+- **em nenhum ponto, sob terminação do supervisor (graceful ou hard), duas execuções automáticas de migration são permitidas se sobrepor** por causa do desaparecimento do primeiro supervisor — comprovado por teste que simula a perda do supervisor com o child Alembic ainda ativo e tenta iniciar um segundo bootstrap concorrente;
+- o mecanismo escolhido para satisfazer o orphan-safety invariant (propriedade A ou B) é comprovado por teste real: ou (A) o child não sobrevive ao supervisor dono do lock, ou (B) a ownership de serialização permanece viva até o child terminar mesmo com o supervisor original ausente;
+- hard termination (kill do processo) é comprovada a não deixar o advisory lock vazado (o próximo processo consegue adquiri-lo) e o próximo processo é comprovado a re-classificar do zero somente depois de ter adquirido legitimamente a proteção de serialização, nunca assumindo completion do attempt anterior;
 - suite existente permanece verde.
 
 ---
@@ -256,7 +286,7 @@ O invariante estático que substitui `tests/unit/test_deployment_compose.py::tes
 
 ### Real PostgreSQL (Integration)
 
-- matriz completa combinando os 9 estados de classificação (SM-901) com os dois modos (`auto`/`verify_only`), contra banco real, incluindo os casos ainda não isoladamente cobertos por SM-902/SM-903: múltiplos heads no código, múltiplos revisions no banco, revision desconhecido, revision divergente, revision mais novo que o head (rollback scenario) — todos fail-closed em ambos os modos, comprovado por teste real;
+- matriz completa combinando os 9 estados observáveis de classificação (SM-901: `PRISTINE_FRESH_SCHEMA`, `UNVERSIONED_NON_EMPTY_SCHEMA`, `EXACT_HEAD`, `KNOWN_ANCESTOR`, `CODE_MULTIPLE_HEADS`, `VERSION_TABLE_EMPTY`, `DATABASE_MULTIPLE_REVISIONS`, `KNOWN_NON_ANCESTOR`, `UNRECOGNIZED_REVISION`) com os dois modos (`auto`/`verify_only`), contra banco real, incluindo os casos ainda não isoladamente cobertos por SM-902/SM-903 — todos fail-closed em ambos os modos onde a tabela do Feature Contract §4 exige, comprovado por teste real; inclui um caso real de `UNRECOGNIZED_REVISION` simulando um rollback genuíno de imagem (revision de uma versão de aplicação futura hipotética, ausente do `ScriptDirectory` corrente), provando fail-closed sem tentar distinguir "futura" de "estrangeira";
 - prova explícita de que Neo4j bootstrap e `worker.start()` **nunca** iniciam enquanto o bootstrap de migration está em progresso ou fail-closed — nem durante uma migration em execução, nem durante o estado sticky-failed, nem durante lock-wait;
 - prova de que storage convergence (`STORAGE_BACKEND=s3`, ADR-0011) permanece igualmente gated até `OPERATIONAL`.
 
@@ -265,11 +295,20 @@ O invariante estático que substitui `tests/unit/test_deployment_compose.py::tes
 - smoke de imagem de release cobrindo um banco fresco (pristine) e um banco previamente lançado (ancestral real de uma release anterior), cada um migrando automaticamente até ficar ready sem nenhum passo manual de Alembic;
 - confirmação de que a imagem de release não regride o D33 liveness guarantee durante o smoke (`/health/live` responde durante o bootstrap).
 
+### Supervisor-loss / orphan-child serialization scenario (Feature Contract §12, erratum)
+
+Execução, no ambiente de integração suportado, do mecanismo escolhido por SM-903 para satisfazer o orphan-safety invariant, sob perda real do supervisor:
+
+- supervisor desaparece (kill/crash) enquanto o child de migration está ativo → nenhuma migration órfã pode continuar mutando o banco desprotegida;
+- um segundo bootstrap, iniciado depois do desaparecimento do supervisor, não consegue começar uma migration concorrente enquanto a migration anterior ainda está ativa ou protegida (propriedade A ou B do erratum, conforme o mecanismo escolhido em SM-903);
+- o bootstrap seguinte, uma vez de posse legítima da proteção de serialização, re-lê o estado autoritativo do PostgreSQL do zero — esta task **não exige** que a migration anterior tenha completado, apenas que nenhuma DDL automática concorrente/não-serializada tenha ocorrido.
+
 ## Não fazer
 
 - não redesenhar classificação, lock, ou critical section — esta task prova, não redesenha;
 - não introduzir nenhum endpoint novo;
-- não bump de versão.
+- não bump de versão;
+- não exigir completion da migration interrompida pela perda do supervisor — a única garantia exigida após hard termination é ausência de DDL automática concorrente/não-serializada.
 
 ## Gate SM-905
 
@@ -279,6 +318,7 @@ A task só encerra quando:
 - a matriz completa dos 9 estados × 2 modos está coberta contra PostgreSQL real, sem gaps relativos à tabela do Feature Contract §4;
 - Neo4j/worker never-start-early está comprovado por teste real, não apenas por ausência de código de acionamento;
 - o smoke de release image (fresh + previously-released) passa, com D33 preservado durante o bootstrap;
+- o cenário de supervisor-loss/orphan-child é comprovado no ambiente de integração suportado: supervisor desaparece com o child ativo → nenhuma migration órfã continua desprotegida → um segundo bootstrap não consegue iniciar migration concorrente → o próximo bootstrap legítimo re-lê o estado autoritativo do zero, sem exigir completion do attempt anterior;
 - suite completa (unit/integration/contract/security) permanece verde.
 
 ---
@@ -327,6 +367,7 @@ O release somente pode ser marcado como concluído quando:
 - o teste de deployment substituído (SM-904, executado como parte da suite completa em SM-905) estiver em vigor, comprovado pelo teste de contrato/estrutural atualizado;
 - a matriz de classificação completa (9 estados × 2 modos) estiver comprovada por teste real PostgreSQL;
 - a sticky failure semantics e a migration critical section de graceful shutdown estiverem comprovadas por teste real;
+- o invariante de orphan-safety de hard termination (Feature Contract §12, erratum) estiver comprovado por teste real de supervisor-loss (SM-903/SM-905) — nenhuma migration desprotegida pode continuar mutando o banco concorrentemente com um novo bootstrap que adquiriu serialização legitimamente;
 - Neo4j/worker never-start-early estiver comprovado;
 - nenhum endpoint HTTP novo, nenhuma tabela nova para este feature, e nenhuma mudança em Neo4j/`graph_outbox` existirem;
 - suite completa estiver verde;

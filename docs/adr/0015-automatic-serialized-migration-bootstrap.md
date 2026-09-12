@@ -125,18 +125,48 @@ only then may graceful shutdown complete
 
 This ADR does not freeze which specific Python primitive implements this (cancellation shielding, a supervising task awaited outside the cancelled scope, or an equivalent mechanism) — that is an implementation choice, made deliberately, not left ambiguous by omission. It does **not** introduce a generic migration timeout to bound how long graceful shutdown may wait: killing DDL merely because shutdown began would violate the same "never interrupt DDL mid-execution" reasoning the previous subsection already froze for the non-shutdown case, and would defeat the entire purpose of this critical-section rule.
 
-**Hard termination is explicitly a different case, not a shutdown-path bug.** `SIGKILL`, a container hard kill, or a process crash are **not** graceful shutdown, and this ADR makes no attempt to give them graceful semantics:
+### Hard termination: no completion guarantee, but the serialization invariant MUST still hold
+
+**Hard termination is explicitly a different case, not a shutdown-path bug.** `SIGKILL`, a container hard kill, or a process crash are **not** graceful shutdown, and this ADR makes no attempt to give them graceful semantics.
+
+**Amendment (hard-termination serialization, added while preparing SM-903; narrows an unsafe assumption, does not reopen the decision):** a prior version of this subsection stated that hard termination causes "process/connections terminate immediately, including the child and the advisory-lock connection" — implying the Alembic child necessarily dies together with its parent/supervisor. That implication is not something POSIX process semantics actually guarantee: killing (or crashing) a parent process does not, by itself, kill an already-spawned child process — a child whose parent disappears is orphaned and re-parented, not reaped, and may keep running and keep mutating the database. The rollback policy and every other decision in this ADR remain unchanged; only this specific, overly strong assumption is corrected.
+
+This ADR therefore freezes a normative invariant, independent of whichever concrete mechanism a future implementation chooses to satisfy it:
 
 ```text
-process/connections terminate immediately, including the child and the
-  advisory-lock connection
-PostgreSQL eventually releases the session-level advisory lock on its own
-  (the lock's own crash-safety property, already frozen above)
-the next application process attempt re-classifies authoritative database
-  state from scratch, exactly as every other restart already does
+An Alembic migration execution MUST NEVER remain capable of mutating the
+database after the serialization protection for that execution has been
+released.
 ```
 
-No completion guarantee is made or implied for a migration interrupted by hard termination — only that the lock does not leak, and that the next attempt starts from a fresh, authoritative read of the database, never from an assumption about what the killed attempt might have finished.
+Equivalently: migration child lifetime MUST NOT outlive the protection that serializes that migration against future automatic bootstrap migrations. This invariant applies uniformly to graceful shutdown, a parent-process crash, `SIGKILL` of the application supervisor, and any other unexpected supervisor termination.
+
+A correct implementation MUST guarantee at least one of the following two equivalent properties. This ADR deliberately does **not** choose between them — that choice belongs to the implementation, made with awareness of the release Docker runtime, local/source execution, `asyncio` subprocess behavior, the project's cross-platform support boundary, and testability:
+
+```text
+A. the migration child/process tree cannot outlive the lock-owning
+   supervisor; or
+
+B. if the migration child can outlive the application supervisor,
+   serialization ownership itself must remain alive and held until that
+   migration process has terminated.
+```
+
+What hard termination continues to guarantee, unchanged from before this amendment:
+
+```text
+PostgreSQL eventually releases the session-level advisory lock on its own
+  when its owning database session ends (the lock's own crash-safety
+  property, already frozen above)
+the next application process attempt re-classifies authoritative database
+  state from scratch, exactly as every other restart already does -- and
+  only once it has legitimately acquired serialization protection, never
+  before or as a substitute for it
+```
+
+Automatic lock release prevents a leaked/stale lock; by itself it does **not** prove that an independently-running Alembic child has also terminated. "The lock does not leak" and "a migration execution cannot outlive the lock owner" are two distinct properties, and this ADR requires both.
+
+No completion guarantee is made or implied for a migration interrupted by hard termination — the implementation instead guarantees the orphan-safety invariant above, so that at no point can an old, unprotected migration continue mutating the database concurrently with a new automatic bootstrap that has itself legitimately acquired serialization protection and started a second migration.
 
 ### Schema classification (Alembic's own DAG is the authority)
 
@@ -150,13 +180,21 @@ No completion guarantee is made or implied for a migration interrupted by hard t
 | Multiple revisions recorded in the database | fail closed (both modes) |
 | Unknown/unrecognized revision | fail closed (both modes) |
 | Divergent revision (not an ancestor of head) | fail closed (both modes) |
-| Database revision newer than this application's head | fail closed (both modes) — this is exactly the application-rollback scenario: an operator starting an older image against an already-migrated-forward database must never attempt `alembic downgrade`, `stamp`, or any other automatic "repair." Application rollback and schema rollback remain two different operations; only the former is ever implied by starting an older image. |
+| Database revision newer than this application's head *(policy scenario — observed at runtime as Unrecognized/unrecognized revision; see Clarification below)* | fail closed (both modes) — this is exactly the application-rollback scenario: an operator starting an older image against an already-migrated-forward database must never attempt `alembic downgrade`, `stamp`, or any other automatic "repair." Application rollback and schema rollback remain two different operations; only the former is ever implied by starting an older image. |
 
 **Pristine fresh schema is a distinct, narrower state than "empty/unversioned," and the two must never be collapsed into one auto-migrable category.** Extensions, types, functions, or other objects that exist outside the application schema do not by themselves make a database non-pristine — only application base tables count. The absence of `alembic_version` alone does **not** prove a database is a genuine fresh install: it can equally mean damaged migration metadata, a partial/legacy/manually-created schema, an incomplete restore, or a foreign/unmanaged schema state that merely happens to lack this one bookkeeping table. Only when `alembic_version` is absent **and** the application schema itself is genuinely empty is auto-migration safe. An unversioned schema that already contains application tables is always **fail closed**, in both `auto` and `verify_only` — the bootstrap never runs `alembic stamp`, never infers a revision from which tables happen to exist, and never attempts any other automatic "repair" of that state. An operator facing this state must resolve it manually (inspect the schema, `stamp` deliberately if that is genuinely correct, or restore from a known-good backup) exactly as they would today.
 
 Ancestry (whether the database's current revision is a genuine ancestor of the code's head, as opposed to diverged/unrelated/newer) is determined using Alembic's **own official revision-graph API** — `alembic.script.ScriptDirectory`'s `get_heads()`, `get_revision()`/`get_revisions()`, and `iterate_revisions()` (or the equivalent current API for the installed Alembic version) — never by manually parsing revision filenames or `down_revision` strings. This is the same graph-walking mechanism `alembic upgrade head` itself already relies on internally; reusing it directly is both more robust and less code than reimplementing DAG ancestry.
 
 Migration never executes before classification completes.
+
+### Clarification (implementation-feasibility note, added while preparing SM-901; does not reopen the decision)
+
+While preparing SM-901 — before any implementation code exists — a read-only investigation of the installed Alembic version's `ScriptDirectory` API confirmed a limit this ADR's classification table did not previously spell out. This is a **narrow clarification of observability**, not a change of decision: the rollback policy above — a database produced by a newer application image must always fail closed, never `downgrade`/`stamp`/repair automatically — remains exactly as decided, unchanged, still `accepted`.
+
+What is clarified: "database revision newer than this application's head" is a **policy scenario**, not something the running image's own `ScriptDirectory` can positively prove at runtime. `get_revision()`, `get_revisions()`, `iterate_revisions()`, and `get_heads()` can only resolve revisions present in the migration graph packaged inside the running image; a revision produced by a genuinely newer image (e.g. a future `0018` when the running image's own graph ends at `0017`) raises `CommandError`/`ResolutionError` from every one of those calls, identically to how a foreign, unrelated, or damaged/manually-typed revision identifier would. The running image has no way to distinguish "this is a genuine future descendant of my own head" from "this is an unrelated identifier my graph has never heard of" without either comparing revision-ID strings lexically/numerically (already explicitly forbidden by this ADR's own ancestry rule, above) or introducing a new external source of lineage metadata (explicitly out of scope for this ADR and for v0.6.0).
+
+Both possible realities behind an unresolvable revision identifier — genuine future descendant, or unrelated/foreign/damaged identifier — resolve to the **same runtime-observable classifier state**, and both **fail closed identically**. The externally observable behavior this ADR already froze does not change: fail closed, in both modes, no automatic repair, in every case. Only the internal justification changes, from "the classifier proves this database is ahead" to "the classifier cannot resolve this revision at all, and every unresolvable revision fails closed" — which correctly and conservatively subsumes the newer-than-head case without needing to prove it specifically. `docs/product/Sofias_Memory_Feature_Contract_v0.6.0_Automatic_Migration_Bootstrap.md` §4 names this runtime-observable state explicitly (`UNRECOGNIZED_REVISION`) as part of formalizing this ADR into an implementation-facing contract.
 
 ### Ordering (unchanged surrounding sequence)
 
@@ -293,7 +331,7 @@ new public HTTP endpoint = 0     (no POST /migrate, no migration admin API)
 This ADR does not implement tests, but freezes the minimum gates a future implementation must satisfy:
 
 - **Unit:** schema classification for every state in the table above, under both `auto` and `verify_only`, **including pristine-fresh vs. unversioned-non-empty as two distinct states, never collapsed into one**; code-side multi-head detection; database-side multi-revision detection; the sticky migration-execution-failure rule (a failed attempt is not retried within the same process).
-- **Real PostgreSQL (Integration):** a fresh, genuinely pristine database → automatically migrates to head; an unversioned database that already contains application tables → fails closed with **zero** Alembic invocation (proven directly, not merely inferred from the end state); known ancestor → head; exact head → no-op; two concurrent bootstraps against the same database → exactly one migration execution, the other observes the already-migrated result after re-reading state; lock-wait timeout and its non-fatal retry; successful unlock; lock release on connection loss/crash; a genuine migration failure, followed by proof that it is not automatically retried on the existing 5-second interval; a subsequent manual operator fix, followed by proof that the existing read-only probe alone (no restart) carries the process to `OPERATIONAL`; **graceful shutdown requested while the Alembic subprocess is running → the advisory lock remains held until the child exits, a second bootstrap attempting to start during that window cannot begin a migration, and only after the child terminates is the lock released and shutdown allowed to complete.**
+- **Real PostgreSQL (Integration):** a fresh, genuinely pristine database → automatically migrates to head; an unversioned database that already contains application tables → fails closed with **zero** Alembic invocation (proven directly, not merely inferred from the end state); known ancestor → head; exact head → no-op; two concurrent bootstraps against the same database → exactly one migration execution, the other observes the already-migrated result after re-reading state; lock-wait timeout and its non-fatal retry; successful unlock; lock release on connection loss/crash; a genuine migration failure, followed by proof that it is not automatically retried on the existing 5-second interval; a subsequent manual operator fix, followed by proof that the existing read-only probe alone (no restart) carries the process to `OPERATIONAL`; **graceful shutdown requested while the Alembic subprocess is running → the advisory lock remains held until the child exits, a second bootstrap attempting to start during that window cannot begin a migration, and only after the child terminates is the lock released and shutdown allowed to complete;** **supervisor loss while the Alembic subprocess is running (hard termination) → the orphan-safety invariant holds: no orphaned migration execution continues mutating the database after its serialization protection has disappeared, no second bootstrap is able to begin a concurrent migration during that window, and the next legitimate bootstrap re-reads authoritative state from scratch without assuming completion of the interrupted attempt.**
 - **Deployment/static:** `tests/unit/test_deployment_compose.py::test_compose_files_never_auto_run_alembic` must be **replaced**, not deleted, by an invariant with equivalent intent: Compose must never invoke raw/unserialized Alembic migration directly as a `command:`/`entrypoint:`; automatic migration is permitted only through this ADR's sanctioned, locked, verified bootstrap path.
 - **CI placement:** unit/static checks run in the normal CI workflow; real-PostgreSQL concurrency/failure scenarios run in the Integration workflow, following this project's existing dedicated-disposable-database discipline; a release-image migration smoke (fresh database and a previously-released database, each migrating automatically to become ready with no manual Alembic step) runs as part of the Integration and/or Release gate, mirroring how this project already validates release images today.
 

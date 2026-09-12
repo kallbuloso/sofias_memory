@@ -12,10 +12,6 @@ from uuid import uuid4
 import pytest
 
 from sofias_memory.config import Settings
-from sofias_memory.infrastructure.postgres.readiness import (
-    PostgresReadinessChecker,
-    PostgresReadinessResult,
-)
 from sofias_memory.infrastructure.storage import SourceStorageRouter
 from sofias_memory.lifespan import (
     BOOTSTRAP_RETRY_INTERVAL_SECONDS,
@@ -25,6 +21,12 @@ from sofias_memory.lifespan import (
     _run_convergence_to_fixed_point,
 )
 from sofias_memory.observability.logging import get_logger
+from sofias_memory.services.migration_bootstrap import (
+    MigrationBootstrap,
+    MigrationClassificationFailedError,
+    MigrationExecutionFailedError,
+    MigrationPostVerificationFailedError,
+)
 from sofias_memory.services.process_state import ProcessState, ProcessStateHolder
 from sofias_memory.services.storage_convergence import (
     CaseBLineage,
@@ -53,14 +55,20 @@ def make_settings(**overrides: object) -> Settings:
     return Settings(**values)  # type: ignore[call-arg, arg-type]
 
 
-class _FakeReadinessChecker:
+class _FakeMigrationBootstrap:
+    """Test double for the D32 gate itself -- SM-902 replaced the direct
+    ``postgres_readiness_checker.check()`` call this file used to exercise
+    with ``migration_bootstrap.ensure_schema_current()``; this fake plays
+    the same "is the schema current" role at that call boundary."""
+
     def __init__(self, *, ready: bool) -> None:
         self._ready = ready
-        self.check_calls = 0
+        self.ensure_calls = 0
 
-    async def check(self) -> PostgresReadinessResult:
-        self.check_calls += 1
-        return PostgresReadinessResult(ready=self._ready, failures=() if self._ready else ("x",))
+    async def ensure_schema_current(self) -> None:
+        self.ensure_calls += 1
+        if not self._ready:
+            raise MigrationClassificationFailedError("schema not current")
 
 
 class _FakeNeo4jResource:
@@ -103,14 +111,14 @@ async def test_schema_not_ready_blocks_bootstrap(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr("sofias_memory.lifespan._probe_postgres", _noop_probe_postgres)
 
     holder = ProcessStateHolder()
-    checker = _FakeReadinessChecker(ready=False)
+    checker = _FakeMigrationBootstrap(ready=False)
 
     with pytest.raises(RuntimeError, match="schema not current"):
         await _attempt_bootstrap(
             settings=make_settings(),
             holder=holder,
             session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-            postgres_readiness_checker=cast(PostgresReadinessChecker, checker),
+            migration_bootstrap=cast(MigrationBootstrap, checker),
             neo4j_resource=None,
             recovery=None,
             worker=None,
@@ -130,13 +138,13 @@ async def test_filesystem_backend_reaches_operational_directly(
     monkeypatch.setattr("sofias_memory.lifespan._probe_postgres", _noop_probe_postgres)
 
     holder = ProcessStateHolder()
-    checker = _FakeReadinessChecker(ready=True)
+    checker = _FakeMigrationBootstrap(ready=True)
 
     await _attempt_bootstrap(
         settings=make_settings(storage_backend="filesystem"),
         holder=holder,
         session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-        postgres_readiness_checker=cast(PostgresReadinessChecker, checker),
+        migration_bootstrap=cast(MigrationBootstrap, checker),
         neo4j_resource=None,
         recovery=None,
         worker=None,
@@ -156,7 +164,7 @@ async def test_s3_backend_enters_storage_converging_before_operational(
     monkeypatch.setattr("sofias_memory.lifespan._probe_postgres", _noop_probe_postgres)
 
     holder = ProcessStateHolder()
-    checker = _FakeReadinessChecker(ready=True)
+    checker = _FakeMigrationBootstrap(ready=True)
     observed_states: list[ProcessState] = []
 
     class _ObservingConvergence:
@@ -170,7 +178,7 @@ async def test_s3_backend_enters_storage_converging_before_operational(
         ),
         holder=holder,
         session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-        postgres_readiness_checker=cast(PostgresReadinessChecker, checker),
+        migration_bootstrap=cast(MigrationBootstrap, checker),
         neo4j_resource=None,
         recovery=None,
         worker=None,
@@ -196,7 +204,7 @@ async def test_entering_storage_converging_starts_recovery_owned_set_empty(
 
     holder = ProcessStateHolder()
     holder.set_recovery_owned_run_ids([uuid4()])  # stale, from a prior attempt
-    checker = _FakeReadinessChecker(ready=True)
+    checker = _FakeMigrationBootstrap(ready=True)
     observed_at_first_converge: frozenset[object] | None = None
 
     class _ObservingConvergence:
@@ -212,7 +220,7 @@ async def test_entering_storage_converging_starts_recovery_owned_set_empty(
         ),
         holder=holder,
         session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-        postgres_readiness_checker=cast(PostgresReadinessChecker, checker),
+        migration_bootstrap=cast(MigrationBootstrap, checker),
         neo4j_resource=None,
         recovery=None,
         worker=None,
@@ -230,7 +238,7 @@ async def test_s3_probe_failure_keeps_storage_converging(monkeypatch: pytest.Mon
     monkeypatch.setattr("sofias_memory.lifespan._probe_postgres", _noop_probe_postgres)
 
     holder = ProcessStateHolder()
-    checker = _FakeReadinessChecker(ready=True)
+    checker = _FakeMigrationBootstrap(ready=True)
 
     class _FailingProbeRouter:
         async def probe(self) -> None:
@@ -243,7 +251,7 @@ async def test_s3_probe_failure_keeps_storage_converging(monkeypatch: pytest.Mon
             ),
             holder=holder,
             session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-            postgres_readiness_checker=cast(PostgresReadinessChecker, checker),
+            migration_bootstrap=cast(MigrationBootstrap, checker),
             neo4j_resource=None,
             recovery=None,
             worker=None,
@@ -397,7 +405,7 @@ async def test_bootstrap_retries_on_unexpected_exception_never_raises(
             settings=make_settings(),
             holder=holder,
             session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-            postgres_readiness_checker=None,
+            migration_bootstrap=None,
             neo4j_resource=None,
             recovery=None,
             worker=None,
@@ -428,7 +436,7 @@ async def test_bootstrap_cancellation_propagates_immediately(
             settings=make_settings(),
             holder=holder,
             session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-            postgres_readiness_checker=None,
+            migration_bootstrap=None,
             neo4j_resource=None,
             recovery=None,
             worker=None,
@@ -446,6 +454,57 @@ async def test_bootstrap_cancellation_propagates_immediately(
 
 def test_bootstrap_retry_interval_is_bounded() -> None:
     assert 0 < BOOTSTRAP_RETRY_INTERVAL_SECONDS <= 60
+
+
+@pytest.mark.parametrize(
+    "sticky_error",
+    [
+        MigrationExecutionFailedError("alembic upgrade head exited with code 1"),
+        MigrationPostVerificationFailedError("post-migration verification failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sticky_migration_failure_stops_the_bootstrap_task_without_retry(
+    monkeypatch: pytest.MonkeyPatch, sticky_error: Exception
+) -> None:
+    """ADR-0015 SM-902: a sticky migration-execution/post-verification
+    failure must never be retried on the ordinary
+    ``BOOTSTRAP_RETRY_INTERVAL_SECONDS`` interval -- ``_run_bootstrap`` must
+    call ``_attempt_bootstrap`` (and therefore
+    ``MigrationBootstrap.ensure_schema_current()``) at most once and then
+    simply stop, leaving the holder in ``BOOTSTRAP_MAINTENANCE`` forever for
+    this process lifetime."""
+
+    monkeypatch.setattr("sofias_memory.lifespan.BOOTSTRAP_RETRY_INTERVAL_SECONDS", 0.01)
+    holder = ProcessStateHolder()
+    attempts = 0
+
+    async def sticky_attempt(**kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise sticky_error
+
+    monkeypatch.setattr("sofias_memory.lifespan._attempt_bootstrap", sticky_attempt)
+
+    await asyncio.wait_for(
+        _run_bootstrap(
+            settings=make_settings(),
+            holder=holder,
+            session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
+            migration_bootstrap=None,
+            neo4j_resource=None,
+            recovery=None,
+            worker=None,
+            source_storage_router=None,
+            convergence_service=None,
+        ),
+        timeout=5.0,
+    )
+
+    # Never retried, even though BOOTSTRAP_RETRY_INTERVAL_SECONDS was
+    # shortened to make a would-be retry observable well within the timeout.
+    assert attempts == 1
+    assert holder.state is ProcessState.BOOTSTRAP_MAINTENANCE
 
 
 @pytest.mark.asyncio
@@ -482,7 +541,7 @@ async def test_unexpected_bootstrap_defect_is_logged_distinctly_and_never_become
             settings=make_settings(),
             holder=holder,
             session_factory=cast(object, _fake_session_factory()),  # type: ignore[arg-type]
-            postgres_readiness_checker=None,
+            migration_bootstrap=None,
             neo4j_resource=None,
             recovery=None,
             worker=None,

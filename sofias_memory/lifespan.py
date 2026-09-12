@@ -13,10 +13,14 @@ from structlog.stdlib import BoundLogger
 from sofias_memory.config import Settings
 from sofias_memory.infrastructure.neo4j import Neo4jResource, ensure_neo4j_schema
 from sofias_memory.infrastructure.postgres import AsyncSessionFactory, dispose_async_engine
-from sofias_memory.infrastructure.postgres.readiness import PostgresReadinessChecker
 from sofias_memory.infrastructure.storage import SourceStorageRouter
 from sofias_memory.observability.logging import configure_logging, get_logger
 from sofias_memory.pipelines.registry import PipelineRegistry
+from sofias_memory.services.migration_bootstrap import (
+    MigrationBootstrap,
+    MigrationExecutionFailedError,
+    MigrationPostVerificationFailedError,
+)
 from sofias_memory.services.operational_metrics import OperationalMetricsReporter
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
@@ -133,9 +137,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings=settings,
             holder=holder,
             session_factory=app_postgres_session_factory(app),
-            postgres_readiness_checker=cast(
-                PostgresReadinessChecker | None,
-                getattr(app.state, "postgres_readiness_checker", None),
+            migration_bootstrap=cast(
+                MigrationBootstrap | None,
+                getattr(app.state, "migration_bootstrap", None),
             ),
             neo4j_resource=cast(Neo4jResource | None, getattr(app.state, "neo4j_resource", None)),
             recovery=cast(
@@ -205,7 +209,7 @@ async def _run_bootstrap(
     settings: Settings,
     holder: ProcessStateHolder,
     session_factory: AsyncSessionFactory,
-    postgres_readiness_checker: PostgresReadinessChecker | None,
+    migration_bootstrap: MigrationBootstrap | None,
     neo4j_resource: Neo4jResource | None,
     recovery: PipelineRecoveryService | None,
     worker: PipelineWorkerCoordinator | None,
@@ -216,10 +220,17 @@ async def _run_bootstrap(
     STORAGE-007) -- not a generic background-job system, this is a single,
     named coroutine driving one process's own boot sequence to
     ``OPERATIONAL``. Retries the whole attempt, with a fixed delay, on any
-    failure (never crash-loops the process, D33) -- an unexpected software
-    defect is logged and retried exactly like an ordinary transient
+    ordinary failure (never crash-loops the process, D33) -- an unexpected
+    software defect is logged and retried exactly like an ordinary transient
     dependency failure; it never silently reports ``OPERATIONAL``, since
     that line is only ever reached after every gate above it succeeded.
+
+    One deliberate exception to "always retry" (ADR-0015 SM-902): a sticky
+    migration-execution or post-verification failure must never be retried
+    on this ordinary interval -- doing so would re-run DDL against a
+    database state a human has not yet examined. See the dedicated
+    ``except`` clause below; SM-903 replaces this minimal stop-here behavior
+    with a continued read-only recovery probe.
     """
 
     logger = get_logger(__name__)
@@ -229,7 +240,7 @@ async def _run_bootstrap(
                 settings=settings,
                 holder=holder,
                 session_factory=session_factory,
-                postgres_readiness_checker=postgres_readiness_checker,
+                migration_bootstrap=migration_bootstrap,
                 neo4j_resource=neo4j_resource,
                 recovery=recovery,
                 worker=worker,
@@ -240,6 +251,21 @@ async def _run_bootstrap(
             return
         except asyncio.CancelledError:
             raise
+        except (MigrationExecutionFailedError, MigrationPostVerificationFailedError) as exc:
+            # ADR-0015 sticky migration-execution-failure (SM-902's minimal
+            # distinction; SM-903 replaces this with a continued read-only
+            # probe): unlike every other bootstrap failure, this one is
+            # never retried on BOOTSTRAP_RETRY_INTERVAL_SECONDS. The
+            # bootstrap task simply stops here, remaining
+            # BOOTSTRAP_MAINTENANCE for the rest of this process's
+            # lifetime -- only a full process restart permits a fresh
+            # automatic migration attempt.
+            logger.error(
+                "migration_bootstrap_sticky_failure",
+                process_state=holder.state.value,
+                exception_type=type(exc).__name__,
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - D33: never crash-loop, always retry
             logger.error(
                 "bootstrap_attempt_failed",
@@ -254,7 +280,7 @@ async def _attempt_bootstrap(
     settings: Settings,
     holder: ProcessStateHolder,
     session_factory: AsyncSessionFactory,
-    postgres_readiness_checker: PostgresReadinessChecker | None,
+    migration_bootstrap: MigrationBootstrap | None,
     neo4j_resource: Neo4jResource | None,
     recovery: PipelineRecoveryService | None,
     worker: PipelineWorkerCoordinator | None,
@@ -265,13 +291,16 @@ async def _attempt_bootstrap(
     log = logger
 
     # D32: schema must be confirmed current before ANY Source inspection,
-    # storage convergence, or normal worker/business processing -- Alembic
-    # is never invoked automatically; an operator runs it explicitly.
-    if postgres_readiness_checker is not None:
-        result = await postgres_readiness_checker.check()
-        if not result.ready:
-            log.warning("bootstrap_schema_not_ready", failures=result.failures)
-            raise RuntimeError("schema not current")
+    # storage convergence, or normal worker/business processing. ADR-0015
+    # (SM-902): "confirmed current" may now be reached automatically, via a
+    # session-level advisory lock + a real Alembic subprocess, in
+    # DATABASE_MIGRATION_MODE=auto -- or by the unchanged pre-ADR-0015
+    # read-only check alone in verify_only mode. Either way this gate
+    # occupies the exact same position in the sequence it always has:
+    # strictly before Neo4j bootstrap, the PostgreSQL worker probe,
+    # pipeline recovery, worker start, and storage convergence.
+    if migration_bootstrap is not None:
+        await migration_bootstrap.ensure_schema_current()
 
     if neo4j_resource is not None:
         await _bootstrap_neo4j(neo4j_resource)

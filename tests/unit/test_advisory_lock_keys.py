@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from sofias_memory.infrastructure.postgres.advisory_lock_keys import (
     GLOBAL_BARRIER_KEY,
+    MIGRATION_BOOTSTRAP_KEY,
     dataset_lock_key,
 )
 
@@ -91,3 +92,39 @@ def test_global_and_dataset_keys_are_disjoint_by_construction() -> None:
     sample = {dataset_lock_key(uuid4()) for _ in range(50)}
     assert all(key >= 0 for key in sample)
     assert GLOBAL_BARRIER_KEY not in sample
+
+
+# --- MIGRATION_BOOTSTRAP_KEY (ADR-0015/SM-902) -------------------------------
+
+
+def test_migration_bootstrap_key_is_a_stable_constant() -> None:
+    from sofias_memory.infrastructure.postgres.advisory_lock_keys import (
+        MIGRATION_BOOTSTRAP_KEY as reimported_key,
+    )
+
+    assert reimported_key == MIGRATION_BOOTSTRAP_KEY
+
+
+def test_migration_bootstrap_key_within_postgresql_signed_bigint_range() -> None:
+    assert _SIGNED_BIGINT_MIN <= MIGRATION_BOOTSTRAP_KEY <= _SIGNED_BIGINT_MAX
+
+
+def test_migration_bootstrap_key_is_negative() -> None:
+    assert MIGRATION_BOOTSTRAP_KEY < 0
+
+
+def test_migration_bootstrap_key_differs_from_global_barrier_key() -> None:
+    assert MIGRATION_BOOTSTRAP_KEY != GLOBAL_BARRIER_KEY
+
+
+def test_migration_bootstrap_key_never_equals_a_dataset_lock_key() -> None:
+    """Not a sampled "no collision found" check: MIGRATION_BOOTSTRAP_KEY is
+    negative and dataset_lock_key() is always non-negative, so no dataset_id
+    -- sampled or not -- could ever produce a key equal to it. The two
+    ranges themselves cannot intersect, the same disjunction-by-construction
+    argument already used for GLOBAL_BARRIER_KEY."""
+
+    assert MIGRATION_BOOTSTRAP_KEY < 0 <= _DATASET_KEY_MAX
+    sample = {dataset_lock_key(uuid4()) for _ in range(50)}
+    assert all(key >= 0 for key in sample)
+    assert MIGRATION_BOOTSTRAP_KEY not in sample

@@ -200,7 +200,13 @@ async def test_real_asgi_maintenance_surface_reachable_then_business_route_execu
     gate = asyncio.Event()
     checker = _GatedPostgresReadinessChecker(gate)
     app = create_app(
-        make_settings(),
+        # SM-902: DATABASE_MIGRATION_MODE=verify_only reproduces the
+        # pre-ADR-0015 contract this test actually exercises -- the D32
+        # gate delegates directly to this exact injected
+        # PostgresReadinessChecker fake, never a real advisory-lock/
+        # classification/subprocess path (which would need a real
+        # PostgreSQL connection this test does not provide).
+        make_settings(database_migration_mode="verify_only"),
         enable_neo4j=False,
         enable_worker=False,
         postgres_readiness_checker=cast(PostgresReadinessChecker, checker),

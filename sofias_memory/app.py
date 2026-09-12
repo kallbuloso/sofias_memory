@@ -97,6 +97,7 @@ from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatch
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.graph_rebuild_service import GraphRebuildService
 from sofias_memory.services.graph_reconciliation_service import GraphReconciliationService
+from sofias_memory.services.migration_bootstrap import MigrationBootstrap
 from sofias_memory.services.operational_metrics import (
     OperationalMetricsReporter,
     OperationalMetricsService,
@@ -207,6 +208,7 @@ def create_app(
     *,
     enable_postgres_readiness: bool = True,
     postgres_readiness_checker: PostgresReadinessChecker | None = None,
+    migration_bootstrap: MigrationBootstrap | None = None,
     enable_neo4j: bool = True,
     neo4j_resource: Neo4jResource | None = None,
     neo4j_readiness_checker: Neo4jReadinessChecker | None = None,
@@ -263,6 +265,13 @@ def create_app(
         resolved_readiness_checks = (
             ("postgres", _postgres_readiness_check(postgres_checker)),
             *resolved_readiness_checks,
+        )
+        # ADR-0015 (SM-902): the same PostgresReadinessChecker instance is
+        # reused internally by MigrationBootstrap for verify_only mode and
+        # post-migration verification -- never a second, independent
+        # checker instance racing the one /health/ready also queries.
+        application.state.migration_bootstrap = migration_bootstrap or MigrationBootstrap(
+            resolved_settings, readiness_checker=postgres_checker
         )
     if enable_neo4j:
         resource = neo4j_resource or create_neo4j_resource_from_settings(resolved_settings)

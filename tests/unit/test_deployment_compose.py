@@ -107,16 +107,48 @@ def test_compose_files_healthcheck_targets_health_live_not_ready() -> None:
         assert "/health/ready" not in service_section, path
 
 
-def test_compose_files_never_auto_run_alembic() -> None:
-    """`alembic upgrade head` may appear only in a comment (documenting the
-    explicit, operator-run procedure, AGENTS.md SS14) -- never as part of an
-    actual executed `command:`/`entrypoint:`/healthcheck instruction."""
+def test_compose_files_never_directly_invoke_raw_alembic_migration() -> None:
+    """Deployment/static invariant (ADR-0015, Feature Contract v0.6.0 SS24,
+    backlog SM-904) -- replaces this file's pre-v0.6.0
+    ``test_compose_files_never_auto_run_alembic`` invariant with an
+    equivalent-intent one for the current contract, never deletes it:
+
+    Compose must never invoke raw/unserialized Alembic migration directly as
+    a service's ``command:``/``entrypoint:``, nor as a separate one-shot
+    migration-job service definition. Automatic migration is permitted only
+    through ADR-0015's sanctioned, locked, verified application-startup
+    bootstrap (``sofias_memory.services.migration_bootstrap``) -- never as a
+    raw Compose-level invocation racing that bootstrap's own advisory lock
+    from outside it.
+
+    `alembic upgrade head` may still appear in these files, but only inside
+    a comment documenting the manual/administrative procedure that remains
+    fully supported (``DATABASE_MIGRATION_MODE=verify_only``, or an operator
+    controlling migration timing explicitly, per ``docs/operations.md`` SS3)
+    -- never as a line that Compose would actually execute.
+
+    This invariant is independent of ``DATABASE_MIGRATION_MODE`` itself:
+    that setting is expected, documented configuration (see
+    ``test_compose_files_forward_database_migration_mode_without_hardcoding_it``
+    below) and must never make this test fail merely by being present."""
 
     for path in COMPOSE_FILES:
         content = _read(path)
         for line in content.splitlines():
             if "alembic upgrade head" in line:
                 assert line.strip().startswith("#"), f"{path}: {line!r}"
+
+
+def test_compose_files_forward_database_migration_mode_without_hardcoding_it() -> None:
+    """Companion to the invariant above: ``DATABASE_MIGRATION_MODE`` is
+    expected, operator-overridable configuration (ADR-0015 default `auto`)
+    -- its presence must never be mistaken for a raw Alembic invocation, and
+    it must never be hard-coded to a fixed value that an operator could not
+    override via `.env`."""
+
+    for path in COMPOSE_FILES:
+        content = _read(path)
+        assert 'DATABASE_MIGRATION_MODE: "${DATABASE_MIGRATION_MODE:-auto}"' in content, path
 
 
 def test_compose_files_declare_exactly_one_replica_where_specified() -> None:

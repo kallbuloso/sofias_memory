@@ -1479,6 +1479,18 @@ application/storage bootstrap (BOOTSTRAP/MAINTENANCE → STORAGE_CONVERGING or d
 → OPERATIONAL for `filesystem`) proceed, per the supported deployment lifecycle
 already described in `docs/operations.md` section 2.
 
+> **Forward reference (v0.6.0, added by SM-904, does not reopen this decision):**
+> [ADR-0015](0015-automatic-serialized-migration-bootstrap.md) supersedes
+> *only* the "must not automatically run Alembic" clause above for
+> `DATABASE_MIGRATION_MODE=auto` (the v0.6.0 default) — schema-confirmed-current
+> may now be reached via ADR-0015's own serialized, fail-closed bootstrap
+> instead of solely by an operator's manual `alembic upgrade head`.
+> `DATABASE_MIGRATION_MODE=verify_only` reproduces this section's original
+> contract exactly. Every other requirement in this section — storage
+> convergence strictly ordered after schema confirmation, no worker/business
+> processing before it, `BOOTSTRAP/MAINTENANCE` and the D33 liveness
+> guarantee unchanged — remains exactly as decided here.
+
 ### D33. Long storage migration / orchestrator safety
 
 **New section (review finding M1.2).**

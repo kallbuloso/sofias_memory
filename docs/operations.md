@@ -34,10 +34,18 @@ according to the operator's own durability/backup policy — see §13.10.
 
 ## 2. First start (empty database)
 
-Principle, unchanged from the architecture: **migration is explicit, never
-automatic at application startup.** `/health/ready` detects a schema that
-does not match the application's expected revision and reports `not_ready`
-rather than guessing or auto-applying anything.
+Principle (ADR-0015, v0.6.0+): `DATABASE_MIGRATION_MODE` (default `auto`)
+controls whether migration is automatic or explicit. Under the default
+`auto`, the application migrates a fresh or known-ancestor schema forward
+to head **automatically, as part of its own startup**, under a serialized
+PostgreSQL advisory lock, with pre- and post-migration verification before
+`/health/ready` can ever report `ready` — see
+[ADR-0015](adr/0015-automatic-serialized-migration-bootstrap.md) for the
+full safety contract (lock semantics, failure classes, graceful-shutdown
+and hard-termination guarantees). `DATABASE_MIGRATION_MODE=verify_only`
+reproduces the pre-v0.6.0 contract exactly: the application never invokes
+Alembic itself, and `/health/ready` reports `not_ready` for anything short
+of an exact schema match rather than guessing or auto-applying anything.
 
 This section describes the default `STORAGE_BACKEND=filesystem` path, which
 is entirely unaffected by ADR-0011. If you are enabling
@@ -47,7 +55,7 @@ reaches ready quickly); enabling S3 on an **existing** filesystem
 installation instead follows §13.7's dedicated upgrade procedure.
 
 Verified procedure, using only the release image (no source checkout, no
-Python installed on the host):
+Python installed on the host), under the default `DATABASE_MIGRATION_MODE=auto`:
 
 ```bash
 # 1. Configure secrets (see README.md#configuration; never commit real values).
@@ -59,17 +67,12 @@ cp .env.example .env
 # 2. Start PostgreSQL and Neo4j only.
 docker compose up -d postgres neo4j
 
-# 3. Run the migration using the application's own image — a one-shot
-#    container that exits after applying migrations. `depends_on:
-#    condition: service_healthy` on `sofias-memory` means this command
-#    waits for both databases to be healthy before running, and `--rm`
-#    removes the one-shot container afterward; nothing is left behind.
-docker compose run --rm sofias-memory alembic upgrade head
-
-# 4. Start the application.
+# 3. Start the application. DATABASE_MIGRATION_MODE=auto (default) migrates
+#    the brand-new, empty schema forward to head automatically, under a
+#    serialized advisory lock, before the process ever reports ready.
 docker compose up -d sofias-memory
 
-# 5. Verify.
+# 4. Verify.
 curl http://127.0.0.1:8000/health/live
 curl http://127.0.0.1:8000/health/ready
 curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/api/v1/info
@@ -77,32 +80,61 @@ curl -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/api/v1/info
 
 This exact sequence was run against a genuinely empty, disposable PostgreSQL
 (verified zero tables beforehand) and a fresh Neo4j: step 3 applied
-`0001` → `0011`; step 4/5 reached `/health/live` = `200`, `/health/ready` =
-`200` with all three checks (`postgres`, `neo4j`, `worker`) ready, and
-`/api/v1/info` reporting the expected version.
+`0001` → `0011` automatically on startup; step 4 reached `/health/live` =
+`200`, `/health/ready` = `200` with all three checks (`postgres`, `neo4j`,
+`worker`) ready, and `/api/v1/info` reporting the expected version.
+
+**Explicit/manual migration remains fully supported** — required under
+`DATABASE_MIGRATION_MODE=verify_only`, and available any time an operator
+prefers to control migration timing precisely instead of relying on the
+automatic bootstrap:
+
+```bash
+docker compose run --rm sofias-memory alembic upgrade head
+```
+
+This one-shot container (`depends_on: condition: service_healthy` on
+`sofias-memory` means it waits for both databases to be healthy before
+running; `--rm` removes it afterward) is the same command §3 and §4 refer
+to below.
 
 ## 3. Migration policy
 
-- Alembic is the **sole** authority for schema evolution.
-- Migrations are applied **explicitly** — `docker compose run --rm
-  sofias-memory alembic upgrade head` (§2) — never automatically when the
-  application starts, and never on every deploy as a matter of course.
-- A schema that doesn't match the application's expected revision leaves
-  `/health/ready` at `not_ready`; the application does not guess or
-  self-heal.
-- A deployment is not healthy until migration has completed (when required)
-  and readiness is confirmed.
+- Alembic is the **sole** authority for schema evolution — this is
+  unchanged. `DATABASE_MIGRATION_MODE` (default `auto`) controls **how**
+  Alembic gets invoked, never whether Alembic itself is the authority.
+- **`auto` (default):** an eligible schema (fresh, or a known ancestor of
+  the application's head) migrates forward automatically as part of
+  ordinary application startup, under a session-level PostgreSQL advisory
+  lock, with pre- and post-migration verification (ADR-0015). Manual
+  `docker compose run --rm sofias-memory alembic upgrade head` remains
+  fully supported for an operator who prefers to control migration timing
+  explicitly (e.g. immediately after a backup, before starting the target
+  image — see §4).
+- **`verify_only`:** reproduces the pre-v0.6.0 contract exactly — the
+  application never invokes Alembic automatically under any circumstance;
+  manual `alembic upgrade head` is the only way a schema advances.
+- A schema state the classifier cannot safely auto-migrate (unversioned but
+  non-empty, multiple heads, a diverged/foreign/unrecognized revision) is
+  **always fail-closed, in both modes** — `/health/ready` stays
+  `not_ready`; the application never guesses, stamps, or self-heals such a
+  state automatically.
+- A deployment is not healthy until migration has completed (automatically
+  under `auto`, or manually under `verify_only`) and readiness is
+  confirmed.
 
-**When `alembic upgrade head` is required, precisely:**
+**When manual `alembic upgrade head` is required, precisely:**
 
-| Situation | `alembic upgrade head` required? |
+| Situation | Manual `alembic upgrade head` required? |
 |---|---|
-| Fresh installation — brand-new, empty PostgreSQL database/volume (§2) | **Yes.** |
+| Fresh installation or upgrade, `DATABASE_MIGRATION_MODE=auto` (default, §2) | No — the application migrates itself on startup. |
+| Any state, `DATABASE_MIGRATION_MODE=verify_only` | **Yes** — this mode never invokes Alembic automatically. |
 | Ordinary application redeploy/restart (no volume change, no version change) | No. |
 | Recreating a Compose Stack/service (Portainer, EasyPanel, or otherwise) while reusing the same, already-migrated PostgreSQL persistent volume | No — recreating the Stack does not reset or otherwise affect the schema already present in that volume. |
-| Upgrading to a release with **no** new database migration | No — proceed straight to the normal health/readiness/smoke verification (§I); there is nothing to apply. |
-| Upgrading to a release **with** one or more new migrations | **Yes**, once, using the target release's image — follow the full backup/quiesce upgrade procedure (§4). |
-| A new Stack pointed at a NEW/EMPTY PostgreSQL volume or database (even if it isn't literally "the first" Stack you've ever created) | **Yes** — this is a fresh installation by definition, regardless of how many prior Stacks exist elsewhere. |
+| Upgrading to a release with **no** new database migration | No — proceed straight to the normal health/readiness/smoke verification (§I); there is nothing to apply, in either mode. |
+| Upgrading to a release **with** one or more new migrations, wanting to control migration timing explicitly (e.g. immediately after the backup in §4, before starting the target image) | Optional under `auto` (the target image migrates itself on start regardless) — follow the full backup/quiesce upgrade procedure (§4) either way. **Required** under `verify_only`. |
+| Inspecting/validating a restored historical backup before deciding whether to advance it (§7) | Start with `DATABASE_MIGRATION_MODE=verify_only` first — otherwise `auto` migrates the restored schema forward automatically on first boot. |
+| An unversioned-but-non-empty schema, multiple heads, a diverged/foreign revision, or any other fail-closed classification | **Yes**, manual investigation and repair — `auto` never guesses, stamps, or repairs these states automatically, in either mode. |
 
 Re-running `alembic upgrade head` when already at the target head is normally
 idempotent (Alembic detects there is nothing left to apply and exits
@@ -142,13 +174,25 @@ PostgreSQL only; an Agent, an Agent↔Skill association, and an Agent↔Session
 association are never projected to Neo4j, so this migration and upgrade
 never touch Neo4j either.
 
+**v0.6.0 note:** this release introduces **zero new migrations** — it
+changes how `alembic upgrade head` gets invoked, not the schema itself
+(ADR-0015). Upgrading from a pre-v0.6.0 deployment therefore falls under
+"Upgrading to a release with **no** new database migration" above: no
+manual migration step is required to reach v0.6.0 specifically. What does
+change starting with this release is the default behavior for *future*
+migrations — with `DATABASE_MIGRATION_MODE=auto` (default), the v0.6.0 (and
+later) image migrates any known-ancestor schema forward to its own head
+automatically on startup, so a deployment that stays on `auto` will not
+need this section's manual `alembic upgrade head` step for an ordinary
+future upgrade either, unless it deliberately runs `verify_only`.
+
 ## 4. Upgrade
 
 **First, check whether the target release adds any migration at all** — read
 its `CHANGELOG.md` entry and/or check `migrations/versions/` for anything
 newer than the currently-deployed revision (`alembic heads` against the
 target image vs. `alembic current` against the running deployment, §3).
-This determines whether step 5 below is performed or skipped.
+This determines whether step 5 below is needed at all.
 
 1. Read the release notes for the target version.
 2. Take a backup (§6) at the currently-deployed version.
@@ -158,13 +202,21 @@ This determines whether step 5 below is performed or skipped.
    sofias-memory`).
 4. Quiesce the application (`docker compose stop sofias-memory`) so no new
    writes land during the migration window.
-5. **If, and only if, the target release adds a new migration:** run it
-   using the target image: `docker compose run --rm sofias-memory alembic
-   upgrade head`. **If the target release adds no new migration, skip this
-   step entirely** — there is nothing to apply, and running it anyway is
-   harmless (idempotent at head) but not required.
+5. **If the target release adds a new migration and you want to control its
+   timing explicitly** (e.g. immediately after the backup above, with the
+   old application still stopped): run it manually using the target image:
+   `docker compose run --rm sofias-memory alembic upgrade head`. **Under the
+   default `DATABASE_MIGRATION_MODE=auto`, this step is optional** — step 6
+   below migrates the schema automatically as part of the target image's own
+   startup — but running it manually first remains fully supported and is
+   harmless (idempotent at head) if the target release adds no new
+   migration at all. **Under `DATABASE_MIGRATION_MODE=verify_only`, this
+   step is required** whenever the target release adds a migration — the
+   application will not start it for you and `/health/ready` will stay
+   `not_ready` without it.
 6. Start the application on the target image: `docker compose up -d
-   sofias-memory`.
+   sofias-memory`. Under `auto` (default), this is where an eligible schema
+   actually migrates, if step 5 was skipped.
 7. Verify readiness (`/health/ready`).
 8. Run a smoke check against a non-production dataset before considering the
    upgrade complete.
@@ -359,7 +411,11 @@ docker run --rm --network <compose-network> \
   sofias-memory:0.5.0 uv run --no-sync python scripts/rebuild_graph.py \
   --all --confirm-all
 
-# 8. Start the application.
+# 8. Start the application. Under the default DATABASE_MIGRATION_MODE=auto,
+#    this AUTOMATICALLY migrates the restored schema forward to the running
+#    image's head if it is a known-ancestor revision -- see the restore
+#    safeguard note below if you want to inspect the backup at its original
+#    revision first instead.
 docker compose up -d sofias-memory
 
 # 9. Verify readiness.
@@ -369,6 +425,21 @@ curl http://127.0.0.1:8000/health/ready
 #     Recall query to confirm content is actually retrievable, not just
 #     present as rows.
 ```
+
+**Restore safeguard (ADR-0015):** because `DATABASE_MIGRATION_MODE=auto` is
+the default and migrates **any** valid ancestor schema forward automatically,
+restoring a historical backup and starting the application normally (step 8
+above) will immediately migrate it to the running image's head — a
+materially different outcome from inspecting the backup at its original
+revision. **If you need to inspect or validate a restored backup at its
+original schema revision before deciding whether to advance it, start the
+application for that session with `DATABASE_MIGRATION_MODE=verify_only`
+instead of step 8's default invocation.** `verify_only` never invokes
+Alembic; it leaves the restored schema exactly as restored, reporting
+`not_ready` unless it already happens to be at exact head. Once you have
+decided to advance it, either restart with `DATABASE_MIGRATION_MODE=auto`
+(or unset, since it is the default) or run `alembic upgrade head` manually
+against it (§3).
 
 **Restoring a historical backup should use the application version recorded
 in that backup's manifest, not an unrelated newer version.** Restore first,
@@ -652,13 +723,18 @@ environment contract as the root `compose.yaml`, differing only in
 (EasyPanel routes its domain to the internal port directly instead).
 
 The full, real-deployment-verified procedure — creating the service, both
-valid source options (Git or Inline), required environment variables, the
-first-install migration steps via EasyPanel's browser console, health
-verification, domain configuration, and production smoke — is documented in
-[`docs/deployment/easypanel.md`](deployment/easypanel.md). It follows the
-same migration policy as §3/§4 above: required once on a fresh install or on
-an upgrade that adds new migrations, never merely because the Stack was
-redeployed or recreated with its existing PostgreSQL volume intact.
+valid source options (Git or Inline), required environment variables,
+health verification, domain configuration, and production smoke — is
+documented in [`docs/deployment/easypanel.md`](deployment/easypanel.md). It
+follows the same migration policy as §3/§4 above: under the default
+`DATABASE_MIGRATION_MODE=auto`, the application migrates a fresh or
+known-ancestor schema automatically on its own startup — no EasyPanel
+browser-console step is required for the ordinary fresh-install/upgrade
+path. Manual migration via EasyPanel's console remains available (required
+under `DATABASE_MIGRATION_MODE=verify_only`, or whenever an operator wants
+to control migration timing explicitly), and is never needed merely because
+the Stack was redeployed or recreated with its existing PostgreSQL volume
+intact.
 
 **If you use `STORAGE_BACKEND=s3` (ADR-0011): read §13.14 before your next
 redeploy.** This document's verified deployment evidence (§ "Validation
@@ -1221,7 +1297,12 @@ values):
 |---|---|
 | `process_state_transition` | The process moved to `bootstrap_maintenance`, `storage_converging`, or `operational`. The single most useful line to grep for "what state is this process in right now." |
 | `bootstrap_attempt_failed` | One full bootstrap attempt failed (schema not current, S3 unreachable, an integrity condition, or a genuine defect) and will retry after a short fixed delay. Includes `exception_type` — a `TypeError`/`ValueError`-shaped defect looks different from a recognized dependency-unavailable condition; treat an unfamiliar `exception_type` as worth investigating even though the process itself stays up. |
-| `bootstrap_schema_not_ready` | Schema is not at the expected Alembic head — run `alembic upgrade head` explicitly (§3); this application never does so automatically. |
+| `bootstrap_schema_not_ready` | Schema is not (yet) at the expected Alembic head. Under `DATABASE_MIGRATION_MODE=verify_only`, this always requires running `alembic upgrade head` manually (§3) — the application never does so itself in this mode. Under the default `auto`, this is usually transient and self-heals on the existing retry interval (e.g. PostgreSQL was briefly unreachable, or migration is still in progress) — but if a migration already failed once in this process (a distinct, sticky condition — look for a preceding `migration_upgrade_failed` or `migration_post_verification_failed` event), Alembic will not be automatically re-invoked, and the schema needs manual investigation/repair before this clears on its own. |
+| `migration_lock_timeout` | `auto` mode only: the automatic bootstrap could not acquire the migration advisory lock before its internal deadline — always transient, retried automatically; no Alembic subprocess was spawned. |
+| `migration_upgrade_started` / `migration_upgrade_succeeded` | `auto` mode only: the automatic bootstrap spawned (or successfully completed) a real `alembic upgrade head` subprocess. Normal, expected progress during an eligible automatic migration. |
+| `migration_upgrade_failed` / `migration_post_verification_failed` | `auto` mode only: the automatic Alembic subprocess exited non-zero, or exited zero but the schema is still not actually at exact head afterward. **Sticky for this process's lifetime** — Alembic is not automatically re-invoked again until an operator repairs the database manually (this same process will detect the repair via `migration_sticky_recovered` below, without needing a restart). Requires manual investigation. |
+| `migration_sticky_probe` / `migration_sticky_recovered` | `auto` mode only: after a sticky migration failure, the process continues probing read-only on the normal retry interval (`migration_sticky_probe`) until it observes the schema has been repaired out-of-band (`migration_sticky_recovered`), at which point it proceeds to `OPERATIONAL` without a restart. |
+| `migration_schema_invalid` | Either mode: the freshly-classified schema state is fail-closed (unversioned-but-non-empty, multiple heads, a diverged/foreign/unrecognized revision, etc.) — never automatically repaired; requires manual investigation (§3). |
 | `storage_convergence_integrity_failures` | At least one Source failed migration validation (missing/mismatched legacy file, an unresolvable S3 target conflict, an unmappable `mime_type`, or a `DELETING` Source with no provable owning `PipelineRun` — ADR-0011 D34 Case D) — readiness stays blocked until an operator resolves the underlying condition; this is a genuine "needs a human" signal, not a transient retry case. |
 | `storage_convergence_awaiting_recovery_owned` | Convergence is otherwise clean but is waiting for an existing Forget/Dataset-DELETE run to reach its own terminal state — normal, expected during that run's own retry/backoff window. |
 | `storage_convergence_fixed_point_reached` | Convergence completed this pass; the process is about to (or already did) become `OPERATIONAL`. |
@@ -1229,7 +1310,10 @@ values):
 **What to look for by symptom:**
 
 - **Stuck at `not_ready`, no S3 errors in the log:** check for
-  `bootstrap_schema_not_ready` — run the explicit migration (§3).
+  `bootstrap_schema_not_ready` (§3) — under `verify_only`, run the manual
+  migration; under `auto`, check whether a sticky `migration_upgrade_failed`/
+  `migration_post_verification_failed` preceded it (manual repair needed) or
+  it is still an ordinary transient retry.
 - **`bootstrap_attempt_failed` repeating with an S3-shaped cause:** confirm
   `STORAGE_S3_ENDPOINT_URL`/`STORAGE_S3_BUCKET`/`STORAGE_S3_REGION` and
   network reachability from the container to that endpoint (§13.8).

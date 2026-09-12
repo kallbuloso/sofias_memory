@@ -111,11 +111,12 @@ first-start/migration/upgrade/rollback/backup/restore contract — every command
 there was run for real against disposable infrastructure, including a
 complete non-empty backup, destroy, restore, and Neo4j-rebuild drill.
 
-> **`alembic upgrade head` below is a FIRST INSTALL / EMPTY DATABASE step.**
-> It is required once, against a brand-new, empty PostgreSQL database/volume.
-> It is **not** part of an ordinary redeploy, restart, or Stack recreation
-> that reuses an already-migrated PostgreSQL volume, and it is only needed
-> again on a later upgrade if that specific release adds new migrations. See
+> **Default `DATABASE_MIGRATION_MODE=auto` migrates a fresh or known-ancestor
+> schema automatically as part of normal application startup** (ADR-0015) —
+> no separate `alembic upgrade head` step is required for the common
+> install/upgrade path below. The manual command remains fully supported —
+> required under `DATABASE_MIGRATION_MODE=verify_only`, and useful whenever
+> an operator prefers to control migration timing explicitly. See
 > [When do I run migrations?](#when-do-i-run-migrations) below.
 
 Minimal Compose-based flow (see `docs/operations.md` §2 for the full version):
@@ -123,8 +124,7 @@ Minimal Compose-based flow (see `docs/operations.md` §2 for the full version):
 ```bash
 cp .env.example .env   # set API_KEY, DB_PASSWORD, DB_NEO4J_PASSWORD, LLM_API_KEY
 docker compose up -d postgres neo4j
-docker compose run --rm sofias-memory alembic upgrade head
-docker compose up -d sofias-memory
+docker compose up -d sofias-memory   # migrates automatically (DATABASE_MIGRATION_MODE=auto, default)
 curl http://127.0.0.1:8000/health/ready
 ```
 
@@ -157,10 +157,11 @@ uv run python scripts/generate_api_key.py   # paste the result into API_KEY in .
 # Also set in .env: DATABASE_URL, NEO4J_URI/NEO4J_PASSWORD (pointing at the
 # containers above), LLM_API_KEY, EMBEDDING_API_KEY.
 
-# 3. Install dependencies and migrate the schema (first install only --
-#    against the brand-new, empty databases started in step 1).
+# 3. Install dependencies. DATABASE_MIGRATION_MODE defaults to `auto`, so
+#    the brand-new, empty database started in step 1 migrates automatically
+#    on startup (step 4) -- set DATABASE_MIGRATION_MODE=verify_only in .env
+#    instead if you'd rather run `alembic upgrade head` yourself first.
 uv sync --dev
-uv run alembic upgrade head
 
 # 4. Run the application.
 uv run uvicorn sofias_memory.app:create_app --factory --host 127.0.0.1 --port 8000
@@ -180,17 +181,20 @@ verified, step-by-step guide.
 
 ### When do I run migrations?
 
-`alembic upgrade head` is a **schema-migration** step, not a startup step —
-the application never migrates itself automatically. It is required in
-exactly two situations:
+`DATABASE_MIGRATION_MODE` (default `auto`) controls this
+([ADR-0015](docs/adr/0015-automatic-serialized-migration-bootstrap.md)).
+Under the default, the application migrates a fresh or known-ancestor
+schema forward to head automatically, at startup, under a serialized
+PostgreSQL advisory lock, with pre- and post-migration verification.
+Manual `alembic upgrade head` remains fully supported and is required in
+exactly these situations:
 
-| Situation | Run `alembic upgrade head`? |
+| Situation | Manual `alembic upgrade head` required? |
 |---|---|
-| Fresh install — brand-new, empty PostgreSQL database/volume | **Yes**, once, before first starting the application. |
-| Ordinary redeploy or restart of an already-migrated deployment | No. |
-| Recreating a Compose Stack/service while reusing the same, already-migrated PostgreSQL volume | No — recreating the Stack does not reset the schema. |
-| Upgrading to a release with **no** new migration | No — verify readiness/smoke as usual, but there is nothing to migrate. |
-| Upgrading to a release **with** one or more new migrations | **Yes**, once, using the target release's image, following the backup/quiesce upgrade procedure (`docs/operations.md` §4). |
+| Fresh install or upgrade, `DATABASE_MIGRATION_MODE=auto` (default) | No — the application migrates itself on startup. |
+| Any state, `DATABASE_MIGRATION_MODE=verify_only` | **Yes** — this mode never invokes Alembic automatically; it only verifies the schema is already at exact head, reporting `not_ready` otherwise. |
+| Inspecting/validating a restored historical backup before deciding whether to advance it (see [Backup and restore](#backup-and-restore)) | Start with `DATABASE_MIGRATION_MODE=verify_only` first — otherwise `auto` migrates the restored schema forward automatically on first boot. |
+| An unversioned-but-non-empty schema, multiple heads, a diverged/foreign revision, or any other fail-closed classification | **Yes**, manual investigation and repair — `auto` never guesses, stamps, or repairs these states automatically, in either mode. |
 
 `alembic current` and `alembic heads` are read-only inspection/verification
 commands — they never mutate the schema and are safe (though not required)
@@ -206,7 +210,7 @@ grouped by area:
 | Area | Examples |
 |---|---|
 | Application/API | `API_KEY`, `HTTP_HOST`, `HTTP_PORT`, `LOG_LEVEL`, `CORS_ALLOWED_ORIGINS`, `MAX_REQUEST_BODY_MB` |
-| PostgreSQL | `DATABASE_URL`, `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW` |
+| PostgreSQL | `DATABASE_URL`, `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW`, `DATABASE_MIGRATION_MODE` (`auto`\|`verify_only`, default `auto` — see [When do I run migrations?](#when-do-i-run-migrations)) |
 | Neo4j | `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` |
 | Storage | `DATA_DIRECTORY`, `TEMP_DIRECTORY`, `MAX_SOURCE_SIZE_MB`, `STORAGE_BACKEND`, `STORAGE_S3_*` (optional — see `docs/operations.md` §13) |
 | LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS` |
@@ -305,14 +309,23 @@ is in [`docs/operations.md`](docs/operations.md#6-backup).
 
 ## Upgrade and migrations
 
-Alembic is the sole authority for schema evolution; migrations are applied
-**explicitly**, never automatically at application startup. `/health/ready`
-detects a schema that doesn't match the application's expected revision and
-reports `not_ready` rather than guessing. Downgrades are not guaranteed in
-general — migration `0011`, for example, adds a native PostgreSQL enum value
-and has no safe destructive downgrade (`ALTER TYPE ... DROP VALUE` does not
-exist in PostgreSQL). The full migration/upgrade/rollback procedure,
-including that limitation's exact operational consequence, is in
+Alembic remains the sole authority for schema evolution. With the default
+`DATABASE_MIGRATION_MODE=auto`, an eligible schema (fresh, or a known
+ancestor of the application's head) migrates forward automatically as part
+of ordinary application startup, under a session-level PostgreSQL advisory
+lock, with pre- and post-migration verification — see
+[ADR-0015](docs/adr/0015-automatic-serialized-migration-bootstrap.md) for
+the full contract. `DATABASE_MIGRATION_MODE=verify_only` reproduces the
+previous explicit-only contract exactly: the application never invokes
+Alembic itself, and `/health/ready` reports `not_ready` for anything short
+of an exact schema match rather than guessing. In both modes, any
+ambiguous or unrecognized schema state (multiple heads, a diverged/foreign
+revision, an unversioned but non-empty schema) always fails closed — never
+guessed, stamped, or repaired automatically. Downgrades are not guaranteed
+in general — migration `0011`, for example, adds a native PostgreSQL enum
+value and has no safe destructive downgrade (`ALTER TYPE ... DROP VALUE`
+does not exist in PostgreSQL). The full migration/upgrade/rollback
+procedure, including that limitation's exact operational consequence, is in
 [`docs/operations.md`](docs/operations.md#3-migration-policy).
 
 ## Security notes

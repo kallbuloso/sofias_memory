@@ -723,6 +723,24 @@ users roles permissions acl api_keys settings tenants owner_id tenant_id
 A dimensão pgvector deve ser compatível com `EMBEDDING_DIMENSIONS`.
 Mudança de dimensão exige migration/reindex planejado.
 
+### Automatic serialized migration bootstrap (ADR-0015, v0.6.0+)
+
+`DATABASE_MIGRATION_MODE=auto|verify_only` (default `auto`) controla como o
+Alembic é invocado, nunca se ele é a autoridade:
+
+- `auto` (default): um schema elegível (pristine fresh ou known ancestor do
+  head) migra automaticamente para head no startup da aplicação, sob um
+  advisory lock PostgreSQL session-level, com verificação antes e depois;
+- `verify_only`: reproduz o contrato anterior a esta ADR exatamente — a
+  aplicação nunca invoca Alembic automaticamente; apenas verifica que o
+  schema já está em exact head.
+
+Em ambos os modos: nenhum estado ambíguo/fail-closed (schema unversioned
+não-vazio, múltiplos heads, revision divergente/estrangeira) é jamais
+reparado, "stampado" ou inferido automaticamente — permanece resolução
+manual, exatamente como antes. A CLI manual (`alembic upgrade head`,
+`current`, `heads`) permanece totalmente suportada e nunca é substituída.
+
 ## 15. Repositories, transações e outbox
 
 Não espalhe ORM por routes/pipelines.

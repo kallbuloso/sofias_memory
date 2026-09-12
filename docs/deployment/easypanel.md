@@ -24,8 +24,13 @@ for that. It only covers what is specific to installing on Easypanel.
 
 **Key facts:**
 
-- Migrations are a first-install / schema-upgrade operation, run explicitly
-  (§4) — never applied automatically at application startup.
+- `DATABASE_MIGRATION_MODE` defaults to `auto` (ADR-0015): the application
+  migrates a fresh or known-ancestor schema forward automatically, under a
+  serialized advisory lock, as part of its own startup — no manual
+  console-based migration step is required for the ordinary first-install/
+  upgrade path (§4). Manual `alembic upgrade head` remains available via
+  Easypanel's console for `DATABASE_MIGRATION_MODE=verify_only` or whenever
+  an operator prefers explicit control.
 - The three named volumes (`sofias_memory_postgres_data`,
   `sofias_memory_neo4j_data`, `sofias_memory_sources`) persist all durable
   state across restarts and redeploys.
@@ -85,15 +90,6 @@ or any equivalent random 32+ character generator with the `sf-` prefix.
 `DB_PASSWORD`/`DB_NEO4J_PASSWORD` should be strong, unique values distinct
 from any other deployment.
 
-**For a first install specifically, also set:**
-
-```text
-WORKER_ENABLED=false
-```
-
-temporarily — see step 4 for why. Step 4 has you set it back to `true` (or
-unset it, since `true` is the default) once the schema is migrated.
-
 Optional but commonly set:
 
 ```text
@@ -107,66 +103,76 @@ default and does not need to be set for a first install.
 ## 3. Deploy — without a public domain yet
 
 Deploy the stack now, but **do not configure/expose the Easypanel domain
-yet** (skip step 5 for now). `sofias-memory` has `depends_on: condition:
-service_healthy` on both `postgres` and `neo4j`, so it will not start
-running until both databases report healthy. With `WORKER_ENABLED=false`
-set in step 2, the application starts read-only-safe with no worker
-attempting to process any (nonexistent, on a fresh install) durable work
-against a not-yet-migrated schema.
+yet** (skip step 5 for now) — confirm health first. `sofias-memory` has
+`depends_on: condition: service_healthy` on both `postgres` and `neo4j`, so
+it will not start running until both databases report healthy. Once it
+starts, `DATABASE_MIGRATION_MODE=auto` (default) migrates a fresh schema to
+head automatically as the first phase of its own startup bootstrap,
+strictly before Neo4j bootstrap or the worker begin (ADR-0015) — no
+separate `WORKER_ENABLED=false` workaround is needed to keep the worker
+from touching a not-yet-migrated schema; the existing bootstrap ordering
+already guarantees that.
 
 Wait until Easypanel reports `postgres` and `neo4j` as healthy before
 continuing.
 
-## 4. Apply migrations explicitly — required before first use
+## 4. Migration — automatic by default
 
-**Do not skip this. Migrations are never applied automatically**, and
-`deploy/easypanel/compose.yaml` deliberately has no auto-migration service —
-see `docs/operations.md` §3 for the general contract this follows.
+Under the default `DATABASE_MIGRATION_MODE=auto` (ADR-0015), **no manual
+migration step is required for a first install or for an ordinary upgrade
+that adds new migrations.** `deploy/easypanel/compose.yaml` deliberately
+has no separate auto-migration service or job of its own — the application
+itself performs the migration, once, under a session-level PostgreSQL
+advisory lock, as part of its own startup sequence, strictly before Neo4j
+bootstrap or the worker begin claiming any work (§3). Simply finish
+deploying (§1-§3) and wait for `/health/ready` (§5) — a fresh or
+known-ancestor schema migrates to head automatically, with no browser
+console step. See `docs/operations.md` §3 for the general contract this
+follows.
 
-**This procedure is specifically for a FIRST INSTALL against an empty
-database.** It does not redefine the general upgrade/migration contract in
-`docs/operations.md` §4 — a later upgrade of an already-migrated deployment
-should still follow that document's backup-first procedure.
+**Manual migration remains fully supported** — via Easypanel's browser
+console/terminal for the running `sofias-memory` container — for two
+situations:
 
-1. Confirm `postgres` and `neo4j` are healthy (step 3) and `WORKER_ENABLED=false`
-   is set (step 2).
-2. Open Easypanel's browser console/terminal for the running `sofias-memory`
+- `DATABASE_MIGRATION_MODE=verify_only` is set: this mode never invokes
+  Alembic automatically under any circumstance; the application only
+  verifies the schema is already at exact head, reporting `not_ready`
+  otherwise. Use this when you need to inspect or validate a database
+  (e.g. a restored historical backup) at its original revision before
+  deciding to advance it (`docs/operations.md` §7).
+- An operator prefers to control migration timing explicitly instead of
+  relying on the automatic bootstrap.
+
+To migrate manually in either case:
+
+1. Open Easypanel's browser console/terminal for the running `sofias-memory`
    container (the exact UI affordance depends on your Easypanel version —
    look for a "Console," "Terminal," or "Shell" action on the service).
-3. Inside that console, run directly (the release image already has its
+2. Inside that console, run directly (the release image already has its
    virtualenv's `bin/` on `PATH`, so no `uv run` prefix is needed):
 
    ```bash
    alembic upgrade head
    ```
 
-4. Confirm the result, both should report `0014 (head)`:
+3. Confirm the result:
 
    ```bash
    alembic current
    alembic heads
    ```
 
-5. Back in Easypanel's environment editor, set `WORKER_ENABLED=true` (or
-   remove the variable, since `true` is the default).
-6. Redeploy/restart the `sofias-memory` service so it picks up the new
-   environment value.
+`alembic current` and `alembic heads` are read-only verification commands;
+they never modify the schema and are always safe to run at any time,
+including as a sanity check after an automatic migration.
 
-> **⚠️ This migration procedure is NOT required on every redeploy.**
->
-> - Do **not** repeat steps 1-6 above merely because Easypanel redeployed or
->   recreated the `sofias-memory` Compose service.
-> - If the existing `sofias_memory_postgres_data` volume is reused and
->   already has the expected schema, migration is **not** required —
->   redeploy/restart normally.
-> - A **new/empty** PostgreSQL volume is a fresh install and **does**
->   require this procedure, regardless of how many other Stacks already
->   exist.
-> - A later Sofias Memory version only requires `alembic upgrade head`
->   again when that specific target release adds one or more **new**
->   migrations (check its `CHANGELOG.md` entry) — not on every version bump.
-> - `alembic current` and `alembic heads` are read-only verification
->   commands; they never modify the schema and are always safe to run.
+**An unversioned-but-non-empty schema, multiple heads, a diverged/foreign
+revision, or any other ambiguous state always fails closed, in both
+modes** — the automatic bootstrap never guesses, stamps, or repairs such a
+state; it requires the same manual investigation via console access as
+before (`docs/operations.md` §3). Do not repeat manual migration merely
+because Easypanel redeployed or recreated the `sofias-memory` Compose
+service with its existing, already-migrated PostgreSQL volume intact.
 
 ### Upgrading an existing Easypanel deployment to v0.4.0
 
@@ -190,6 +196,14 @@ This is the same general contract as `docs/operations.md` §4 (backup-first
 upgrade procedure) — that document remains the authoritative, full
 walkthrough; the four steps above are the Easypanel-specific shorthand for
 this one release's migration.
+
+**Historical note:** the four manual steps above are preserved as the exact
+record of what this specific v0.4.0 upgrade required at the time (before
+`DATABASE_MIGRATION_MODE` existed). Starting with v0.6.0
+(ADR-0015), the default `DATABASE_MIGRATION_MODE=auto` performs this same
+migration automatically as part of the target image's own startup — an
+ordinary future upgrade under `auto` no longer needs this manual
+console-based dance; see §4 above.
 
 ## 5. Confirm health, then configure the domain
 

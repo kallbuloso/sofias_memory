@@ -10,12 +10,15 @@ refused (fail-safe), matching this project's existing dedicated-disposable-
 database integration discipline (see e.g.
 ``tests/integration/test_dataset_delete_postgres_integration.py``).
 
-Out of scope here (SM-903): graceful-shutdown critical-section shielding and
-hard-termination/orphan-child safety. This file proves ADR-0015's SM-902
-gate: classification-under-lock, exactly one automatic upgrade under
-concurrency, lock-timeout/unlock/connection-loss lock semantics, and
-post-migration verification -- all against real PostgreSQL and a real
-subprocess.
+This file proves ADR-0015's SM-902 gate: classification-under-lock, exactly
+one automatic upgrade under concurrency, lock-timeout/unlock/connection-loss
+lock semantics, and post-migration verification -- all against real
+PostgreSQL and a real subprocess. It also proves SM-903's graceful-shutdown
+advisory-lock property directly (a second bootstrap cannot acquire migration
+protection while a first bootstrap's critical section is still open).
+Hard-termination/orphan-child safety (SM-903 Property A, `PR_SET_PDEATHSIG`)
+has its own dedicated real-OS-process proof in
+``tests/integration/test_migration_bootstrap_supervisor_loss_postgres_integration.py``.
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ from sofias_memory.infrastructure.postgres.advisory_lock_keys import MIGRATION_B
 from sofias_memory.infrastructure.postgres.readiness import PostgresReadinessChecker
 from sofias_memory.services.migration_bootstrap import (
     MigrationBootstrap,
+    MigrationClassificationFailedError,
+    MigrationExecutionFailedError,
     MigrationLockTimeoutError,
     MigrationSchemaInvalidError,
     OsSubprocessMigrationRunner,
@@ -500,6 +505,192 @@ async def test_connection_loss_releases_the_session_level_lock(
 # S42: subprocess environment -- child Settings parsing does not need real
 # Neo4j/LLM connectivity, only valid-shaped disposable values
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# SM-903 Part 1: sticky failure -- multi-cycle no-new-Alembic and manual
+# out-of-band recovery, both against real PostgreSQL.
+# ---------------------------------------------------------------------------
+
+
+class _FailOnceThenExplodeRunner:
+    """Fails its first invocation, then treats any further invocation as a
+    test bug -- the real proof that stickiness holds is that this runner is
+    never called a second time, no matter how many more times
+    `ensure_schema_current()` is called afterward."""
+
+    def __init__(self) -> None:
+        self.invocations = 0
+
+    async def upgrade_head(self, *, database_url: str) -> int:
+        self.invocations += 1
+        if self.invocations > 1:
+            raise AssertionError("alembic must never be invoked a second time while sticky")
+        return 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sticky_failure_survives_multiple_cycles_then_recovers_without_restart(
+    dedicated_database_url: str,
+) -> None:
+    """Backlog SM-903 (a)+(b), against real PostgreSQL throughout: a failed
+    Alembic invocation -> several outer-loop-equivalent
+    `ensure_schema_current()` calls -> the real advisory lock is never
+    re-acquired and Alembic is never re-invoked -- then an operator repairs
+    the database out-of-band (a real `alembic upgrade head` run, deliberately
+    never through the bootstrap's own runner), and the *same*
+    `MigrationBootstrap` instance observes this via its next real read-only
+    readiness probe and proceeds normally, with no restart."""
+
+    settings = migration_bootstrap_settings(dedicated_database_url)
+    checker = PostgresReadinessChecker(settings)
+    runner = _FailOnceThenExplodeRunner()
+    bootstrap = MigrationBootstrap(settings, readiness_checker=checker, runner=runner)
+    try:
+        with pytest.raises(MigrationExecutionFailedError):
+            await bootstrap.ensure_schema_current()
+        assert runner.invocations == 1
+
+        # The real advisory lock must be fully free while sticky -- proven
+        # by acquiring it from a completely independent connection during
+        # several outer-loop-equivalent sticky-probe cycles.
+        probe_engine = create_async_engine(dedicated_database_url, pool_pre_ping=True)
+        try:
+            for _ in range(3):
+                with pytest.raises(MigrationClassificationFailedError):
+                    await bootstrap.ensure_schema_current()
+
+                async with probe_engine.connect() as probe_connection:
+                    held = await probe_connection.execute(
+                        text("SELECT pg_try_advisory_lock(:key)"),
+                        {"key": MIGRATION_BOOTSTRAP_KEY},
+                    )
+                    assert bool(held.scalar_one()) is True, (
+                        "sticky probe must never hold the real advisory lock"
+                    )
+                    await probe_connection.rollback()
+                    released = await probe_connection.execute(
+                        text("SELECT pg_advisory_unlock(:key)"), {"key": MIGRATION_BOOTSTRAP_KEY}
+                    )
+                    assert bool(released.scalar_one()) is True
+                    await probe_connection.commit()
+        finally:
+            await probe_engine.dispose()
+
+        assert runner.invocations == 1  # still never re-invoked
+
+        # An operator repairs the database out-of-band -- a real Alembic
+        # run through Alembic's own in-process API, deliberately never
+        # through the bootstrap's own runner (mirrors `upgrade_in_process_to`'s
+        # existing rationale elsewhere in this file: this is fixture-shaped
+        # setup for the proof, not the thing being proven).
+        config = alembic_config()
+        head = single_code_head(config)
+        await upgrade_in_process_to(dedicated_database_url, head)
+
+        # The same process, same instance, no restart: the next call
+        # observes the repair via a real readiness probe and proceeds.
+        await bootstrap.ensure_schema_current()
+
+        assert runner.invocations == 1  # never re-invoked, even after recovery
+        assert bootstrap._migration_failed_this_process is False  # noqa: SLF001
+        assert (await checker.check()).ready is True
+    finally:
+        await checker.dispose()
+
+
+# ---------------------------------------------------------------------------
+# SM-903 Part 2: graceful shutdown -- a second bootstrap cannot acquire
+# migration protection while a first bootstrap's critical section is open.
+# ---------------------------------------------------------------------------
+
+
+class _ControllableMigrationRunner:
+    """A runner whose `upgrade_head()` blocks until explicitly released --
+    lets this test observe "a child is alive and the advisory lock is held,
+    with a shutdown already pending" as a distinct, controllable moment,
+    entirely independent of a real Alembic subprocess's actual duration."""
+
+    def __init__(self, *, exit_code: int = 0) -> None:
+        self.exit_code = exit_code
+        self.started = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def upgrade_head(self, *, database_url: str) -> int:
+        self.started.set()
+        await self._release.wait()
+        return self.exit_code
+
+    def release(self) -> None:
+        self._release.set()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_second_bootstrap_cannot_acquire_lock_while_first_shutdown_pending(
+    dedicated_database_url: str,
+) -> None:
+    """SM-903 Part 2: once bootstrap A's child is alive and A's own
+    cancellation is pending (shutdown in progress, critical section not yet
+    closed), the real advisory lock stays held -- a concurrent bootstrap B
+    must be unable to acquire migration protection (and therefore unable to
+    spawn a second Alembic) until A's critical section actually closes.
+    Exercises the real PostgreSQL session-level advisory lock throughout."""
+
+    settings_a = migration_bootstrap_settings(dedicated_database_url)
+    checker_a = PostgresReadinessChecker(settings_a)
+    runner_a = _ControllableMigrationRunner(exit_code=0)
+    bootstrap_a = MigrationBootstrap(settings_a, readiness_checker=checker_a, runner=runner_a)
+
+    task_a = asyncio.create_task(bootstrap_a.ensure_schema_current())
+    try:
+        await asyncio.wait_for(runner_a.started.wait(), timeout=10.0)
+
+        task_a.cancel()
+        # Give the cancellation a real chance to reach the shielded critical
+        # section before B even tries -- A must still be alive and holding
+        # the real lock the whole time.
+        await asyncio.sleep(0.2)
+        assert not task_a.done()
+
+        settings_b = migration_bootstrap_settings(dedicated_database_url)
+        checker_b = PostgresReadinessChecker(settings_b)
+        runner_b = CountingMigrationRunner()
+        bootstrap_b = MigrationBootstrap(
+            settings_b,
+            readiness_checker=checker_b,
+            runner=runner_b,
+            lock_acquire_deadline_seconds=1.0,
+            lock_acquire_poll_interval_seconds=0.05,
+        )
+        try:
+            with pytest.raises(MigrationLockTimeoutError):
+                await bootstrap_b.ensure_schema_current()
+            assert runner_b.invocations == 0
+        finally:
+            await checker_b.dispose()
+
+        # Only now does A's child "finish" -- the critical section can
+        # close, classify the (fake, non-zero-DDL) exit, and release the
+        # real advisory lock.
+        runner_a.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task_a
+    finally:
+        await checker_a.dispose()
+
+    # The lock is now free: a fresh bootstrap B can legitimately acquire
+    # protection and perform the real migration (the database was never
+    # actually touched by A's fake runner, so it is still eligible).
+    checker_b2 = PostgresReadinessChecker(settings_b)
+    bootstrap_b2 = MigrationBootstrap(settings_b, readiness_checker=checker_b2, runner=runner_b)
+    try:
+        await bootstrap_b2.ensure_schema_current()
+        assert runner_b.invocations == 1
+        assert (await checker_b2.check()).ready is True
+    finally:
+        await checker_b2.dispose()
 
 
 @pytest.mark.integration

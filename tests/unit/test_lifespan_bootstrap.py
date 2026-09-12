@@ -464,27 +464,36 @@ def test_bootstrap_retry_interval_is_bounded() -> None:
     ],
 )
 @pytest.mark.asyncio
-async def test_sticky_migration_failure_stops_the_bootstrap_task_without_retry(
+async def test_migration_sticky_errors_are_retried_like_any_other_bootstrap_failure(
     monkeypatch: pytest.MonkeyPatch, sticky_error: Exception
 ) -> None:
-    """ADR-0015 SM-902: a sticky migration-execution/post-verification
-    failure must never be retried on the ordinary
-    ``BOOTSTRAP_RETRY_INTERVAL_SECONDS`` interval -- ``_run_bootstrap`` must
-    call ``_attempt_bootstrap`` (and therefore
-    ``MigrationBootstrap.ensure_schema_current()``) at most once and then
-    simply stop, leaving the holder in ``BOOTSTRAP_MAINTENANCE`` forever for
-    this process lifetime."""
+    """ADR-0015/SM-903: the sticky-failure protection now lives entirely
+    inside ``MigrationBootstrap`` itself (an in-memory, instance-scoped
+    marker, ``services.migration_bootstrap``) -- ``_run_bootstrap`` has no
+    special case for ``MigrationExecutionFailedError``/
+    ``MigrationPostVerificationFailedError`` at all, unlike SM-902's earlier
+    minimal stop-here behavior. In production these two exception types can
+    only ever reach ``_attempt_bootstrap`` on the *first* failing automatic
+    attempt: every later call is routed by ``MigrationBootstrap`` itself to
+    a read-only probe instead of a fresh automatic attempt. This test proves
+    the outer loop's own contribution to that story: if one of these is ever
+    raised, it is retried exactly like any other ordinary bootstrap failure,
+    on the same interval, and the loop keeps running rather than stopping."""
 
     monkeypatch.setattr("sofias_memory.lifespan.BOOTSTRAP_RETRY_INTERVAL_SECONDS", 0.01)
     holder = ProcessStateHolder()
     attempts = 0
 
-    async def sticky_attempt(**kwargs: object) -> None:
+    async def failing_then_succeeding_attempt(**kwargs: object) -> None:
         nonlocal attempts
         attempts += 1
-        raise sticky_error
+        if attempts < 3:
+            raise sticky_error
+        cast(ProcessStateHolder, kwargs["holder"]).transition(ProcessState.OPERATIONAL)
 
-    monkeypatch.setattr("sofias_memory.lifespan._attempt_bootstrap", sticky_attempt)
+    monkeypatch.setattr(
+        "sofias_memory.lifespan._attempt_bootstrap", failing_then_succeeding_attempt
+    )
 
     await asyncio.wait_for(
         _run_bootstrap(
@@ -501,10 +510,8 @@ async def test_sticky_migration_failure_stops_the_bootstrap_task_without_retry(
         timeout=5.0,
     )
 
-    # Never retried, even though BOOTSTRAP_RETRY_INTERVAL_SECONDS was
-    # shortened to make a would-be retry observable well within the timeout.
-    assert attempts == 1
-    assert holder.state is ProcessState.BOOTSTRAP_MAINTENANCE
+    assert attempts == 3
+    assert holder.state is ProcessState.OPERATIONAL
 
 
 @pytest.mark.asyncio

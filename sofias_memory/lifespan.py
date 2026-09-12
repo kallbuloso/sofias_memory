@@ -16,11 +16,7 @@ from sofias_memory.infrastructure.postgres import AsyncSessionFactory, dispose_a
 from sofias_memory.infrastructure.storage import SourceStorageRouter
 from sofias_memory.observability.logging import configure_logging, get_logger
 from sofias_memory.pipelines.registry import PipelineRegistry
-from sofias_memory.services.migration_bootstrap import (
-    MigrationBootstrap,
-    MigrationExecutionFailedError,
-    MigrationPostVerificationFailedError,
-)
+from sofias_memory.services.migration_bootstrap import MigrationBootstrap
 from sofias_memory.services.operational_metrics import OperationalMetricsReporter
 from sofias_memory.services.pipeline_recovery import PipelineRecoveryService
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
@@ -225,12 +221,18 @@ async def _run_bootstrap(
     dependency failure; it never silently reports ``OPERATIONAL``, since
     that line is only ever reached after every gate above it succeeded.
 
-    One deliberate exception to "always retry" (ADR-0015 SM-902): a sticky
-    migration-execution or post-verification failure must never be retried
-    on this ordinary interval -- doing so would re-run DDL against a
-    database state a human has not yet examined. See the dedicated
-    ``except`` clause below; SM-903 replaces this minimal stop-here behavior
-    with a continued read-only recovery probe.
+    ADR-0015/SM-903: a sticky migration-execution or post-verification
+    failure is never re-invoked as a fresh automatic Alembic attempt on this
+    ordinary interval -- but unlike a bare "stop retrying forever", the
+    stickiness itself lives entirely inside ``MigrationBootstrap`` (an
+    instance-level, in-memory-only marker). This outer loop has no special
+    case for it at all: it keeps calling ``_attempt_bootstrap`` ->
+    ``migration_bootstrap.ensure_schema_current()`` on the same
+    ``BOOTSTRAP_RETRY_INTERVAL_SECONDS`` cadence as any other failure, and
+    ``MigrationBootstrap`` itself routes each such call to a read-only
+    PostgreSQL probe instead of the lock/Alembic path while its sticky
+    marker is set -- see ``services.migration_bootstrap`` for the full
+    mechanism, including same-process recovery without a restart.
     """
 
     logger = get_logger(__name__)
@@ -251,21 +253,6 @@ async def _run_bootstrap(
             return
         except asyncio.CancelledError:
             raise
-        except (MigrationExecutionFailedError, MigrationPostVerificationFailedError) as exc:
-            # ADR-0015 sticky migration-execution-failure (SM-902's minimal
-            # distinction; SM-903 replaces this with a continued read-only
-            # probe): unlike every other bootstrap failure, this one is
-            # never retried on BOOTSTRAP_RETRY_INTERVAL_SECONDS. The
-            # bootstrap task simply stops here, remaining
-            # BOOTSTRAP_MAINTENANCE for the rest of this process's
-            # lifetime -- only a full process restart permits a fresh
-            # automatic migration attempt.
-            logger.error(
-                "migration_bootstrap_sticky_failure",
-                process_state=holder.state.value,
-                exception_type=type(exc).__name__,
-            )
-            return
         except Exception as exc:  # noqa: BLE001 - D33: never crash-loop, always retry
             logger.error(
                 "bootstrap_attempt_failed",

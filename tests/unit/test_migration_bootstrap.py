@@ -1,12 +1,15 @@
-"""Unit tests for ADR-0015/SM-902's automatic serialized migration bootstrap
-(``sofias_memory.services.migration_bootstrap``) -- exercised entirely
-against fakes, independent of real PostgreSQL/Alembic/subprocess. Real-
-PostgreSQL/real-subprocess proof lives in
-``tests/integration/test_migration_bootstrap_postgres_integration.py``.
+"""Unit tests for ADR-0015/SM-902/SM-903's automatic serialized migration
+bootstrap (``sofias_memory.services.migration_bootstrap``) -- exercised
+entirely against fakes, independent of real PostgreSQL/Alembic/subprocess.
+Real-PostgreSQL/real-subprocess proof lives in
+``tests/integration/test_migration_bootstrap_postgres_integration.py`` (SM-902)
+and ``tests/integration/test_migration_bootstrap_supervisor_loss_postgres_integration.py``
+(SM-903 sticky-failure/graceful-shutdown/hard-termination proofs).
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import cast
 
 import pytest
@@ -709,3 +712,194 @@ async def test_migration_lock_waiting_is_logged_once_per_attempt_not_per_poll(
         assert len(waiting_events) == 1
     finally:
         clear_log_context()
+
+
+# ---------------------------------------------------------------------------
+# SM-903 Part 1: sticky failure -- full read-only recovery semantics.
+# ---------------------------------------------------------------------------
+
+
+class ControllableMigrationRunner:
+    """A runner whose `upgrade_head()` blocks until explicitly released --
+    used to prove SM-903's graceful-shutdown critical section, where a real
+    test needs to observe "the child is alive and the lock is held" as a
+    distinct moment in time, then decide what happens next."""
+
+    def __init__(self, *, exit_code: int = 0) -> None:
+        self.exit_code = exit_code
+        self.calls: list[str] = []
+        self.started = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def upgrade_head(self, *, database_url: str) -> int:
+        self.calls.append(database_url)
+        self.started.set()
+        await self._release.wait()
+        return self.exit_code
+
+    def release(self) -> None:
+        self._release.set()
+
+
+@pytest.mark.asyncio
+async def test_sticky_failure_gates_all_future_automatic_attempts_this_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backlog SM-903 (a): a failed Alembic invocation -> several outer-loop-
+    equivalent calls to `ensure_schema_current()` -> the runner is invoked
+    exactly once, never again, and no further lock acquisition is even
+    attempted -- every subsequent call is a read-only probe."""
+
+    patch_classification(monkeypatch, state=MigrationSchemaState.KNOWN_ANCESTOR)
+    runner = FakeMigrationRunner(exit_code=1)
+    checker = FakeReadinessChecker(results=[PostgresReadinessResult(False, failures=("x",))])
+    bootstrap, engine = make_bootstrap(mode="auto", readiness_checker=checker, runner=runner)
+
+    with pytest.raises(MigrationExecutionFailedError):
+        await bootstrap.ensure_schema_current()
+
+    assert len(runner.calls) == 1
+    assert engine.connect_calls == 1
+
+    # Several more outer-loop-equivalent cycles: the process keeps probing,
+    # but never re-touches the lock and never re-invokes Alembic.
+    for _ in range(3):
+        with pytest.raises(MigrationClassificationFailedError):
+            await bootstrap.ensure_schema_current()
+
+    assert len(runner.calls) == 1
+    assert engine.connect_calls == 1
+    # Non-zero exit code never reaches post-migration verification, so all
+    # 3 `check()` calls are sticky probes.
+    assert checker.check_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_manual_repair_lets_the_same_process_recover_without_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backlog SM-903 (b): after a sticky failure, an operator repairs the
+    database out-of-band; the next read-only probe observes it as ready, and
+    the *same* `MigrationBootstrap` instance proceeds normally (returns from
+    `ensure_schema_current()` without error) -- no restart, no new instance,
+    no re-acquired lock, no second Alembic invocation."""
+
+    patch_classification(monkeypatch, state=MigrationSchemaState.KNOWN_ANCESTOR)
+    runner = FakeMigrationRunner(exit_code=1)
+    checker = FakeReadinessChecker(
+        results=[
+            # Non-zero exit code never reaches post-migration verification --
+            # both entries below are sticky-probe reads.
+            PostgresReadinessResult(False, failures=("still broken",)),  # first sticky probe
+            PostgresReadinessResult(True),  # operator has repaired it out-of-band
+        ]
+    )
+    bootstrap, engine = make_bootstrap(mode="auto", readiness_checker=checker, runner=runner)
+
+    with pytest.raises(MigrationExecutionFailedError):
+        await bootstrap.ensure_schema_current()
+    with pytest.raises(MigrationClassificationFailedError):
+        await bootstrap.ensure_schema_current()
+
+    # Third call: the repaired database is observed -- returns cleanly.
+    await bootstrap.ensure_schema_current()
+
+    assert len(runner.calls) == 1  # never re-invoked
+    assert engine.connect_calls == 1  # lock never re-acquired
+    assert bootstrap._migration_failed_this_process is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_new_bootstrap_instance_has_no_inherited_sticky_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process restart always constructs a brand-new `MigrationBootstrap`;
+    it must never start sticky."""
+
+    patch_classification(monkeypatch, state=MigrationSchemaState.PRISTINE_FRESH_SCHEMA)
+    checker = FakeReadinessChecker(results=[PostgresReadinessResult(True)])
+    runner = FakeMigrationRunner(exit_code=0)
+    bootstrap, _engine = make_bootstrap(mode="auto", readiness_checker=checker, runner=runner)
+
+    assert bootstrap._migration_failed_this_process is False  # noqa: SLF001
+    await bootstrap.ensure_schema_current()
+    assert len(runner.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# SM-903 Part 2: graceful shutdown migration critical section.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_child_alive_does_not_release_lock_or_abandon_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the Alembic child is spawned, `{child, lock ownership}` is one
+    critical section: cancelling the calling task while the child is alive
+    must not release the advisory lock, must not abandon/cancel the child,
+    and must not let the coroutine return early. Only once the child
+    actually finishes does the lock get released and does the original
+    cancellation finally propagate."""
+
+    patch_classification(monkeypatch, state=MigrationSchemaState.PRISTINE_FRESH_SCHEMA)
+    checker = FakeReadinessChecker(results=[PostgresReadinessResult(True)])
+    runner = ControllableMigrationRunner(exit_code=0)
+    connection = FakeLockConnection(lock_results=[True])
+    bootstrap, _engine = make_bootstrap(
+        mode="auto", readiness_checker=checker, runner=runner, lock_connection=connection
+    )
+
+    task = asyncio.create_task(bootstrap.ensure_schema_current())
+    await asyncio.wait_for(runner.started.wait(), timeout=5.0)
+
+    task.cancel()
+    # Give the cancellation a few event-loop turns to actually reach the
+    # shielded await -- the task must still be alive, and the lock must
+    # still be held, the whole time.
+    for _ in range(5):
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert connection.commit_calls == 0
+        assert not any("pg_advisory_unlock" in sql for sql in connection.executed_sql)
+
+    # Only now does the child "finish" -- the critical section can close.
+    runner.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(runner.calls) == 1
+    assert any("pg_advisory_unlock(" in sql for sql in connection.executed_sql)
+    assert connection.commit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_migration_execution_failure_preserves_sticky_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation observed while the child is alive must not swallow a
+    genuine migration-execution failure that happened to finish concurrently
+    -- the sticky flag must still be set."""
+
+    patch_classification(monkeypatch, state=MigrationSchemaState.PRISTINE_FRESH_SCHEMA)
+    checker = ExplodingReadinessChecker()
+    runner = ControllableMigrationRunner(exit_code=1)
+    connection = FakeLockConnection(lock_results=[True])
+    bootstrap, _engine = make_bootstrap(
+        mode="auto", readiness_checker=checker, runner=runner, lock_connection=connection
+    )
+
+    task = asyncio.create_task(bootstrap.ensure_schema_current())
+    await asyncio.wait_for(runner.started.wait(), timeout=5.0)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    runner.release()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert bootstrap._migration_failed_this_process is True  # noqa: SLF001
+    assert connection.commit_calls == 1  # lock still released despite the cancellation

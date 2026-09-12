@@ -1,30 +1,51 @@
-"""Automatic serialized migration bootstrap (ADR-0015, SM-902).
+"""Automatic serialized migration bootstrap (ADR-0015, SM-902/SM-903).
 
 SM-901 answers "what schema state is PostgreSQL in?" (schema classification
-only, `infrastructure/postgres/migration_state.py`). This module answers the
-next question: "given that state and `DATABASE_MIGRATION_MODE`, may this
-process safely run `alembic upgrade head` now?" -- and, for the first time,
-actually acts on the answer: session-level advisory serialization, a fresh
-state re-read after lock acquisition, `alembic upgrade head` as a real OS
-subprocess, and post-migration verification.
+only, `infrastructure/postgres/migration_state.py`). SM-902 answered the next
+question -- "given that state and `DATABASE_MIGRATION_MODE`, may this process
+safely run `alembic upgrade head` now?" -- and acted on it for the first
+time: session-level advisory serialization, a fresh state re-read after lock
+acquisition, `alembic upgrade head` as a real OS subprocess, and post-
+migration verification.
 
-Explicitly out of scope here (SM-903): the full sticky-failure read-only
-recovery loop, graceful-shutdown migration-critical-section shielding
-(cancellation shielding around an in-flight child), and hard-termination/
-orphan-child safety (process-group supervision, parent-death signalling).
-SM-902's own failure semantics are the minimum necessary to avoid the
-specific runaway behavior ADR-0015 forbids -- see
-:class:`MigrationExecutionFailedError`/:class:`MigrationPostVerificationFailedError`
-and `lifespan._run_bootstrap`'s dedicated `except` clause for them.
+SM-903 hardens the full process lifecycle around that single automatic
+attempt:
+
+- **Sticky failure**: once a migration-execution/post-verification failure
+  has occurred, this instance never invokes Alembic again for the rest of
+  this process's lifetime -- `self._migration_failed_this_process` gates
+  `ensure_schema_current()` to a read-only probe
+  (`_probe_sticky_readiness`) instead. If an operator repairs the database
+  out-of-band and the probe subsequently observes it as current, this same
+  process resumes normally without a restart. A process restart always
+  starts a brand-new `MigrationBootstrap` instance with no sticky marker.
+- **Graceful shutdown**: once an Alembic child has been spawned,
+  `{child process, advisory lock ownership}` form one critical section
+  (`_run_migration_critical_section`) that a caller's cancellation can never
+  abandon -- the child is always supervised to natural completion, its exit
+  classified, post-verification performed, and the lock released, before
+  cancellation is allowed to propagate. Implemented via `asyncio.shield`
+  around an independently-running supervising task; no execution timeout is
+  introduced.
+- **Hard-termination / orphan safety**: `OsSubprocessMigrationRunner`
+  implements ADR-0015's orphan-safety invariant via **Property A** (the
+  migration child cannot outlive the supervisor that owns the advisory
+  lock), using Linux's `PR_SET_PDEATHSIG` so the kernel itself kills the
+  Alembic child the instant this process dies for any reason -- including a
+  hard `SIGKILL`/crash that no Python cleanup code can observe. This is a
+  Linux-specific guarantee (matching this project's actual release runtime,
+  a Linux Docker image); it is a no-op on non-Linux platforms, which is
+  documented, not silently promised.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol
@@ -157,17 +178,22 @@ class MigrationSchemaInvalidError(MigrationBootstrapError):
 class MigrationExecutionFailedError(MigrationBootstrapError):
     """ADR-0015 failure class 2 (migration execution failure), part A: the
     Alembic subprocess exited non-zero. Sticky for the remainder of this
-    process's lifetime -- `lifespan._run_bootstrap` catches this
-    specifically and stops retrying rather than re-invoking Alembic on the
-    ordinary 5-second interval (SM-902's minimal distinction; SM-903 adds
-    the full continued read-only probe in its place)."""
+    process's lifetime (SM-903): `MigrationBootstrap` itself sets
+    `self._migration_failed_this_process = True` when this is raised, which
+    makes every subsequent `ensure_schema_current()` call on this instance a
+    read-only probe (`_probe_sticky_readiness`) instead of a fresh automatic
+    attempt -- `lifespan._run_bootstrap`'s ordinary 5-second retry loop keeps
+    running, but never invokes Alembic again unless this same process
+    observes (via the probe) that the database has been repaired out-of-
+    band."""
 
 
 class MigrationPostVerificationFailedError(MigrationBootstrapError):
     """ADR-0015 failure class 2, part B: the Alembic subprocess exited zero,
     but PostgreSQL is not actually at the expected exact head afterward.
-    Same stickiness as :class:`MigrationExecutionFailedError` -- exit code 0
-    is never treated as sufficient proof of success on its own."""
+    Same stickiness as :class:`MigrationExecutionFailedError` (SM-903) --
+    exit code 0 is never treated as sufficient proof of success on its
+    own."""
 
 
 class MigrationRunner(Protocol):
@@ -180,18 +206,61 @@ class MigrationRunner(Protocol):
         child process's exit code; never raises for a non-zero exit."""
 
 
+def _set_parent_death_signal_sigkill() -> None:
+    """`preexec_fn` for the migration child (Linux only, SM-903 orphan
+    safety, ADR-0015 Property A): runs in the forked child, before `exec`,
+    and asks the kernel to send it `SIGKILL` the instant its parent (this
+    supervisor process) dies for *any* reason -- crash, `SIGKILL`, or a
+    normal exit that never got a chance to run Python cleanup code. This is
+    the mechanism that makes "the migration child cannot outlive the
+    supervisor that owns the advisory lock" a kernel-level guarantee rather
+    than a best-effort promise: it does not depend on this process's own
+    signal handlers, `finally` blocks, or asyncio shutdown code ever
+    running.
+
+    `PR_SET_PDEATHSIG` (`prctl(2)`) is Linux-specific; there is no POSIX
+    portable equivalent. This is called only when `sys.platform == "linux"`
+    (see `OsSubprocessMigrationRunner.upgrade_head`) -- on any other
+    platform (e.g. a developer's `uv run` on Windows/macOS) no parent-death
+    guarantee is installed, and that boundary is documented rather than
+    silently promised. It matches this project's actual release runtime, a
+    Linux Docker image (`AGENTS.md`).
+    """
+
+    import ctypes
+
+    PR_SET_PDEATHSIG = 1
+    SIGKILL = 9
+    # A plain literal, not `signal.SIGKILL`: that attribute is only defined
+    # by typeshed's Linux/POSIX stubs, and this module must still type-check
+    # cleanly under a Windows mypy run (this function's only caller already
+    # gates it to `sys.platform == "linux"` at runtime).
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.prctl(PR_SET_PDEATHSIG, SIGKILL)
+
+
 class OsSubprocessMigrationRunner:
     """`alembic upgrade head` as a real OS subprocess (ADR-0015) -- never
     `alembic.command.upgrade(...)` in-process, never a shell.
 
-    Invoked as `<this process's own interpreter> -m alembic upgrade head`:
-    the same installed Alembic package/version this process already imports
-    runs, with no dependency on an `alembic` console-script entry point
-    being on `PATH` -- correct identically in a source checkout (`uv run
-    ...`) and inside the release Docker image. `cwd` is pinned to
+    Invoked by default as `<this process's own interpreter> -m alembic
+    upgrade head`: the same installed Alembic package/version this process
+    already imports runs, with no dependency on an `alembic` console-script
+    entry point being on `PATH` -- correct identically in a source checkout
+    (`uv run ...`) and inside the release Docker image. `cwd` is pinned to
     `REPO_ROOT` so the child finds `alembic.ini`/`migrations/` deterministically,
     never depending on the operator's/`uvicorn`'s own working directory.
+
+    `command` is overridable (SM-903) strictly as a test seam: it lets
+    `tests/integration`'s hard-termination/orphan-safety proof spawn a real,
+    deliberately long-running child through this exact class -- the same
+    `preexec_fn`/subprocess-construction code path production migrations
+    use -- without actually invoking Alembic or mutating a database. The
+    default is always the real `alembic upgrade head` invocation.
     """
+
+    def __init__(self, *, command: Sequence[str] = ("-m", "alembic", "upgrade", "head")) -> None:
+        self._command = tuple(command)
 
     async def upgrade_head(self, *, database_url: str) -> int:
         env = os.environ.copy()
@@ -201,17 +270,18 @@ class OsSubprocessMigrationRunner:
         # `.env` file) -- force it explicitly so the child always targets
         # the exact same database this running instance is configured for.
         env["DATABASE_URL"] = database_url
+        preexec_fn = _set_parent_death_signal_sigkill if sys.platform == "linux" else None
         process = await asyncio.create_subprocess_exec(
             sys.executable,
-            "-m",
-            "alembic",
-            "upgrade",
-            "head",
+            *self._command,
             cwd=str(REPO_ROOT),
             env=env,
+            preexec_fn=preexec_fn,
         )
         # No execution timeout wraps this await, by design (ADR-0015): a
-        # legitimate migration may run for as long as it needs to.
+        # legitimate migration may run for as long as it needs to. Orphan
+        # safety for a hard-killed *supervisor* is handled entirely by
+        # `preexec_fn` above, never by a timeout on this side.
         return await process.wait()
 
 
@@ -255,18 +325,74 @@ class MigrationBootstrap:
         self._deadline_seconds = lock_acquire_deadline_seconds
         self._poll_interval_seconds = lock_acquire_poll_interval_seconds
         self._logger = get_logger(__name__)
+        # SM-903 sticky-failure marker: in-memory only, never a durable
+        # table/column, and never anything but instance-scoped -- a brand
+        # new `MigrationBootstrap` (a real process restart) always starts
+        # with this `False`, which is exactly how a restart is allowed a
+        # fresh automatic attempt even after a prior process's sticky
+        # failure (ADR-0015).
+        self._migration_failed_this_process = False
 
     async def ensure_schema_current(self) -> None:
         """D32 gate: raises unless the schema is confirmed current (or was
         just migrated to current) for this application version. Replaces
         `_attempt_bootstrap`'s previous direct
         `postgres_readiness_checker.check()` call at the exact same position
-        in the startup sequence."""
+        in the startup sequence.
 
+        SM-903: once this instance has observed a sticky migration-execution
+        or post-verification failure, every subsequent call here -- for the
+        rest of this process's lifetime -- is routed to a read-only probe
+        instead of a fresh automatic attempt, no matter how many times
+        `lifespan._run_bootstrap`'s outer loop keeps calling this. Checked
+        before the `verify_only`/`auto` mode branch below because it is a
+        process-lifetime property of *this instance*, orthogonal to mode."""
+
+        if self._migration_failed_this_process:
+            await self._probe_sticky_readiness()
+            return
         if self._settings.database_migration_mode == "verify_only":
             await self._ensure_schema_current_verify_only()
             return
         await self._ensure_schema_current_auto()
+
+    async def _probe_sticky_readiness(self) -> None:
+        """SM-903 sticky-failure recovery path: a read-only re-check of
+        PostgreSQL, never the advisory lock, never Alembic. Two outcomes:
+
+        - Still not ready (or the check itself raises): re-raises as an
+          ordinary `MigrationClassificationFailedError`, which
+          `lifespan._run_bootstrap`'s existing generic `except Exception`
+          clause retries on the normal interval -- the outer loop keeps
+          running, but never touches the lock or spawns Alembic while this
+          flag remains set.
+        - Ready: an operator has repaired the database out-of-band while
+          this same process was alive. The sticky marker is cleared and
+          this call returns normally, letting `ensure_schema_current`'s
+          caller (`_attempt_bootstrap`) proceed past the D32 gate exactly as
+          if this had been an ordinary successful `NO_OP` -- Neo4j bootstrap,
+          recovery, worker start, and storage convergence all continue in
+          this same process, with no restart required.
+        """
+
+        self._logger.info("migration_sticky_probe")
+        try:
+            result = await self._readiness_checker.check()
+        except Exception as exc:  # noqa: BLE001 - sticky probe failure is ordinary/retryable
+            self._logger.warning(
+                "bootstrap_schema_not_ready", exception_type=type(exc).__name__, sticky=True
+            )
+            raise MigrationClassificationFailedError(
+                "schema not current (sticky recovery probe)"
+            ) from exc
+        if not result.ready:
+            self._logger.warning(
+                "bootstrap_schema_not_ready", failures=result.failures, sticky=True
+            )
+            raise MigrationClassificationFailedError("schema not current (sticky recovery probe)")
+
+        self._migration_failed_this_process = False
+        self._logger.info("migration_sticky_recovered")
 
     async def _ensure_schema_current_verify_only(self) -> None:
         """`verify_only`: reproduces the pre-ADR-0015 contract exactly --
@@ -301,23 +427,123 @@ class MigrationBootstrap:
     async def _migrate_and_release(
         self, lock_connection: AsyncConnection, *, code_heads: frozenset[str]
     ) -> None:
-        """Runs the migration under the held lock, then always attempts to
-        release it -- but a sticky migration-execution/post-verification
-        failure (ADR-0015 failure class 2) must remain the exception that
-        ultimately propagates, even if the unlock cleanup itself also fails
-        (connection loss, a failed `pg_advisory_unlock`/commit). A cleanup
-        failure must never silently replace a sticky failure with an
-        ordinary retryable one -- that would let `_run_bootstrap` retry
-        Alembic on the generic 5-second interval, exactly the runaway
-        behavior ADR-0015 forbids. For every other failure here
-        (classification/schema-invalid/lock/readiness transient, or
-        cancellation), no automatic DDL was ever started, so a cleanup
+        """Classifies under the held lock, then either releases it directly
+        (`NO_OP`/`FAIL_CLOSED`/any classification failure -- no Alembic
+        child was ever spawned) or, for `MIGRATE`, hands off to
+        `_run_migration_critical_section` (SM-903), which owns the lock
+        release itself once the child has actually terminated.
+
+        A cleanup failure while releasing the lock after a pre-`MIGRATE`
         failure is allowed to propagate normally as an ordinary error --
-        unchanged from before this restructuring."""
+        nothing was attempted against the schema, so there is no sticky
+        error it could mask."""
 
         try:
-            await self._migrate_under_lock(lock_connection, code_heads=code_heads)
+            action, state = await self._classify_under_lock(lock_connection, code_heads=code_heads)
+
+            if action is MigrationAction.NO_OP:
+                self._logger.info("migration_not_required", schema_state=state.value)
+                await self._verify_ready_or_raise(post_migration=False)
+                await self._release_lock(lock_connection)
+                return
+
+            if action is MigrationAction.FAIL_CLOSED:
+                self._logger.warning("migration_schema_invalid", schema_state=state.value)
+                raise MigrationSchemaInvalidError(f"schema state {state.value} is fail-closed")
+        except BaseException:
+            await self._release_lock(lock_connection)
+            raise
+
+        # action is MIGRATE. From here on, `{child process, advisory lock
+        # ownership}` form one critical section (ADR-0015 / backlog SM-903):
+        # this process's own cancellation/shutdown must never abandon a live
+        # child or release the lock out from under it -- see
+        # `_run_migration_critical_section` for how that is enforced. Lock
+        # release (ordinary or sticky-preserving) happens entirely inside
+        # it, never here.
+        await self._run_migration_critical_section(lock_connection, state)
+
+    async def _classify_under_lock(
+        self, lock_connection: AsyncConnection, *, code_heads: frozenset[str]
+    ) -> tuple[MigrationAction, MigrationSchemaState]:
+        # ADR-0015: always re-derive classification from PostgreSQL AFTER
+        # acquiring the lock -- never reuse anything observed before
+        # waiting began. A fresh RevisionGraph is loaded here too, not
+        # cached across calls, for the same reason.
+        revision_graph = self._revision_graph_loader()
+        snapshot = await collect_migration_state_snapshot(lock_connection, code_heads=code_heads)
+        # Read-only observation only -- end the implicit transaction before
+        # the (potentially long) external Alembic subprocess runs. Session-
+        # level advisory locks are unaffected by COMMIT/ROLLBACK.
+        await lock_connection.rollback()
+
+        state = classify_migration_state(snapshot, revision_graph=revision_graph)
+        return migration_policy(mode="auto", state=state), state
+
+    async def _run_migration_critical_section(
+        self, lock_connection: AsyncConnection, state: MigrationSchemaState
+    ) -> None:
+        """SM-903 graceful-shutdown critical section: from the moment the
+        Alembic child is spawned (inside `_run_upgrade_and_release`) until
+        it has terminated, been classified, (on success) post-verified, and
+        the advisory lock has been released -- this process's own
+        cancellation must never abandon the child, close the lock
+        connection, or release the lock early.
+
+        `_run_upgrade_and_release` runs as its own `Task`, independent of
+        this coroutine's own cancellation. The ordinary (never-cancelled)
+        path is a single `await asyncio.shield(task)`: it returns/raises
+        exactly what the task itself returns/raises, completely unchanged
+        from SM-902.
+
+        If this coroutine's caller is cancelled while the task is still
+        running (e.g. `lifespan`'s `bootstrap_task.cancel()` during
+        application shutdown), `shield` raises `CancelledError` here while
+        the task itself keeps running untouched. That is caught, logged
+        once, and this coroutine then keeps re-shielding the *same* task
+        (swallowing anything it raises -- a repeated cancellation, or the
+        task's own sticky failure, whose side effects, sticky flag and lock
+        release, already happened inside `_run_upgrade_and_release`) until
+        it is actually done. Only then is the *original* cancellation
+        re-raised, so the caller's own shutdown can proceed -- never the
+        task's own exception, which would misrepresent what happened as an
+        ordinary retryable failure instead of a completed, safely-closed
+        critical section. No execution timeout is introduced anywhere
+        here."""
+
+        task: asyncio.Task[None] = asyncio.ensure_future(
+            self._run_upgrade_and_release(lock_connection, state)
+        )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                self._logger.info("migration_shutdown_waiting_for_child")
+                while not task.done():
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await asyncio.shield(task)
+                self._logger.info("migration_child_supervision_completed")
+            # Mark the task's own outcome retrieved (never let it replace
+            # this cancellation as what the caller observes) -- asyncio
+            # would otherwise log an unretrieved-exception warning for a
+            # sticky failure that raced with shutdown.
+            if not task.cancelled():
+                task.exception()
+            raise
+
+    async def _run_upgrade_and_release(
+        self, lock_connection: AsyncConnection, state: MigrationSchemaState
+    ) -> None:
+        """The actual critical-section body, run as an independent `Task` so
+        `_run_migration_critical_section` can shield it from this process's
+        own cancellation. Mirrors SM-902's original sticky-preserving unlock
+        semantics exactly, just scoped to the `MIGRATE` action only (`NO_OP`/
+        `FAIL_CLOSED` never reach here -- see `_migrate_and_release`)."""
+
+        try:
+            await self._run_upgrade(state)
         except (MigrationExecutionFailedError, MigrationPostVerificationFailedError) as sticky_exc:
+            self._migration_failed_this_process = True
             await self._release_lock_preserving_sticky_error(lock_connection, sticky_exc)
             raise
         except BaseException:
@@ -336,34 +562,6 @@ class MigrationBootstrap:
                 "migration_lock_release_failed", exception_type=type(cleanup_exc).__name__
             )
             raise sticky_error from cleanup_exc
-
-    async def _migrate_under_lock(
-        self, lock_connection: AsyncConnection, *, code_heads: frozenset[str]
-    ) -> None:
-        # ADR-0015: always re-derive classification from PostgreSQL AFTER
-        # acquiring the lock -- never reuse anything observed before
-        # waiting began. A fresh RevisionGraph is loaded here too, not
-        # cached across calls, for the same reason.
-        revision_graph = self._revision_graph_loader()
-        snapshot = await collect_migration_state_snapshot(lock_connection, code_heads=code_heads)
-        # Read-only observation only -- end the implicit transaction before
-        # the (potentially long) external Alembic subprocess runs. Session-
-        # level advisory locks are unaffected by COMMIT/ROLLBACK.
-        await lock_connection.rollback()
-
-        state = classify_migration_state(snapshot, revision_graph=revision_graph)
-        action = migration_policy(mode="auto", state=state)
-
-        if action is MigrationAction.NO_OP:
-            self._logger.info("migration_not_required", schema_state=state.value)
-            await self._verify_ready_or_raise(post_migration=False)
-            return
-
-        if action is MigrationAction.FAIL_CLOSED:
-            self._logger.warning("migration_schema_invalid", schema_state=state.value)
-            raise MigrationSchemaInvalidError(f"schema state {state.value} is fail-closed")
-
-        await self._run_upgrade(state)
 
     async def _run_upgrade(self, state: MigrationSchemaState) -> None:
         self._logger.info("migration_upgrade_started", schema_state=state.value)

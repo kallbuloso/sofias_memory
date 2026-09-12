@@ -269,6 +269,26 @@ A task só encerra quando:
 - hard termination (kill do processo) é comprovada a não deixar o advisory lock vazado (o próximo processo consegue adquiri-lo) e o próximo processo é comprovado a re-classificar do zero somente depois de ter adquirido legitimamente a proteção de serialização, nunca assumindo completion do attempt anterior;
 - suite existente permanece verde.
 
+## Resultado
+
+**Status:** DONE
+
+Implementação validada no commit:
+
+- `c011905986dd4098347fdfb2302eb46f3d1cd602` — `feat(db): harden migration bootstrap lifecycle`
+
+Gate final:
+
+- sticky failure: `MigrationBootstrap._migration_failed_this_process` (flag em memória, nunca tabela/coluna) gate `ensure_schema_current()` para um probe read-only (`_probe_sticky_readiness`) assim que uma falha genuína de execução/post-verification ocorre; o loop externo (`lifespan._run_bootstrap`) continua retentando no intervalo padrão, mas Alembic nunca é reinvocado enquanto o flag estiver setado — comprovado por teste real PostgreSQL observando múltiplos ciclos sem nova invocação e sem reaquisição do lock;
+- recuperação sem restart: uma correção manual out-of-band (aplicada via API in-process do Alembic, nunca pelo runner do bootstrap) é observada pelo probe read-only da mesma instância/processo, que limpa o flag e prossegue normalmente — comprovado por teste real PostgreSQL;
+- graceful shutdown: uma vez spawnado, `{child process, advisory lock ownership}` formam uma critical section (`_run_migration_critical_section`) via `asyncio.shield` sobre uma task independente — cancellation nunca aborta o child nem libera o lock antecipadamente; a supervisão continua até o child terminar naturalmente, o resultado é classificado, post-verification roda quando aplicável, o lock é liberado, e só então a cancellation original é repropagada — comprovado por teste unitário e por teste real PostgreSQL (uma segunda tentativa de bootstrap não consegue adquirir o advisory lock real enquanto a primeira critical section está aberta com shutdown pendente);
+- hard termination / orphan safety: escolhida e implementada a **Propriedade A** (o child de migration não sobrevive ao supervisor dono do lock), via `PR_SET_PDEATHSIG` (Linux `prctl(2)`) instalado no child através de `preexec_fn` em `OsSubprocessMigrationRunner` — fronteira de suporte documentada honestamente como Linux/Docker-only (o runtime de release real do projeto), no-op em outras plataformas; comprovado por teste de processo OS real (`tests/integration/test_migration_bootstrap_supervisor_loss_postgres_integration.py` + `_migration_bootstrap_supervisor_child.py`, executado sob um interpretador Python Linux real via WSL) que mata (`SIGKILL`) um supervisor real com um child de migration real ainda vivo e comprova: o child grandchild não sobrevive ao supervisor; o advisory lock não vaza; um segundo participante subsequentemente adquire a proteção legitimamente e re-classifica o PostgreSQL do zero (nunca assumindo completion do attempt anterior), completando uma migration real;
+- `migrations/env.py` permanece byte-a-byte inalterado;
+- nenhum timeout genérico de execução de migration introduzido;
+- nenhuma tabela/coluna de falha de migration durável introduzida;
+- suite existente (unit/contract/security, 2311 testes) permanece verde, em Windows e em Linux (WSL);
+- CI verde no SHA `c011905986dd4098347fdfb2302eb46f3d1cd602` (lint/type-check/testes e build de imagem Docker).
+
 ---
 
 # SM-904 — Operational/deployment documentation integration

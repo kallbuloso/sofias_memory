@@ -38,6 +38,7 @@ SETTINGS_ENV_NAMES = {
     "DATABASE_URL",
     "DATABASE_POOL_SIZE",
     "DATABASE_MAX_OVERFLOW",
+    "DATABASE_MIGRATION_MODE",
     "NEO4J_URI",
     "NEO4J_USERNAME",
     "NEO4J_PASSWORD",
@@ -133,6 +134,7 @@ def test_minimal_valid_configuration_uses_prd_defaults() -> None:
     assert settings.worker_enabled is True
     assert settings.log_document_content is False
     assert settings.storage_backend == "filesystem"
+    assert settings.database_migration_mode == "auto"
 
 
 def test_api_key_valid() -> None:
@@ -236,6 +238,78 @@ def test_storage_backend_accepts_s3_with_mandatory_write_config() -> None:
 
 def test_storage_backend_rejects_unknown_value() -> None:
     assert_invalid(storage_backend="minio")
+
+
+def test_database_migration_mode_defaults_to_auto_when_unset() -> None:
+    settings = make_settings()
+
+    assert settings.database_migration_mode == "auto"
+
+
+def test_database_migration_mode_accepts_explicit_auto() -> None:
+    settings = make_settings(database_migration_mode="auto")
+
+    assert settings.database_migration_mode == "auto"
+
+
+def test_database_migration_mode_accepts_verify_only() -> None:
+    settings = make_settings(database_migration_mode="verify_only")
+
+    assert settings.database_migration_mode == "verify_only"
+
+
+def test_database_migration_mode_rejects_unknown_value() -> None:
+    assert_invalid(database_migration_mode="downgrade")
+
+
+def test_database_migration_mode_env_var_unset_defaults_to_auto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("API_KEY", VALID_API_KEY)
+    monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
+    monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
+    monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_migration_mode == "auto"
+
+
+def test_database_migration_mode_env_var_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_KEY", VALID_API_KEY)
+    monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
+    monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
+    monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("DATABASE_MIGRATION_MODE", "auto")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_migration_mode == "auto"
+
+
+def test_database_migration_mode_env_var_verify_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_KEY", VALID_API_KEY)
+    monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
+    monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
+    monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("DATABASE_MIGRATION_MODE", "verify_only")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_migration_mode == "verify_only"
+
+
+def test_database_migration_mode_env_var_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("API_KEY", VALID_API_KEY)
+    monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
+    monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
+    monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("DATABASE_MIGRATION_MODE", "stamp")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 def test_default_backend_filesystem_requires_zero_s3_configuration() -> None:

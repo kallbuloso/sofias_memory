@@ -125,6 +125,13 @@ class Settings(BaseSettings):
     database_url: SecretStr = Field(alias="DATABASE_URL")
     database_pool_size: int = Field(default=10, gt=0, alias="DATABASE_POOL_SIZE")
     database_max_overflow: int = Field(default=10, ge=0, alias="DATABASE_MAX_OVERFLOW")
+    # ADR-0015: two-value automatic-migration-bootstrap mode selector.
+    # "auto" migrates a known-ancestor/pristine database forward automatically;
+    # "verify_only" reproduces the pre-ADR-0015 contract exactly (never
+    # invokes Alembic). SM-901 only reads this value; SM-902 acts on it.
+    database_migration_mode: Literal["auto", "verify_only"] = Field(
+        default="auto", alias="DATABASE_MIGRATION_MODE"
+    )
 
     neo4j_uri: str = Field(default="bolt://neo4j:7687", alias="NEO4J_URI")
     neo4j_username: str = Field(default="neo4j", alias="NEO4J_USERNAME")

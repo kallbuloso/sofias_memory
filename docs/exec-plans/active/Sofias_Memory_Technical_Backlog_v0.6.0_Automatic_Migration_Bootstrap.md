@@ -69,7 +69,7 @@ Durante SM-901..SM-906:
 
 | Ticket | Entrega principal | Depende de | Migration | Status |
 |---|---|---|---|---|
-| SM-901 | Schema classification model (sem executar Alembic) | — | — | TODO |
+| SM-901 | Schema classification model (sem executar Alembic) | — | — | DONE |
 | SM-902 | Advisory lock + subprocess bootstrap | SM-901 | — | TODO |
 | SM-903 | Sticky failure + graceful shutdown critical section + hard-termination orphan safety | SM-902 | — | TODO |
 | SM-904 | Operational/deployment documentation integration + Compose deployment/static invariant | SM-903 | — | TODO |
@@ -133,6 +133,26 @@ cobrindo `auto` e `verify_only` onde o comportamento difere; e além disso:
 - `database_migration_mode` está presente em `Settings` com o `Literal[...]`/alias/default congelados acima, comprovado por teste de config;
 - nenhum subprocess Alembic é invocado em nenhum teste desta task;
 - suite existente permanece verde.
+
+## Resultado
+
+**Status:** DONE
+
+Implementação validada nos commits:
+
+- `17ef44066dca34e2923c291bd70c810f71087727` — `feat(db): add migration schema state classifier`
+- `b455638a5512b5f4c6af97fada94bd1276f0403a` — `fix(ci): add migration mode config parity`
+- `09a4cf2d29c617421dfc39f6aef7668dcb10e9fe` — `fix(ci): enforce easypanel config parity`
+
+Gate final:
+
+- classifier dos 9 estados observáveis implementado;
+- `DATABASE_MIGRATION_MODE=auto|verify_only`, default `auto`;
+- nenhuma execução Alembic introduzida;
+- `lifespan.py` permanece inalterado;
+- paridade de Settings preservada em `.env.example`, root Compose e EasyPanel Compose;
+- guardrail de CI endurecido para cobrir também o environment contract do EasyPanel;
+- CI #60 verde no SHA `09a4cf2d29c617421dfc39f6aef7668dcb10e9fe`.
 
 ---
 

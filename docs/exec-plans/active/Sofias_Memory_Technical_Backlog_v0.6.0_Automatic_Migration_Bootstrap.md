@@ -71,8 +71,8 @@ Durante SM-901..SM-906:
 |---|---|---|---|---|
 | SM-901 | Schema classification model (sem executar Alembic) | — | — | DONE |
 | SM-902 | Advisory lock + subprocess bootstrap | SM-901 | — | DONE |
-| SM-903 | Sticky failure + graceful shutdown critical section + hard-termination orphan safety | SM-902 | — | TODO |
-| SM-904 | Operational/deployment documentation integration + Compose deployment/static invariant | SM-903 | — | TODO |
+| SM-903 | Sticky failure + graceful shutdown critical section + hard-termination orphan safety | SM-902 | — | DONE |
+| SM-904 | Operational/deployment documentation integration + Compose deployment/static invariant | SM-903 | — | DONE |
 | SM-905 | Real-PostgreSQL hardening matrix + release-image smoke + orphan-safety scenario | SM-903, SM-904 | — | TODO |
 | SM-906 | Release prep — quality gates, version bump, GATE-v0.6.0 | SM-905 | — | TODO |
 
@@ -333,6 +333,27 @@ A task só encerra quando:
 - `tests/unit/test_deployment_compose.py::test_compose_files_never_auto_run_alembic` foi **substituído**, não deletado, por um invariante de intenção equivalente (Compose nunca invoca Alembic raw diretamente; automático só via bootstrap sancionado), comprovado pelo teste passando localmente;
 - `git diff --stat` confirma zero mudança em código de produção, migrations, Compose, Dockerfile ou workflows;
 - suite existente permanece verde (nenhuma suite depende do texto de documentação alterado, mas o gate de lint/format e o teste estático substituído continuam rodando).
+
+## Resultado
+
+**Status:** DONE
+
+Implementação validada no commit:
+
+- `78d0817292c2c5eba3485289151ea007269795f4` — `docs(v0.6): integrate automatic migration operations`
+
+Gate final:
+
+- `README.md`, `docs/operations.md`, `docs/deployment/easypanel.md`, `AGENTS.md` e `CLAUDE.md` atualizados e consistentes entre si quanto à spelling/semântica de `DATABASE_MIGRATION_MODE=auto|verify_only` (default `auto`), comprovado por revisão manual do diff completo;
+- busca textual por "never automatic"/"nunca automática"/"migration is explicit" confirmou zero afirmação remanescente contradizendo `auto` — os únicos hits restantes estão corretamente escopados a `verify_only` ou a estados fail-closed (nunca ao caminho normal `auto`);
+- `docs/operations.md` §2–§4 reescritos para o novo default; §7 (Restore) recebeu o restore safeguard explícito do ADR-0015 (restore histórico sob `auto` migra para frente automaticamente no primeiro boot; recomendação de `verify_only` para inspeção); §13.15 (observability) ganhou os eventos de log do migration bootstrap (SM-901/902/903);
+- `docs/deployment/easypanel.md` §3/§4 reescritos: o dance `WORKER_ENABLED=false` + console manual deixou de ser necessário no caminho normal (a própria ordenação do bootstrap já impede o worker de tocar um schema não migrado); migration manual preservada como workflow de `verify_only`/controle explícito; o procedimento histórico de upgrade para v0.4.0 permanece verbatim, com nota de forward-reference ao final;
+- `AGENTS.md`/`CLAUDE.md` sincronizados: bloco novo idêntico (byte-a-byte, comprovado por diff) sob "SQLAlchemy e Alembic", com a semântica `auto`/`verify_only`;
+- `docs/adr/0011-...md` recebeu apenas uma nota de forward-reference em blockquote (12 linhas, puramente aditiva) após D32, apontando para ADR-0015 — texto histórico da decisão inalterado;
+- `tests/unit/test_deployment_compose.py::test_compose_files_never_auto_run_alembic` **substituído** (nunca deletado) por `test_compose_files_never_directly_invoke_raw_alembic_migration` (mesma asserção estrutural: nenhum `alembic upgrade head` executável em `command:`/`entrypoint:` do Compose) mais um teste companheiro (`test_compose_files_forward_database_migration_mode_without_hardcoding_it`) confirmando que a presença de `DATABASE_MIGRATION_MODE` no Compose é configuração esperada, nunca uma invocação raw — ambos passando, em Windows e em Linux (WSL);
+- `git diff --stat` confirmado: zero mudança em `sofias_memory/`, `migrations/`, Compose, Dockerfile ou workflows — apenas os 7 arquivos documentais/teste-estático listados;
+- gates completos verdes: `uv lock --check`, `ruff check .`, `ruff format --check .`, `mypy sofias_memory scripts`, `pytest tests/unit tests/contract tests/security` (2312 testes), `git diff --check`, `scripts/ci_release_consistency_check.py` (via WSL/Docker) — todos em Windows e, exceto o script de release, também revalidados em Linux;
+- CI verde no SHA `78d0817292c2c5eba3485289151ea007269795f4` (lint/type-check/testes e build de imagem Docker).
 
 ---
 

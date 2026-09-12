@@ -70,7 +70,7 @@ Durante SM-901..SM-906:
 | Ticket | Entrega principal | Depende de | Migration | Status |
 |---|---|---|---|---|
 | SM-901 | Schema classification model (sem executar Alembic) | — | — | DONE |
-| SM-902 | Advisory lock + subprocess bootstrap | SM-901 | — | TODO |
+| SM-902 | Advisory lock + subprocess bootstrap | SM-901 | — | DONE |
 | SM-903 | Sticky failure + graceful shutdown critical section + hard-termination orphan safety | SM-902 | — | TODO |
 | SM-904 | Operational/deployment documentation integration + Compose deployment/static invariant | SM-903 | — | TODO |
 | SM-905 | Real-PostgreSQL hardening matrix + release-image smoke + orphan-safety scenario | SM-903, SM-904 | — | TODO |
@@ -193,6 +193,30 @@ A task só encerra quando:
 - post-migration verification é comprovada rejeitando um subprocess exit-zero cujo estado final não é exact head (cenário simulado);
 - `migrations/env.py` permanece byte-a-byte inalterado;
 - suite existente permanece verde.
+
+## Resultado
+
+**Status:** DONE
+
+Implementação validada no commit:
+
+- `30f06509f5a55f5f610080a00494f9ba58ca67d3` — `feat(db): add serialized migration bootstrap`
+
+Gate final:
+
+- advisory lock session-level (`pg_try_advisory_lock`/`pg_advisory_unlock`, key fixa `MIGRATION_BOOTSTRAP_KEY = -2`) em conexão dedicada (`NullPool`), nunca transaction-level;
+- fresh re-read da classificação SM-901 sempre após adquirir o lock, nunca reusando estado pré-espera;
+- nenhuma transação SQL aberta durante o subprocess Alembic (rollback explícito após cada tentativa de lock e após a leitura de classificação);
+- `alembic upgrade head` invocado como subprocess OS real (`<interpretador> -m alembic upgrade head`), nunca `alembic.command.upgrade(...)` in-process, nunca shell;
+- post-migration verification via `PostgresReadinessChecker` reutilizado — exit code 0 isolado nunca é suficiente;
+- falha de execução/post-verification é sticky por processo (`MigrationExecutionFailedError`/`MigrationPostVerificationFailedError`), capturada distintamente por `lifespan._run_bootstrap`, sem retry no intervalo genérico de 5s; sobrevive a uma falha de unlock durante o cleanup (nunca mascarada);
+- exceção crua do readiness checker é classificada corretamente por contexto (pré-migration → `MigrationClassificationFailedError`; pós-migration → sticky);
+- `verify_only` nunca adquire lock nem invoca Alembic — delega diretamente ao `PostgresReadinessChecker` já existente;
+- `migrations/env.py` inalterado (diff vazio confirmado);
+- gate de concorrência real (`exatamente 1` upgrade automático entre dois bootstraps concorrentes), fresh/known-ancestor/exact-head/unversioned-non-empty, lock-timeout, unlock e connection-loss — todos comprovados contra PostgreSQL real (banco dedicado `sofias_memory_migration_bootstrap_test`), 9/9 cenários verdes;
+- suite completa (unit/contract/security) verde: 2306 testes.
+
+Escopo da SM-903 (graceful shutdown shielding, hard-termination/orphan-child safety, continued read-only sticky probing) permanece explicitamente não implementado, conforme congelado.
 
 ---
 

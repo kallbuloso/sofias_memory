@@ -806,3 +806,119 @@ participation, and never exact per-operation provenance.
   INVALID_REQUEST`; `DELETE` needs only the Agent to exist (removing a
   non-existent association, or one whose `session_uuid` never referenced
   anything at all, is still `204`).
+
+## 20. Cognitive Memory
+
+First-class, durable **Native Cognitive Memory** (ADR-0016): a small,
+typed, synchronously-written unit of durable fact/preference (`profile` or
+`semantic`), independent of Dataset/Source/Document/Chunk and independent
+of Session history. This release implements exactly **Create** and **Get**
+— typed recall, supersession, and precise Forget are separate, later
+releases.
+
+### 20.1 Compatibility negotiation
+
+`GET /api/v1/info` gains, purely additively, three fields alongside every
+existing one (`name`, `version`, `environment`, `config_fingerprint`,
+`llm_model`, `embedding_model`, `embedding_dimensions`, all unchanged):
+
+```json
+{
+  "api_contract_version": "1",
+  "contracts": {"cognitive_memory": "1"},
+  "capabilities": ["cognitive_memory.write", "cognitive_memory.get"]
+}
+```
+
+`api_contract_version` is a machine contract identifier, independent of
+`version` (the application release SemVer) — never infer Cognitive Memory
+support from `version >= 0.7.0` alone. `capabilities` lists only operations
+genuinely implemented by the running HEAD; it grows to include
+`cognitive_memory.recall`, `cognitive_memory.supersede`, and
+`cognitive_memory.forget` only once those routes exist.
+
+```bash
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/info" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+```
+
+### 20.2 Create
+
+```bash
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/memories" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+        "memory_type": "profile",
+        "scope": "global",
+        "content": "Prefers teal interfaces.",
+        "provenance": {
+          "origin_kind": "user_asserted",
+          "source_system": "sofias-assistant",
+          "turn_uuid": "b3b6b5a0-...-...-...-..."
+        }
+      }'
+```
+
+Create is **synchronous** — `201` returns the finished `MemoryItem`
+directly, never a `PipelineRun`/`202`. The external embedding call always
+happens before the short authoritative PostgreSQL transaction; no
+transaction is ever held open across it.
+
+- `memory_type`: `profile` or `semantic` only — anything else is `422
+  INVALID_REQUEST`.
+- `scope`: exactly `global` or `project:<key>` (lowercase `a-z0-9._-`,
+  1..128 chars) — exact-match only, no hierarchy/wildcard.
+- `content`: 1..16384 Unicode characters after CRLF/CR→LF normalization and
+  edge trim; blank-after-trim is rejected.
+- `confidence`: nullable `[0,1]`; **required** when `provenance.origin_kind`
+  is `inferred`; never synthesized for any other origin.
+- `valid_from`/`valid_until`: optional, timezone-aware timestamps
+  (normalized to UTC); when both are present, `valid_until` must be
+  strictly after `valid_from`.
+- `provenance.origin_kind`: `user_asserted`, `tool_observed`, `imported`,
+  `inferred`, or `assistant_generated` — each has its own minimum required
+  fields beyond `source_system` (see `docs/adr/0016-native-cognitive-memory-model-and-lifecycle.md`
+  §7.3).
+- Embedding is **never** returned by any Cognitive Memory response.
+
+**`Idempotency-Key` is optional.** Without it, every valid request is an
+independent Create — identical `content`/`scope`/`provenance` submitted
+twice (no key) produces **two distinct** `memory_id` values; there is no
+content-hash dedupe. With it:
+
+| Same key | Semantic request | Result |
+|---|---|---|
+| yes | same (all semantic fields match) | replays the original `201` outcome, same `memory_id`, no second embedding call |
+| yes | different | `409 IDEMPOTENCY_CONFLICT` |
+| — | key in the reserved `sys:` namespace | `400 RESERVED_IDEMPOTENCY_KEY_NAMESPACE` |
+
+The race between two concurrent Create calls sharing one key is resolved by
+a PostgreSQL `UNIQUE` claim on the key, never by a pre-check alone: exactly
+one caller creates the `MemoryItem`+provenance+ledger row; every other
+concurrent caller either replays that same winner (same request) or gets
+`409` (different request) — never a duplicate, never a `500`.
+
+### 20.3 Get
+
+```bash
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/memories/$MEMORY_ID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+```
+
+`200` with the same `MemoryItem` shape Create returns. A syntactically
+valid but non-existent UUID is `404 MEMORY_NOT_FOUND`; a malformed path
+segment is `422 INVALID_REQUEST` (the project's ordinary path-parameter
+validation contract). Get never calls the embedding provider and never
+reads Neo4j.
+
+The response shape is deliberately lifecycle-safe: `scope`/`content`/
+`confidence`/`valid_from`/`valid_until` and every `provenance` field beyond
+`origin_kind`/`source_system` are nullable so a later SUPERSEDED/FORGOTTEN
+tombstone (once those transitions exist) fits the exact same schema —
+this release only ever produces `lifecycle: "active"`.
+
+### 20.4 Explicitly not yet implemented
+
+`POST /api/v1/memories/recall`, `POST /api/v1/memories/{id}/supersede`,
+`POST /api/v1/memories/{id}/forget`, and `PATCH /api/v1/memories/{id}` do
+not exist in this release. Cognitive Memory never creates a `PipelineRun`,
+never projects to Neo4j, and never emits a `graph_outbox` event.

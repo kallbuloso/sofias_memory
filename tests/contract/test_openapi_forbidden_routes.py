@@ -615,6 +615,68 @@ def test_no_secret_value_appears_anywhere_in_schema() -> None:
         assert secret not in serialized, f"secret value leaked into OpenAPI schema: {secret!r}"
 
 
+def test_memories_create_get_routes_present_with_exact_methods() -> None:
+    """SM-1002 scope: exactly Create + Get. No recall/supersede/forget route
+    exists yet -- those are SM-1003/SM-1004."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert set(paths["/api/v1/memories"]) == {"post"}
+    assert set(paths["/api/v1/memories/{memory_id}"]) == {"get"}
+
+    memories_paths = {path for path in paths if path.startswith("/api/v1/memories")}
+    assert memories_paths == {
+        "/api/v1/memories",
+        "/api/v1/memories/{memory_id}",
+    }
+
+
+def test_memories_create_response_is_201_and_get_response_is_200() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    create_responses = paths["/api/v1/memories"]["post"]["responses"]
+    assert "201" in create_responses
+    get_responses = paths["/api/v1/memories/{memory_id}"]["get"]["responses"]
+    assert "200" in get_responses
+    assert "404" in get_responses
+
+
+def test_memory_item_result_never_exposes_embedding() -> None:
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+
+    memory_item_result = schemas["MemoryItemResult"]
+    assert isinstance(memory_item_result, dict)
+    properties = set(memory_item_result["properties"])
+    assert "embedding" not in properties
+    assert properties == {
+        "memory_id",
+        "memory_type",
+        "scope",
+        "content",
+        "lifecycle",
+        "confidence",
+        "valid_from",
+        "valid_until",
+        "created_at",
+        "superseded_at",
+        "superseded_by",
+        "forgotten_at",
+        "provenance",
+    }
+
+    memory_provenance_result = schemas["MemoryProvenanceResult"]
+    assert isinstance(memory_provenance_result, dict)
+    assert "embedding" not in memory_provenance_result["properties"]
+
+
 def test_no_provider_or_database_configuration_schema_exposed() -> None:
     schema = openapi_schema()
     components = schema.get("components", {})

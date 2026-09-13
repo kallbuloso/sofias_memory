@@ -29,6 +29,9 @@ INFO_DATA_FIELDS = {
     "llm_model",
     "embedding_model",
     "embedding_dimensions",
+    "api_contract_version",
+    "contracts",
+    "capabilities",
 }
 
 
@@ -128,6 +131,9 @@ async def test_info_returns_expected_application_metadata() -> None:
         "llm_model": "gpt-5-mini-test",
         "embedding_model": "text-embedding-test",
         "embedding_dimensions": 3072,
+        "api_contract_version": "1",
+        "contracts": {"cognitive_memory": "1"},
+        "capabilities": ["cognitive_memory.write", "cognitive_memory.get"],
     }
 
 
@@ -298,3 +304,43 @@ async def test_info_is_not_in_public_allowlist() -> None:
 
     assert response.status_code == 401
     assert json_object(response)["error"]["code"] == "MISSING_API_KEY"
+
+
+@pytest.mark.asyncio
+async def test_info_announces_exactly_sm_1002_capabilities() -> None:
+    """SM-1002 HEAD: only write/get are implemented -- recall (SM-1003) and
+    supersede/forget (SM-1004) must not be announced in advance of their
+    own routes/services (ADR-0016 SS 16, Feature Contract SS 11)."""
+
+    async with make_client(create_app(make_settings())) as client:
+        response = await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
+
+    data = data_object(response)
+    assert data["api_contract_version"] == "1"
+    assert data["contracts"] == {"cognitive_memory": "1"}
+    assert data["capabilities"] == ["cognitive_memory.write", "cognitive_memory.get"]
+    assert "cognitive_memory.recall" not in data["capabilities"]
+    assert "cognitive_memory.supersede" not in data["capabilities"]
+    assert "cognitive_memory.forget" not in data["capabilities"]
+
+
+@pytest.mark.asyncio
+async def test_info_capability_negotiation_is_purely_additive() -> None:
+    """Every v0.6 field keeps the exact same key set and semantics; the
+    negotiation fields are strictly additional (ADR-0016 SS 16)."""
+
+    async with make_client(create_app(make_settings())) as client:
+        response = await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
+
+    data = data_object(response)
+    legacy_fields = {
+        "name",
+        "version",
+        "environment",
+        "config_fingerprint",
+        "llm_model",
+        "embedding_model",
+        "embedding_dimensions",
+    }
+    assert legacy_fields.issubset(set(data))
+    assert set(data) - legacy_fields == {"api_contract_version", "contracts", "capabilities"}

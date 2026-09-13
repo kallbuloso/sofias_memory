@@ -9,6 +9,22 @@ from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
 
 router = APIRouter(tags=["info"])
 
+API_CONTRACT_VERSION = "1"
+"""Machine-readable API contract version (ADR-0016 SS 16) -- independent of
+``version`` (the application release SemVer). A consumer must never infer
+Cognitive Memory support from ``version >= 0.7.0`` alone."""
+
+COGNITIVE_MEMORY_CONTRACT_VERSION = "1"
+
+COGNITIVE_MEMORY_CAPABILITIES: tuple[str, ...] = (
+    "cognitive_memory.write",
+    "cognitive_memory.get",
+)
+"""SM-1002 HEAD: only Create/Get are implemented. Deterministic, frozen
+order matching the Feature Contract SS 11 listing order -- ``recall``
+(SM-1003) and ``supersede``/``forget`` (SM-1004) are added only once their
+routes/services actually exist, never in advance of the implementation."""
+
 
 class ApplicationInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -26,6 +42,22 @@ class ApplicationInfo(BaseModel):
     llm_model: str = Field(description="Configured OpenAI-compatible LLM model.")
     embedding_model: str = Field(description="Configured OpenAI-compatible embedding model.")
     embedding_dimensions: int = Field(description="Configured embedding vector dimensions.")
+    api_contract_version: str = Field(
+        description=(
+            "Machine-readable API contract version -- distinct from `version` "
+            "(the application release SemVer), never inferred from it."
+        )
+    )
+    contracts: dict[str, str] = Field(
+        description="Per-feature contract major versions, e.g. {'cognitive_memory': '1'}."
+    )
+    capabilities: list[str] = Field(
+        description=(
+            "Cognitive Memory capability strings actually implemented by this "
+            "HEAD -- never a health/readiness signal, never anticipates an "
+            "operation whose route/service does not exist yet."
+        )
+    )
 
 
 @router.get(
@@ -49,6 +81,9 @@ async def info(request: Request) -> SuccessEnvelope[ApplicationInfo]:
             llm_model=settings.llm_model,
             embedding_model=settings.embedding_model,
             embedding_dimensions=settings.embedding_dimensions,
+            api_contract_version=API_CONTRACT_VERSION,
+            contracts={"cognitive_memory": COGNITIVE_MEMORY_CONTRACT_VERSION},
+            capabilities=list(COGNITIVE_MEMORY_CAPABILITIES),
         ),
         meta=ResponseMeta(request_id=current_request_id()),
     )

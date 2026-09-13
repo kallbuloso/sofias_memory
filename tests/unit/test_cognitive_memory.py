@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta, timezone
+
 import pytest
 
 from sofias_memory.domain import (
@@ -9,11 +11,15 @@ from sofias_memory.domain import (
     InvalidCognitiveMemoryConfidenceError,
     InvalidCognitiveMemoryContentError,
     InvalidCognitiveMemoryProvenanceError,
+    InvalidCognitiveMemoryTimestampError,
+    InvalidCognitiveMemoryValidityWindowError,
     normalize_cognitive_memory_content,
+    normalize_cognitive_memory_timestamp,
     validate_cognitive_memory_confidence,
     validate_cognitive_memory_external_ref,
     validate_cognitive_memory_provenance_origin_requirements,
     validate_cognitive_memory_source_system,
+    validate_cognitive_memory_validity_window,
 )
 
 # --- memory type -------------------------------------------------------
@@ -233,4 +239,55 @@ def test_assistant_generated_requires_turn_task_or_source_ref() -> None:
             task_uuid=None,
             source_ref=None,
             observed_at=None,
+        )
+
+
+# --- timestamp normalization -------------------------------------------------
+
+
+def test_timestamp_normalizes_non_utc_offset_to_utc() -> None:
+    plus_two = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    normalized = normalize_cognitive_memory_timestamp(plus_two)
+    assert normalized == datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+    assert normalized.tzinfo is UTC
+
+
+def test_timestamp_already_utc_is_unchanged() -> None:
+    value = datetime(2026, 1, 1, tzinfo=UTC)
+    assert normalize_cognitive_memory_timestamp(value) == value
+
+
+def test_naive_timestamp_is_rejected() -> None:
+    with pytest.raises(InvalidCognitiveMemoryTimestampError):
+        normalize_cognitive_memory_timestamp(datetime(2026, 1, 1))  # noqa: DTZ001
+
+
+# --- validity window ----------------------------------------------------------
+
+
+def test_validity_window_accepts_none_none() -> None:
+    validate_cognitive_memory_validity_window(None, None)
+
+
+def test_validity_window_accepts_one_sided_bounds() -> None:
+    validate_cognitive_memory_validity_window(datetime(2026, 1, 1, tzinfo=UTC), None)
+    validate_cognitive_memory_validity_window(None, datetime(2026, 1, 1, tzinfo=UTC))
+
+
+def test_validity_window_accepts_until_strictly_after_from() -> None:
+    validate_cognitive_memory_validity_window(
+        datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)
+    )
+
+
+def test_validity_window_rejects_until_equal_to_from() -> None:
+    same = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(InvalidCognitiveMemoryValidityWindowError):
+        validate_cognitive_memory_validity_window(same, same)
+
+
+def test_validity_window_rejects_until_before_from() -> None:
+    with pytest.raises(InvalidCognitiveMemoryValidityWindowError):
+        validate_cognitive_memory_validity_window(
+            datetime(2026, 1, 2, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC)
         )

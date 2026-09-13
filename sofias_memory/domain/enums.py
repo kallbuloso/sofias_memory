@@ -120,12 +120,12 @@ class AgentStatus(StrEnum):
 
 
 class CognitiveMemoryType(StrEnum):
-    """Native Cognitive Memory type (ADR-0016, Feature Contract v0.7.0 SS 4).
+    """Native Cognitive Memory type (Feature Contract v0.7.0 SS 4).
 
     Contract v1 supports exactly ``PROFILE``/``SEMANTIC``. ``EPISODIC`` and
     ``PROCEDURAL`` are explicitly deferred and must never be added here
-    without a new accepted ADR -- Skills (ADR-0013) remain the separate
-    procedural domain.
+    without a new accepted architecture decision -- Skills remain the
+    separate procedural domain.
     """
 
     PROFILE = "profile"
@@ -133,7 +133,7 @@ class CognitiveMemoryType(StrEnum):
 
 
 class CognitiveMemoryLifecycle(StrEnum):
-    """Native Cognitive Memory lifecycle state machine (ADR-0016 SS 10).
+    """Native Cognitive Memory lifecycle state machine.
 
     Allowed transitions: ``active -> superseded``, ``active -> forgotten``,
     ``superseded -> forgotten``, ``forgotten -> forgotten`` (idempotent
@@ -146,8 +146,8 @@ class CognitiveMemoryLifecycle(StrEnum):
 
 
 class CognitiveMemoryOriginKind(StrEnum):
-    """Native Cognitive Memory provenance origin kind (ADR-0016 SS 7,
-    Feature Contract v0.7.0 SS 7.1)."""
+    """Native Cognitive Memory provenance origin kind (Feature Contract
+    v0.7.0 SS 7.1)."""
 
     USER_ASSERTED = "user_asserted"
     TOOL_OBSERVED = "tool_observed"
@@ -157,9 +157,9 @@ class CognitiveMemoryOriginKind(StrEnum):
 
 
 class CognitiveMemoryOperation(StrEnum):
-    """``cognitive_memory_idempotency`` ledger operation identity (ADR-0016
-    SS 14). Independent of ``PipelineType`` -- Cognitive Memory mutations
-    are never routed through PipelineRun."""
+    """``cognitive_memory_idempotency`` ledger operation identity.
+    Independent of ``PipelineType`` -- Cognitive Memory mutations are never
+    routed through PipelineRun."""
 
     CREATE = "create"
     SUPERSEDE = "supersede"

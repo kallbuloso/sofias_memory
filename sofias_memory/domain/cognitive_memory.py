@@ -18,6 +18,7 @@ preserved, every external ref set to NULL) structurally impossible
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 from sofias_memory.domain.enums import CognitiveMemoryOriginKind
 
@@ -50,6 +51,22 @@ class InvalidCognitiveMemoryProvenanceError(ValueError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"Invalid Cognitive Memory provenance: {reason}")
+
+
+class InvalidCognitiveMemoryTimestampError(ValueError):
+    """A caller-supplied Cognitive Memory timestamp is not timezone-aware."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Invalid Cognitive Memory timestamp: {reason}")
+
+
+class InvalidCognitiveMemoryValidityWindowError(ValueError):
+    """``valid_from``/``valid_until`` fail the frozen ordering contract."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Invalid Cognitive Memory validity window: {reason}")
 
 
 def normalize_newlines(value: str) -> str:
@@ -119,6 +136,31 @@ def validate_cognitive_memory_external_ref(value: str) -> str:
             f"external reference must be 1..{COGNITIVE_MEMORY_EXTERNAL_REF_MAX_LENGTH} characters"
         )
     return trimmed
+
+
+def normalize_cognitive_memory_timestamp(value: datetime) -> datetime:
+    """Requires a timezone-aware value, then normalizes it to UTC (Feature
+    Contract SS 7.2/general codebase UTC-timestamp convention). Used for
+    ``valid_from``/``valid_until``/``observed_at`` -- never silently treats a
+    naive timestamp as UTC."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise InvalidCognitiveMemoryTimestampError("timestamp must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def validate_cognitive_memory_validity_window(
+    valid_from: datetime | None, valid_until: datetime | None
+) -> None:
+    """``valid_from`` is inclusive, ``valid_until`` is exclusive; when both
+    are present, ``valid_until`` must be strictly after ``valid_from``
+    (Feature Contract SS 9, mirrored by the ``validity_window_ordered``
+    PostgreSQL CHECK constraint)."""
+
+    if valid_from is not None and valid_until is not None and valid_until <= valid_from:
+        raise InvalidCognitiveMemoryValidityWindowError(
+            "valid_until must be strictly after valid_from"
+        )
 
 
 def validate_cognitive_memory_provenance_origin_requirements(

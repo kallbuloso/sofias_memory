@@ -44,6 +44,7 @@ from sofias_memory.api.routes.health import (
 from sofias_memory.api.routes.health import router as health_router
 from sofias_memory.api.routes.improve import router as improve_router
 from sofias_memory.api.routes.info import router as info_router
+from sofias_memory.api.routes.memories import router as memories_router
 from sofias_memory.api.routes.provenance import router as provenance_router
 from sofias_memory.api.routes.recall import router as recall_router
 from sofias_memory.api.routes.remember import router as remember_router
@@ -191,6 +192,14 @@ TAG_METADATA: list[dict[str, str]] = [
             "Create, inspect, update, archive, and restore durable Agent "
             "Profiles -- a management resource, never an agent runtime, "
             "tool executor, or provider session manager."
+        ),
+    },
+    {
+        "name": "memories",
+        "description": (
+            "Create and retrieve native Cognitive Memory items (durable typed "
+            "facts/preferences), independent of Dataset/Source/Document/Chunk "
+            "and independent of Session history."
         ),
     },
 ]
@@ -413,6 +422,7 @@ def create_app(
     application.include_router(sessions_router, prefix="/api/v1")
     application.include_router(skills_router, prefix="/api/v1")
     application.include_router(agents_router, prefix="/api/v1")
+    application.include_router(memories_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

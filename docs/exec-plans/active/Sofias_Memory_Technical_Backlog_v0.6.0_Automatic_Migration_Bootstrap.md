@@ -73,7 +73,7 @@ Durante SM-901..SM-906:
 | SM-902 | Advisory lock + subprocess bootstrap | SM-901 | — | DONE |
 | SM-903 | Sticky failure + graceful shutdown critical section + hard-termination orphan safety | SM-902 | — | DONE |
 | SM-904 | Operational/deployment documentation integration + Compose deployment/static invariant | SM-903 | — | DONE |
-| SM-905 | Real-PostgreSQL hardening matrix + release-image smoke + orphan-safety scenario | SM-903, SM-904 | — | TODO |
+| SM-905 | Real-PostgreSQL hardening matrix + release-image smoke + orphan-safety scenario | SM-903, SM-904 | — | DONE |
 | SM-906 | Release prep — quality gates, version bump, GATE-v0.6.0 | SM-905 | — | TODO |
 
 ---
@@ -405,6 +405,29 @@ A task só encerra quando:
 - o smoke de release image (fresh + previously-released) passa, com D33 preservado durante o bootstrap;
 - o cenário de supervisor-loss/orphan-child é comprovado no ambiente de integração suportado: supervisor desaparece com o child ativo → nenhuma migration órfã continua desprotegida → um segundo bootstrap não consegue iniciar migration concorrente → o próximo bootstrap legítimo re-lê o estado autoritativo do zero, sem exigir completion do attempt anterior;
 - suite completa (unit/integration/contract/security) permanece verde.
+
+## Resultado
+
+**Status:** DONE
+
+Implementação validada no commit:
+
+- `07e021c766c662c0eb3b3ca1a43fd44e16307a36` — `test(v0.6): harden migration bootstrap integration`
+
+Nenhum defeito foi encontrado em SM-901..SM-904 — todos os 18 cenários (estado, modo) e os 5 cenários de gating bateram com o contrato congelado já na primeira execução real.
+
+Gate final:
+
+- matriz completa dos 9 estados × 2 modos comprovada contra PostgreSQL real (`tests/integration/test_migration_bootstrap_matrix_postgres_integration.py`, 9 testes, 18 cenários): `PRISTINE_FRESH_SCHEMA`/`KNOWN_ANCESTOR` migram automaticamente (exatamente 1 invocação de Alembic) sob `auto` e permanecem not-ready sem invocar Alembic sob `verify_only`; `EXACT_HEAD` é no-op/ready em ambos os modos; os seis estados restantes (`UNVERSIONED_NON_EMPTY_SCHEMA`, `CODE_MULTIPLE_HEADS`, `VERSION_TABLE_EMPTY`, `DATABASE_MULTIPLE_REVISIONS`, `KNOWN_NON_ANCESTOR`, `UNRECOGNIZED_REVISION`) falham fechados com zero invocação de Alembic em ambos os modos; `CODE_MULTIPLE_HEADS`/`KNOWN_NON_ANCESTOR` (irreproduzíveis a partir do grafo real linear único deste projeto) usam um `alembic.script.ScriptDirectory` real e temporário com um fork genuíno de duas revisions, construído via API oficial do Alembic e injetado pelos seams já existentes `code_heads_loader`/`revision_graph_loader`; `UNRECOGNIZED_REVISION` inclui o cenário de rollback de imagem (revision futura hipotética ausente do `ScriptDirectory` corrente) sem qualquer comparação lexical/numérica;
+- Neo4j/worker/storage never-start-early comprovado por teste real (`tests/integration/test_migration_bootstrap_gating_postgres_integration.py`, 5 testes): migration ativamente em execução, lock-wait, schema fail-closed, processo sticky-failed, e um cenário dedicado `STORAGE_BACKEND=s3` isolando storage convergence — todos usando stand-ins que explodem (`AssertionError`) se tocados cedo demais; o cenário de migration ativa prova tanto "nunca antes" (silêncio observado durante uma janela real de execução em voo) quanto "exatamente aqui, não depois" (a explosão esperada em Neo4j bootstrap ocorre imediatamente após a migration genuína terminar com sucesso);
+- smoke de release image de duas fases (Docker build a partir do HEAD, execução real via WSL/Docker contra a stack local): banco fresco pristine migra automaticamente para head (`0017`) em ~2.3s, com `/health/live` alcançável e `/health/ready`=503 durante o bootstrap (D33 preservado); banco "previamente lançado" (reaproveitando o estado genuíno pós-migração da fase anterior — v0.6.0 não introduz nenhuma migration nova, então a v0.5.0 real já está em head) executa um bootstrap no-op genuíno e fica ready em ~1s — nenhum passo manual de Alembic em nenhuma fase;
+- cenário de supervisor-loss/orphan-safety da SM-903 (Propriedade A, `PR_SET_PDEATHSIG`) re-executado com sucesso sob Linux real (WSL) como parte deste hardening, sem necessidade de alteração;
+- regressão completa da suite real PostgreSQL de SM-902/903 (`test_migration_bootstrap_postgres_integration.py`, `test_migration_bootstrap_supervisor_loss_postgres_integration.py`) permanece verde, em Windows e Linux;
+- `tests/unit/test_deployment_compose.py` (invariante substituído por SM-904) executado como parte da suite completa e permanece verde;
+- gates completos verdes: `uv lock --check`, `ruff check .`, `ruff format --check .`, `mypy sofias_memory scripts`, `pytest tests/unit tests/contract tests/security` (2312 testes), `pip-audit` (dependências runtime, zero vulnerabilidades), `bandit --severity-level high` (zero findings), `scripts/ci_release_consistency_check.py` — todos em Windows e, exceto o smoke de imagem e o script de release (WSL/Docker-only), também revalidados em Linux;
+- `git diff --stat` confirmado: zero mudança em código de produção, migrations, Compose, Dockerfile ou workflows — apenas dois novos arquivos de teste de integração;
+- `.github/workflows/integration.yml` permanece intencionalmente intocado — conectar a suíte de migration bootstrap a esse workflow (flags opt-in dedicados) é escopo explícito de SM-906, não desta task;
+- CI verde no SHA `07e021c766c662c0eb3b3ca1a43fd44e16307a36` (lint/type-check/testes e build de imagem Docker, run #67).
 
 ---
 

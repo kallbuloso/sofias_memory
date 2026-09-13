@@ -13,12 +13,16 @@
 # for `sofias-memory` -- Easypanel routes its HTTP domain directly to the
 # service's internal port 8000 instead.
 #
-# Migrations are NOT run automatically by this file -- see
-# docs/deployment/easypanel.md for the required explicit one-shot
-# `alembic upgrade head` procedure before first start.
+# This file never runs Alembic itself (no migration `command:`/`entrypoint:`
+# or one-shot job of any kind) -- under the default DATABASE_MIGRATION_MODE=
+# auto (v0.6.0, ADR-0015), the application migrates an eligible schema
+# forward automatically as part of its own startup; see
+# docs/deployment/easypanel.md for the full contract, including the manual
+# `alembic upgrade head` procedure that remains available for
+# DATABASE_MIGRATION_MODE=verify_only or explicit operator control.
 services:
   sofias-memory:
-    image: ghcr.io/kallbuloso/sofias-memory:0.5.0
+    image: ghcr.io/kallbuloso/sofias-memory:0.6.0
     restart: unless-stopped
     depends_on:
       postgres:
@@ -31,7 +35,7 @@ services:
     environment:
       APP_NAME: "${APP_NAME:-Sofias Memory}"
       APP_ENV: "${APP_ENV:-production}"
-      APP_VERSION: "${APP_VERSION:-0.5.0}"
+      APP_VERSION: "${APP_VERSION:-0.6.0}"
       API_KEY: "${API_KEY:?API_KEY is required}"
       HTTP_HOST: "0.0.0.0"
       HTTP_PORT: "8000"

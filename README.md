@@ -23,7 +23,13 @@ association; **v0.4.0** adds first-class durable procedural **Skills** —
 management, immutable revisions, archive/restore, standalone `SKILL.md`
 interoperability, and semantic resolve over pgvector; **v0.5.0** adds
 first-class durable **Agent** profiles — management, active/archive
-lifecycle, and explicit Agent↔Skill and Agent↔Session associations (see
+lifecycle, and explicit Agent↔Skill and Agent↔Session associations;
+**v0.6.0** adds an automatic, serialized, fail-closed **migration
+bootstrap** (`DATABASE_MIGRATION_MODE=auto|verify_only`, default `auto`)
+that migrates an eligible schema forward automatically on ordinary
+application startup, removing the previously-required manual
+`alembic upgrade head` step for the common install/upgrade path while
+preserving fail-closed startup and the manual CLI (see
 `CHANGELOG.md`) — see
 `docs/exec-plans/completed/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.

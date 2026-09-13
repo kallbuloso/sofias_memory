@@ -122,6 +122,7 @@ jobs:
             sofias_memory_process_kill_test \
             sofias_memory_sessions_compat_test \
             sofias_memory_skills_resolve_test \
+            sofias_memory_migration_bootstrap_test \
           ; do
             psql -c "CREATE DATABASE ${db}"
           done
@@ -133,6 +134,13 @@ jobs:
       # because this is a separate `docker run`, not a step running
       # directly on the runner -- it cannot resolve the service container
       # by its service name the way the runner's own steps can.
+      #
+      # `sofias_memory_migration_bootstrap_test` (v0.6.0, ADR-0015) is
+      # deliberately NOT pre-migrated here: every one of its own tests
+      # resets it to a specific classification state (pristine, a known
+      # ancestor, fail-closed, etc.) via `reset_dedicated_database()` before
+      # running, so pre-migrating it to head would just be undone
+      # immediately -- see `test_migration_bootstrap_postgres_integration.py`.
       - name: Migrate every database from the built image (0001 -> 0017)
         run: |
           set -e
@@ -303,6 +311,25 @@ jobs:
           SOFIAS_MEMORY_RUN_AGENTS_CONCURRENCY_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_AGENTS_CROSS_FEATURE_POSTGRES_TESTS: "1"
           SOFIAS_MEMORY_RUN_AGENTS_NEO4J_TESTS: "1"
+          # Automatic serialized migration bootstrap (v0.6.0, ADR-0015,
+          # SM-901..905). A single opt-in flag/dedicated-database pair gates
+          # all four files below (the other three import and reuse the
+          # first file's own fixture/opt-in constants directly) --
+          # `test_migration_bootstrap_matrix_postgres_integration.py` (the
+          # real 9-states x 2-modes classification matrix),
+          # `test_migration_bootstrap_gating_postgres_integration.py`
+          # (Neo4j/worker/storage never-start-early), and
+          # `test_migration_bootstrap_supervisor_loss_postgres_integration.py`
+          # (hard-termination/orphan-safety via a real SIGKILL of a real
+          # supervisor process and a real Alembic-shaped child -- this
+          # Linux runner is exactly the supported environment for the
+          # chosen Property A / `PR_SET_PDEATHSIG` mechanism). The dedicated
+          # database's exact name is enforced fail-safe by the tests
+          # themselves; each test resets it to its own required
+          # classification state before running, independent of the
+          # pre-migration step above.
+          SOFIAS_MEMORY_RUN_MIGRATION_BOOTSTRAP_POSTGRES_INTEGRATION: "1"
+          SOFIAS_MEMORY_MIGRATION_BOOTSTRAP_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_migration_bootstrap_test
 
       - name: Diagnostics on failure
         if: failure()

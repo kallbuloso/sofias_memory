@@ -90,6 +90,37 @@ preservation tests for Forget and Dataset Delete live inside those two
 features' own existing suites, reusing their existing dedicated-database
 harness rather than a separate Agent-specific file.
 
+### Migration bootstrap integration tests
+
+A single opt-in flag/dedicated-database pair gates every real-PostgreSQL
+test for the automatic serialized migration bootstrap (v0.6.0, ADR-0015,
+SM-901..905): `test_migration_bootstrap_matrix_postgres_integration.py`,
+`test_migration_bootstrap_gating_postgres_integration.py`, and
+`test_migration_bootstrap_supervisor_loss_postgres_integration.py` each
+import and reuse the fixture/constants declared in
+`test_migration_bootstrap_postgres_integration.py` rather than declaring
+their own. Unlike every other suite above, this one *does* enforce a
+dedicated database **name** — `sofias_memory_migration_bootstrap_test`,
+refused fail-safe if the URL points anywhere else — because several tests
+construct specific, otherwise-unreachable schema states (an unversioned
+non-empty schema, a database revision newer than any known code head,
+etc.) directly against it, and a shared database would make those
+constructions unsafe.
+
+| Test file | Opt-in flag |
+|---|---|
+| `test_migration_bootstrap_postgres_integration.py` (SM-902/903) | `SOFIAS_MEMORY_RUN_MIGRATION_BOOTSTRAP_POSTGRES_INTEGRATION`, plus required `SOFIAS_MEMORY_MIGRATION_BOOTSTRAP_TEST_DATABASE_URL` (dedicated database, exact name enforced) |
+| `test_migration_bootstrap_matrix_postgres_integration.py` (SM-905) | same two variables as above |
+| `test_migration_bootstrap_gating_postgres_integration.py` (SM-905) | same two variables as above |
+| `test_migration_bootstrap_supervisor_loss_postgres_integration.py` (SM-903/905) | same two variables as above; the hard-termination/orphan-safety test additionally requires a real Linux interpreter (`sys.platform == "linux"`) to exercise the chosen `PR_SET_PDEATHSIG` mechanism -- it `pytest.skip`s with an honest message on any other platform rather than failing |
+
+The supervisor-loss file spawns a real, separate OS child process
+(`_migration_bootstrap_supervisor_child.py`) and sends it a real `SIGKILL`
+mid-migration; it needs no additional environment variables beyond the two
+above, but does need `PYTHONPATH` to resolve `sofias_memory` from that
+child process (already handled internally, matching this project's
+existing real-OS-process-kill pattern, `_process_kill_child.py`).
+
 ## Running the application on the host
 
 ```bash
@@ -174,7 +205,7 @@ neo4j:7687
 These scripts run from a source checkout via `uv run python scripts/...` as
 shown below. They are also packaged inside the release image itself (see
 `docs/operations.md`), so the same scripts run there too, with no source
-checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.5.0
+checkout needed — e.g. `docker run --rm --entrypoint uv sofias-memory:0.6.0
 run --no-sync python scripts/rebuild_graph.py --all --confirm-all`.
 
 ```bash

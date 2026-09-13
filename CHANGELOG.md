@@ -2,6 +2,91 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.6.0]
+
+Minor release adding an **automatic, serialized, fail-closed migration
+bootstrap** (ADR-0015): the application can now migrate an eligible
+PostgreSQL schema forward to head automatically, on ordinary startup,
+removing the operational burden of remembering to run `alembic upgrade
+head` manually before or after every redeploy. This is a narrower,
+carefully-scoped guard rail layered on top of Alembic, never a replacement
+for it — Alembic remains the sole schema-evolution authority, the manual
+CLI remains fully supported, and any ambiguous schema state still fails
+closed rather than being guessed, stamped, or repaired automatically.
+
+### Migration mode
+
+- New `DATABASE_MIGRATION_MODE=auto|verify_only` setting, default `auto`.
+- `auto`: a schema that is either pristine/fresh or a known ancestor of the
+  application's Alembic head migrates forward to head automatically at
+  startup, under a session-level PostgreSQL advisory lock, with
+  pre- and post-migration verification. Any other schema state (an
+  unversioned-but-non-empty schema, multiple code heads, multiple database
+  revisions, a diverged/foreign/unrecognized revision) fails closed —
+  never guessed, stamped, or repaired.
+- `verify_only`: reproduces the pre-v0.6.0 contract exactly — the
+  application never invokes Alembic itself under any circumstance; a
+  schema not already at exact head simply stays `not_ready`.
+- Restoring a historical backup under the `auto` default migrates it
+  forward automatically on first boot; start with `verify_only` to inspect
+  a restored backup at its original revision first (see
+  `docs/operations.md`).
+
+### Sticky failure and manual recovery
+
+- A genuine migration-execution failure is sticky for the remainder of
+  that process's lifetime — Alembic is never automatically re-invoked
+  within the same process after a failed attempt, avoiding a runaway
+  DDL-retry loop against a database state a human has not yet examined.
+- If an operator repairs the database manually while that same process is
+  still running, a continuing read-only probe detects it and the process
+  proceeds to ready **without requiring a restart**. A process restart
+  always re-classifies the schema from scratch.
+
+### Graceful shutdown and hard-termination safety
+
+- Once the Alembic child process has been spawned, it and the advisory
+  lock ownership form one critical section: a graceful application
+  shutdown never abandons a live migration child or releases the lock
+  while it is still running — the shutdown waits for the child to finish
+  naturally, classifies its result, and only then completes.
+- A hard-killed supervisor (`SIGKILL`, crash, container kill) can never
+  leave an unprotected migration child able to keep mutating the database
+  after its serialization protection has disappeared — on this project's
+  Linux release runtime, the migration child cannot outlive the supervisor
+  that owns its advisory lock (`PR_SET_PDEATHSIG`); this guarantee is
+  Linux-specific and is documented as such, not silently promised
+  cross-platform. The advisory lock itself never leaks, and the next
+  legitimate participant always re-reads authoritative PostgreSQL state
+  from scratch before acting.
+
+### Documentation
+
+- `README.md`, `docs/operations.md`, and `docs/deployment/easypanel.md`
+  updated for the `auto`/`verify_only` contract — the previous
+  "always run migrations manually" instructions no longer describe the
+  default path. `AGENTS.md`/`CLAUDE.md` synchronized with the same
+  semantics.
+- The deployment static invariant that used to assert Compose never runs
+  Alembic automatically now asserts the equivalent, updated property:
+  Compose never invokes Alembic directly (`command:`/`entrypoint:`);
+  automatic migration is permitted only through this release's sanctioned,
+  locked, verified application-startup bootstrap.
+
+### Database/upgrade
+
+- **Introduces zero new database migrations.** This release changes how
+  and when `alembic upgrade head` gets invoked, not the schema itself —
+  the Alembic head remains `0017`. Upgrading from `0.5.0` requires no
+  migration step at all; starting the `0.6.0` image against an
+  already-migrated `0.5.0` database performs a no-op automatic bootstrap
+  and reaches ready immediately.
+
+### Configuration
+
+- New setting: `DATABASE_MIGRATION_MODE` (`auto`/`verify_only`, default
+  `auto`). No other new runtime configuration surface.
+
 ## [0.5.0]
 
 Minor release adding first-class durable **Agent** profiles (ADR-0014):

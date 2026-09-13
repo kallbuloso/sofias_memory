@@ -133,7 +133,7 @@ Durante toda a v0.7:
 | G1 | SM-1001 | Foundation — domain/schema/provenance/idempotency primitives | docs freeze | `0018` | DONE |
 | G2 | SM-1002 | Compatibility negotiation + synchronous Create/Get | SM-1001 | nenhuma nova esperada | DONE |
 | G3 | SM-1003 | Typed Cognitive Recall + temporal/current-truth query | SM-1002 | nenhuma nova esperada | DONE |
-| G4 | SM-1004 | Atomic Supersession + destructive precise Forget | SM-1003 | nenhuma nova esperada | TODO |
+| G4 | SM-1004 | Atomic Supersession + destructive precise Forget | SM-1003 | nenhuma nova esperada | DONE |
 | G5 | SM-1005 | Real-PG concurrency/security/privacy/integration hardening | SM-1004 | somente corretiva se inevitável | TODO |
 | G6 | SM-1006 | Release prep + exact-SHA GATE-v0.7.0 + publication/closeout | SM-1005 | valida `0017 -> 0018+` | TODO |
 
@@ -1332,6 +1332,131 @@ Qualquer missing constraint discovered aqui deve become `0019+`, not rewrite `00
 6. typed recall/GET refletem lifecycle corretamente;
 7. nenhum Neo4j/outbox/legacy Forget coupling;
 8. suites anteriores verdes.
+
+## SM-1004 — Evidência de fechamento (DONE)
+
+```text
+Baseline:                main @ c8ef8e366db88e7505e91d2ce8881a229c5ff95f
+                          (SM-1003 corrective evidence closeout, CI SUCCESS)
+Implementation SHA:      e2220ee10ce3a9551272c205b811a3be1db0fdcc
+Alembic head:            0018 (down_revision = 0017) -- unchanged, no new migration
+```
+
+Rotas públicas novas:
+
+```text
+POST /api/v1/memories/{memory_id}/supersede  -- 200 {"old": MemoryItem,
+                                                 "replacement": MemoryItem}
+POST /api/v1/memories/{memory_id}/forget     -- 200 MemoryItem tombstone
+```
+
+`/info.capabilities` agora anuncia as cinco capabilities congeladas pelo
+Feature Contract: `cognitive_memory.write`, `.get`, `.recall`,
+`.supersede`, `.forget` -- nenhuma além dessas.
+
+Finding real descoberto e corrigido durante a implementação (não apenas
+documentação): a primeira versão de `supersede`/`forget` tentava o
+authoritative idempotency claim (`INSERT` em `cognitive_memory_idempotency`)
+**antes** de confirmar que o `memory_id` alvo existia. Como
+`cognitive_memory_idempotency.target_memory_id` tem FK `RESTRICT` para
+`memory_items.id`, um claim para um alvo inexistente falha com
+`ForeignKeyViolationError` (não `UniqueViolation`), vazando como erro 500
+não tratado em vez de `404 MEMORY_NOT_FOUND` -- descoberto pelo teste real
+`test_supersede_missing_target_with_key_leaves_no_ledger_row`. Corrigido
+travando (`get_by_id_for_update`) e confirmando a existência do alvo
+**antes** de qualquer tentativa de claim; a invariante crítica de
+same-operation-replay-precedes-lifecycle-conflict permanece intacta porque
+o check de `lifecycle == ACTIVE` (Supersede) / o no-op de `FORGOTTEN`
+(Forget) continuam ocorrendo **depois** da resolução do claim -- um loser
+nunca alcança esses checks, independentemente de quando a existência foi
+confirmada.
+
+Prova de aceitação obrigatória (real PostgreSQL,
+`test_supersede_same_key_same_request_replay_after_already_superseded`):
+uma repetição exata (mesma key, mesmo request) depois que o próprio vencedor
+já moveu `old` para `SUPERSEDED` recebe replay do outcome original (`200`,
+mesmo `replacement`), nunca um `409 MEMORY_STATE_CONFLICT` falso.
+
+Prova de scrub destrutivo (real PostgreSQL,
+`test_forget_scrubs_all_cognitive_and_provenance_columns`): sentinels únicos
+em `content`/`scope`/`conversation_uuid`/`turn_uuid`/`task_uuid`/
+`confirmation_ref`/`source_ref` são todos NULL após Forget, confirmado via
+`session.get` direto e via busca textual nos `__dict__` serializados das
+linhas `memory_items`/`memory_provenance`/`cognitive_memory_idempotency`
+(o ledger nunca contém o conteúdo, apenas um digest hex de 64 caracteres).
+
+Prova de resource-state no-op (real PostgreSQL,
+`test_forget_forgotten_with_new_key_is_200_no_op_no_second_mutation`): uma
+**nova** `Idempotency-Key` nunca vista contra um alvo já `FORGOTTEN` retorna
+`200` com o mesmo tombstone (`forgotten_at` idêntico), sem segunda mutação
+destrutiva; e (`test_forget_reused_key_different_request_returns_409_before_state_noop`)
+uma key já vinculada a outro alvo continua `409 IDEMPOTENCY_CONFLICT` mesmo
+quando o novo alvo já está `FORGOTTEN`.
+
+Concorrência determinística básica provada em PostgreSQL real, sem
+`sleep()`:
+
+```text
+test_supersede_concurrent_same_key_same_request_converges_to_one_winner
+    (BarrierEmbeddingClient, 2 participantes) -> um único replacement,
+    uma única linha de ledger, ambas as respostas apontam para o mesmo
+    replacement.
+test_supersede_concurrent_distinct_operations_one_wins_one_conflicts
+    (BarrierEmbeddingClient, keys distintas) -> um 200, um
+    409 MEMORY_STATE_CONFLICT, exatamente um replacement, via
+    PostgreSQL row-level locking puro (get_by_id_for_update).
+test_forget_concurrent_two_requests_different_fresh_keys_converge
+    (asyncio.gather direto, sem embedding) -> ambos resolvem 200,
+    forgotten_at idêntico (única mutação destrutiva).
+```
+
+Refatoração DRY aplicada (sem framework genérico): `_MemoryContentPayloadFields`
+(schemas) compartilha content/confidence/validity/provenance entre
+`MemoryCreateRequest` e `MemorySupersedeRequest`; `_require_same_operation_and_digest`
++ `_find_ledger_snapshot` (serviço) eliminam a duplicação de comparação
+same-key/digest entre Create/Supersede/Forget; `_digest_for` centraliza a
+construção HMAC. Nenhum service de idempotency genérico separado foi
+criado -- a duplicação restante era pequena o suficiente para não
+justificar mais abstração.
+
+Testes novos (contagem exata via `pytest --collect-only`):
+
+```text
+schemas (test_memories_supersede_forget_schemas.py):     14
+routes, service faked (test_memories_supersede_forget_routes.py): 14
+/info all-five-capabilities (test_info.py):                1
+OpenAPI route/shape contract
+  (test_openapi_forbidden_routes.py):                      3
+real PostgreSQL
+  (test_cognitive_memory_supersede_forget_postgres_integration.py):
+                                                           29/29 passed,
+                                                           incluindo os
+                                                           dois cenários
+                                                           de corrida e o
+                                                           scrub/privacy
+                                                           proof
+full unit/contract/security:                              2609 passed,
+                                                           630 skipped
+SM-1001/SM-1002/SM-1003 real-PG regression:                48 passed
+legacy /api/v1/recall regression:                          38 passed
+legacy /forget (Source/Dataset) regression:                92 passed
+```
+
+Escopo confirmado intocado: nenhum `PipelineRun`/`PipelineStep`/
+`graph_outbox` criado por Supersede/Forget (contagem antes/depois idêntica,
+teste dedicado); nenhum node Neo4j; nenhum `PATCH /memories/{id}`; Forget
+de um item `SUPERSEDED` preserva `superseded_at`/`superseded_by` e nunca
+afeta o replacement; Forget de um item `ACTIVE` nunca cria replacement;
+`POST /api/v1/forget` (legacy Source/Dataset), `POST /api/v1/recall`
+(knowledge), `POST /api/v1/remember`, Sessions/Skills/Agents/Datasets/Runs
+permanecem semanticamente inalterados (full regression verde).
+
+Quality gates: `uv lock --check`, `ruff check`, `ruff format --check`,
+`mypy sofias_memory scripts`, `git diff --check` todos verdes na
+implementation SHA.
+
+CI implementation: run `34790808645`, head_sha
+`e2220ee10ce3a9551272c205b811a3be1db0fdcc`, conclusion SUCCESS.
 
 ---
 

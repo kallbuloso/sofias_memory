@@ -203,6 +203,8 @@ async def insert_superseded_pair(
     replacement_embedding: list[float] | None,
     old_created_at: datetime,
     superseded_at: datetime,
+    old_valid_from: datetime | None = None,
+    old_valid_until: datetime | None = None,
 ) -> tuple[UUID, UUID]:
     """Old item: lifecycle=superseded, superseded_at/superseded_by set.
     Replacement: lifecycle=active, created_at approx at superseded_at.
@@ -241,6 +243,8 @@ async def insert_superseded_pair(
                 embedding=old_embedding,
                 lifecycle="superseded",
                 created_at=old_created_at,
+                valid_from=old_valid_from,
+                valid_until=old_valid_until,
                 superseded_at=superseded_at,
                 superseded_by=replacement_id,
             )
@@ -422,6 +426,155 @@ async def test_superseded_item_included_with_is_current_truth_false_when_flag_tr
         assert by_id[old_id].is_current_truth is False
         assert replacement_id in by_id
         assert by_id[replacement_id].is_current_truth is True
+    finally:
+        await cleanup(postgres_session_factory, {old_id, replacement_id})
+
+
+# --- include_superseded=true still enforces temporal validity ----------------
+#
+# External-review finding (post-SM-1003-closeout): a historical superseded
+# item must remain subject to its own valid_from/valid_until window at
+# as_of even when include_superseded=true -- existence + not-yet-forgotten
+# alone is not enough (Feature Contract SS 14.1). Cases A-D below are the
+# exact scenarios from that finding.
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_case_a_historical_superseded_before_valid_from_excluded(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Case A: item not yet valid at as_of -- excluded even though it
+    existed (created_at <= as_of) and was not yet superseded."""
+
+    scope = unique_scope("case-a-before-valid-from")
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    valid_from = datetime(2026, 1, 20, tzinfo=UTC)
+    superseded_at = datetime(2026, 2, 10, tzinfo=UTC)
+    as_of = datetime(2026, 1, 10, tzinfo=UTC)  # before valid_from
+    client = DeterministicEmbeddingClient({QUERY_TEXT: VEC_A})
+
+    old_id, replacement_id = await insert_superseded_pair(
+        postgres_session_factory,
+        scope=scope,
+        old_embedding=VEC_A,
+        replacement_embedding=VEC_C,
+        old_created_at=created_at,
+        superseded_at=superseded_at,
+        old_valid_from=valid_from,
+    )
+
+    try:
+        result = await recall_service(postgres_session_factory, client).recall(
+            build_recall_request(scopes=[scope], as_of=as_of, include_superseded=True, top_k=50)
+        )
+        assert old_id not in {item.memory.memory_id for item in result.items}
+    finally:
+        await cleanup(postgres_session_factory, {old_id, replacement_id})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_case_b_historical_superseded_at_valid_from_included(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Case B: valid_from is inclusive -- eligible exactly at as_of == valid_from."""
+
+    scope = unique_scope("case-b-at-valid-from")
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    valid_from = datetime(2026, 1, 20, tzinfo=UTC)
+    superseded_at = datetime(2026, 2, 10, tzinfo=UTC)
+    as_of = valid_from
+    client = DeterministicEmbeddingClient({QUERY_TEXT: VEC_A})
+
+    old_id, replacement_id = await insert_superseded_pair(
+        postgres_session_factory,
+        scope=scope,
+        old_embedding=VEC_A,
+        replacement_embedding=VEC_C,
+        old_created_at=created_at,
+        superseded_at=superseded_at,
+        old_valid_from=valid_from,
+    )
+
+    try:
+        result = await recall_service(postgres_session_factory, client).recall(
+            build_recall_request(scopes=[scope], as_of=as_of, include_superseded=True, top_k=50)
+        )
+        assert old_id in {item.memory.memory_id for item in result.items}
+    finally:
+        await cleanup(postgres_session_factory, {old_id, replacement_id})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_case_c_historical_superseded_at_valid_until_excluded(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Case C: valid_until is exclusive -- not eligible exactly at
+    as_of == valid_until."""
+
+    scope = unique_scope("case-c-at-valid-until")
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    valid_until = datetime(2026, 1, 30, tzinfo=UTC)
+    superseded_at = datetime(2026, 2, 10, tzinfo=UTC)
+    as_of = valid_until
+    client = DeterministicEmbeddingClient({QUERY_TEXT: VEC_A})
+
+    old_id, replacement_id = await insert_superseded_pair(
+        postgres_session_factory,
+        scope=scope,
+        old_embedding=VEC_A,
+        replacement_embedding=VEC_C,
+        old_created_at=created_at,
+        superseded_at=superseded_at,
+        old_valid_until=valid_until,
+    )
+
+    try:
+        result = await recall_service(postgres_session_factory, client).recall(
+            build_recall_request(scopes=[scope], as_of=as_of, include_superseded=True, top_k=50)
+        )
+        assert old_id not in {item.memory.memory_id for item in result.items}
+    finally:
+        await cleanup(postgres_session_factory, {old_id, replacement_id})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_case_d_historical_superseded_after_supersession_but_temporally_valid(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Case D: as_of is after superseded_at (so the item is not current
+    truth) but still inside its own valid_from/valid_until window --
+    eligible for include_superseded=true, with is_current_truth=false."""
+
+    scope = unique_scope("case-d-after-super-still-valid")
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    valid_from = datetime(2026, 1, 1, tzinfo=UTC)
+    valid_until = datetime(2026, 3, 1, tzinfo=UTC)
+    superseded_at = datetime(2026, 2, 1, tzinfo=UTC)
+    as_of = datetime(2026, 2, 15, tzinfo=UTC)  # after superseded_at, before valid_until
+    client = DeterministicEmbeddingClient({QUERY_TEXT: VEC_A})
+
+    old_id, replacement_id = await insert_superseded_pair(
+        postgres_session_factory,
+        scope=scope,
+        old_embedding=VEC_A,
+        replacement_embedding=VEC_C,
+        old_created_at=created_at,
+        superseded_at=superseded_at,
+        old_valid_from=valid_from,
+        old_valid_until=valid_until,
+    )
+
+    try:
+        result = await recall_service(postgres_session_factory, client).recall(
+            build_recall_request(scopes=[scope], as_of=as_of, include_superseded=True, top_k=50)
+        )
+        by_id = {item.memory.memory_id: item for item in result.items}
+        assert old_id in by_id
+        assert by_id[old_id].is_current_truth is False
     finally:
         await cleanup(postgres_session_factory, {old_id, replacement_id})
 

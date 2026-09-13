@@ -970,19 +970,24 @@ decided by an item's *present* `lifecycle` label alone — a `MemoryItem` now
 
 - `created_at <= as_of` — an item created after `as_of` did not exist yet
   and is always excluded, regardless of every other field.
-- `valid_from` is **inclusive**: at `as_of == valid_from`, the item is
-  eligible.
-- `valid_until` is **exclusive**: at `as_of == valid_until`, the item is
-  **not** eligible.
+- The semantic validity window applies to **every** returned item,
+  regardless of `include_superseded`: `valid_from` is **inclusive** (at
+  `as_of == valid_from`, eligible) and `valid_until` is **exclusive** (at
+  `as_of == valid_until`, **not** eligible). A historical superseded item
+  outside its own `valid_from`/`valid_until` window at `as_of` is excluded
+  even with `include_superseded=true` — having existed and not yet been
+  forgotten is never sufficient on its own.
 - With `include_superseded=false` (default): only items that were current
-  truth *at `as_of`* are returned — `superseded_at IS NULL OR as_of <
-  superseded_at`, plus the validity window above. A presently-`superseded`
-  item queried before its own `superseded_at` is included; queried at or
-  after it, it is excluded.
+  truth *at `as_of`* are returned — additionally `superseded_at IS NULL OR
+  as_of < superseded_at`. A presently-`superseded` item queried before its
+  own `superseded_at` (and inside its validity window) is included; queried
+  at or after it, it is excluded.
 - With `include_superseded=true`: historical superseded items are also
-  returned (still subject to `created_at <= as_of` and non-`forgotten`),
-  each carrying its own correct `is_current_truth` — `false` once
-  `as_of >= superseded_at`.
+  returned, still subject to `created_at <= as_of`, non-`forgotten`, *and*
+  the validity window above — never merely because they existed and were
+  not yet superseded. Each result carries its own correct
+  `is_current_truth` — `false` once `as_of >= superseded_at`, even when the
+  item is otherwise still inside its validity window.
 - `forgotten` items are **never** returned, under any `include_superseded`
   or `as_of` value — Forget destroys cognitive content, and history cannot
   reconstruct what no longer exists.

@@ -29,19 +29,44 @@ class TypedRecallHit:
     is_current_truth: bool
 
 
+def _temporal_validity_predicate(as_of: datetime) -> ColumnElement[bool]:
+    """``valid_from``/``valid_until`` semantic validity at ``as_of``
+    (``valid_from`` inclusive, ``valid_until`` exclusive; Feature Contract
+    SS 9). Required for EVERY eligible row regardless of
+    ``include_superseded`` -- a historical superseded item is only
+    eligible when it still falls inside its own semantic validity window
+    at ``as_of``, never merely because it existed and was not yet
+    superseded (Feature Contract SS 14.1)."""
+
+    return and_(
+        or_(MemoryItem.valid_from.is_(None), MemoryItem.valid_from <= as_of),
+        or_(MemoryItem.valid_until.is_(None), MemoryItem.valid_until > as_of),
+    )
+
+
+def _supersession_currentness_predicate(as_of: datetime) -> ColumnElement[bool]:
+    """Whether the item had not yet been superseded at ``as_of``. Applied
+    to ``WHERE`` only when ``include_superseded=false`` (in addition to
+    :func:`_temporal_validity_predicate`, which always applies) -- and
+    combined with it below to define ``is_current_truth`` for every
+    returned row."""
+
+    return or_(MemoryItem.superseded_at.is_(None), MemoryItem.superseded_at > as_of)
+
+
 def _current_truth_predicate(as_of: datetime) -> ColumnElement[bool]:
-    """The one definition of "current truth at ``as_of``" beyond existence
-    (``created_at <= as_of``, non-FORGOTTEN, content/embedding present --
-    those are structural preconditions shared by every eligible row, see
-    :meth:`MemoryItemRepository.typed_recall`). Used unchanged both as a
-    ``WHERE`` filter (``include_superseded=false``) and as the selected
-    ``is_current_truth`` column (ADR-0016 SS 9), so the two can never
+    """Current truth at ``as_of``, beyond existence (``created_at <=
+    as_of``, non-FORGOTTEN, content/embedding present -- those are
+    structural preconditions shared by every eligible row, see
+    :meth:`MemoryItemRepository.typed_recall`): temporal validity AND not
+    yet superseded. Selected unchanged as the ``is_current_truth`` column
+    for every returned row (ADR-0016 SS 9) -- composed from the same two
+    predicates ``typed_recall`` uses for ``WHERE``, so the two can never
     diverge."""
 
     return and_(
-        or_(MemoryItem.superseded_at.is_(None), MemoryItem.superseded_at > as_of),
-        or_(MemoryItem.valid_from.is_(None), MemoryItem.valid_from <= as_of),
-        or_(MemoryItem.valid_until.is_(None), MemoryItem.valid_until > as_of),
+        _temporal_validity_predicate(as_of),
+        _supersession_currentness_predicate(as_of),
     )
 
 
@@ -87,12 +112,16 @@ class MemoryItemRepository:
         Structural eligibility (always required, regardless of
         ``include_superseded``): non-FORGOTTEN, content/embedding present,
         ``created_at <= as_of`` (an item created after ``as_of`` did not
-        cognitively exist yet), exact ``memory_type``/``scope`` match.
-        ``include_superseded=false`` additionally requires
-        :func:`_current_truth_predicate` -- never a naive
-        ``lifecycle = 'active'`` shortcut, so an item that is presently
-        SUPERSEDED but was current truth at ``as_of`` is still eligible
-        (ADR-0016 SS 9/Feature Contract SS 14.1).
+        cognitively exist yet), exact ``memory_type``/``scope`` match, and
+        :func:`_temporal_validity_predicate` -- a historical superseded
+        item is eligible for ``include_superseded=true`` only when it
+        still falls inside its own semantic validity window at ``as_of``,
+        never merely because it existed and was not yet superseded
+        (Feature Contract SS 14.1). ``include_superseded=false``
+        additionally requires :func:`_supersession_currentness_predicate`
+        -- never a naive ``lifecycle = 'active'`` shortcut, so an item
+        that is presently SUPERSEDED but was current truth at ``as_of`` is
+        still eligible (ADR-0016 SS 9).
         """
 
         relevance = (1 - MemoryItem.embedding.cosine_distance(list(query_embedding))).label(
@@ -110,10 +139,11 @@ class MemoryItemRepository:
                 MemoryItem.created_at <= as_of,
                 MemoryItem.memory_type.in_(memory_types),
                 MemoryItem.scope.in_(scopes),
+                _temporal_validity_predicate(as_of),
             )
         )
         if not include_superseded:
-            statement = statement.where(_current_truth_predicate(as_of))
+            statement = statement.where(_supersession_currentness_predicate(as_of))
         if min_relevance is not None:
             statement = statement.where(relevance >= min_relevance)
         statement = statement.order_by(

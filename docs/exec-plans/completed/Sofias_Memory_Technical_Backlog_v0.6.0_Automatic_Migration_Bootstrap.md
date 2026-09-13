@@ -2,7 +2,7 @@
 
 **Release:** v0.6.0\
 **Feature:** Automatic Serialized Migration Bootstrap\
-**Status:** TODO\
+**Status:** DONE — GATE-v0.6.0 PASSED; v0.6.0 RELEASED\
 **Sequência:** SM-901..SM-906\
 **Regra de execução:** executar uma task por vez; não antecipar dependências ou escopo de tickets posteriores.
 
@@ -74,7 +74,7 @@ Durante SM-901..SM-906:
 | SM-903 | Sticky failure + graceful shutdown critical section + hard-termination orphan safety | SM-902 | — | DONE |
 | SM-904 | Operational/deployment documentation integration + Compose deployment/static invariant | SM-903 | — | DONE |
 | SM-905 | Real-PostgreSQL hardening matrix + release-image smoke + orphan-safety scenario | SM-903, SM-904 | — | DONE |
-| SM-906 | Release prep — quality gates, version bump, GATE-v0.6.0 | SM-905 | — | TODO |
+| SM-906 | Release prep — quality gates, version bump, GATE-v0.6.0 | SM-905 | — | DONE |
 
 ---
 
@@ -485,3 +485,146 @@ O release somente pode ser marcado como concluído quando:
 Após esse gate, nenhum trabalho de migration audit table, dedicated migration role, ou rolling-upgrade compatibility deve ser incluído retroativamente no v0.6.0 — esses itens permanecem non-goals explícitos (Feature Contract §27) até um requisito futuro separadamente escopado.
 
 O próximo release funcional planejado permanece separado.
+
+## GATE-v0.6.0 — PASSED
+
+SM-906 (release prep, quality gates, GATE-v0.6.0) closed the release following
+the exact two-phase discipline this task defined: a `chore(release): prepare
+v0.6.0` commit wired the v0.6.0 migration-bootstrap real-PostgreSQL suites
+into `.github/workflows/integration.yml`, bumped every version surface
+`scripts/ci_release_consistency_check.py` enforces (`0.5.0 -> 0.6.0`), and
+added the `CHANGELOG.md` `[0.6.0]` section — with the Feature Contract
+deliberately left `Proposed` and this exec-plan left `SM-906 = TODO` until
+that exact commit's CI **and** the manually-dispatched Integration workflow
+were both independently confirmed green. Only then did a second,
+`docs(v0.6): finalize release gate` commit promote the Feature Contract to
+`Implemented` — and that second commit was itself required to reach its own,
+independent green CI + Integration run (Phase A's green was never reused as
+a substitute) before its exact SHA was frozen as `release_sha` and tagged.
+
+### Remote evidence
+
+**CI (Phase A)** — workflow `CI`, run `34730558522` (run number `69`),
+commit `abda180a277b46ee9370b7b75cc704205da9e6f0`
+(`chore(release): prepare v0.6.0`), conclusion **success**. Covered ruff,
+ruff format, mypy, unit/contract/security, runtime `pip-audit`, Bandit,
+release consistency, Docker build, and OCI label validation.
+
+**Integration (Phase A)** — workflow `Integration (real PostgreSQL +
+Neo4j)`, run `34731077257` (run number `26`), same commit
+`abda180a277b46ee9370b7b75cc704205da9e6f0`, conclusion **success**. Proved
+the full v0.6.0 migration-bootstrap suite — SM-902/903 real-PostgreSQL
+scenarios, the SM-905 9×2 classification matrix, the never-start-early
+gating suite, and the real supervisor-loss/orphan-safety (`SIGKILL` +
+`PR_SET_PDEATHSIG`) proof — green on GitHub's own Linux runner, alongside
+every pre-existing Skills/Agents/pipeline integration suite.
+
+**CI (Phase B / release_sha)** — workflow `CI`, run `34731931477` (run
+number `70`), commit `cf0ea0bcf55c49d2f2f23f958d5989ffdc269796`
+(`docs(v0.6): finalize release gate`), conclusion **success**.
+
+**Integration (Phase B / release_sha)** — workflow `Integration (real
+PostgreSQL + Neo4j)`, run `34731968381` (run number `27`), same commit
+`cf0ea0bcf55c49d2f2f23f958d5989ffdc269796`, conclusion **success** —
+independently re-verified on this exact SHA, not inherited from Phase A.
+
+**Exact-SHA release-image smoke** — performed locally (WSL/Docker) against
+`release_sha` immediately before tagging, using the same two-phase
+procedure as SM-905: a fresh pristine database migrated automatically to
+head (`0017`) in ~2.2s with `/health/live` reachable and `/health/ready`
+returning `503` during the bootstrap (D33 preserved); the same,
+now-migrated database restarted as a stand-in "previously-released
+database already at head" (v0.6.0 introduces zero new migrations) and
+reached ready via a genuine no-op bootstrap in ~1s. `/api/v1/info` reported
+`"version":"0.6.0"` in both phases.
+
+**Release** — workflow `Release`, run `34733092725` (run number `12`), tag
+`v0.6.0`, commit `cf0ea0bcf55c49d2f2f23f958d5989ffdc269796`, conclusion
+**success**. Job "Validate tag against canonical version" (PASS): tag
+commit belongs to `main`; the exact commit's CI was already green;
+`uv lock --check`; canonical release kind/version; the CHANGELOG `[0.6.0]`
+section; Settings/`.env.example`/Compose parity; version consistency. Job
+"Build, publish to GHCR, create GitHub Release" (PASS): build release
+image; verify OCI labels before publishing; log in to GHCR; check tag
+availability; push image to GHCR; extract release notes from
+`CHANGELOG.md`; create GitHub Release.
+
+**GHCR** — `Push image to GHCR = success`. Published tag:
+`ghcr.io/kallbuloso/sofias-memory:0.6.0`, with OCI labels verified by the
+workflow before publishing (`org.opencontainers.image.version=0.6.0`,
+`org.opencontainers.image.revision=cf0ea0bcf55c49d2f2f23f958d5989ffdc269796`,
+`org.opencontainers.image.source=https://github.com/kallbuloso/sofias_memory`).
+
+**Published release** — `Sofias Memory v0.6.0`, tag `v0.6.0` (annotated,
+target `cf0ea0bcf55c49d2f2f23f958d5989ffdc269796`), stable,
+`prerelease: false`, `draft: false`, release notes sourced from
+`CHANGELOG.md`'s `[0.6.0]` section, immutable.
+
+### Release flow (what actually happened)
+
+```text
+SM-901..SM-905 done
+↓
+Phase A commit abda180a (prepare v0.6.0: integration.yml wiring,
+  version bump, CHANGELOG) pushed
+↓
+CI #69 PASS (commit abda180a)
+↓
+Integration #26 PASS (commit abda180a, same exact SHA as CI)
+↓
+Phase B commit cf0ea0bc (finalize release gate: Feature Contract
+  Proposed -> Implemented) pushed
+↓
+CI #70 PASS (commit cf0ea0bc -- independent of Phase A)
+↓
+Integration #27 PASS (commit cf0ea0bc -- independent of Phase A)
+↓
+cf0ea0bc frozen as release_sha
+↓
+final local gates + exact-SHA release-image smoke PASS
+↓
+annotated tag v0.6.0 created, pointing exactly at release_sha, pushed
+↓
+Release #12 validates exact SHA/tag
+↓
+release image built + OCI validated
+↓
+GHCR image published (ghcr.io/kallbuloso/sofias-memory:0.6.0)
+↓
+GitHub Release published
+↓
+post-release closeout (this commit, docs(v0.6): close release --
+  strictly after the tag; the tag itself never moves)
+```
+
+### Release boundaries preserved
+
+v0.6.0 does **not** include, and none of it was added retroactively: a
+migration audit table, a dedicated migration database role, rolling-upgrade
+compatibility, a public migration HTTP endpoint, or any new production
+database migration (Alembic head remains `0017`, exactly as it was at the
+end of v0.5.0). These remain explicit non-goals (Feature Contract §27)
+until a future, separately scoped requirement. Neo4j and `graph_outbox`
+remain completely untouched by this feature.
+
+### Final state
+
+```text
+SM-901 ✅ PASSED
+SM-902 ✅ PASSED
+SM-903 ✅ PASSED
+SM-904 ✅ PASSED
+SM-905 ✅ PASSED
+SM-906 ✅ PASSED
+
+GATE-v0.6.0 ✅ PASSED
+v0.6.0 ✅ RELEASED
+```
+
+The `v0.6.0` tag is immutable and must not be moved. It points to
+`release_sha = cf0ea0bcf55c49d2f2f23f958d5989ffdc269796` — the commit that
+carried both independent green CI and Integration runs immediately before
+tagging, **not** this documental closeout commit, which lands strictly
+after the tag and never causes it to move.
+
+The next functional release remains separately scoped.

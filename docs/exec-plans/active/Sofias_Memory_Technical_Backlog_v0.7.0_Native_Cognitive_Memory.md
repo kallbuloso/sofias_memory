@@ -130,7 +130,7 @@ Durante toda a v0.7:
 
 | Gate | Ticket | Entrega principal | Depende de | Migration impact | Status |
 |---|---|---|---|---|---|
-| G1 | SM-1001 | Foundation — domain/schema/provenance/idempotency primitives | docs freeze | `0018` | TODO |
+| G1 | SM-1001 | Foundation — domain/schema/provenance/idempotency primitives | docs freeze | `0018` | DONE |
 | G2 | SM-1002 | Compatibility negotiation + synchronous Create/Get | SM-1001 | nenhuma nova esperada | TODO |
 | G3 | SM-1003 | Typed Cognitive Recall + temporal/current-truth query | SM-1002 | nenhuma nova esperada | TODO |
 | G4 | SM-1004 | Atomic Supersession + destructive precise Forget | SM-1003 | nenhuma nova esperada | TODO |
@@ -393,6 +393,94 @@ SM-1001 só fecha quando:
 6. nenhuma rota `/memories` pública foi antecipada;
 7. Neo4j/graph_outbox/PipelineRun permanecem intocados;
 8. `uv lock --check`, ruff, format, mypy e suites existentes permanecem verdes.
+
+## SM-1001 — Evidência de fechamento (DONE)
+
+```text
+Baseline:                main @ 2490e32833358c27d4b4b2ce0f99c27d9d087ce2 (CI #72 SUCCESS)
+Implementation SHA:      230e06ba56d0f522c56e36bffe1cf35572a446e8
+CI fix SHA:              bd8c32d426... (fix(ci): supply COGNITIVE_IDEMPOTENCY_HMAC_KEY
+                          to the release consistency gate)
+Final HEAD:               bd8c32d4
+Alembic head:             0018 (down_revision = 0017)
+```
+
+Tabelas criadas (real PostgreSQL, verificado via introspecção direta):
+
+```text
+memory_items                    -- id, memory_type, scope, content, embedding
+                                    VECTOR(3072), lifecycle, confidence,
+                                    valid_from/until, created_at,
+                                    superseded_at/by, forgotten_at
+memory_provenance                -- 1:1 (memory_id é PK+FK), origin_kind,
+                                    source_system, external refs, observed_at
+cognitive_memory_idempotency     -- idempotency_key UNIQUE, operation,
+                                    request_digest, target/result memory ids
+```
+
+Constraints estruturais provadas contra PostgreSQL real (não apenas em unit
+tests com spy): `confidence` bounds, `validity_window_ordered`,
+`no_self_supersession`, `content_not_blank`/`content_max_length`,
+`scope_grammar`, `non_forgotten_requires_cognitive_payload`,
+`active_requires_clean_lineage`, `superseded_requires_lineage_markers`,
+`forgotten_requires_tombstone_shape`, partial `UNIQUE(superseded_by)`
+(lineage linear), `UNIQUE(idempotency_key)`, `request_digest_hex`,
+`operation_target_shape`. Nenhum ANN/HNSW index foi criado.
+
+Domain primitives: `sofias_memory/domain/cognitive_memory.py` (content
+normalization, confidence, provenance-by-origin, source_system slug),
+`cognitive_memory_scope.py` (`global`/`project:<key>` grammar),
+`cognitive_memory_idempotency.py` (canonical request + HMAC-SHA-256 keyed
+digest; `sys:` reserved namespace proven equal to
+`services.pipeline_submission`'s contract).
+
+Testes:
+
+```text
+unit (domain + migration/model):  111 tests (test_cognitive_memory*.py,
+                                   test_cognitive_memory_scope.py,
+                                   test_cognitive_memory_idempotency.py,
+                                   test_native_cognitive_memory_migration.py)
+migration/model:                  10/10 passed (OperationSpy-based)
+real PostgreSQL (dedicated):      16/16 passed
+                                   (test_native_cognitive_memory_postgres_integration.py,
+                                   env SOFIAS_MEMORY_RUN_POSTGRES_COGNITIVE_MEMORY_TESTS=1)
+full unit/contract/security:      2403 passed
+real-infra regression sweep:      227 passed, 0 failed (all opt-in
+                                   PostgreSQL+Neo4j suites except one
+                                   testcontainers-only gate unavailable in
+                                   this environment)
+migration round-trip:             0017 -> 0018 -> 0017 -> 0018 (upgrade/
+                                   downgrade/re-upgrade) verified against
+                                   real PostgreSQL, plus the full
+                                   empty-database gate
+                                   (test_postgres_migration_gate.py, updated
+                                   for the new head)
+```
+
+Quality gates: `uv lock --check`, `ruff check`, `ruff format --check`,
+`mypy sofias_memory scripts`, `git diff --check` all green at the final
+HEAD.
+
+CI: implementation SHA `230e06b` failed once (`Settings / .env.example /
+Compose parity + version consistency` — `docker compose config` required
+the new `COGNITIVE_IDEMPOTENCY_HMAC_KEY` that the job's env block did not
+yet supply); fixed and re-pushed as `bd8c32d`, both jobs green
+(`CI` run `34779224743`).
+
+Escopo confirmado intocado: nenhuma rota `/memories` pública, nenhum
+`PipelineRun`/`PipelineStep`, nenhum evento `graph_outbox`, nenhum node
+Neo4j — provado por teste de integração dedicado
+(`test_no_pipeline_run_or_graph_outbox_row_is_created`) e por leitura
+literal da migration (nenhuma referência a essas tabelas fora do
+docstring).
+
+Ripple conhecido e documentado: `COGNITIVE_IDEMPOTENCY_HMAC_KEY` é um novo
+secret obrigatório (`SecretStr`, sem default), seguindo o precedente de
+`API_KEY`/`NEO4J_PASSWORD`/`LLM_API_KEY` — isso exigiu adicionar o valor de
+teste em todo fixture/local helper que já construía `Settings` (35 arquivos
+de teste unitário + 3 de contract/security), sem alterar o comportamento
+desses testes.
 
 ---
 

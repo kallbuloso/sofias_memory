@@ -132,7 +132,7 @@ Durante toda a v0.7:
 |---|---|---|---|---|---|
 | G1 | SM-1001 | Foundation — domain/schema/provenance/idempotency primitives | docs freeze | `0018` | DONE |
 | G2 | SM-1002 | Compatibility negotiation + synchronous Create/Get | SM-1001 | nenhuma nova esperada | DONE |
-| G3 | SM-1003 | Typed Cognitive Recall + temporal/current-truth query | SM-1002 | nenhuma nova esperada | TODO |
+| G3 | SM-1003 | Typed Cognitive Recall + temporal/current-truth query | SM-1002 | nenhuma nova esperada | DONE |
 | G4 | SM-1004 | Atomic Supersession + destructive precise Forget | SM-1003 | nenhuma nova esperada | TODO |
 | G5 | SM-1005 | Real-PG concurrency/security/privacy/integration hardening | SM-1004 | somente corretiva se inevitável | TODO |
 | G6 | SM-1006 | Release prep + exact-SHA GATE-v0.7.0 + publication/closeout | SM-1005 | valida `0017 -> 0018+` | TODO |
@@ -933,6 +933,112 @@ Não criar ANN index “por performance preventiva”. Se explain/query plan rev
 6. legacy knowledge recall regression verde;
 7. OpenAPI/contract tests verdes;
 8. nenhuma dependência Neo4j/ANN introduzida.
+
+## SM-1003 — Evidência de fechamento (DONE)
+
+```text
+Baseline:                main @ 8d0410c27eb69580a02a13b9d9499d4af4804996
+                          (SM-1002 closeout, CI SUCCESS)
+Implementation SHA:      237c858b241f3cb8b3445bf0195022da1281f8a4
+Alembic head:            0018 (down_revision = 0017) -- unchanged, no new migration
+```
+
+Rota pública nova:
+
+```text
+POST /api/v1/memories/recall  -- 200 SuccessEnvelope[MemoryRecallResult],
+                                  read-only, separada do knowledge
+                                  POST /api/v1/recall
+```
+
+`/info.capabilities` agora anuncia exatamente `cognitive_memory.write`,
+`cognitive_memory.get`, `cognitive_memory.recall` -- `supersede`/`forget`
+continuam ausentes.
+
+Predicate central: uma única expressão SQLAlchemy
+(`_current_truth_predicate`, `infrastructure/postgres/repositories/
+memory_items.py`) é reaproveitada sem alteração tanto no filtro `WHERE`
+(quando `include_superseded=false`) quanto na coluna selecionada
+`is_current_truth`, eliminando por construção o risco de divergência entre
+o predicado de inclusão e o predicado de exibição. Elegibilidade estrutural
+(`lifecycle != forgotten`, `content`/`embedding IS NOT NULL`,
+`created_at <= as_of`, `memory_type`/`scope` exato) é sempre exigida,
+independentemente de `include_superseded`.
+
+Prova de aceitação obrigatória (real PostgreSQL,
+`test_currently_superseded_item_returned_as_current_truth_before_supersession`):
+um item hoje `lifecycle=superseded` (`created_at=2026-01-01`,
+`superseded_at=2026-01-10`) é retornado com `is_current_truth=true` quando
+consultado com `as_of=2026-01-05` e `include_superseded=false` -- prova
+direta de que a implementação nunca aplica um filtro ingênuo
+`lifecycle='active'`.
+
+Prova FORGOTTEN (real PostgreSQL,
+`test_forgotten_tombstone_never_returned`): tombstone com `content`/
+`embedding`/`scope` NULL nunca retorna, para nenhuma combinação de
+`include_superseded`/`as_of` (incluindo `as_of` anterior a `forgotten_at`),
+e a query não falha ao encontrar a linha com embedding NULL (um sibling
+ACTIVE na mesma query prova que a consulta de fato executa e retorna
+resultado).
+
+Ranking: `relevance = 1 - cosine_distance` (nunca distance invertida
+incorretamente), ordenação total `relevance DESC, created_at DESC,
+memory_id ASC` comprovada com vetores controlados
+(`DeterministicEmbeddingClient`, mesmo padrão do suite de resolve de
+Skills); `confidence` provado sem efeito no ranking; `min_relevance`
+provado inclusivo no limite exato.
+
+Ordering embedding-antes-de-transaction provado com
+`BlockingEmbeddingClient` + contador de chamadas ao `session_factory`:
+zero sessões PostgreSQL abertas enquanto o embedding está bloqueado.
+Provider failure provado sem nenhuma chamada ao `session_factory`.
+
+Testes novos (contagem exata via `pytest --collect-only`):
+
+```text
+schemas (test_memories_recall_schemas.py):          34
+routes, service faked (test_memories_recall_routes.py): 6
+domain recall-query normalization
+  (test_cognitive_memory.py):                        6
+/info capability negotiation (test_info.py):         2 (atualizados)
+OpenAPI route/shape contract
+  (test_openapi_forbidden_routes.py):                3 novos + 1 atualizado
+real PostgreSQL + pgvector
+  (test_cognitive_memory_recall_postgres_integration.py):
+                                                     17/17 passed, incluindo
+                                                     os dois cenários de
+                                                     aceitação obrigatórios
+                                                     (historical superseded,
+                                                     FORGOTTEN tombstone)
+full unit/contract/security:                        2578 passed, 598 skipped
+SM-1001/SM-1002 real-PG regression:                 27 passed
+```
+
+Achado corrigido durante a implementação (bug real, não apenas
+documentação): a primeira versão de `CognitiveMemoryRecallService.recall`
+construía o `MemoryRecallResult` **depois** de sair do bloco `async with
+self._unit_of_work_factory()`, causando `DetachedInstanceError` em
+PostgreSQL real -- `PostgresUnitOfWork.__aexit__` executa `rollback()`
+(Recall nunca comita), e `Session.rollback()` expira todas as instâncias
+ORM carregadas; qualquer acesso a atributo depois do `async with` tenta
+recarregar contra uma sessão já fechada. Corrigido movendo a construção de
+`MemoryRecallItem`/`memory_item_result` para dentro do bloco, exatamente
+como `CognitiveMemoryService.create`/`get` (SM-1002) já faziam
+corretamente. As 13 falhas observadas antes da correção (todo teste real-PG
+que efetivamente atravessava uma query) confirmam que a suite pega esse
+tipo de regressão de verdade.
+
+Escopo confirmado intocado: `POST /api/v1/recall` (knowledge) sem nenhuma
+mudança de schema/ranking/status codes (full regression verde); nenhum
+`PATCH /memories/{id}`, nenhum Supersede/Forget, nenhum Neo4j, nenhum
+ANN/HNSW/IVFFlat, nenhuma migration nova.
+
+Quality gates: `uv lock --check`, `ruff check`, `ruff format --check`,
+`mypy sofias_memory scripts`, `git diff --check` todos verdes na
+implementation SHA.
+
+CI implementation: run `34785135310`, head_sha
+`237c858b241f3cb8b3445bf0195022da1281f8a4`, conclusion SUCCESS.
 
 ---
 

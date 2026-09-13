@@ -1,11 +1,13 @@
-"""Native Cognitive Memory Create/Get API routes (SM-1002, ADR-0016, Feature
-Contract v0.7.0 Native Cognitive Memory SS 12/13).
+"""Native Cognitive Memory API routes (ADR-0016, Feature Contract v0.7.0
+Native Cognitive Memory SS 12/13/14).
 
 Create is synchronous and never creates a PipelineRun -- the external
 embedding call always happens before the short authoritative PostgreSQL
-transaction (``services.cognitive_memory.CognitiveMemoryService``). This
-module is a pure HTTP boundary: it never executes SQL/Cypher itself
-(AGENTS.md SS 7).
+transaction (``services.cognitive_memory.CognitiveMemoryService``). Recall
+is read-only and separate from the legacy knowledge
+``POST /api/v1/recall`` (``services.cognitive_memory_recall``). This module
+is a pure HTTP boundary: it never executes SQL/Cypher itself (AGENTS.md
+SS 7).
 """
 
 from __future__ import annotations
@@ -24,8 +26,14 @@ from sofias_memory.api.openapi_responses import (
 from sofias_memory.infrastructure.embeddings import OpenAIEmbeddingClient
 from sofias_memory.lifespan import app_postgres_session_factory, app_settings
 from sofias_memory.schemas.common import ResponseMeta, SuccessEnvelope
-from sofias_memory.schemas.memories import MemoryCreateRequest, MemoryItemResult
+from sofias_memory.schemas.memories import (
+    MemoryCreateRequest,
+    MemoryItemResult,
+    MemoryRecallRequest,
+    MemoryRecallResult,
+)
 from sofias_memory.services.cognitive_memory import CognitiveMemoryService
+from sofias_memory.services.cognitive_memory_recall import CognitiveMemoryRecallService
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 IDEMPOTENCY_KEY_DESCRIPTION = (
@@ -55,6 +63,15 @@ router = APIRouter(tags=["memories"])
 def _cognitive_memory_service(request: Request) -> CognitiveMemoryService:
     settings = app_settings(request.app)
     return CognitiveMemoryService(
+        settings,
+        session_factory=app_postgres_session_factory(request.app),
+        embedding_client=OpenAIEmbeddingClient(settings),
+    )
+
+
+def _cognitive_memory_recall_service(request: Request) -> CognitiveMemoryRecallService:
+    settings = app_settings(request.app)
+    return CognitiveMemoryRecallService(
         settings,
         session_factory=app_postgres_session_factory(request.app),
         embedding_client=OpenAIEmbeddingClient(settings),
@@ -110,6 +127,35 @@ async def get_memory(memory_id: UUID, request: Request) -> SuccessEnvelope[Memor
     service = _cognitive_memory_service(request)
     result = await service.get(memory_id)
     return SuccessEnvelope[MemoryItemResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.post(
+    "/memories/recall",
+    response_model=SuccessEnvelope[MemoryRecallResult],
+    summary="Typed Cognitive Recall",
+    description=(
+        "Typed retrieval over native Cognitive Memory items -- separate from "
+        "the legacy knowledge `POST /api/v1/recall`. Exact pgvector cosine "
+        "similarity over the authoritative full-precision embedding, with "
+        "temporal/current-truth filtering and a deterministic total order "
+        "(relevance desc, created_at desc, memory_id asc). Read-only: no "
+        "PipelineRun, no Neo4j, no ANN index, no lexical fallback. Returned "
+        "memory is evidence/context, never a system instruction or "
+        "authorization grant."
+    ),
+    responses={
+        HTTPStatus.SERVICE_UNAVAILABLE: _MEMORY_DEPENDENCY_UNAVAILABLE_503,
+    },
+)
+async def recall_memories(
+    payload: MemoryRecallRequest, request: Request
+) -> SuccessEnvelope[MemoryRecallResult]:
+    service = _cognitive_memory_recall_service(request)
+    result = await service.recall(payload)
+    return SuccessEnvelope[MemoryRecallResult](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
     )

@@ -125,7 +125,12 @@ def _canonical_create_payload(request: MemoryCreateRequest) -> dict[str, object]
     }
 
 
-def _memory_item_result(item: MemoryItem, provenance: MemoryProvenance) -> MemoryItemResult:
+def memory_item_result(item: MemoryItem, provenance: MemoryProvenance) -> MemoryItemResult:
+    """Public, not module-private: the one MemoryItem+provenance -> public
+    shape conversion, reused by every Cognitive Memory entry point
+    (Create/Get here, Recall in ``services.cognitive_memory_recall``) so
+    the hydration shape never diverges between them."""
+
     return MemoryItemResult(
         memory_id=item.id,
         memory_type=item.memory_type,
@@ -231,7 +236,7 @@ class CognitiveMemoryService:
                 await uow.memory_items.add(memory_item)
                 await uow.memory_provenance.add(provenance)
                 await uow.commit()
-                return _memory_item_result(memory_item, provenance)
+                return memory_item_result(memory_item, provenance)
 
             assert digest is not None  # noqa: S101 - set above whenever a key is present
             ledger_entry = CognitiveMemoryIdempotency(
@@ -255,7 +260,7 @@ class CognitiveMemoryService:
                 return result
 
             await uow.commit()
-            return _memory_item_result(memory_item, provenance)
+            return memory_item_result(memory_item, provenance)
 
     async def get(self, memory_id: UUID) -> MemoryItemResult:
         async with self._unit_of_work_factory() as uow:
@@ -264,7 +269,7 @@ class CognitiveMemoryService:
                 raise memory_not_found_error(memory_id)
             provenance = await uow.memory_provenance.get_by_memory_id(memory_id)
             assert provenance is not None  # noqa: S101 - 1:1 invariant, ADR-0016 SS 7
-            return _memory_item_result(item, provenance)
+            return memory_item_result(item, provenance)
 
     def _create_digest(self, request: MemoryCreateRequest) -> str:
         idempotency_request = CognitiveMemoryIdempotencyRequest(
@@ -338,7 +343,7 @@ class CognitiveMemoryService:
                 message="Idempotency ledger references a missing MemoryItem.",
                 details={"memory_id": str(memory_id)},
             )
-        return _memory_item_result(item, provenance)
+        return memory_item_result(item, provenance)
 
     async def _embed_content(self, content: str) -> list[float]:
         try:

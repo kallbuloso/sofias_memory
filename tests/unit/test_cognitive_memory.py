@@ -6,6 +6,7 @@ import pytest
 
 from sofias_memory.domain import (
     COGNITIVE_MEMORY_CONTENT_MAX_LENGTH,
+    COGNITIVE_MEMORY_RECALL_QUERY_MAX_LENGTH,
     CognitiveMemoryOriginKind,
     CognitiveMemoryType,
     InvalidCognitiveMemoryConfidenceError,
@@ -14,6 +15,7 @@ from sofias_memory.domain import (
     InvalidCognitiveMemoryTimestampError,
     InvalidCognitiveMemoryValidityWindowError,
     normalize_cognitive_memory_content,
+    normalize_cognitive_memory_recall_query,
     normalize_cognitive_memory_timestamp,
     validate_cognitive_memory_confidence,
     validate_cognitive_memory_external_ref,
@@ -291,3 +293,34 @@ def test_validity_window_rejects_until_before_from() -> None:
         validate_cognitive_memory_validity_window(
             datetime(2026, 1, 2, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC)
         )
+
+
+# --- recall query normalization -----------------------------------------
+
+
+def test_recall_query_normalizes_crlf_and_cr_to_lf() -> None:
+    assert normalize_cognitive_memory_recall_query("q1\r\nq2\rq3") == "q1\nq2\nq3"
+
+
+def test_recall_query_trims_edge_whitespace_only() -> None:
+    assert normalize_cognitive_memory_recall_query("  what does X do?  ") == "what does X do?"
+
+
+def test_recall_query_empty_after_trim_is_rejected() -> None:
+    with pytest.raises(InvalidCognitiveMemoryContentError):
+        normalize_cognitive_memory_recall_query("   \n\t  ")
+
+
+def test_recall_query_within_max_length_is_accepted() -> None:
+    value = "a" * COGNITIVE_MEMORY_RECALL_QUERY_MAX_LENGTH
+    assert normalize_cognitive_memory_recall_query(value) == value
+
+
+def test_recall_query_over_max_length_is_rejected() -> None:
+    oversized = "a" * (COGNITIVE_MEMORY_RECALL_QUERY_MAX_LENGTH + 1)
+    with pytest.raises(InvalidCognitiveMemoryContentError):
+        normalize_cognitive_memory_recall_query(oversized)
+
+
+def test_recall_query_max_length_differs_from_content_max_length() -> None:
+    assert COGNITIVE_MEMORY_RECALL_QUERY_MAX_LENGTH != COGNITIVE_MEMORY_CONTENT_MAX_LENGTH

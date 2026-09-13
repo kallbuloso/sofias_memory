@@ -812,9 +812,9 @@ participation, and never exact per-operation provenance.
 First-class, durable **Native Cognitive Memory** (ADR-0016): a small,
 typed, synchronously-written unit of durable fact/preference (`profile` or
 `semantic`), independent of Dataset/Source/Document/Chunk and independent
-of Session history. This release implements exactly **Create** and **Get**
-— typed recall, supersession, and precise Forget are separate, later
-releases.
+of Session history. This release implements **Create**, **Get**, and
+**typed Recall** — supersession and precise Forget are a separate, later
+release.
 
 ### 20.1 Compatibility negotiation
 
@@ -826,7 +826,11 @@ existing one (`name`, `version`, `environment`, `config_fingerprint`,
 {
   "api_contract_version": "1",
   "contracts": {"cognitive_memory": "1"},
-  "capabilities": ["cognitive_memory.write", "cognitive_memory.get"]
+  "capabilities": [
+    "cognitive_memory.write",
+    "cognitive_memory.get",
+    "cognitive_memory.recall"
+  ]
 }
 ```
 
@@ -834,8 +838,8 @@ existing one (`name`, `version`, `environment`, `config_fingerprint`,
 `version` (the application release SemVer) — never infer Cognitive Memory
 support from `version >= 0.7.0` alone. `capabilities` lists only operations
 genuinely implemented by the running HEAD; it grows to include
-`cognitive_memory.recall`, `cognitive_memory.supersede`, and
-`cognitive_memory.forget` only once those routes exist.
+`cognitive_memory.supersede` and `cognitive_memory.forget` only once those
+routes exist.
 
 ```bash
 curl -sS "$SOFIAS_MEMORY_URL/api/v1/info" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
@@ -916,9 +920,79 @@ The response shape is deliberately lifecycle-safe: `scope`/`content`/
 tombstone (once those transitions exist) fits the exact same schema —
 this release only ever produces `lifecycle: "active"`.
 
-### 20.4 Explicitly not yet implemented
+### 20.4 Typed Recall
 
-`POST /api/v1/memories/recall`, `POST /api/v1/memories/{id}/supersede`,
-`POST /api/v1/memories/{id}/forget`, and `PATCH /api/v1/memories/{id}` do
-not exist in this release. Cognitive Memory never creates a `PipelineRun`,
-never projects to Neo4j, and never emits a `graph_outbox` event.
+```bash
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/memories/recall" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "query": "What interface color does the user prefer?",
+        "scopes": ["global"],
+        "top_k": 10
+      }'
+```
+
+`POST /api/v1/memories/recall` is a **separate, read-only** operation from
+the legacy knowledge `POST /api/v1/recall` — the two never share a request/
+response shape, and neither one's semantics changes because of the other.
+Cognitive Recall never touches Neo4j, never uses an ANN/HNSW index (exact
+cosine similarity only), never falls back to lexical search, and never
+creates a `PipelineRun`.
+
+Request fields:
+
+- `query` (required): 1..8192 Unicode characters after normalization.
+- `memory_types` (optional, default `["profile", "semantic"]`): restrict to
+  one or both types — `episodic`/`procedural`/anything else is `422`.
+- `scopes` (required, 1..16): canonical scopes, exact-match only — the same
+  `global`/`project:<key>` grammar as Create. Requesting `["project:alpha"]`
+  never implicitly includes `global`; list both explicitly if you want both.
+- `top_k` (optional, default `10`, range `1..50`): applied **after**
+  structural/temporal filtering and `min_relevance`, never before.
+- `as_of` (optional, default: server now UTC): timezone-aware, normalized
+  to UTC. A future value is `422 INVALID_REQUEST`.
+- `include_superseded` (optional, default `false`): see current-truth
+  semantics below.
+- `min_relevance` (optional, `[-1, 1]`): inclusive threshold on the same
+  cosine `relevance` value the response returns — never on a raw/inverted
+  distance.
+
+Response: `200`, `SuccessEnvelope[MemoryRecallResult]`, `{"items": [...]}`
+where each item is `{"memory": <MemoryItem>, "relevance": <float>,
+"is_current_truth": <bool>}`. Embedding is never returned. `relevance` is
+cosine similarity in `[-1, 1]`, computed by PostgreSQL/pgvector over the
+authoritative full-precision `VECTOR(3072)` — never a raw distance value.
+
+**Current-truth semantics (the central invariant).** Eligibility is never
+decided by an item's *present* `lifecycle` label alone — a `MemoryItem` now
+`superseded` is still returned, with `is_current_truth: true`, when it
+*was* current truth at the effective `as_of`:
+
+- `created_at <= as_of` — an item created after `as_of` did not exist yet
+  and is always excluded, regardless of every other field.
+- `valid_from` is **inclusive**: at `as_of == valid_from`, the item is
+  eligible.
+- `valid_until` is **exclusive**: at `as_of == valid_until`, the item is
+  **not** eligible.
+- With `include_superseded=false` (default): only items that were current
+  truth *at `as_of`* are returned — `superseded_at IS NULL OR as_of <
+  superseded_at`, plus the validity window above. A presently-`superseded`
+  item queried before its own `superseded_at` is included; queried at or
+  after it, it is excluded.
+- With `include_superseded=true`: historical superseded items are also
+  returned (still subject to `created_at <= as_of` and non-`forgotten`),
+  each carrying its own correct `is_current_truth` — `false` once
+  `as_of >= superseded_at`.
+- `forgotten` items are **never** returned, under any `include_superseded`
+  or `as_of` value — Forget destroys cognitive content, and history cannot
+  reconstruct what no longer exists.
+
+Deterministic total order: `relevance` descending, then `created_at`
+descending, then `memory_id` ascending. `confidence` never affects ranking.
+
+### 20.5 Explicitly not yet implemented
+
+`POST /api/v1/memories/{id}/supersede`, `POST /api/v1/memories/{id}/forget`,
+and `PATCH /api/v1/memories/{id}` do not exist in this release. Cognitive
+Memory never creates a `PipelineRun`, never projects to Neo4j, and never
+emits a `graph_outbox` event.

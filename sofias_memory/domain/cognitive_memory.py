@@ -25,6 +25,7 @@ from sofias_memory.domain.enums import CognitiveMemoryOriginKind
 COGNITIVE_MEMORY_CONTENT_MAX_LENGTH = 16384
 COGNITIVE_MEMORY_SOURCE_SYSTEM_MAX_LENGTH = 64
 COGNITIVE_MEMORY_EXTERNAL_REF_MAX_LENGTH = 255
+COGNITIVE_MEMORY_RECALL_QUERY_MAX_LENGTH = 8192
 
 _SOURCE_SYSTEM_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
@@ -73,6 +74,24 @@ def normalize_newlines(value: str) -> str:
     """``\\r\\n`` and bare ``\\r`` -> ``\\n``. No other transformation here."""
 
     return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def normalize_cognitive_memory_recall_query(value: str) -> str:
+    """CRLF/CR -> LF, then trim edges only, then require 1..8192 Unicode
+    characters (Feature Contract SS 14). Deliberately a separate limit from
+    :func:`normalize_cognitive_memory_content` -- a recall query is not
+    persisted cognitive content, but the normalization rule (newline
+    normalization, edge trim, non-blank) is identical, so the shared
+    :func:`normalize_newlines` helper is reused rather than reimplemented.
+    """
+
+    normalized = normalize_newlines(value).strip()
+    if not (1 <= len(normalized) <= COGNITIVE_MEMORY_RECALL_QUERY_MAX_LENGTH):
+        raise InvalidCognitiveMemoryContentError(
+            f"query must be 1..{COGNITIVE_MEMORY_RECALL_QUERY_MAX_LENGTH} Unicode "
+            "characters after normalization"
+        )
+    return normalized
 
 
 def normalize_cognitive_memory_content(value: str) -> str:

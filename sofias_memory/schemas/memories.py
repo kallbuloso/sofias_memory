@@ -27,6 +27,7 @@ from sofias_memory.domain import (
     CognitiveMemoryOriginKind,
     CognitiveMemoryType,
     normalize_cognitive_memory_content,
+    normalize_cognitive_memory_recall_query,
     normalize_cognitive_memory_scope,
     normalize_cognitive_memory_timestamp,
     validate_cognitive_memory_confidence,
@@ -35,6 +36,11 @@ from sofias_memory.domain import (
     validate_cognitive_memory_source_system,
     validate_cognitive_memory_validity_window,
 )
+from sofias_memory.schemas.common import utc_now
+
+MEMORY_RECALL_MAX_SCOPES = 16
+MEMORY_RECALL_DEFAULT_TOP_K = 10
+MEMORY_RECALL_MAX_TOP_K = 50
 
 
 class MemoryProvenanceCreateRequest(BaseModel):
@@ -165,3 +171,84 @@ class MemoryItemResult(BaseModel):
     superseded_by: UUID | None
     forgotten_at: datetime | None
     provenance: MemoryProvenanceResult
+
+
+class MemoryRecallRequest(BaseModel):
+    """``POST /api/v1/memories/recall`` request body (Feature Contract
+    SS 14) -- a typed retrieval separate from the legacy knowledge
+    ``POST /api/v1/recall``. No dataset/session/tenant field exists here:
+    Cognitive Memory scope is the only namespace this endpoint accepts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(description="1..8192 Unicode characters after normalization.")
+    memory_types: list[CognitiveMemoryType] = Field(
+        default_factory=lambda: [CognitiveMemoryType.PROFILE, CognitiveMemoryType.SEMANTIC],
+        description="Defaults to both types when omitted.",
+    )
+    scopes: list[str] = Field(
+        min_length=1,
+        max_length=MEMORY_RECALL_MAX_SCOPES,
+        description="1..16 canonical scopes ('global' or 'project:<key>'); exact match only.",
+    )
+    top_k: int = Field(
+        default=MEMORY_RECALL_DEFAULT_TOP_K,
+        ge=1,
+        le=MEMORY_RECALL_MAX_TOP_K,
+    )
+    as_of: datetime = Field(
+        default_factory=utc_now,
+        description="Defaults to server now (UTC). Must not be in the future.",
+    )
+    include_superseded: bool = Field(
+        default=False,
+        description=(
+            "false: only current truth at as_of. true: also include historical "
+            "SUPERSEDED items eligible at as_of, each with is_current_truth set "
+            "accordingly. FORGOTTEN is never eligible either way."
+        ),
+    )
+    min_relevance: float | None = Field(
+        default=None,
+        ge=-1.0,
+        le=1.0,
+        description="Inclusive cosine-similarity threshold, applied to relevance.",
+    )
+
+    @pydantic_field_validator("query")
+    @classmethod
+    def _normalize_query(cls, value: str) -> str:
+        return normalize_cognitive_memory_recall_query(value)
+
+    @pydantic_field_validator("scopes")
+    @classmethod
+    def _normalize_scopes(cls, value: list[str]) -> list[str]:
+        normalized = [normalize_cognitive_memory_scope(item) for item in value]
+        return list(dict.fromkeys(normalized))
+
+    @pydantic_field_validator("as_of")
+    @classmethod
+    def _normalize_and_reject_future_as_of(cls, value: datetime) -> datetime:
+        normalized = normalize_cognitive_memory_timestamp(value)
+        if normalized > utc_now():
+            raise ValueError("as_of must not be in the future")
+        return normalized
+
+
+class MemoryRecallItem(BaseModel):
+    """One typed recall hit. ``memory`` is evidence/context returned to the
+    caller -- never a system instruction, policy, or authorization grant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory: MemoryItemResult
+    relevance: float = Field(description="Cosine similarity in [-1, 1]. Never a raw distance.")
+    is_current_truth: bool = Field(
+        description="Whether this item was current truth at the effective as_of."
+    )
+
+
+class MemoryRecallResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[MemoryRecallItem]

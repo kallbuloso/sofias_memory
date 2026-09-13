@@ -615,9 +615,9 @@ def test_no_secret_value_appears_anywhere_in_schema() -> None:
         assert secret not in serialized, f"secret value leaked into OpenAPI schema: {secret!r}"
 
 
-def test_memories_create_get_routes_present_with_exact_methods() -> None:
-    """SM-1002 scope: exactly Create + Get. No recall/supersede/forget route
-    exists yet -- those are SM-1003/SM-1004."""
+def test_memories_create_get_recall_routes_present_with_exact_methods() -> None:
+    """SM-1003 scope: exactly Create + Get + Recall. No supersede/forget/
+    PATCH route exists yet -- those are SM-1004."""
 
     schema = openapi_schema()
     paths = schema["paths"]
@@ -625,12 +625,66 @@ def test_memories_create_get_routes_present_with_exact_methods() -> None:
 
     assert set(paths["/api/v1/memories"]) == {"post"}
     assert set(paths["/api/v1/memories/{memory_id}"]) == {"get"}
+    assert set(paths["/api/v1/memories/recall"]) == {"post"}
+    assert "patch" not in paths["/api/v1/memories/{memory_id}"]
 
     memories_paths = {path for path in paths if path.startswith("/api/v1/memories")}
     assert memories_paths == {
         "/api/v1/memories",
         "/api/v1/memories/{memory_id}",
+        "/api/v1/memories/recall",
     }
+
+
+def test_memories_supersede_and_forget_routes_absent() -> None:
+    """SM-1004 scope, not yet implemented -- explicit negative contract so a
+    future accidental route addition is caught here first."""
+
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert "/api/v1/memories/{memory_id}/supersede" not in paths
+    assert "/api/v1/memories/{memory_id}/forget" not in paths
+
+
+def test_memory_recall_result_never_exposes_embedding_or_raw_distance() -> None:
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+
+    recall_item = schemas["MemoryRecallItem"]
+    assert isinstance(recall_item, dict)
+    properties = set(recall_item["properties"])
+    assert properties == {"memory", "relevance", "is_current_truth"}
+
+    recall_request = schemas["MemoryRecallRequest"]
+    assert isinstance(recall_request, dict)
+    assert set(recall_request["properties"]) == {
+        "query",
+        "memory_types",
+        "scopes",
+        "top_k",
+        "as_of",
+        "include_superseded",
+        "min_relevance",
+    }
+
+    recall_response = schemas["MemoryRecallResult"]
+    assert isinstance(recall_response, dict)
+    assert set(recall_response["properties"]) == {"items"}
+
+
+def test_memories_recall_does_not_accept_idempotency_key() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    operation = paths["/api/v1/memories/recall"]["post"]
+    header_names = {p.get("name") for p in operation.get("parameters", [])}
+    assert "Idempotency-Key" not in header_names
 
 
 def test_memories_create_response_is_201_and_get_response_is_200() -> None:

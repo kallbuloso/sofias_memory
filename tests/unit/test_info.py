@@ -133,7 +133,11 @@ async def test_info_returns_expected_application_metadata() -> None:
         "embedding_dimensions": 3072,
         "api_contract_version": "1",
         "contracts": {"cognitive_memory": "1"},
-        "capabilities": ["cognitive_memory.write", "cognitive_memory.get"],
+        "capabilities": [
+            "cognitive_memory.write",
+            "cognitive_memory.get",
+            "cognitive_memory.recall",
+        ],
     }
 
 
@@ -307,10 +311,10 @@ async def test_info_is_not_in_public_allowlist() -> None:
 
 
 @pytest.mark.asyncio
-async def test_info_announces_exactly_sm_1002_capabilities() -> None:
-    """SM-1002 HEAD: only write/get are implemented -- recall (SM-1003) and
-    supersede/forget (SM-1004) must not be announced in advance of their
-    own routes/services (ADR-0016 SS 16, Feature Contract SS 11)."""
+async def test_info_announces_exactly_sm_1003_capabilities() -> None:
+    """SM-1003 HEAD: write/get/recall are implemented -- supersede/forget
+    (SM-1004) must not be announced in advance of their own routes/services
+    (ADR-0016 SS 16, Feature Contract SS 11)."""
 
     async with make_client(create_app(make_settings())) as client:
         response = await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
@@ -318,8 +322,11 @@ async def test_info_announces_exactly_sm_1002_capabilities() -> None:
     data = data_object(response)
     assert data["api_contract_version"] == "1"
     assert data["contracts"] == {"cognitive_memory": "1"}
-    assert data["capabilities"] == ["cognitive_memory.write", "cognitive_memory.get"]
-    assert "cognitive_memory.recall" not in data["capabilities"]
+    assert data["capabilities"] == [
+        "cognitive_memory.write",
+        "cognitive_memory.get",
+        "cognitive_memory.recall",
+    ]
     assert "cognitive_memory.supersede" not in data["capabilities"]
     assert "cognitive_memory.forget" not in data["capabilities"]
 

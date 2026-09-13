@@ -399,10 +399,16 @@ SM-1001 só fecha quando:
 ```text
 Baseline:                main @ 2490e32833358c27d4b4b2ce0f99c27d9d087ce2 (CI #72 SUCCESS)
 Implementation SHA:      230e06ba56d0f522c56e36bffe1cf35572a446e8
-CI fix SHA:              bd8c32d426... (fix(ci): supply COGNITIVE_IDEMPOTENCY_HMAC_KEY
-                          to the release consistency gate)
-Final HEAD:               bd8c32d4
+CI fix SHA:              bd8c32d4262c57521fc6466a8c6d309a02229fa2 (fix(ci): supply
+                          COGNITIVE_IDEMPOTENCY_HMAC_KEY to the release consistency gate)
+Closeout SHA:            83c3992c092d8c50ee401608b75fad9ff64e362e (docs(v0.7): close SM-1001)
 Alembic head:             0018 (down_revision = 0017)
+
+Final closeout CI:
+CI #75
+run 34779407916
+SUCCESS
+head_sha = 83c3992c092d8c50ee401608b75fad9ff64e362e
 ```
 
 Tabelas criadas (real PostgreSQL, verificado via introspecção direta):

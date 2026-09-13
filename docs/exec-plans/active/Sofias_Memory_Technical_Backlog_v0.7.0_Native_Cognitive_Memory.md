@@ -1040,6 +1040,95 @@ implementation SHA.
 CI implementation: run `34785135310`, head_sha
 `237c858b241f3cb8b3445bf0195022da1281f8a4`, conclusion SUCCESS.
 
+## SM-1003 — Correção pós-closeout: temporal validity em include_superseded=true
+
+Finding de revisão externa (após o closeout acima): o Feature Contract §14.1
+exige que `include_superseded=true` continue sujeito à semantic validity
+window (`valid_from`/`valid_until`) -- não apenas a existência
+(`created_at <= as_of`) e não-forgotten. A implementação original agrupava
+`superseded_at`/`valid_from`/`valid_until` em um único
+`_current_truth_predicate` e só aplicava esse predicate inteiro ao `WHERE`
+quando `include_superseded=false`; com `include_superseded=true`, a query
+deixava de exigir a validity window por completo, podendo devolver uma
+memória histórica fora de seu próprio `valid_from`/`valid_until` em
+`as_of`.
+
+```text
+Original implementation SHA: 237c858b241f3cb8b3445bf0195022da1281f8a4
+Original closeout SHA:       8092c13ed49fc11db22f9485a0c9e89c1e94ebad
+Corrective implementation SHA: 9bbfa738533599be6849c09e719d050cd15a586c
+Alembic head: 0018 (inalterado -- correção é lógica de query, não schema)
+```
+
+Correção (`sofias_memory/infrastructure/postgres/repositories/
+memory_items.py`): o predicate foi decomposto em três funções puras,
+nenhuma duplicando a outra:
+
+```text
+_temporal_validity_predicate(as_of)
+    valid_from IS NULL OR valid_from <= as_of
+    AND
+    valid_until IS NULL OR as_of < valid_until
+    -- sempre aplicado no WHERE, independente de include_superseded
+
+_supersession_currentness_predicate(as_of)
+    superseded_at IS NULL OR as_of < superseded_at
+    -- aplicado no WHERE somente quando include_superseded=false
+
+_current_truth_predicate(as_of)
+    = _temporal_validity_predicate(as_of) AND _supersession_currentness_predicate(as_of)
+    -- selecionado sem alteração como a coluna is_current_truth de toda
+       linha retornada, composta exatamente pelos dois predicates acima
+       (nunca uma terceira definição divergente)
+```
+
+Casos reais em PostgreSQL (`test_cognitive_memory_recall_postgres_integration.py`,
+todos novos, todos passando):
+
+```text
+test_case_a_historical_superseded_before_valid_from_excluded
+    as_of antes de valid_from, include_superseded=true -> excluído
+test_case_b_historical_superseded_at_valid_from_included
+    as_of == valid_from, include_superseded=true -> elegível (inclusivo)
+test_case_c_historical_superseded_at_valid_until_excluded
+    as_of == valid_until, include_superseded=true -> excluído (exclusivo)
+test_case_d_historical_superseded_after_supersession_but_temporally_valid
+    as_of após superseded_at mas dentro de valid_from/valid_until,
+    include_superseded=true -> retornado, is_current_truth=false
+```
+
+Casos preexistentes preservados sem alteração de comportamento (Case E/F
+do finding):
+
+```text
+test_currently_superseded_item_returned_as_current_truth_before_supersession
+    as_of antes de superseded_at, include_superseded=false ->
+    retornado, is_current_truth=true
+test_forgotten_tombstone_never_returned
+    FORGOTTEN nunca retorna, para qualquer as_of/include_superseded
+```
+
+`docs/api.md` §20.4 corrigido: `include_superseded=true` agora documenta
+explicitamente que a validity window continua obrigatória para todo item
+histórico retornado.
+
+Testes: `test_cognitive_memory_recall_postgres_integration.py` 21/21
+passed (17 anteriores + 4 novos casos A-D) contra PostgreSQL real;
+`test_cognitive_memory_create_get_postgres_integration.py` +
+`test_native_cognitive_memory_postgres_integration.py` 27 passed
+(regressão SM-1001/SM-1002); `test_recall.py` 38 passed (regressão knowledge
+`/api/v1/recall`, semanticamente intocado); full unit/contract/security
+2578 passed, 602 skipped.
+
+Quality gates: `uv lock --check`, `ruff check`, `ruff format --check`,
+`mypy sofias_memory scripts`, `git diff --check` todos verdes na
+corrective implementation SHA. Nenhuma migration nova; nenhuma alteração a
+ADR-0016/Feature Contract/Integration Contract; nenhum arquivo fora do
+escopo do finding foi tocado.
+
+CI corrective: run `34788308101`, head_sha
+`9bbfa738533599be6849c09e719d050cd15a586c`, conclusion SUCCESS.
+
 ---
 
 # SM-1004 — Atomic Supersession and destructive precise Forget

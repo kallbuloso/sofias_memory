@@ -1,6 +1,6 @@
 # Sofias Memory — Feature Contract v0.6.0: Automatic Serialized Migration Bootstrap
 
-**Status:** Proposed\
+**Status:** Implemented\
 **Target release:** v0.6.0\
 **Feature:** Automatic Serialized Migration Bootstrap\
 **Architecture authority:** ADR-0015 (`docs/adr/0015-automatic-serialized-migration-bootstrap.md`, accepted)

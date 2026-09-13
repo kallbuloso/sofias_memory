@@ -131,7 +131,7 @@ Durante toda a v0.7:
 | Gate | Ticket | Entrega principal | Depende de | Migration impact | Status |
 |---|---|---|---|---|---|
 | G1 | SM-1001 | Foundation — domain/schema/provenance/idempotency primitives | docs freeze | `0018` | DONE |
-| G2 | SM-1002 | Compatibility negotiation + synchronous Create/Get | SM-1001 | nenhuma nova esperada | TODO |
+| G2 | SM-1002 | Compatibility negotiation + synchronous Create/Get | SM-1001 | nenhuma nova esperada | DONE |
 | G3 | SM-1003 | Typed Cognitive Recall + temporal/current-truth query | SM-1002 | nenhuma nova esperada | TODO |
 | G4 | SM-1004 | Atomic Supersession + destructive precise Forget | SM-1003 | nenhuma nova esperada | TODO |
 | G5 | SM-1005 | Real-PG concurrency/security/privacy/integration hardening | SM-1004 | somente corretiva se inevitável | TODO |
@@ -680,6 +680,84 @@ Se o gate descobrir requisito de schema ausente, parar para classificar se é:
 5. legacy APIs v0.6 passam sem mudanças semânticas;
 6. no PipelineRun/Neo4j/outbox;
 7. CI padrão verde.
+
+## SM-1002 — Evidência de fechamento (DONE)
+
+```text
+Baseline:                main @ 2d0c2d6cc4488ecc60f56fcbfd0b648e90e6d7ae
+                          (SM-1001 evidence correction, CI SUCCESS)
+Implementation SHA:      87765a8ec6ed6dc73446eb74d1504d47e219ebb6
+Alembic head:            0018 (down_revision = 0017) -- unchanged, no new migration
+```
+
+Rotas públicas novas:
+
+```text
+GET  /api/v1/info        -- additive: api_contract_version, contracts,
+                             capabilities (write/get only at this HEAD)
+POST /api/v1/memories    -- 201 SuccessEnvelope[MemoryItem], synchronous
+GET  /api/v1/memories/{memory_id}  -- 200 MemoryItem / 404 MEMORY_NOT_FOUND
+```
+
+Capabilities anunciadas neste HEAD: `cognitive_memory.write`,
+`cognitive_memory.get` -- exatamente as duas, nenhuma antecipada.
+
+Create ordering provado (real PostgreSQL, `BlockingEmbeddingClient` +
+session-factory call counter): zero sessões PostgreSQL abertas enquanto o
+embedding está bloqueado; a authoritative transaction só abre depois do
+retorno do provider.
+
+Idempotência: pre-check committed (read-only) antes do embedding; claim
+autoritativo via `UNIQUE(idempotency_key)` dentro de um `SAVEPOINT` que
+also contém o insert de `MemoryItem`+`MemoryProvenance`, de forma que um
+loser não deixa nenhuma linha órfã. Prova de corrida real com
+`asyncio.Barrier` (duas chamadas concorrentes, mesma key/mesmo request,
+sem `sleep`): convergem para um único `memory_id`, uma única
+`memory_provenance`, uma única linha de ledger.
+
+Testes novos (contagem exata via `pytest --collect-only`):
+
+```text
+schemas (test_memories_schemas.py):                28
+routes, service faked (test_memories_routes.py):   10
+domain timestamp/validity-window additions
+  (test_cognitive_memory.py):                       8
+/info capability negotiation (test_info.py):        2
+OpenAPI route/shape contract
+  (test_openapi_forbidden_routes.py):               3
+real PostgreSQL/HTTP
+  (test_cognitive_memory_create_get_postgres_integration.py):
+                                                    11/11 passed, incluindo
+                                                    o teste de corrida com
+                                                    barrier
+full unit/contract/security:                       2528 passed, 582 skipped
+SM-1001 real-PG regression:                        47 passed, 3 skipped
+security suite:                                    32 passed
+```
+
+Escopo confirmado intocado: nenhum `PipelineRun`/`PipelineStep`/
+`graph_outbox` criado por Create (contagem antes/depois idêntica, teste
+dedicado); nenhum node Neo4j; nenhum `PATCH`/`recall`/`supersede`/`forget`
+de Cognitive Memory implementado; `/api/v1/recall`, `/api/v1/remember`,
+`/api/v1/forget`, `/api/v1/sessions`, `/api/v1/skills`, `/api/v1/agents`
+permanecem semanticamente inalterados (full regression verde).
+
+Achado corrigido durante a implementação (documentação, não decisão
+técnica): as docstrings dos enums `CognitiveMemoryType`/
+`CognitiveMemoryLifecycle`/`CognitiveMemoryOriginKind`/
+`CognitiveMemoryOperation` (`sofias_memory/domain/enums.py`) continham
+marcadores `ADR-0016`/`ADR-0013` que, ao serem expostos pela primeira vez
+publicamente via `/memories`, vazavam para o OpenAPI (`enum.description`
+gerado pelo docstring da classe). Reescritas sem marcador interno,
+preservando o significado; nenhuma tag de rota faltava metadata (`memories`
+adicionada a `TAG_METADATA`).
+
+Quality gates: `uv lock --check`, `ruff check`, `ruff format --check`,
+`mypy sofias_memory scripts`, `git diff --check` todos verdes na
+implementation SHA.
+
+CI implementation: run `34782479814`, head_sha
+`87765a8ec6ed6dc73446eb74d1504d47e219ebb6`, conclusion SUCCESS.
 
 ---
 

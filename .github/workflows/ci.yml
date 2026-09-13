@@ -96,6 +96,7 @@ jobs:
           DB_PASSWORD: ci-disposable-password
           DB_NEO4J_PASSWORD: ci-disposable-password
           LLM_API_KEY: ${{ env.CI_LLM_API_KEY }}
+          COGNITIVE_IDEMPOTENCY_HMAC_KEY: ci-disposable-cognitive-idempotency-hmac-key
 
   docker-build:
     name: Docker image build + OCI label check

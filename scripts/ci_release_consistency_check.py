@@ -159,6 +159,7 @@ def render_compose_config(compose_path: Path | None = None) -> dict[str, Any]:
     env.setdefault("DB_PASSWORD", "ci-disposable-password")
     env.setdefault("DB_NEO4J_PASSWORD", "ci-disposable-password")
     env.setdefault("LLM_API_KEY", "sk-ci-disposable")
+    env.setdefault("COGNITIVE_IDEMPOTENCY_HMAC_KEY", "ci-disposable-cognitive-idempotency-hmac-key")
     command = ["docker", "compose"]
     if compose_path is not None:
         command += ["-f", str(compose_path)]

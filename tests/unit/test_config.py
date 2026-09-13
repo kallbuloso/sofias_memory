@@ -23,6 +23,7 @@ VALID_API_KEY = f"{API_KEY_PREFIX}{'a' * 32}"
 VALID_LLM_API_KEY = "sk-fake-test-key"
 VALID_NEO4J_PASSWORD = "fake-neo4j-password"
 VALID_DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
+VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 
 SETTINGS_ENV_NAMES = {
     "APP_NAME",
@@ -43,6 +44,7 @@ SETTINGS_ENV_NAMES = {
     "NEO4J_USERNAME",
     "NEO4J_PASSWORD",
     "NEO4J_DATABASE",
+    "COGNITIVE_IDEMPOTENCY_HMAC_KEY",
     "DATA_DIRECTORY",
     "TEMP_DIRECTORY",
     "MAX_SOURCE_SIZE_MB",
@@ -105,6 +107,7 @@ def minimal_settings_values(**overrides: Any) -> dict[str, Any]:
         "database_url": VALID_DATABASE_URL,
         "neo4j_password": VALID_NEO4J_PASSWORD,
         "llm_api_key": VALID_LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY,
     }
     values.update(overrides)
     return values
@@ -185,10 +188,45 @@ def test_llm_api_key_missing_is_rejected() -> None:
         "database_url",
         "neo4j_password",
         "llm_api_key",
+        "cognitive_idempotency_hmac_key",
     ],
 )
 def test_required_secrets_reject_whitespace_only(field_name: str) -> None:
     assert_invalid(**{field_name: "   "})
+
+
+def test_cognitive_idempotency_hmac_key_missing_is_rejected() -> None:
+    values = minimal_settings_values()
+    del values["cognitive_idempotency_hmac_key"]
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **values)
+
+
+def test_cognitive_idempotency_hmac_key_too_short_is_rejected() -> None:
+    assert_invalid(cognitive_idempotency_hmac_key="a" * 31)
+
+
+def test_cognitive_idempotency_hmac_key_minimum_length_is_accepted() -> None:
+    settings = make_settings(cognitive_idempotency_hmac_key="a" * 32)
+
+    assert settings.cognitive_idempotency_hmac_key.get_secret_value() == "a" * 32
+
+
+def test_cognitive_idempotency_hmac_key_placeholder_is_rejected() -> None:
+    assert_invalid(cognitive_idempotency_hmac_key="change-me-" + "a" * 30)
+
+
+def test_cognitive_idempotency_hmac_key_never_equals_api_key_by_construction() -> None:
+    # Not a runtime constraint (nothing forbids equal *values*), but the two
+    # fields are independent config surfaces -- confirms neither field
+    # silently falls back to or aliases the other.
+    settings = make_settings()
+
+    assert (
+        settings.cognitive_idempotency_hmac_key.get_secret_value()
+        != settings.api_key.get_secret_value()
+    )
 
 
 def test_embedding_api_key_inherits_llm_api_key_when_missing() -> None:
@@ -269,6 +307,7 @@ def test_database_migration_mode_env_var_unset_defaults_to_auto(
     monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
     monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
     monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("COGNITIVE_IDEMPOTENCY_HMAC_KEY", VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY)
 
     settings = Settings(_env_file=None)
 
@@ -280,6 +319,7 @@ def test_database_migration_mode_env_var_auto(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
     monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
     monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("COGNITIVE_IDEMPOTENCY_HMAC_KEY", VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY)
     monkeypatch.setenv("DATABASE_MIGRATION_MODE", "auto")
 
     settings = Settings(_env_file=None)
@@ -292,6 +332,7 @@ def test_database_migration_mode_env_var_verify_only(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
     monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
     monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("COGNITIVE_IDEMPOTENCY_HMAC_KEY", VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY)
     monkeypatch.setenv("DATABASE_MIGRATION_MODE", "verify_only")
 
     settings = Settings(_env_file=None)
@@ -306,6 +347,7 @@ def test_database_migration_mode_env_var_rejects_invalid_value(
     monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
     monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
     monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("COGNITIVE_IDEMPOTENCY_HMAC_KEY", VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY)
     monkeypatch.setenv("DATABASE_MIGRATION_MODE", "stamp")
 
     with pytest.raises(ValidationError):
@@ -541,6 +583,7 @@ def test_secrets_do_not_appear_in_repr() -> None:
 
     assert VALID_API_KEY not in rendered
     assert VALID_LLM_API_KEY not in rendered
+    assert VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY not in rendered
     assert VALID_NEO4J_PASSWORD not in rendered
     assert VALID_DATABASE_URL not in rendered
     assert "**********" in rendered
@@ -555,6 +598,7 @@ def test_env_file_can_be_loaded(tmp_path: Path) -> None:
                 f"DATABASE_URL={VALID_DATABASE_URL}",
                 f"NEO4J_PASSWORD={VALID_NEO4J_PASSWORD}",
                 f"LLM_API_KEY={VALID_LLM_API_KEY}",
+                f"COGNITIVE_IDEMPOTENCY_HMAC_KEY={VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY}",
                 "APP_NAME=Loaded From Env",
             ]
         ),
@@ -575,6 +619,7 @@ def test_env_file_can_disable_cors_with_empty_value(tmp_path: Path) -> None:
                 f"DATABASE_URL={VALID_DATABASE_URL}",
                 f"NEO4J_PASSWORD={VALID_NEO4J_PASSWORD}",
                 f"LLM_API_KEY={VALID_LLM_API_KEY}",
+                f"COGNITIVE_IDEMPOTENCY_HMAC_KEY={VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY}",
                 "CORS_ALLOWED_ORIGINS=",
             ]
         ),
@@ -595,6 +640,7 @@ def test_env_file_with_utf8_bom_can_be_loaded(tmp_path: Path) -> None:
                 f"DATABASE_URL={VALID_DATABASE_URL}",
                 f"NEO4J_PASSWORD={VALID_NEO4J_PASSWORD}",
                 f"LLM_API_KEY={VALID_LLM_API_KEY}",
+                f"COGNITIVE_IDEMPOTENCY_HMAC_KEY={VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY}",
             ]
         ),
         encoding="utf-8-sig",
@@ -610,6 +656,7 @@ def test_environment_values_override_defaults(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("DATABASE_URL", VALID_DATABASE_URL)
     monkeypatch.setenv("NEO4J_PASSWORD", VALID_NEO4J_PASSWORD)
     monkeypatch.setenv("LLM_API_KEY", VALID_LLM_API_KEY)
+    monkeypatch.setenv("COGNITIVE_IDEMPOTENCY_HMAC_KEY", VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY)
     monkeypatch.setenv("HTTP_PORT", "9000")
 
     settings = Settings(_env_file=None)
@@ -652,6 +699,7 @@ def test_env_file_unknown_setting_is_rejected(tmp_path: Path) -> None:
                 f"DATABASE_URL={VALID_DATABASE_URL}",
                 f"NEO4J_PASSWORD={VALID_NEO4J_PASSWORD}",
                 f"LLM_API_KEY={VALID_LLM_API_KEY}",
+                f"COGNITIVE_IDEMPOTENCY_HMAC_KEY={VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY}",
                 "SOFIAS_MEMORY_UNKNOWN_SETTING=value",
             ]
         ),
@@ -671,6 +719,7 @@ def test_unknown_env_file_variable_is_rejected(tmp_path: Path) -> None:
                 f"DATABASE_URL={VALID_DATABASE_URL}",
                 f"NEO4J_PASSWORD={VALID_NEO4J_PASSWORD}",
                 f"LLM_API_KEY={VALID_LLM_API_KEY}",
+                f"COGNITIVE_IDEMPOTENCY_HMAC_KEY={VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY}",
                 "APP_NMAE=typo",
             ]
         ),

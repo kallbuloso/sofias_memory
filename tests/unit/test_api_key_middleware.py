@@ -25,6 +25,7 @@ WRONG_API_KEY = "sf-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
 NEO4J_PASSWORD = "fake-neo4j-password"
 LLM_API_KEY = "sk-fake-test-key"
+COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 
 ASGIMessage = dict[str, object]
 ASGIScope = dict[str, object]
@@ -339,6 +340,7 @@ async def test_middleware_configuration_does_not_modify_settings(log_stream: Str
         database_url=DATABASE_URL,
         neo4j_password=NEO4J_PASSWORD,
         llm_api_key=LLM_API_KEY,
+        cognitive_idempotency_hmac_key=COGNITIVE_IDEMPOTENCY_HMAC_KEY,
     )
     before = repr(settings)
 

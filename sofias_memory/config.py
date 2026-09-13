@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 API_KEY_PREFIX = "sf-"
 API_KEY_MIN_RANDOM_CHARACTERS = 32
 API_KEY_PATTERN = re.compile(rf"^{API_KEY_PREFIX}[A-Za-z0-9_-]{{32,}}$")
+COGNITIVE_IDEMPOTENCY_HMAC_KEY_MIN_LENGTH = 32
 EXPECTED_EMBEDDING_DIMENSIONS = 3072
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_PROMPT_VERSIONS: Mapping[str, str] = {
@@ -137,6 +138,14 @@ class Settings(BaseSettings):
     neo4j_username: str = Field(default="neo4j", alias="NEO4J_USERNAME")
     neo4j_password: SecretStr = Field(alias="NEO4J_PASSWORD")
     neo4j_database: str = Field(default="neo4j", alias="NEO4J_DATABASE")
+
+    # ADR-0016 SS 14 / Feature Contract v0.7.0 SS 17.3: the keyed,
+    # non-reversible HMAC secret for the cognitive_memory_idempotency
+    # ledger's request digest. Deliberately independent from API_KEY --
+    # rotating the HTTP credential must never invalidate idempotency
+    # history -- and never given a default (an unset value must fail
+    # startup, not silently produce a low-entropy digest key).
+    cognitive_idempotency_hmac_key: SecretStr = Field(alias="COGNITIVE_IDEMPOTENCY_HMAC_KEY")
 
     data_directory: Path = Field(default=Path("/data/sources"), alias="DATA_DIRECTORY")
     temp_directory: Path = Field(default=Path("/data/tmp"), alias="TEMP_DIRECTORY")
@@ -301,6 +310,22 @@ class Settings(BaseSettings):
     def validate_required_secret(cls, value: SecretStr) -> SecretStr:
         if _secret_is_blank(value):
             raise ValueError("secret value is required")
+        return value
+
+    @field_validator("cognitive_idempotency_hmac_key")
+    @classmethod
+    def validate_cognitive_idempotency_hmac_key(cls, value: SecretStr) -> SecretStr:
+        secret = value.get_secret_value()
+        if _secret_is_blank(value):
+            raise ValueError("COGNITIVE_IDEMPOTENCY_HMAC_KEY is required")
+        if len(secret) < COGNITIVE_IDEMPOTENCY_HMAC_KEY_MIN_LENGTH:
+            raise ValueError(
+                "COGNITIVE_IDEMPOTENCY_HMAC_KEY must be at least "
+                f"{COGNITIVE_IDEMPOTENCY_HMAC_KEY_MIN_LENGTH} characters of high-entropy "
+                "random material"
+            )
+        if "change-me" in secret.lower():
+            raise ValueError("COGNITIVE_IDEMPOTENCY_HMAC_KEY placeholder is not allowed")
         return value
 
     @field_validator("embedding_api_key", mode="before")

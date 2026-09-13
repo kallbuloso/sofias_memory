@@ -508,14 +508,19 @@ async def assert_last_migration_downgraded(
         constraints = await constraints_by_name(connection, schema=schema)
 
     assert revisions == frozenset({expected_revision})
-    # 0017 (SM-804) is purely additive (agent_sessions): downgrading it
-    # removes exactly that one table, never any earlier table or constraint
-    # (0016's Agent<->Skill association, 0015's Agent foundation, 0014's
-    # Skills foundation, 0013's SM-603 constraint, or anything earlier).
-    assert "agent_sessions" not in tables
+    # 0018 (SM-1001) is purely additive (memory_items, memory_provenance,
+    # cognitive_memory_idempotency): downgrading it removes exactly those
+    # three tables, never any earlier table or constraint (0017's Agent<->
+    # Session association, 0016's Agent<->Skill association, 0015's Agent
+    # foundation, 0014's Skills foundation, 0013's SM-603 constraint, or
+    # anything earlier).
+    assert "memory_items" not in tables
+    assert "memory_provenance" not in tables
+    assert "cognitive_memory_idempotency" not in tables
     assert {
         "agents",
         "agent_skills",
+        "agent_sessions",
         "skills",
         "skill_revisions",
         "sessions",
@@ -527,8 +532,11 @@ async def assert_last_migration_downgraded(
         "pipeline_steps",
         "graph_outbox",
     } <= tables
-    # 0016's own table must survive a 0017-only downgrade -- proves the
-    # downgrade removed exactly the 0017 objects, not anything from 0016.
+    # 0017's own table must survive a 0018-only downgrade -- proves the
+    # downgrade removed exactly the 0018 objects, not anything from 0017.
+    assert "fk_agent_sessions_agent_id_agents" in constraints
+    assert "fk_agent_sessions_session_id_sessions" in constraints
+    # 0016's own table must survive too.
     assert "fk_agent_skills_agent_id_agents" in constraints
     assert "fk_agent_skills_skill_id_skills" in constraints
     # 0015's own additive check constraints must survive too.
@@ -539,7 +547,7 @@ async def assert_last_migration_downgraded(
     assert "ck_skill_revisions_procedure_not_blank" in constraints
     assert "ck_skill_revisions_content_sha256_hex" in constraints
     # 0013's own additive constraint must survive too, transitively proving
-    # no migration older than 0017 was touched.
+    # no migration older than 0018 was touched.
     assert "ck_session_entries_external_id_trimmed" in constraints
     assert "ck_session_entries_external_id_not_blank" in constraints
     assert "ck_session_entries_external_id_max_length" in constraints

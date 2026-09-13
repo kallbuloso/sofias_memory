@@ -26,6 +26,7 @@ VALID_NEO4J_USERNAME = "neo4j-test-user"
 VALID_NEO4J_PASSWORD = "SUPER_SECRET_DO_NOT_LEAK_NEO4J_PASSWORD"
 VALID_NEO4J_DATABASE = "sofias-memory-test"
 VALID_LLM_API_KEY = "sk-fake-test-key"
+VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 
 
 class FakeAsyncNeo4jDriver:
@@ -176,6 +177,7 @@ def make_settings(**overrides: object) -> Settings:
         "neo4j_password": VALID_NEO4J_PASSWORD,
         "neo4j_database": VALID_NEO4J_DATABASE,
         "llm_api_key": VALID_LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY,
         "app_env": "test",
     }
     values.update(overrides)

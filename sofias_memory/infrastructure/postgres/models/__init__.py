@@ -4,6 +4,9 @@ from sofias_memory.infrastructure.postgres.models.agent import Agent
 from sofias_memory.infrastructure.postgres.models.agent_session import AgentSession
 from sofias_memory.infrastructure.postgres.models.agent_skill import AgentSkill
 from sofias_memory.infrastructure.postgres.models.chunk import Chunk
+from sofias_memory.infrastructure.postgres.models.cognitive_memory_idempotency import (
+    CognitiveMemoryIdempotency,
+)
 from sofias_memory.infrastructure.postgres.models.dataset import Dataset
 from sofias_memory.infrastructure.postgres.models.document import Document
 from sofias_memory.infrastructure.postgres.models.entity import Entity
@@ -11,6 +14,8 @@ from sofias_memory.infrastructure.postgres.models.entity_mention import EntityMe
 from sofias_memory.infrastructure.postgres.models.feedback import Feedback
 from sofias_memory.infrastructure.postgres.models.graph_outbox import GraphOutbox
 from sofias_memory.infrastructure.postgres.models.memory_entry import MemoryEntry
+from sofias_memory.infrastructure.postgres.models.memory_item import MemoryItem
+from sofias_memory.infrastructure.postgres.models.memory_provenance import MemoryProvenance
 from sofias_memory.infrastructure.postgres.models.pipeline_run import PipelineRun
 from sofias_memory.infrastructure.postgres.models.pipeline_step import PipelineStep
 from sofias_memory.infrastructure.postgres.models.query import Query
@@ -28,6 +33,7 @@ __all__ = [
     "AgentSession",
     "AgentSkill",
     "Chunk",
+    "CognitiveMemoryIdempotency",
     "Dataset",
     "Document",
     "Entity",
@@ -35,6 +41,8 @@ __all__ = [
     "Feedback",
     "GraphOutbox",
     "MemoryEntry",
+    "MemoryItem",
+    "MemoryProvenance",
     "PipelineRun",
     "PipelineStep",
     "Query",

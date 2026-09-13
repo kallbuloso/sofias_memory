@@ -6,6 +6,9 @@ from sofias_memory.infrastructure.postgres.repositories.agent_sessions import (
 from sofias_memory.infrastructure.postgres.repositories.agent_skills import AgentSkillRepository
 from sofias_memory.infrastructure.postgres.repositories.agents import AgentRepository
 from sofias_memory.infrastructure.postgres.repositories.chunks import ChunkRepository
+from sofias_memory.infrastructure.postgres.repositories.cognitive_memory_idempotency import (
+    CognitiveMemoryIdempotencyRepository,
+)
 from sofias_memory.infrastructure.postgres.repositories.datasets import DatasetRepository
 from sofias_memory.infrastructure.postgres.repositories.documents import DocumentRepository
 from sofias_memory.infrastructure.postgres.repositories.entities import EntityRepository
@@ -15,6 +18,10 @@ from sofias_memory.infrastructure.postgres.repositories.entity_mentions import (
 from sofias_memory.infrastructure.postgres.repositories.feedback import FeedbackRepository
 from sofias_memory.infrastructure.postgres.repositories.graph_outbox import GraphOutboxRepository
 from sofias_memory.infrastructure.postgres.repositories.graph_rebuild import GraphRebuildRepository
+from sofias_memory.infrastructure.postgres.repositories.memory_items import MemoryItemRepository
+from sofias_memory.infrastructure.postgres.repositories.memory_provenance import (
+    MemoryProvenanceRepository,
+)
 from sofias_memory.infrastructure.postgres.repositories.pipeline_runs import PipelineRunRepository
 from sofias_memory.infrastructure.postgres.repositories.pipeline_steps import PipelineStepRepository
 from sofias_memory.infrastructure.postgres.repositories.queries import QueryRepository
@@ -38,6 +45,7 @@ __all__ = [
     "AgentSessionRepository",
     "AgentSkillRepository",
     "ChunkRepository",
+    "CognitiveMemoryIdempotencyRepository",
     "DatasetRepository",
     "DocumentRepository",
     "EntityMentionRepository",
@@ -45,6 +53,8 @@ __all__ = [
     "FeedbackRepository",
     "GraphOutboxRepository",
     "GraphRebuildRepository",
+    "MemoryItemRepository",
+    "MemoryProvenanceRepository",
     "PipelineRunRepository",
     "PipelineStepRepository",
     "QueryRepository",

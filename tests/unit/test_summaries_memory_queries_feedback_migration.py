@@ -131,6 +131,7 @@ def test_sm210_revision_is_current_head() -> None:
         "0015_create_agents_foundation.py",
         "0016_create_agent_skills.py",
         "0017_create_agent_sessions.py",
+        "0018_create_native_cognitive_memory.py",
     ]
 
 

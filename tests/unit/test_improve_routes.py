@@ -33,6 +33,7 @@ EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
 NEO4J_PASSWORD = "fake-neo4j-password"
 LLM_API_KEY = "sk-fake-test-key"
+COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 
 DATASET_ID = UUID("33333333-3333-3333-3333-333333333333")
 RUN_ID = UUID("55555555-5555-5555-5555-555555555555")
@@ -46,6 +47,7 @@ def make_settings(**overrides: object) -> Settings:
         "database_url": DATABASE_URL,
         "neo4j_password": NEO4J_PASSWORD,
         "llm_api_key": LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": COGNITIVE_IDEMPOTENCY_HMAC_KEY,
         "app_env": "test",
     }
     values.update(overrides)

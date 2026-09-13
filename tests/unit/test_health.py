@@ -25,6 +25,7 @@ EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 DATABASE_URL = "postgresql+asyncpg://sofias_memory:fake@postgres:5432/sofias_memory"
 NEO4J_PASSWORD = "fake-neo4j-password"
 LLM_API_KEY = "sk-fake-test-key"
+COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 KNOWN_SECRET = "SUPER_SECRET_DO_NOT_LEAK_123"
 
 
@@ -34,6 +35,7 @@ def make_settings(**overrides: object) -> Settings:
         "database_url": DATABASE_URL,
         "neo4j_password": NEO4J_PASSWORD,
         "llm_api_key": LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": COGNITIVE_IDEMPOTENCY_HMAC_KEY,
         "app_name": "Sofias Memory Test",
         "app_version": "9.8.7",
         "app_env": "test",

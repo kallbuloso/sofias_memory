@@ -35,6 +35,7 @@ VALID_DATABASE_URL = "postgresql+asyncpg://sofias_memory:db-secret@postgres:5432
 VALID_NEO4J_DATABASE = "sofias-memory-readiness-test"
 VALID_NEO4J_PASSWORD = "SUPER_SECRET_DO_NOT_LEAK_NEO4J_READINESS_PASSWORD"
 VALID_LLM_API_KEY = "sk-fake-test-key"
+VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 
 
 class FakeRecord:
@@ -143,6 +144,7 @@ def make_settings(**overrides: object) -> Settings:
         "neo4j_password": VALID_NEO4J_PASSWORD,
         "neo4j_database": VALID_NEO4J_DATABASE,
         "llm_api_key": VALID_LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY,
         "app_env": "test",
     }
     values.update(overrides)

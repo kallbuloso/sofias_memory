@@ -279,18 +279,21 @@ def test_real_script_directory_proves_a_genuine_known_ancestor() -> None:
 def test_real_script_directory_reports_a_future_revision_as_unrecognized() -> None:
     revision_graph = load_revision_graph()
 
-    # "0018" does not exist in this repository's migrations/versions/ at this
+    # "9999" does not exist in this repository's migrations/versions/ at this
     # baseline -- resolved via Alembic's own official API, never via string
-    # comparison against the real head "0017".
-    assert not revision_graph.is_known_revision("0018")
-    assert "0018" not in revision_graph.ancestors_of("0017")
+    # comparison against the real head. Was "0018" before SM-1001 (v0.7.0)
+    # added that revision for real; bumped to a value that will remain
+    # future for the foreseeable lifetime of this repository's linear
+    # revision sequence.
+    assert not revision_graph.is_known_revision("9999")
+    assert "9999" not in revision_graph.ancestors_of("0017")
 
 
 def test_real_classify_migration_state_end_to_end_for_unrecognized_revision() -> None:
     revision_graph = load_revision_graph()
 
     state = classify_migration_state(
-        snapshot(database_revisions=frozenset({"0018"}), code_heads=frozenset({"0017"})),
+        snapshot(database_revisions=frozenset({"9999"}), code_heads=frozenset({"0017"})),
         revision_graph=revision_graph,
     )
 

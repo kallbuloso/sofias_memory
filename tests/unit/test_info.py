@@ -18,6 +18,7 @@ INVALID_API_KEY = "sf-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 DATABASE_PASSWORD = "DATABASE_SECRET_DO_NOT_LEAK_123"
 NEO4J_PASSWORD = "NEO4J_SECRET_DO_NOT_LEAK_123"
 LLM_API_KEY = "LLM_SECRET_DO_NOT_LEAK_123"
+COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 EMBEDDING_API_KEY = "EMBEDDING_SECRET_DO_NOT_LEAK_123"
 DATABASE_URL = f"postgresql+asyncpg://sofias_memory:{DATABASE_PASSWORD}@postgres:5432/sofias_memory"
 INFO_DATA_FIELDS = {
@@ -37,6 +38,7 @@ def make_settings(**overrides: object) -> Settings:
         "database_url": DATABASE_URL,
         "neo4j_password": NEO4J_PASSWORD,
         "llm_api_key": LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": COGNITIVE_IDEMPOTENCY_HMAC_KEY,
         "embedding_api_key": EMBEDDING_API_KEY,
         "app_name": "Sofias Memory Test",
         "app_version": "9.8.7",

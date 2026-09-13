@@ -14,6 +14,7 @@ from sofias_memory.observability.logging import configure_logging
 
 VALID_API_KEY = f"{API_KEY_PREFIX}{'a' * 32}"
 VALID_LLM_API_KEY = "sk-fake-test-key"
+VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 VALID_NEO4J_PASSWORD = "fake-neo4j-password"
 VALID_DATABASE_URL = "postgresql+asyncpg://sofias_memory:db-secret@postgres:5432/db"
 
@@ -24,6 +25,7 @@ def make_settings(**overrides: object) -> Settings:
         "database_url": VALID_DATABASE_URL,
         "neo4j_password": VALID_NEO4J_PASSWORD,
         "llm_api_key": VALID_LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": VALID_COGNITIVE_IDEMPOTENCY_HMAC_KEY,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]

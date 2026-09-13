@@ -31,6 +31,8 @@ from sofias_memory.schemas.memories import (
     MemoryItemResult,
     MemoryRecallRequest,
     MemoryRecallResult,
+    MemorySupersedeRequest,
+    MemorySupersedeResult,
 )
 from sofias_memory.services.cognitive_memory import CognitiveMemoryService
 from sofias_memory.services.cognitive_memory_recall import CognitiveMemoryRecallService
@@ -55,6 +57,11 @@ _MEMORY_IDEMPOTENCY_CONFLICT_409 = error_response(
 _MEMORY_DEPENDENCY_UNAVAILABLE_503 = error_response(
     "The embedding provider is unavailable, or returned an unexpected vector "
     "dimension. ErrorEnvelope with error.code=DEPENDENCY_UNAVAILABLE."
+)
+_MEMORY_SUPERSEDE_CONFLICT_409 = error_response(
+    "Conflict superseding this MemoryItem. ErrorEnvelope with error.code "
+    "one of: IDEMPOTENCY_CONFLICT (the same Idempotency-Key was already used "
+    "for different work) or MEMORY_STATE_CONFLICT (the target is not ACTIVE)."
 )
 
 router = APIRouter(tags=["memories"])
@@ -156,6 +163,71 @@ async def recall_memories(
     service = _cognitive_memory_recall_service(request)
     result = await service.recall(payload)
     return SuccessEnvelope[MemoryRecallResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.post(
+    "/memories/{memory_id}/supersede",
+    response_model=SuccessEnvelope[MemorySupersedeResult],
+    summary="Atomically supersede a Cognitive Memory item",
+    description=(
+        "Atomically replace an ACTIVE MemoryItem with exactly one new ACTIVE "
+        "replacement, which inherits `memory_type`/`scope` from the target -- "
+        "changing either is a new memory, never a supersession of this one. "
+        "The external embedding call always happens before the short "
+        "authoritative PostgreSQL transaction. Never creates a PipelineRun."
+    ),
+    responses={
+        HTTPStatus.NOT_FOUND: _MEMORY_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: _MEMORY_SUPERSEDE_CONFLICT_409,
+        HTTPStatus.SERVICE_UNAVAILABLE: _MEMORY_DEPENDENCY_UNAVAILABLE_503,
+    },
+)
+async def supersede_memory(
+    memory_id: UUID,
+    payload: MemorySupersedeRequest,
+    request: Request,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
+) -> SuccessEnvelope[MemorySupersedeResult]:
+    service = _cognitive_memory_service(request)
+    result = await service.supersede(memory_id, payload, idempotency_key=idempotency_key)
+    return SuccessEnvelope[MemorySupersedeResult](
+        data=result,
+        meta=ResponseMeta(request_id=current_request_id()),
+    )
+
+
+@router.post(
+    "/memories/{memory_id}/forget",
+    response_model=SuccessEnvelope[MemoryItemResult],
+    summary="Precisely and destructively forget a Cognitive Memory item",
+    description=(
+        "Destroys cognitive content/embedding/scope/confidence/validity and "
+        "scrubs every external provenance reference to this exact memory_id, "
+        "atomically. ACTIVE and SUPERSEDED both transition to FORGOTTEN; "
+        "FORGOTTEN -> FORGOTTEN is a resource-state idempotent no-op, even "
+        "with a brand-new Idempotency-Key. Never cascades to a superseding "
+        "replacement or a superseded predecessor, and never calls the legacy "
+        "Source/Dataset Forget."
+    ),
+    responses={HTTPStatus.NOT_FOUND: _MEMORY_NOT_FOUND_404},
+)
+async def forget_memory(
+    memory_id: UUID,
+    request: Request,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias=IDEMPOTENCY_KEY_HEADER, description=IDEMPOTENCY_KEY_DESCRIPTION),
+    ] = None,
+) -> SuccessEnvelope[MemoryItemResult]:
+    service = _cognitive_memory_service(request)
+    result = await service.forget(memory_id, idempotency_key=idempotency_key)
+    return SuccessEnvelope[MemoryItemResult](
         data=result,
         meta=ResponseMeta(request_id=current_request_id()),
     )

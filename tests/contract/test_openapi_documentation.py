@@ -29,10 +29,10 @@ COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789
 INTERNAL_MARKER_PATTERN = re.compile(r"SM-\d|ADR-\d|\bB5\b|\bB4\b|\bB3\b")
 
 # Idempotency-Key is accepted only by these operations (verified against the
-# route code, not docs/api.md) -- SWAGGER-002 SS10. SM-1002 adds
-# POST /api/v1/memories as a seventh mutation with the same header: it is
-# another synchronous mutation with the exact same Idempotency-Key semantics,
-# never a special case (AGENTS.md SS 12/backlog SM-1002 SS "OpenAPI").
+# route code, not docs/api.md) -- SWAGGER-002 SS10. Every synchronous
+# mutation that accepts the header uses the exact same semantics, never a
+# special case (AGENTS.md SS 12) -- this set is the single source of truth
+# for "how many"/"which"; never hardcode a count separately from its length.
 IDEMPOTENCY_KEY_OPERATIONS = {
     ("post", "/api/v1/remember"),
     ("post", "/api/v1/remember/file"),
@@ -41,6 +41,8 @@ IDEMPOTENCY_KEY_OPERATIONS = {
     ("post", "/api/v1/improve"),
     ("post", "/api/v1/forget"),
     ("post", "/api/v1/memories"),
+    ("post", "/api/v1/memories/{memory_id}/supersede"),
+    ("post", "/api/v1/memories/{memory_id}/forget"),
 }
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete")
@@ -399,10 +401,10 @@ def documentation_schema() -> dict[str, Any]:
     return _documentation_schema(openapi_schema())
 
 
-def test_canonical_schema_has_exactly_six_idempotency_key_parameters() -> None:
+def test_canonical_schema_has_exactly_the_expected_idempotency_key_parameters() -> None:
     canonical = openapi_schema()
     matches = _idempotency_key_params(canonical)
-    assert len(matches) == 7
+    assert len(matches) == len(IDEMPOTENCY_KEY_OPERATIONS)
     assert set(matches) == IDEMPOTENCY_KEY_OPERATIONS
 
 
@@ -416,7 +418,11 @@ def test_documentation_schema_does_not_mutate_canonical_schema() -> None:
     idem_before = len(_idempotency_key_params(canonical_before))
     documentation_schema()
     canonical_after = openapi_schema()
-    assert len(_idempotency_key_params(canonical_after)) == idem_before == 7
+    assert (
+        len(_idempotency_key_params(canonical_after))
+        == idem_before
+        == len(IDEMPOTENCY_KEY_OPERATIONS)
+    )
 
 
 def test_canonical_and_documentation_schemas_share_identical_paths_and_methods() -> None:
@@ -480,7 +486,9 @@ async def test_docs_renders_and_openapi_docs_json_is_reachable_in_development() 
 
         canonical_response = await client.get("/openapi.json")
         assert canonical_response.status_code == 200
-        assert len(_idempotency_key_params(canonical_response.json())) == 7
+        assert len(_idempotency_key_params(canonical_response.json())) == len(
+            IDEMPOTENCY_KEY_OPERATIONS
+        )
 
 
 @pytest.mark.asyncio

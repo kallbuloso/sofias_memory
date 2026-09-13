@@ -20,11 +20,12 @@ COGNITIVE_MEMORY_CAPABILITIES: tuple[str, ...] = (
     "cognitive_memory.write",
     "cognitive_memory.get",
     "cognitive_memory.recall",
+    "cognitive_memory.supersede",
+    "cognitive_memory.forget",
 )
-"""SM-1003 HEAD: Create/Get/Recall are implemented. Deterministic, frozen
-order matching the Feature Contract SS 11 listing order -- ``supersede``/
-``forget`` (SM-1004) are added only once their routes/services actually
-exist, never in advance of the implementation."""
+"""SM-1004 HEAD: all five v0.7 Cognitive Memory capabilities are
+implemented -- the complete Feature Contract SS 11 list, in its frozen
+deterministic order. No capability beyond these five exists."""
 
 
 class ApplicationInfo(BaseModel):

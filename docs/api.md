@@ -812,9 +812,9 @@ participation, and never exact per-operation provenance.
 First-class, durable **Native Cognitive Memory** (ADR-0016): a small,
 typed, synchronously-written unit of durable fact/preference (`profile` or
 `semantic`), independent of Dataset/Source/Document/Chunk and independent
-of Session history. This release implements **Create**, **Get**, and
-**typed Recall** — supersession and precise Forget are a separate, later
-release.
+of Session history. This release implements the complete v0.7 mutable
+lifecycle: **Create**, **Get**, **typed Recall**, **Supersede**, and
+**Forget**.
 
 ### 20.1 Compatibility negotiation
 
@@ -829,7 +829,9 @@ existing one (`name`, `version`, `environment`, `config_fingerprint`,
   "capabilities": [
     "cognitive_memory.write",
     "cognitive_memory.get",
-    "cognitive_memory.recall"
+    "cognitive_memory.recall",
+    "cognitive_memory.supersede",
+    "cognitive_memory.forget"
   ]
 }
 ```
@@ -837,9 +839,9 @@ existing one (`name`, `version`, `environment`, `config_fingerprint`,
 `api_contract_version` is a machine contract identifier, independent of
 `version` (the application release SemVer) — never infer Cognitive Memory
 support from `version >= 0.7.0` alone. `capabilities` lists only operations
-genuinely implemented by the running HEAD; it grows to include
-`cognitive_memory.supersede` and `cognitive_memory.forget` only once those
-routes exist.
+genuinely implemented by the running HEAD; as of this release all five
+Cognitive Memory capabilities in the Feature Contract are implemented, and
+none beyond them exist.
 
 ```bash
 curl -sS "$SOFIAS_MEMORY_URL/api/v1/info" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
@@ -995,9 +997,119 @@ decided by an item's *present* `lifecycle` label alone — a `MemoryItem` now
 Deterministic total order: `relevance` descending, then `created_at`
 descending, then `memory_id` ascending. `confidence` never affects ranking.
 
-### 20.5 Explicitly not yet implemented
+### 20.5 Supersede
 
-`POST /api/v1/memories/{id}/supersede`, `POST /api/v1/memories/{id}/forget`,
-and `PATCH /api/v1/memories/{id}` do not exist in this release. Cognitive
-Memory never creates a `PipelineRun`, never projects to Neo4j, and never
-emits a `graph_outbox` event.
+```bash
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/memories/$MEMORY_ID/supersede" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+        "content": "The user now prefers dark mode.",
+        "provenance": {
+          "origin_kind": "user_asserted",
+          "source_system": "sofias-assistant",
+          "turn_uuid": "b3b6b5a0-...-...-...-..."
+        }
+      }'
+```
+
+Atomically replaces an `ACTIVE` MemoryItem with exactly one new `ACTIVE`
+replacement. Success is `200` with `{"old": <MemoryItem>, "replacement":
+<MemoryItem>}` — `old.lifecycle` is `superseded`, `replacement.lifecycle`
+is `active`. There is no other Supersede response shape.
+
+- The replacement **always inherits** `memory_type` and `scope` from the
+  target — the request body never accepts either field; sending them is
+  `422 INVALID_REQUEST`. Changing type/scope is conceptually a new memory,
+  never a supersession of this one.
+- The request body is otherwise the same shape as Create minus
+  `memory_type`/`scope`: `content` (required), `confidence`, `valid_from`/
+  `valid_until`, and a fresh `provenance` for the replacement — the same
+  normalization/validation rules apply (`inferred` still requires
+  `confidence`, etc.).
+- The external embedding call for the replacement's content always happens
+  before the short authoritative PostgreSQL transaction; no transaction is
+  ever held open across it. Embedding failure leaves the old item
+  untouched (`ACTIVE`), creates no replacement, and returns `503
+  DEPENDENCY_UNAVAILABLE`.
+- Only an `ACTIVE` target can be superseded. A target that is already
+  `superseded` or `forgotten` (and the request is a genuinely different
+  operation, not a replay — see below) is `409 MEMORY_STATE_CONFLICT`. A
+  syntactically valid but non-existent `memory_id` is `404
+  MEMORY_NOT_FOUND`.
+- A replacement can later be superseded again, forming a strictly linear
+  chain — an old item has at most one direct replacement.
+
+**Idempotency and the same-operation replay precedence invariant.**
+`Idempotency-Key` works exactly as it does for Create, with one critical
+addition the Feature Contract requires: the authoritative key claim is
+resolved **before** the target's lifecycle is ever evaluated. Concretely,
+retrying the exact same key + exact same replacement request after that
+very retry's own earlier attempt already moved `old` to `superseded`
+replays the original `200` outcome (same `old`/`replacement` pair) — it
+never becomes a `409 MEMORY_STATE_CONFLICT` just because the target is no
+longer `ACTIVE`. Only a genuinely different operation (a different
+key/request against a target that is not `ACTIVE`) gets the conflict.
+Reusing a key already bound to a different target, a different payload, or
+even a prior `Create` call is `409 IDEMPOTENCY_CONFLICT`. The race between
+two concurrent Supersede calls sharing one key converges on exactly one
+replacement via the same PostgreSQL `UNIQUE` claim Create uses; two
+concurrent calls with *different* keys against the same target converge to
+exactly one `200` winner and one `409 MEMORY_STATE_CONFLICT` loser, via
+ordinary PostgreSQL row-level locking — no advisory locks, no `sleep`.
+
+### 20.6 Forget
+
+```bash
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/memories/$MEMORY_ID/forget" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" \
+  -H "Idempotency-Key: $(uuidgen)"
+```
+
+Precisely and destructively forgets the exact `memory_id` — no request
+body exists or is accepted. Success is `200` with the same `MemoryItem`
+shape as Create/Get/Supersede, now a tombstone. A non-existent `memory_id`
+is `404 MEMORY_NOT_FOUND`. Forget never touches `POST /api/v1/forget`
+(the legacy Source/Dataset/Everything pipeline), never cascades to a
+superseding replacement or a superseded predecessor, and never creates a
+`PipelineRun`/Neo4j/`graph_outbox` side effect.
+
+**Destructive scrub, atomically.** Both `ACTIVE` and `SUPERSEDED` targets
+transition to `forgotten` in one transaction that also destroys:
+
+- `content`, the embedding, `scope`, `confidence`, `valid_from`,
+  `valid_until` on the `MemoryItem` itself;
+- every external provenance reference on the (preserved, still 1:1)
+  `memory_provenance` row: `conversation_uuid`, `turn_uuid`, `task_uuid`,
+  `confirmation_ref`, `source_ref`, `observed_at`.
+
+Only `memory_id`, `memory_type`, `lifecycle`, `created_at`, `forgotten_at`,
+prior `superseded_at`/`superseded_by` (if the item had already been
+superseded before this Forget), and `provenance.origin_kind`/
+`provenance.source_system` survive — the tombstone shape Get already
+documents. Forgetting a `SUPERSEDED` item preserves its lineage identity
+(`superseded_at`/`superseded_by` untouched) without affecting its
+replacement in any way; forgetting an `ACTIVE` item creates no replacement
+and leaves `superseded_at`/`superseded_by` `null`. After commit, the
+content is not retrievable through `GET`, typed Recall (current or
+historical `as_of`, with or without `include_superseded`), provenance, or
+the idempotency ledger — the ledger keeps only a keyed HMAC digest, never
+a copy of the destroyed content.
+
+**`FORGOTTEN -> FORGOTTEN` is a resource-state idempotent no-op** — this
+holds even with a **brand-new** `Idempotency-Key` the target has never
+seen before: the response is still `200` with the identical tombstone
+(`forgotten_at` unchanged), and no second destructive mutation occurs.
+Normal same-key semantics still take precedence over that no-op, though:
+if the key was already bound to a *different* request (a different target,
+or reused from Create/Supersede), it is `409 IDEMPOTENCY_CONFLICT` even
+when the target you are now naming happens to already be `forgotten` — the
+no-op never silently absorbs a caller's key-reuse mistake.
+
+### 20.7 Explicitly not yet implemented
+
+`PATCH /api/v1/memories/{id}` does not exist and never will — correction
+happens only through Supersede (preserving history) or a new Create.
+Cognitive Memory never creates a `PipelineRun`, never projects to Neo4j,
+and never emits a `graph_outbox` event, for any of Create/Get/Recall/
+Supersede/Forget.

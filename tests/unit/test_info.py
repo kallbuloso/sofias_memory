@@ -137,6 +137,8 @@ async def test_info_returns_expected_application_metadata() -> None:
             "cognitive_memory.write",
             "cognitive_memory.get",
             "cognitive_memory.recall",
+            "cognitive_memory.supersede",
+            "cognitive_memory.forget",
         ],
     }
 
@@ -311,10 +313,10 @@ async def test_info_is_not_in_public_allowlist() -> None:
 
 
 @pytest.mark.asyncio
-async def test_info_announces_exactly_sm_1003_capabilities() -> None:
-    """SM-1003 HEAD: write/get/recall are implemented -- supersede/forget
-    (SM-1004) must not be announced in advance of their own routes/services
-    (ADR-0016 SS 16, Feature Contract SS 11)."""
+async def test_info_announces_all_five_cognitive_memory_capabilities() -> None:
+    """SM-1004 HEAD: the full v0.7 Cognitive Memory contract -- write, get,
+    recall, supersede, forget -- and nothing beyond those five (ADR-0016
+    SS 16, Feature Contract SS 11)."""
 
     async with make_client(create_app(make_settings())) as client:
         response = await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
@@ -326,9 +328,9 @@ async def test_info_announces_exactly_sm_1003_capabilities() -> None:
         "cognitive_memory.write",
         "cognitive_memory.get",
         "cognitive_memory.recall",
+        "cognitive_memory.supersede",
+        "cognitive_memory.forget",
     ]
-    assert "cognitive_memory.supersede" not in data["capabilities"]
-    assert "cognitive_memory.forget" not in data["capabilities"]
 
 
 @pytest.mark.asyncio

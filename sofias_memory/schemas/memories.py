@@ -84,13 +84,19 @@ class MemoryProvenanceCreateRequest(BaseModel):
         return normalize_cognitive_memory_timestamp(value)
 
 
-class MemoryCreateRequest(BaseModel):
-    """``POST /api/v1/memories`` request body (Feature Contract SS 12)."""
+class _MemoryContentPayloadFields(BaseModel):
+    """Shared caller-supplied cognitive payload -- ``content``,
+    ``confidence``, validity window, and ``provenance`` -- reused by both
+    Create (Feature Contract SS 12) and Supersede's replacement payload
+    (Feature Contract SS 15): identical normalization/cross-field rules,
+    defined exactly once. Deliberately excludes ``memory_type``/``scope``:
+    Create requires them explicitly, while Supersede's replacement always
+    inherits them from the target and must never accept a caller override
+    (Feature Contract SS 15 -- changing type/scope is a new memory, never a
+    supersession of this one)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    memory_type: CognitiveMemoryType
-    scope: str = Field(description="'global' or 'project:<key>'.")
     content: str = Field(description="Cognitive content, 1..16384 Unicode characters.")
     confidence: float | None = Field(
         default=None,
@@ -99,11 +105,6 @@ class MemoryCreateRequest(BaseModel):
     valid_from: datetime | None = Field(default=None, description="Inclusive; UTC.")
     valid_until: datetime | None = Field(default=None, description="Exclusive; UTC.")
     provenance: MemoryProvenanceCreateRequest
-
-    @pydantic_field_validator("scope")
-    @classmethod
-    def _normalize_scope(cls, value: str) -> str:
-        return normalize_cognitive_memory_scope(value)
 
     @pydantic_field_validator("content")
     @classmethod
@@ -118,7 +119,7 @@ class MemoryCreateRequest(BaseModel):
         return normalize_cognitive_memory_timestamp(value)
 
     @model_validator(mode="after")
-    def _validate_cross_field_rules(self) -> MemoryCreateRequest:
+    def _validate_cross_field_rules(self) -> _MemoryContentPayloadFields:
         validate_cognitive_memory_confidence(
             self.confidence, origin_kind=self.provenance.origin_kind
         )
@@ -131,6 +132,25 @@ class MemoryCreateRequest(BaseModel):
         )
         validate_cognitive_memory_validity_window(self.valid_from, self.valid_until)
         return self
+
+
+class MemoryCreateRequest(_MemoryContentPayloadFields):
+    """``POST /api/v1/memories`` request body (Feature Contract SS 12)."""
+
+    memory_type: CognitiveMemoryType
+    scope: str = Field(description="'global' or 'project:<key>'.")
+
+    @pydantic_field_validator("scope")
+    @classmethod
+    def _normalize_scope(cls, value: str) -> str:
+        return normalize_cognitive_memory_scope(value)
+
+
+class MemorySupersedeRequest(_MemoryContentPayloadFields):
+    """``POST /api/v1/memories/{memory_id}/supersede`` request body (Feature
+    Contract SS 15). No ``memory_type``/``scope`` field exists here -- the
+    replacement always inherits both from the target old item; changing
+    either is a new memory, never a supersession of this one."""
 
 
 class MemoryProvenanceResult(BaseModel):
@@ -171,6 +191,18 @@ class MemoryItemResult(BaseModel):
     superseded_by: UUID | None
     forgotten_at: datetime | None
     provenance: MemoryProvenanceResult
+
+
+class MemorySupersedeResult(BaseModel):
+    """``POST /api/v1/memories/{memory_id}/supersede`` success response
+    (Feature Contract SS 15): the old item, already ``superseded``, and its
+    new ``active`` replacement -- the same lifecycle-safe ``MemoryItemResult``
+    shape as Create/Get, never a distinct lifecycle representation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    old: MemoryItemResult
+    replacement: MemoryItemResult
 
 
 class MemoryRecallRequest(BaseModel):

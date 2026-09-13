@@ -615,9 +615,10 @@ def test_no_secret_value_appears_anywhere_in_schema() -> None:
         assert secret not in serialized, f"secret value leaked into OpenAPI schema: {secret!r}"
 
 
-def test_memories_create_get_recall_routes_present_with_exact_methods() -> None:
-    """SM-1003 scope: exactly Create + Get + Recall. No supersede/forget/
-    PATCH route exists yet -- those are SM-1004."""
+def test_memories_routes_present_with_exact_methods() -> None:
+    """SM-1004 scope: exactly Create + Get + Recall + Supersede + Forget --
+    the full v0.7 Cognitive Memory mutable lifecycle. No PATCH, no other
+    `/memories/**` route of any kind."""
 
     schema = openapi_schema()
     paths = schema["paths"]
@@ -626,6 +627,8 @@ def test_memories_create_get_recall_routes_present_with_exact_methods() -> None:
     assert set(paths["/api/v1/memories"]) == {"post"}
     assert set(paths["/api/v1/memories/{memory_id}"]) == {"get"}
     assert set(paths["/api/v1/memories/recall"]) == {"post"}
+    assert set(paths["/api/v1/memories/{memory_id}/supersede"]) == {"post"}
+    assert set(paths["/api/v1/memories/{memory_id}/forget"]) == {"post"}
     assert "patch" not in paths["/api/v1/memories/{memory_id}"]
 
     memories_paths = {path for path in paths if path.startswith("/api/v1/memories")}
@@ -633,19 +636,9 @@ def test_memories_create_get_recall_routes_present_with_exact_methods() -> None:
         "/api/v1/memories",
         "/api/v1/memories/{memory_id}",
         "/api/v1/memories/recall",
+        "/api/v1/memories/{memory_id}/supersede",
+        "/api/v1/memories/{memory_id}/forget",
     }
-
-
-def test_memories_supersede_and_forget_routes_absent() -> None:
-    """SM-1004 scope, not yet implemented -- explicit negative contract so a
-    future accidental route addition is caught here first."""
-
-    schema = openapi_schema()
-    paths = schema["paths"]
-    assert isinstance(paths, dict)
-
-    assert "/api/v1/memories/{memory_id}/supersede" not in paths
-    assert "/api/v1/memories/{memory_id}/forget" not in paths
 
 
 def test_memory_recall_result_never_exposes_embedding_or_raw_distance() -> None:
@@ -697,6 +690,60 @@ def test_memories_create_response_is_201_and_get_response_is_200() -> None:
     get_responses = paths["/api/v1/memories/{memory_id}"]["get"]["responses"]
     assert "200" in get_responses
     assert "404" in get_responses
+
+
+def test_memories_supersede_and_forget_responses_documented() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    supersede_responses = paths["/api/v1/memories/{memory_id}/supersede"]["post"]["responses"]
+    assert "200" in supersede_responses
+    assert "404" in supersede_responses
+    assert "409" in supersede_responses
+    assert "503" in supersede_responses
+
+    forget_responses = paths["/api/v1/memories/{memory_id}/forget"]["post"]["responses"]
+    assert "200" in forget_responses
+    assert "404" in forget_responses
+
+
+def test_memory_supersede_result_shape_never_exposes_embedding() -> None:
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+
+    supersede_result = schemas["MemorySupersedeResult"]
+    assert isinstance(supersede_result, dict)
+    assert set(supersede_result["properties"]) == {"old", "replacement"}
+
+    supersede_request = schemas["MemorySupersedeRequest"]
+    assert isinstance(supersede_request, dict)
+    assert set(supersede_request["properties"]) == {
+        "content",
+        "confidence",
+        "valid_from",
+        "valid_until",
+        "provenance",
+    }
+    assert "memory_type" not in supersede_request["properties"]
+    assert "scope" not in supersede_request["properties"]
+
+
+def test_memories_supersede_and_forget_accept_idempotency_key() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    for path in (
+        "/api/v1/memories/{memory_id}/supersede",
+        "/api/v1/memories/{memory_id}/forget",
+    ):
+        operation = paths[path]["post"]
+        header_names = {p.get("name") for p in operation.get("parameters", [])}
+        assert "Idempotency-Key" in header_names
 
 
 def test_memory_item_result_never_exposes_embedding() -> None:

@@ -231,6 +231,7 @@ async def test_info_response_does_not_expose_secrets_or_sensitive_configuration(
         LLM_API_KEY,
         EMBEDDING_API_KEY,
         DATABASE_URL,
+        COGNITIVE_IDEMPOTENCY_HMAC_KEY,
     }
 
     async with make_client(create_app(settings)) as client:
@@ -247,6 +248,7 @@ async def test_info_response_does_not_expose_secrets_or_sensitive_configuration(
         "neo4j_password",
         "llm_base_url",
         "embedding_base_url",
+        "cognitive_idempotency_hmac_key",
     }
     assert forbidden_fields.isdisjoint(data_object(response))
 

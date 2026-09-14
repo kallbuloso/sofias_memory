@@ -57,6 +57,7 @@ jobs:
       # GitHub Actions secret (this workflow needs none).
       API_KEY: sf-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       LLM_API_KEY: sk-ci-disposable
+      COGNITIVE_IDEMPOTENCY_HMAC_KEY: ci-disposable-cognitive-idempotency-hmac-key-0123456789abcdef
       NEO4J_URI: bolt://localhost:7687
       NEO4J_USERNAME: neo4j
       NEO4J_PASSWORD: ci-disposable-password
@@ -141,7 +142,7 @@ jobs:
       # ancestor, fail-closed, etc.) via `reset_dedicated_database()` before
       # running, so pre-migrating it to head would just be undone
       # immediately -- see `test_migration_bootstrap_postgres_integration.py`.
-      - name: Migrate every database from the built image (0001 -> 0017)
+      - name: Migrate every database from the built image (0001 -> 0018)
         run: |
           set -e
           for db in \
@@ -171,16 +172,17 @@ jobs:
               -e API_KEY="$API_KEY" \
               -e NEO4J_PASSWORD="$NEO4J_PASSWORD" \
               -e LLM_API_KEY="$LLM_API_KEY" \
+              -e COGNITIVE_IDEMPOTENCY_HMAC_KEY="$COGNITIVE_IDEMPOTENCY_HMAC_KEY" \
               --entrypoint uv \
               sofias-memory:ci run --no-sync alembic upgrade head
           done
 
-      - name: Confirm alembic current == 0017 on the main database
+      - name: Confirm alembic current == 0018 on the main database
         run: |
           set -e
           CURRENT=$(psql -tAc "SELECT version_num FROM alembic_version")
           echo "alembic current: $CURRENT"
-          test "$CURRENT" = "0017"
+          test "$CURRENT" = "0018"
 
       # CI-compatible integration modules only -- see docs/development.md
       # and the REL-004 report for the full per-module inventory and the
@@ -330,6 +332,17 @@ jobs:
           # pre-migration step above.
           SOFIAS_MEMORY_RUN_MIGRATION_BOOTSTRAP_POSTGRES_INTEGRATION: "1"
           SOFIAS_MEMORY_MIGRATION_BOOTSTRAP_TEST_DATABASE_URL: postgresql+asyncpg://sofias_memory:ci-disposable-password@localhost:5432/sofias_memory_migration_bootstrap_test
+          # Native Cognitive Memory (v0.7.0, ADR-0016, SM-1001..1005). All
+          # four files below read DATABASE_URL directly (via the standard
+          # Settings loader) and declare no dedicated `*_TEST_DATABASE_URL`
+          # of their own, so all four share the job's main `sofias_memory`
+          # database -- safe because every test scopes its assertions to
+          # the memory_id(s)/idempotency key(s) it created itself, never a
+          # global/unfiltered count.
+          SOFIAS_MEMORY_RUN_POSTGRES_COGNITIVE_MEMORY_TESTS: "1"
+          SOFIAS_MEMORY_RUN_COGNITIVE_MEMORY_HTTP_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_COGNITIVE_MEMORY_RECALL_POSTGRES_TESTS: "1"
+          SOFIAS_MEMORY_RUN_COGNITIVE_MEMORY_SUPERSEDE_FORGET_POSTGRES_TESTS: "1"
 
       - name: Diagnostics on failure
         if: failure()

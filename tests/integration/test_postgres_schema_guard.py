@@ -51,6 +51,9 @@ REQUIRED_TABLES = frozenset(
         "agents",
         "agent_skills",
         "agent_sessions",
+        "memory_items",
+        "memory_provenance",
+        "cognitive_memory_idempotency",
     }
 )
 
@@ -200,6 +203,9 @@ def test_schema_guard_policy_constants_are_exact() -> None:
                 "agents",
                 "agent_skills",
                 "agent_sessions",
+                "memory_items",
+                "memory_provenance",
+                "cognitive_memory_idempotency",
             }
         )
         == REQUIRED_TABLES

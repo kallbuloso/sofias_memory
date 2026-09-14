@@ -26,8 +26,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
+from datetime import datetime
 from typing import cast
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -37,8 +39,20 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from sofias_memory.config import Settings
+from sofias_memory.infrastructure.postgres import (
+    create_async_engine_from_settings,
+    create_session_factory,
+    dispose_async_engine,
+)
 from sofias_memory.infrastructure.postgres.advisory_lock_keys import MIGRATION_BOOTSTRAP_KEY
 from sofias_memory.infrastructure.postgres.readiness import PostgresReadinessChecker
+from sofias_memory.schemas.memories import (
+    MemoryCreateRequest,
+    MemoryRecallRequest,
+    MemorySupersedeRequest,
+)
+from sofias_memory.services.cognitive_memory import CognitiveMemoryService
+from sofias_memory.services.cognitive_memory_recall import CognitiveMemoryRecallService
 from sofias_memory.services.migration_bootstrap import (
     MigrationBootstrap,
     MigrationClassificationFailedError,
@@ -62,6 +76,7 @@ MIGRATION_BOOTSTRAP_TEST_DATABASE_NAME = "sofias_memory_migration_bootstrap_test
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 TEST_NEO4J_PASSWORD = "test-neo4j-password"
 TEST_LLM_API_KEY = "sk-test-llm-api-key"
+TEST_COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 
 
 def migration_bootstrap_test_database_url(env: Mapping[str, str]) -> str:
@@ -120,6 +135,7 @@ def migration_bootstrap_settings(database_url: str, **overrides: object) -> Sett
         "database_url": database_url,
         "neo4j_password": TEST_NEO4J_PASSWORD,
         "llm_api_key": TEST_LLM_API_KEY,
+        "cognitive_idempotency_hmac_key": TEST_COGNITIVE_IDEMPOTENCY_HMAC_KEY,
         "app_env": "test",
     }
     values.update(overrides)
@@ -176,10 +192,12 @@ async def upgrade_in_process_to(database_url: str, revision: str) -> None:
     previous_api_key = os.environ.get("API_KEY")
     previous_neo4j = os.environ.get("NEO4J_PASSWORD")
     previous_llm = os.environ.get("LLM_API_KEY")
+    previous_hmac_key = os.environ.get("COGNITIVE_IDEMPOTENCY_HMAC_KEY")
     os.environ["DATABASE_URL"] = database_url
     os.environ["API_KEY"] = EXPECTED_API_KEY
     os.environ["NEO4J_PASSWORD"] = TEST_NEO4J_PASSWORD
     os.environ["LLM_API_KEY"] = TEST_LLM_API_KEY
+    os.environ["COGNITIVE_IDEMPOTENCY_HMAC_KEY"] = TEST_COGNITIVE_IDEMPOTENCY_HMAC_KEY
     try:
         # command.upgrade() -> migrations/env.py's run_migrations_online()
         # calls asyncio.run() internally (the same nested-event-loop
@@ -194,6 +212,7 @@ async def upgrade_in_process_to(database_url: str, revision: str) -> None:
         _restore_env("API_KEY", previous_api_key)
         _restore_env("NEO4J_PASSWORD", previous_neo4j)
         _restore_env("LLM_API_KEY", previous_llm)
+        _restore_env("COGNITIVE_IDEMPOTENCY_HMAC_KEY", previous_hmac_key)
 
 
 def _restore_env(name: str, value: str | None) -> None:
@@ -267,6 +286,165 @@ async def test_known_ancestor_database_migrates_automatically_to_head(
         assert (await checker.check()).ready is True
     finally:
         await checker.dispose()
+
+
+class _FakeEmbeddingClient:
+    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        return [[0.125] * 3072 for _ in texts]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_known_ancestor_upgrade_preserves_legacy_data_and_enables_cognitive_memory(
+    dedicated_database_url: str,
+) -> None:
+    """SM-1005: a genuine automatic upgrade from the known ancestor
+    revision (dynamically the previous head -- 0017 at the time Cognitive
+    Memory was introduced) must both preserve pre-existing legacy data
+    untouched AND leave the database immediately usable for the full
+    Cognitive Memory Create/Get/Recall/Supersede/Forget surface -- proving
+    the migration is additive, not destructive, and that 0018's new tables
+    are actually reachable the moment the automatic bootstrap completes."""
+
+    config = alembic_config()
+    head = single_code_head(config)
+    ancestor = single_down_revision(config, head)
+    await upgrade_in_process_to(dedicated_database_url, ancestor)
+
+    legacy_dataset_id = uuid4()
+    legacy_dataset_name = f"legacy-dataset-{legacy_dataset_id.hex}"
+    legacy_dataset_slug = f"legacy-dataset-{legacy_dataset_id.hex}"
+    legacy_engine = create_async_engine(dedicated_database_url, pool_pre_ping=True)
+    try:
+        async with legacy_engine.begin() as connection:
+            await connection.execute(
+                text("INSERT INTO datasets (id, name, slug) VALUES (:id, :name, :slug)"),
+                {"id": legacy_dataset_id, "name": legacy_dataset_name, "slug": legacy_dataset_slug},
+            )
+    finally:
+        await legacy_engine.dispose()
+
+    settings = migration_bootstrap_settings(dedicated_database_url)
+    checker = PostgresReadinessChecker(settings)
+    runner = CountingMigrationRunner()
+    bootstrap = MigrationBootstrap(settings, readiness_checker=checker, runner=runner)
+    try:
+        await bootstrap.ensure_schema_current()
+        assert runner.invocations == 1
+        assert await read_alembic_version(dedicated_database_url) == frozenset({head})
+        assert (await checker.check()).ready is True
+    finally:
+        await checker.dispose()
+
+    verification_engine = create_async_engine(dedicated_database_url, pool_pre_ping=True)
+    try:
+        async with verification_engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text("SELECT name, slug FROM datasets WHERE id = :id"),
+                    {"id": legacy_dataset_id},
+                )
+            ).first()
+        assert row is not None
+        assert row.name == legacy_dataset_name
+        assert row.slug == legacy_dataset_slug
+    finally:
+        await verification_engine.dispose()
+
+    engine = create_async_engine_from_settings(settings)
+    memory_id = None
+    try:
+        session_factory = create_session_factory(engine)
+        memory_service = CognitiveMemoryService(
+            settings,
+            embedding_client=_FakeEmbeddingClient(),
+            session_factory=session_factory,
+        )
+        recall_service = CognitiveMemoryRecallService(
+            settings,
+            embedding_client=_FakeEmbeddingClient(),
+            session_factory=session_factory,
+        )
+
+        created = await memory_service.create(
+            _cognitive_memory_smoke_create_request(), idempotency_key=None
+        )
+        memory_id = created.memory_id
+
+        fetched = await memory_service.get(memory_id)
+        assert fetched.memory_id == memory_id
+        assert fetched.lifecycle.value == "active"
+
+        recall_result = await recall_service.recall(
+            _cognitive_memory_smoke_recall_request(as_of=fetched.created_at)
+        )
+        assert any(item.memory.memory_id == memory_id for item in recall_result.items)
+
+        superseded = await memory_service.supersede(
+            memory_id, _cognitive_memory_smoke_supersede_request(), idempotency_key=None
+        )
+        replacement_id = superseded.replacement.memory_id
+        assert superseded.old.lifecycle.value == "superseded"
+        assert superseded.replacement.lifecycle.value == "active"
+
+        forgotten = await memory_service.forget(replacement_id, idempotency_key=None)
+        assert forgotten.lifecycle.value == "forgotten"
+        assert forgotten.content is None
+    finally:
+        cleanup_engine = create_async_engine(dedicated_database_url, pool_pre_ping=True)
+        try:
+            async with cleanup_engine.begin() as connection:
+                await connection.execute(
+                    text("DELETE FROM datasets WHERE id = :id"), {"id": legacy_dataset_id}
+                )
+                await connection.execute(text("DELETE FROM cognitive_memory_idempotency"))
+                await connection.execute(text("DELETE FROM memory_items"))
+        finally:
+            await cleanup_engine.dispose()
+        await dispose_async_engine(engine)
+
+
+def _cognitive_memory_smoke_create_request() -> MemoryCreateRequest:
+    return MemoryCreateRequest(
+        memory_type="profile",  # type: ignore[arg-type]
+        scope="global",  # type: ignore[arg-type]
+        content=f"Bootstrap smoke content {uuid4().hex}.",
+        provenance={  # type: ignore[arg-type]
+            "origin_kind": "user_asserted",
+            "source_system": "sofias-assistant",
+            "turn_uuid": str(uuid4()),
+        },
+    )
+
+
+def _cognitive_memory_smoke_recall_request(*, as_of: datetime) -> MemoryRecallRequest:
+    # `as_of` is pinned to the just-created item's own PostgreSQL-assigned
+    # `created_at`, and built via `model_construct` (bypassing
+    # `MemoryRecallRequest`'s "as_of must not be in the future" validator,
+    # which compares against THIS process's own clock) rather than a normal
+    # constructor call. Some local Docker Desktop setups let the container's
+    # clock and the host's clock drift by more than a second (measured on
+    # this environment), which this smoke test -- run immediately after a
+    # real multi-second Alembic subprocess migration -- can otherwise hit;
+    # Recall's actual temporal contract (including that same "not in the
+    # future" rule) is already exhaustively proven clock-independent by
+    # ``test_cognitive_memory_recall_postgres_integration.py``, so this one
+    # synthetic object is not re-testing that here. Never uses `sleep` to
+    # paper over the difference.
+    return MemoryRecallRequest.model_construct(
+        query="Bootstrap smoke content", scopes=["global"], as_of=as_of
+    )
+
+
+def _cognitive_memory_smoke_supersede_request() -> MemorySupersedeRequest:
+    return MemorySupersedeRequest(
+        content=f"Bootstrap smoke replacement {uuid4().hex}.",
+        provenance={  # type: ignore[arg-type]
+            "origin_kind": "user_asserted",
+            "source_system": "sofias-assistant",
+            "turn_uuid": str(uuid4()),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -488,3 +488,57 @@ async def test_concurrent_same_key_same_request_converges_to_one_winner(
         assert ledger_count == 1
     finally:
         await cleanup(postgres_session_factory, {memory_id})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_same_key_different_request_one_wins_one_conflicts(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Two concurrent Create calls, the SAME Idempotency-Key but two
+    semantically DIFFERENT requests, both complete embedding before either
+    reaches the authoritative transaction (barrier-synchronized, no
+    ``sleep``). The ``UNIQUE(idempotency_key)`` claim must let exactly one
+    caller win (201, one MemoryItem) while the other loses deterministically
+    with 409 IDEMPOTENCY_CONFLICT and creates no second item -- never two
+    successes, never a silent duplicate, never an unhandled 500."""
+
+    from sofias_memory.api.errors import SofiasMemoryError
+
+    key = unique_key("race-conflict")
+    barrier_client = BarrierEmbeddingClient(participants=2)
+    service_a = CognitiveMemoryService(
+        load_settings(), embedding_client=barrier_client, session_factory=postgres_session_factory
+    )
+    service_b = CognitiveMemoryService(
+        load_settings(), embedding_client=barrier_client, session_factory=postgres_session_factory
+    )
+
+    results = await asyncio.gather(
+        service_a.create(build_create_request(content="race content A"), idempotency_key=key),
+        service_b.create(build_create_request(content="race content B"), idempotency_key=key),
+        return_exceptions=True,
+    )
+
+    successes = [r for r in results if not isinstance(r, BaseException)]
+    failures = [r for r in results if isinstance(r, BaseException)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], SofiasMemoryError)
+    assert failures[0].code.value == "IDEMPOTENCY_CONFLICT"
+
+    memory_id = successes[0].memory_id
+    try:
+        async with postgres_session_factory() as session:
+            item_count = await session.scalar(
+                select(func.count()).select_from(MemoryItem).where(MemoryItem.id == memory_id)
+            )
+            ledger_count = await session.scalar(
+                select(func.count())
+                .select_from(CognitiveMemoryIdempotency)
+                .where(CognitiveMemoryIdempotency.idempotency_key == key)
+            )
+        assert item_count == 1
+        assert ledger_count == 1
+    finally:
+        await cleanup(postgres_session_factory, {memory_id})

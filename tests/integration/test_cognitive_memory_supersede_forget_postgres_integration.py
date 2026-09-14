@@ -45,6 +45,7 @@ from sofias_memory.infrastructure.postgres.models import (
     PipelineStep,
 )
 from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
+from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.schemas.memories import (
     MemoryCreateRequest,
     MemoryRecallRequest,
@@ -103,6 +104,30 @@ class BarrierEmbeddingClient:
     async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
         await self._barrier.wait()
         return [[0.125] * EMBEDDING_DIMENSIONS for _ in texts]
+
+
+class BlockingUnitOfWork:
+    """Wraps a real ``PostgresUnitOfWork`` so entering it (``async with``)
+    blocks on an ``asyncio.Event`` before opening the real transaction --
+    used to deterministically control which of two concurrent operations
+    reaches its authoritative PostgreSQL transaction first, for operations
+    (like Forget) that have no external provider call to block on instead.
+    Never uses ``sleep`` as the synchronization point."""
+
+    def __init__(
+        self, inner: PostgresUnitOfWork, *, started: asyncio.Event, release: asyncio.Event
+    ) -> None:
+        self._inner = inner
+        self._started = started
+        self._release = release
+
+    async def __aenter__(self) -> PostgresUnitOfWork:
+        self._started.set()
+        await self._release.wait()
+        return await self._inner.__aenter__()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._inner.__aexit__(*exc_info)  # type: ignore[arg-type]
 
 
 def _test_database_url(env: dict[str, str]) -> str:
@@ -840,6 +865,160 @@ async def test_forget_concurrent_two_requests_different_fresh_keys_converge(
         assert row.content is None
     finally:
         await cleanup(postgres_session_factory, {old_id})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_forget_concurrent_same_key_same_request_converges_to_one_winner(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Two concurrent Forget calls, the SAME Idempotency-Key against the
+    SAME target. Forget never calls the embedding provider, so PostgreSQL's
+    row lock (``get_by_id_for_update``) is solely responsible for
+    serializing the two claim attempts: the loser's claim INSERT hits the
+    ``UNIQUE(idempotency_key)`` constraint and must replay the winner's
+    result rather than raising, and only one destructive mutation must ever
+    occur (no ``sleep``)."""
+
+    old_id = await create_old(postgres_session_factory)
+    service_a = cognitive_memory_service(postgres_session_factory, FakeEmbeddingClient())
+    service_b = cognitive_memory_service(postgres_session_factory, FakeEmbeddingClient())
+    key = unique_key("race-forget-same-key")
+
+    results = await asyncio.gather(
+        service_a.forget(old_id, idempotency_key=key),
+        service_b.forget(old_id, idempotency_key=key),
+    )
+    try:
+        assert results[0].memory_id == old_id
+        assert results[1].memory_id == old_id
+        assert results[0].lifecycle.value == "forgotten"
+        assert results[1].lifecycle.value == "forgotten"
+        assert results[0].forgotten_at == results[1].forgotten_at  # single destructive mutation
+
+        async with postgres_session_factory() as session:
+            ledger_count = await session.scalar(
+                select(func.count())
+                .select_from(CognitiveMemoryIdempotency)
+                .where(CognitiveMemoryIdempotency.idempotency_key == key)
+            )
+        assert ledger_count == 1
+    finally:
+        await cleanup(postgres_session_factory, {old_id})
+
+
+# --- Forget vs Supersede cross-race ---------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_forget_vs_supersede_cross_race_forget_wins_first_supersede_gets_conflict(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Deterministic cross-race, ordering A: Forget reaches and commits its
+    authoritative transaction while Supersede is still parked mid-embedding
+    (an ``asyncio.Event``, never ``sleep``, is the synchronization point --
+    matching the already-proven embedding-before-transaction invariant, so
+    Supersede provably holds no session/transaction while blocked). Once
+    Forget has fully committed, Supersede is released and must see the
+    target no longer ACTIVE and fail with 409 MEMORY_STATE_CONFLICT,
+    creating no replacement."""
+
+    old_id = await create_old(postgres_session_factory)
+    blocking_client = BlockingEmbeddingClient()
+    service_forget = cognitive_memory_service(postgres_session_factory, FakeEmbeddingClient())
+    service_supersede = CognitiveMemoryService(
+        load_settings(),
+        embedding_client=blocking_client,
+        session_factory=postgres_session_factory,
+    )
+
+    supersede_task = asyncio.create_task(
+        service_supersede.supersede(
+            old_id, build_supersede_request(content="should never win"), idempotency_key=None
+        )
+    )
+    try:
+        await asyncio.wait_for(blocking_client.started.wait(), timeout=5)
+
+        forget_result = await service_forget.forget(old_id, idempotency_key=None)
+        assert forget_result.lifecycle.value == "forgotten"
+
+        blocking_client.release.set()
+        with pytest.raises(SofiasMemoryError) as exc_info:
+            await asyncio.wait_for(supersede_task, timeout=5)
+        assert exc_info.value.code.value == "MEMORY_STATE_CONFLICT"
+
+        row = await fetch_row(postgres_session_factory, old_id)
+        assert row is not None
+        assert row.lifecycle.value == "forgotten"
+        assert row.superseded_by is None
+    finally:
+        blocking_client.release.set()
+        await cleanup(postgres_session_factory, {old_id})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_forget_vs_supersede_cross_race_supersede_wins_first_forgets_only_old(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Deterministic cross-race, ordering B: Supersede reaches and commits
+    its authoritative transaction while Forget is genuinely in flight but
+    parked before opening its own transaction -- an instrumented
+    ``PostgresUnitOfWork`` wrapper (``BlockingUnitOfWork``) blocked on an
+    ``asyncio.Event`` is the synchronization point (Forget has no external
+    provider call to block on instead; never ``sleep``). Once Supersede has
+    fully committed (old SUPERSEDED, replacement ACTIVE), Forget is released
+    and must transition the now-SUPERSEDED old item to FORGOTTEN while the
+    replacement remains completely untouched -- the same postcondition as
+    the sequential lineage test, now proven under true concurrency."""
+
+    old_id = await create_old(postgres_session_factory)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    def blocking_unit_of_work_factory() -> BlockingUnitOfWork:
+        return BlockingUnitOfWork(
+            PostgresUnitOfWork(postgres_session_factory), started=started, release=release
+        )
+
+    service_forget = CognitiveMemoryService(
+        load_settings(),
+        embedding_client=FakeEmbeddingClient(),
+        unit_of_work_factory=blocking_unit_of_work_factory,  # type: ignore[arg-type]
+    )
+    service_supersede = cognitive_memory_service(postgres_session_factory, FakeEmbeddingClient())
+
+    forget_task = asyncio.create_task(service_forget.forget(old_id, idempotency_key=None))
+    replacement_id: UUID | None = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        supersede_result = await service_supersede.supersede(
+            old_id,
+            build_supersede_request(content="replacement wins the race"),
+            idempotency_key=None,
+        )
+        won_replacement_id = supersede_result.replacement.memory_id
+        replacement_id = won_replacement_id
+
+        release.set()
+        forget_result = await asyncio.wait_for(forget_task, timeout=5)
+        assert forget_result.lifecycle.value == "forgotten"
+        assert forget_result.superseded_at is not None
+        assert forget_result.superseded_by == won_replacement_id
+
+        replacement_row = await fetch_row(postgres_session_factory, won_replacement_id)
+        assert replacement_row is not None
+        assert replacement_row.lifecycle.value == "active"
+        assert replacement_row.content == "replacement wins the race"
+        assert replacement_row.embedding is not None
+    finally:
+        release.set()
+        await cleanup(
+            postgres_session_factory, {old_id} | ({replacement_id} if replacement_id else set())
+        )
 
 
 # --- Forget: destructive scrub / privacy proof ----------------------------------

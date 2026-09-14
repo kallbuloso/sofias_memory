@@ -50,6 +50,7 @@ EXPECTED_UNIQUE_CONSTRAINTS = frozenset(
         "uq_sources_dataset_id_content_sha256_version",
         "uq_chunks_document_id_generation_ordinal",
         "uq_sessions_key",
+        "uq_cognitive_memory_idempotency_idempotency_key",
     }
 )
 EXPECTED_CHECK_CONSTRAINTS = frozenset(
@@ -67,6 +68,15 @@ EXPECTED_CHECK_CONSTRAINTS = frozenset(
         "ck_session_entries_external_id_not_blank",
         "ck_session_entries_external_id_max_length",
         "ck_session_entries_external_id_trimmed",
+        "ck_memory_items_confidence_bounds",
+        "ck_memory_items_validity_window_ordered",
+        "ck_memory_items_no_self_supersession",
+        "ck_memory_items_non_forgotten_requires_cognitive_payload",
+        "ck_memory_items_active_requires_clean_lineage",
+        "ck_memory_items_superseded_requires_lineage_markers",
+        "ck_memory_items_forgotten_requires_tombstone_shape",
+        "ck_memory_provenance_source_system_slug",
+        "ck_cognitive_memory_idempotency_request_digest_hex",
     }
 )
 EXPECTED_FK_DELETE_POLICIES = {
@@ -81,6 +91,10 @@ EXPECTED_FK_DELETE_POLICIES = {
     "fk_session_entries_session_id_sessions": "CASCADE",
     "fk_queries_session_id_sessions": "SET NULL",
     "fk_pipeline_runs_session_id_sessions": "SET NULL",
+    "fk_memory_items_superseded_by_memory_items": "RESTRICT",
+    "fk_memory_provenance_memory_id_memory_items": "CASCADE",
+    "fk_cognitive_memory_idempotency_target_memory_id_memory_items": "RESTRICT",
+    "fk_cognitive_memory_idempotency_result_memory_id_memory_items": "RESTRICT",
 }
 POSTGRES_FK_DELETE_ACTION_NAMES = {
     "a": "NO ACTION",
@@ -1446,4 +1460,4 @@ def test_schema_guard_policy_reused_by_migration_gate() -> None:
     )
     assert frozenset({"owner_id", "tenant_id"}) == FORBIDDEN_COLUMNS
     assert frozenset({"vector", "pg_trgm", "citext"}) == REQUIRED_EXTENSIONS
-    assert len(REQUIRED_TABLES) == 22
+    assert len(REQUIRED_TABLES) == 25

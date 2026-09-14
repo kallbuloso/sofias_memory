@@ -83,12 +83,17 @@ API_KEY
 DB_PASSWORD
 DB_NEO4J_PASSWORD
 LLM_API_KEY
+COGNITIVE_IDEMPOTENCY_HMAC_KEY
 ```
 
 Generate `API_KEY` with `scripts/generate_api_key.py` from a source checkout,
 or any equivalent random 32+ character generator with the `sf-` prefix.
 `DB_PASSWORD`/`DB_NEO4J_PASSWORD` should be strong, unique values distinct
-from any other deployment.
+from any other deployment. `COGNITIVE_IDEMPOTENCY_HMAC_KEY` must be a
+separate high-entropy secret (minimum 32 characters, never reuse `API_KEY`
+or any other secret) — it keys the non-reversible idempotency digest for
+the Cognitive Memory (`/memories`) write endpoints and never appears in
+the database, logs, or `/info`.
 
 Optional but commonly set:
 

@@ -2,6 +2,93 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [0.7.0]
+
+Minor release adding **Native Cognitive Memory** (ADR-0016): a first-class,
+PostgreSQL-authoritative `MemoryItem` resource for durable profile/semantic
+facts, entirely additive to the existing knowledge-memory API
+(`/remember`, `/recall`, `/forget`, datasets, sessions, skills, agents) —
+nothing existing is removed, renamed, or made a breaking change.
+
+### `MemoryItem` and lifecycle
+
+- New resource `MemoryItem`, typed `profile` or `semantic` — never
+  `episodic`/`procedural`, which remain permanently out of scope, not
+  "not yet implemented."
+- Scope is exactly `global` or `project:<key>` — no generic tenancy, no
+  ACL, no owner/organization concept.
+- Lifecycle is `active -> superseded -> forgotten`, with `forgotten ->
+  forgotten` a resource-state idempotent no-op even under a brand-new
+  `Idempotency-Key`.
+- First-class provenance (`origin_kind`, `source_system`, external
+  references) travels with every `MemoryItem`; `confidence` exists,
+  `importance` does not.
+
+### Create, Get, Typed Recall
+
+- `POST /api/v1/memories` — synchronous create, no `PipelineRun`, no
+  Neo4j projection. The external embedding call always happens before the
+  short authoritative PostgreSQL transaction.
+- `GET /api/v1/memories/{memory_id}`.
+- `POST /api/v1/memories/recall` — typed retrieval, separate from the
+  legacy knowledge `POST /api/v1/recall`. Exact pgvector cosine similarity
+  over the full-precision embedding (never ANN/HNSW), with historical
+  current-truth semantics: an `as_of` timestamp determines which items are
+  temporally valid and not-yet-superseded at that point in time, so a
+  caller can query "what was true then" as well as "what is true now."
+
+### Atomic Supersede and destructive precise Forget
+
+- `POST /api/v1/memories/{memory_id}/supersede` — atomically replaces an
+  `ACTIVE` `MemoryItem` with exactly one new `ACTIVE` replacement, which
+  inherits `memory_type`/`scope` from the target. No `PATCH` exists or is
+  planned for `MemoryItem` — every content change is a new supersession.
+- `POST /api/v1/memories/{memory_id}/forget` — destroys cognitive content,
+  embedding, and every external provenance reference for exactly the
+  targeted `memory_id`, atomically. `ACTIVE` and `SUPERSEDED` both
+  transition to `FORGOTTEN`; a superseding replacement or a superseded
+  predecessor is never cascaded into.
+
+### Compatibility negotiation and idempotency
+
+- `GET /api/v1/info` now additionally reports `api_contract_version`, a
+  per-feature `contracts` map (`{"cognitive_memory": "1"}`), and a
+  `capabilities` list (`cognitive_memory.write`, `.get`, `.recall`,
+  `.supersede`, `.forget`) so a caller such as Sofia's Assistant can
+  negotiate support explicitly instead of inferring it from the
+  application version.
+- Every Cognitive Memory write accepts an optional `Idempotency-Key`,
+  authoritatively resolved via a `UNIQUE` PostgreSQL constraint against a
+  keyed, non-reversible HMAC-SHA-256 digest of the request — never a raw
+  hash, and never the request body itself. Same-key/same-request always
+  replays the original result; same-key/different-request is a `409`.
+
+### Database/upgrade
+
+- New migration `0018` (Alembic head: `0017 -> 0018`), creating
+  `memory_items`, `memory_provenance`, and `cognitive_memory_idempotency`.
+  Purely additive — no existing table or column is altered.
+- Upgrading from `0.6.0` requires no manual step: starting the `0.7.0`
+  image against a `0.6.0` database (Alembic `0017`) with the default
+  `DATABASE_MIGRATION_MODE=auto` migrates it forward to `0018`
+  automatically, under the same serialized, fail-closed Automatic
+  Migration Bootstrap introduced in `0.6.0` (ADR-0015) — no manual
+  `alembic upgrade head` is required on the normal upgrade path.
+
+### Configuration
+
+- New required setting: `COGNITIVE_IDEMPOTENCY_HMAC_KEY` — a high-entropy
+  secret (minimum 32 characters, never `API_KEY`, never a placeholder
+  containing "change-me") used exclusively to compute the non-reversible
+  idempotency digest above. It never appears in the database, logs,
+  `/info`, exceptions, or metrics.
+
+### Documentation
+
+- `README.md`, `AGENTS.md`, `docs/api.md`, `docs/operations.md`, and
+  `docs/development.md` updated for the new `/memories` surface and the
+  `COGNITIVE_IDEMPOTENCY_HMAC_KEY` requirement.
+
 ## [0.6.0]
 
 Minor release adding an **automatic, serialized, fail-closed migration

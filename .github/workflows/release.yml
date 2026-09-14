@@ -134,6 +134,7 @@ jobs:
           DB_PASSWORD: ci-disposable-password
           DB_NEO4J_PASSWORD: ci-disposable-password
           LLM_API_KEY: sk-ci-disposable
+          COGNITIVE_IDEMPOTENCY_HMAC_KEY: ci-disposable-cognitive-idempotency-hmac-key
 
   publish:
     name: Build, publish to GHCR, create GitHub Release

@@ -630,6 +630,32 @@ Somente as famílias definidas no PRD:
   reversa `/sessions/{session_uuid}/agents`, e qualquer rota runtime-shaped
   (`/run`, `/execute`, `/chat`, `/respond`, `/complete`, `/invoke`,
   `/tools`).
+- memories (Native Cognitive Memory, v0.7.0, ADR-0016) **implementado em
+  sua totalidade**:
+  - `MemoryItem` first-class, tipos `profile`/`semantic` (nunca
+    `episodic`/`procedural`), escopo `global` ou `project:<key>`, lifecycle
+    `active` -> `superseded` -> `forgotten`;
+  - `POST /memories` (Create), `GET /memories/{memory_id}` (Get),
+    `POST /memories/recall` (Typed Recall -- pgvector cosine exato, nunca
+    ANN/HNSW, com semântica histórica de current-truth via `as_of`),
+    `POST /memories/{memory_id}/supersede` (atomic supersession),
+    `POST /memories/{memory_id}/forget` (destructive precise forget --
+    escopo apenas o `memory_id` alvo, nunca cascata para lineage);
+  - first-class provenance (`origin_kind`, `source_system`, referências
+    externas) por `MemoryItem`; `confidence` existe, `importance` nunca;
+  - idempotência via `Idempotency-Key` com digest HMAC-SHA-256 keyed e
+    não-reversível (`COGNITIVE_IDEMPOTENCY_HMAC_KEY`, obrigatório, nunca
+    `API_KEY`);
+  - `/info` anuncia `api_contract_version`/`contracts.cognitive_memory`/
+    `capabilities` (`cognitive_memory.write|get|recall|supersede|forget`)
+    para negociação de compatibilidade explícita pelo Sofia's Assistant.
+
+  Cognitive Memory é **exclusivamente PostgreSQL** -- nunca projetada para
+  Neo4j, nunca lê/escreve `graph_outbox`, nunca cria `PipelineRun`. Fora de
+  escopo permanentemente (não "ainda não implementado"): `PATCH`, semantic
+  dedupe, AI conflict resolution, consolidation, decay, prefetch, generic
+  tenancy/ACL, e qualquer integração direta com o Sofia's Assistant runtime
+  (Slice 05).
 
 Não invente aliases/endpoints de conveniência.
 

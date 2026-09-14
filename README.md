@@ -29,7 +29,13 @@ bootstrap** (`DATABASE_MIGRATION_MODE=auto|verify_only`, default `auto`)
 that migrates an eligible schema forward automatically on ordinary
 application startup, removing the previously-required manual
 `alembic upgrade head` step for the common install/upgrade path while
-preserving fail-closed startup and the manual CLI (see
+preserving fail-closed startup and the manual CLI; **v0.7.0** adds
+first-class, PostgreSQL-authoritative **Native Cognitive Memory** —
+typed `MemoryItem` (`profile`/`semantic`) with `active`/`superseded`/
+`forgotten` lifecycle, first-class provenance, exact-pgvector-cosine
+Typed Recall with historical current-truth semantics, atomic Supersede,
+destructive precise Forget, and HMAC-keyed idempotency, entirely additive
+to the existing knowledge-memory API (see
 `CHANGELOG.md`) — see
 `docs/exec-plans/completed/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
 original release discovery/backlog.
@@ -78,6 +84,19 @@ original release discovery/backlog.
   Session with multiple associated Agents has no per-operation Agent
   discriminator of any kind. See `docs/api.md` and the
   [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.5.0_Agent_Management.md).
+- **Cognitive Memory** — first-class, PostgreSQL-authoritative
+  `MemoryItem`s (`profile`/`semantic`, never `episodic`/`procedural`),
+  scoped `global` or `project:<key>`, with an `active` -> `superseded` ->
+  `forgotten` lifecycle and first-class provenance. `POST /api/v1/memories`
+  (Create), `GET /api/v1/memories/{memory_id}` (Get), typed
+  `POST /api/v1/memories/recall` (exact pgvector cosine, historical
+  current-truth semantics via `as_of` — separate from the legacy knowledge
+  `/recall`), atomic `POST /api/v1/memories/{memory_id}/supersede`, and
+  destructive `POST /api/v1/memories/{memory_id}/forget` are all
+  implemented; `GET /api/v1/info` negotiates support explicitly via
+  `capabilities`. No `PATCH`, no semantic dedupe, no Neo4j projection. See
+  `docs/api.md` and the
+  [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.7.0_Native_Cognitive_Memory.md).
 
 ## Architecture
 
@@ -221,6 +240,7 @@ grouped by area:
 | Storage | `DATA_DIRECTORY`, `TEMP_DIRECTORY`, `MAX_SOURCE_SIZE_MB`, `STORAGE_BACKEND`, `STORAGE_S3_*` (optional — see `docs/operations.md` §13) |
 | LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS` |
 | Embeddings | `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` |
+| Cognitive Memory | `COGNITIVE_IDEMPOTENCY_HMAC_KEY` — **required**, high-entropy (minimum 32 characters), distinct from `API_KEY`; keys the non-reversible idempotency digest for `/memories` writes and never appears in the database, logs, or `/info` |
 | Chunking/retrieval | `CHUNK_MAX_TOKENS`, `RECALL_DEFAULT_TOP_K`, `RECALL_RRF_K` |
 | Session context | `SESSION_CONTEXT_MAX_ENTRIES`, `SESSION_CONTEXT_MAX_CHARS` |
 | Graph/provenance | `GRAPH_SUBGRAPH_MAX_DEPTH`, `PROVENANCE_MAX_EVIDENCE` |

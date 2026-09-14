@@ -2207,6 +2207,100 @@ SM-1006 só fecha quando:
 9. exec plan é movido `active/ -> completed/` conforme convenção;
 10. CI do closeout final = success.
 
+## SM-1006 — Phase A evidence (release candidate gates, publication pendente)
+
+**Este registro NÃO marca SM-1006 como DONE.** Publicação (tag/Release
+workflow/GHCR/GitHub Release) ainda não ocorreu neste ponto do gate.
+
+```text
+Baseline autorizado:        ac3e2053212d8d3491a27734b52fdc9571ffb30d
+                             (SM-1005 closeout, CI SUCCESS)
+Phase A release-prep SHA:   50faff3d334eebe475572b780dfd4c3fb9df4abc
+                             (chore(release): prepare v0.7.0)
+```
+
+Escopo do commit: version bump `0.6.0 -> 0.7.0` em
+`pyproject.toml`/`uv.lock`/`.env.example`/`compose.yaml`/`Dockerfile`/
+`deploy/easypanel/compose.yaml`; `CHANGELOG.md` `## [0.7.0]` (única
+ocorrência); `README.md`/`AGENTS.md` sincronizados para descrever
+`/memories` como implementado; `docs/operations.md`,
+`docs/development.md`, `docs/deployment/easypanel.md` atualizados para a
+tag de imagem `0.7.0` e o secret `COGNITIVE_IDEMPOTENCY_HMAC_KEY`
+(obrigatório, ausente desses documentos até agora); correção do gap real
+encontrado em `.github/workflows/release.yml` (o step "Settings /
+.env.example / Compose parity + version consistency" não fornecia
+`COGNITIVE_IDEMPOTENCY_HMAC_KEY` no seu `env:`, ao contrário do mesmo step
+em `ci.yml` — o script `ci_release_consistency_check.py` já tem um
+`setdefault` interno para essa variável, então não era uma quebra
+funcional, apenas uma lacuna de transparência/paridade, corrigida antes da
+tag). Nenhuma linha de `sofias_memory/`/`migrations/` foi tocada.
+
+Local gates (Phase A SHA): `uv lock --check`, `ruff check .`,
+`ruff format --check .`, `mypy sofias_memory scripts`,
+`tests/unit`+`tests/contract`+`tests/security` (2533 passed), Bandit
+(HIGH = 0), pip-audit (no known vulnerabilities), `git diff --check` —
+todos verdes. `scripts/ci_release_consistency_check.py` não pôde ser
+executado localmente (Docker CLI indisponível neste ambiente de
+desenvolvimento) — verificado via CI (que executa o mesmo script em
+`ci.yml`) na mesma SHA.
+
+```text
+CI (Phase A SHA):          run 34798523412, head_sha 50faff3d..., SUCCESS
+                            ("Lint, type check, unit/contract/security
+                            tests" + "Docker image build + OCI label
+                            check", ambos SUCCESS)
+Manual Integration
+(Phase A SHA):              run #30 (34798571776), head_sha 50faff3d...,
+                            SUCCESS em 4m 13s — "Run CI-compatible
+                            integration suite": 707 passed, 3 deselected
+                            (test_b3_neo4j_gate.py, intencional), 0
+                            skipped, 1 warning, em 141.18s — idêntico ao
+                            baseline SM-1005 (nenhum teste/produção
+                            alterado nesta gate).
+```
+
+Exact release acceptance review (contra ADR-0016/Feature Contract/
+Integration Contract), verificado por leitura direta do código-fonte na
+Phase A SHA:
+
+```text
+SM-1001..SM-1005:           DONE (confirmado, blocos de evidência acima)
+MemoryItem native:          YES (sofias_memory/infrastructure/postgres/
+                             models/memory_item.py)
+PROFILE / SEMANTIC:         YES -- CognitiveMemoryType(StrEnum) contém
+                             exatamente PROFILE/SEMANTIC; docstring proíbe
+                             EPISODIC/PROCEDURAL sem novo ADR
+EPISODIC / PROCEDURAL:      NO (ausentes do enum)
+Create/Get/Recall/
+Supersede/Forget:           YES -- exatamente 5 rotas em
+                             sofias_memory/api/routes/memories.py
+                             (4x POST, 1x GET), zero PATCH/PUT/DELETE
+confidence / importance:    confidence existe (REAL, CHECK 0.0-1.0);
+                             importance ausente de schemas e do modelo ORM
+PATCH /memories:             NO (grep confirma zero ocorrência)
+Neo4j Cognitive:             NO (Cognitive Memory é exclusivamente
+                             PostgreSQL; nenhuma rota/serviço a projeta)
+PostgreSQL authoritative:    YES
+HMAC keyed idempotency:      YES (uq_cognitive_memory_idempotency_
+                             idempotency_key + digest HMAC-SHA-256)
+historical truth semantics:  YES (as_of + is_current_truth, SM-1003)
+destructive Forget:          YES (SM-1004)
+/info capabilities:          exatamente as 5 frozen
+                             (cognitive_memory.write/get/recall/
+                             supersede/forget), api_contract_version="1",
+                             contracts={"cognitive_memory":"1"}
+Legacy routers preservados:  YES -- todos os 14 routers legados
+                             (health/info/datasets/remember/cognify/
+                             recall/feedback/improve/forget/graph/
+                             provenance/runs/sessions/skills/agents)
+                             permanecem registrados em app.py, memories_
+                             router é estritamente aditivo
+```
+
+Próximos passos (Phase B): flip do Feature Contract para `Implemented`,
+commit `docs(v0.7): finalize release gate`, novo ciclo de CI + Integration
+exact-SHA sobre esse commit, e só então freeze do `RELEASE_SHA` imutável.
+
 ---
 
 # 6. Test matrix consolidada da release

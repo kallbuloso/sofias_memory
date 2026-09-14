@@ -1,6 +1,6 @@
 # Sofias Memory — Feature Contract v0.7.0: Native Cognitive Memory
 
-**Status:** APPROVED / FROZEN FOR IMPLEMENTATION  
+**Status:** Implemented  
 **Target release:** v0.7.0  
 **Feature:** Native Cognitive Memory  
 **Architecture authority:** ADR-0016 (`docs/adr/0016-native-cognitive-memory-model-and-lifecycle.md`, accepted)  

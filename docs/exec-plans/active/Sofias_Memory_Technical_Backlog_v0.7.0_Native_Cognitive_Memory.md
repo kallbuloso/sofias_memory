@@ -134,7 +134,7 @@ Durante toda a v0.7:
 | G2 | SM-1002 | Compatibility negotiation + synchronous Create/Get | SM-1001 | nenhuma nova esperada | DONE |
 | G3 | SM-1003 | Typed Cognitive Recall + temporal/current-truth query | SM-1002 | nenhuma nova esperada | DONE |
 | G4 | SM-1004 | Atomic Supersession + destructive precise Forget | SM-1003 | nenhuma nova esperada | DONE |
-| G5 | SM-1005 | Real-PG concurrency/security/privacy/integration hardening | SM-1004 | somente corretiva se inevitável | TODO |
+| G5 | SM-1005 | Real-PG concurrency/security/privacy/integration hardening | SM-1004 | somente corretiva se inevitável | DONE |
 | G6 | SM-1006 | Release prep + exact-SHA GATE-v0.7.0 + publication/closeout | SM-1005 | valida `0017 -> 0018+` | TODO |
 
 **Regra:** se um gate posterior revelar necessidade de schema não prevista em `0018`, criar revision linear posterior (`0019+`). Não reescrever uma migration já aterrissada/aplicada em gate anterior.
@@ -1712,6 +1712,275 @@ SM-1005 fecha somente quando:
 7. manual Integration workflow contém e executa os novos testes;
 8. no production defect conhecido permanece aberto;
 9. no scope creep para deferred features.
+
+## SM-1005 — Evidência de fechamento (DONE)
+
+```text
+Baseline:                main @ 053cf79c2710d021192c6851c633db8c75414b01
+                          (docs(v0.7): close SM-1004, CI SUCCESS)
+Implementation SHA:      d5638a9e6ca28e64d221e5930de327da55980f0b
+Alembic head:            0018 (down_revision = 0017) -- unchanged, nenhuma
+                          migration nova (hardening gate, sem defeito
+                          estrutural encontrado)
+```
+
+Hardening gate: nenhuma feature nova. Toda mudança de código foi em
+`tests/` e `.github/workflows/integration.yml`; `sofias_memory/` (produto)
+permanece byte-a-byte o mesmo do fechamento de SM-1004.
+
+### Concurrency matrix (real PostgreSQL, sem `sleep()` como mecanismo de
+### ordenação/correção -- somente `asyncio.Event`/`asyncio.Barrier`/lock
+### real do PostgreSQL)
+
+```text
+Create:
+  same-key/same-request     (SM-1002, pré-existente) -- Barrier, converge
+  same-key/different-request (NOVO)                  -- Barrier, um 201 +
+                                                          um 409
+                                                          IDEMPOTENCY_CONFLICT
+Supersede:
+  same-key/same-request     (SM-1004, pré-existente) -- Barrier, converge
+  distinct-key (mesmo alvo) (SM-1004, pré-existente) -- Barrier, um 200 +
+                                                          um 409
+                                                          MEMORY_STATE_CONFLICT
+Forget:
+  different-fresh-keys      (SM-1004, pré-existente) -- asyncio.gather
+                                                          (sem provider),
+                                                          row-lock puro
+  same-key/same-request     (NOVO)                   -- asyncio.gather,
+                                                          row-lock puro,
+                                                          converge (ledger
+                                                          count == 1)
+Forget vs Supersede cross-race (NOVO, obrigatório):
+  Forget-wins-first  -- BlockingEmbeddingClient bloqueia o Supersede em
+                         `embed_texts` (zero transação aberta, propriedade
+                         já provada por SM-1002); Forget completa
+                         integralmente primeiro; Supersede então recebe
+                         409 MEMORY_STATE_CONFLICT; item permanece
+                         FORGOTTEN, superseded_by nunca setado.
+  Supersede-wins-first -- `BlockingUnitOfWork` (wrapper de
+                          `PostgresUnitOfWork.__aenter__`, instrumentação
+                          nova, análoga a `BlockingEmbeddingClient`) bloqueia
+                          Forget antes de abrir sua própria transação;
+                          Supersede completa integralmente primeiro (old
+                          SUPERSEDED, replacement ACTIVE); Forget então
+                          transiciona o old (já SUPERSEDED) para FORGOTTEN,
+                          preservando `superseded_at`/`superseded_by`; o
+                          replacement permanece ACTIVE e com conteúdo
+                          intocado -- provado sob concorrência real, não
+                          apenas sequencialmente.
+```
+
+Nenhum `sleep()`/`time.sleep()`/`asyncio.sleep()` foi usado como mecanismo
+de corretude/ordenação em qualquer teste novo ou pré-existente.
+
+### Privacy hardening
+
+- `test_forget_scrubs_all_cognitive_and_provenance_columns` (SM-1004,
+  pré-existente): scrub sentinel-based direto no PostgreSQL, já cobre o
+  requisito.
+- `test_cognitive_memory_never_logs_content_provenance_vectors_or_secrets`
+  (NOVO,
+  `tests/integration/test_cognitive_memory_log_privacy_postgres_integration.py`):
+  captura os logs reais (`configure_logging` + `StringIO`, mesmo padrão de
+  `test_api_errors.py`) através de Create success + idempotency-conflict,
+  Supersede success + not-found, Forget success + not-found, e Recall
+  provider-failure -- todos com sentinels únicos por execução -- e confirma
+  ausência de: conteúdo cognitivo completo, external provenance refs, valor
+  do vetor de embedding, o segredo `COGNITIVE_IDEMPOTENCY_HMAC_KEY`, o
+  `request_digest` efetivamente persistido no ledger (lido direto do
+  PostgreSQL), e o `Idempotency-Key` completo (Create/Supersede/Forget).
+  `sofias_memory/services/cognitive_memory*.py` não chama `get_logger`
+  hoje; este teste existe para pegar uma regressão futura imediatamente.
+- `test_info_response_does_not_expose_secrets_or_sensitive_configuration`
+  (ampliado): `COGNITIVE_IDEMPOTENCY_HMAC_KEY` adicionado ao conjunto de
+  segredos conhecidos verificados ausentes em `/info` (corpo da resposta e
+  `config_fingerprint`); `cognitive_idempotency_hmac_key` adicionado aos
+  nomes de campo proibidos.
+- Digest keyed/non-reversible: já integralmente coberto por
+  `test_cognitive_memory_idempotency.py` (SM-1001) -- confirmado ainda
+  verde.
+
+### Auth, `/info`, OpenAPI
+
+Full regression (`tests/unit`, `tests/contract`, `tests/security`) verde
+--nenhuma mudança de contrato; os 5 endpoints Cognitive Memory continuam
+exigindo `X-API-Key` (exceto `/health/*`); capabilities list, ausência de
+`PATCH`/EPISODIC/PROCEDURAL, e Idempotency-Key apenas nas rotas mutáveis
+aplicáveis permanecem exatamente como fechados em SM-1004.
+
+### Cross-domain side effects
+
+`test_create_memory_creates_no_pipeline_run_or_graph_outbox_row` e
+`test_supersede_and_forget_create_no_pipeline_run_or_graph_outbox_row`
+(pré-existentes) seguem verdes; nenhum teste novo de Cognitive Memory cria
+`PipelineRun`/`PipelineStep`/`graph_outbox`. Verificação estrutural
+Neo4j-negativa permanece a do schema-guard (nenhuma tabela/coluna proibida)
+-- Cognitive Memory nunca depende de Neo4j em nenhum teste.
+
+### Migration/bootstrap proof (real PostgreSQL)
+
+Finding real corrigido (gap pré-existente, não uma feature nova): o
+schema-guard usado pelo gate de migração fresh
+(`tests/integration/test_postgres_migration_gate.py` +
+`tests/integration/test_postgres_schema_guard.py`) nunca incluía
+`memory_items`/`memory_provenance`/`cognitive_memory_idempotency` em
+`REQUIRED_TABLES` (22 -> 25 tabelas), nem os UNIQUE/CHECK/FK constraints de
+Cognitive Memory em `EXPECTED_*` -- ou seja, o gate de "fresh database
+migra corretamente" nunca de fato verificava que as tabelas SM-1001
+existiam. Corrigido (adição, `>=`/subset semantics preservadas, nenhuma
+mudança de contrato); re-verificado contra PostgreSQL real local: 24
+passed, 2 skipped.
+
+```text
+Fresh:            test_fresh_pristine_database_migrates_automatically_to_head
+                  (pré-existente, dinâmico via single_code_head) -- verde.
+Upgrade 0017->0018: test_known_ancestor_database_migrates_automatically_to_head
+                  (pré-existente, dinâmico via single_down_revision) -- verde;
+                  NOVO: test_known_ancestor_upgrade_preserves_legacy_data_and_enables_cognitive_memory
+                  -- insere uma linha legada real em `datasets` a partir de
+                  0017, migra automaticamente para 0018 via subprocess real
+                  (`OsSubprocessMigrationRunner`), confirma a linha legada
+                  intacta, e então executa Create -> Get -> Recall ->
+                  Supersede -> Forget via CognitiveMemoryService/
+                  CognitiveMemoryRecallService reais contra o schema
+                  recém-migrado -- prova que 0018 é aditivo e imediatamente
+                  utilizável.
+verify_only:      test_matrix_exact_head / test_matrix_known_ancestor
+                  (pré-existentes, dinâmicos) -- verde, nenhuma migração
+                  automática ocorre.
+Concurrent starters: test_two_concurrent_bootstraps_perform_exactly_one_real_upgrade
+                  (pré-existente) -- verde, upgrade único serializado.
+Sticky-failure:   test_sticky_failure_survives_multiple_cycles_then_recovers_without_restart
+                  (pré-existente) -- verde.
+Hard-termination: test_migration_bootstrap_supervisor_loss_postgres_integration.py
+                  (PR_SET_PDEATHSIG, Linux-only) -- self-skip local
+                  (Windows); confirmado executado e verde no runner
+                  ubuntu-24.04 do workflow manual Integration (run #29,
+                  707 passed / 0 skipped na suite completa -- ausência de
+                  qualquer skip na linha de resumo confirma que o teste
+                  Linux-only genuinamente rodou, não apenas foi coletado).
+```
+
+Finding real corrigido (gap pré-existente na infraestrutura de teste, não
+no produto): `tests/integration/test_migration_bootstrap_postgres_integration.py::migration_bootstrap_settings()`
+nunca fornecia `cognitive_idempotency_hmac_key` ao construir `Settings`
+diretamente (`_env_file=None`), e `upgrade_in_process_to()` nunca exportava
+`COGNITIVE_IDEMPOTENCY_HMAC_KEY` no `os.environ` antes de invocar o Alembic
+in-process -- ambos quebravam com `pydantic.ValidationError: Field
+required` desde que SM-1001 tornou o campo obrigatório sem default. As 25
+tests do arquivo (mais os 3 arquivos que reusam `migration_bootstrap_settings`)
+falhavam 100% antes da correção. Corrigido adicionando o valor test-only
+`test-cognitive-idempotency-hmac-key-0123456789abcdef` em ambos os pontos;
+re-verificado: 26 passed, 1 skipped (hard-termination local).
+
+Corrida de clock real descoberta e corrigida durante a escrita do smoke
+test acima: `created_at` é atribuído pelo `now()` do próprio PostgreSQL,
+enquanto a validação `as_of` de `MemoryRecallRequest` compara contra o
+relógio do processo cliente -- medido localmente até ~1.16s de deriva entre
+o container Docker e o host Windows (infraestrutura local, não o
+contrato). Nenhum `sleep()` foi usado para compensar: a construção do
+request de recall deste smoke test usa `MemoryRecallRequest.model_construct()`
+(bypass deliberado e documentado do validator "as_of must not be in the
+future", que compara contra o relógio do cliente) com `as_of` fixado no
+`created_at` já retornado pelo próprio servidor -- determinístico, sem
+depender de quanto tempo real passou. O contrato de temporal validity em si
+já é exaustivamente provado clock-independente por
+`test_cognitive_memory_recall_postgres_integration.py` (inalterado).
+
+### Backward compatibility
+
+`tests/unit` + `tests/contract` + `tests/security`: 2533 passed (rodados
+integralmente nesta sessão). Todos os 5 endpoints Cognitive Memory reais
+(83 testes) mais toda a suite de migration/bootstrap (26 passed, 1 skipped
+local) rodados contra PostgreSQL real local sem regressão. Nenhum arquivo
+de `sofias_memory/` (produto) foi alterado nesta gate, portanto nenhuma
+regressão de comportamento legado é estruturalmente possível além do que os
+testes acima já confirmam.
+
+### Security
+
+```text
+Bandit (HIGH, blocking gate):     0 findings
+Bandit (full scan, informational): 36 Low (assert, todos # noqa: S101
+                                    documentados), 1 Medium (0.0.0.0 bind,
+                                    intencional) -- baseline inalterada,
+                                    nenhum finding novo introduzido por
+                                    Cognitive Memory
+pip-audit (runtime deps only):     No known vulnerabilities found
+```
+
+### Workflow (`.github/workflows/integration.yml`)
+
+Finding real corrigido: o workflow nunca definia
+`COGNITIVE_IDEMPOTENCY_HMAC_KEY` no `env:` do job, quebrando qualquer
+invocação `alembic upgrade head` dentro dos containers `docker run` (que
+chamam `load_settings()`); o passo "Confirm alembic current == 0017"
+verificava a revisão errada (`0018` é o head real desde SM-1001); e nenhuma
+das quatro flags real-PG de Cognitive Memory estava presente, fazendo os 4
+arquivos de teste correspondentes silenciosamente pularem em toda execução
+do workflow. Corrigido: `COGNITIVE_IDEMPOTENCY_HMAC_KEY` adicionado ao
+`env:` do job e propagado a cada `docker run`; título/asserção do passo de
+migração atualizados para `0018`; as quatro flags
+(`SOFIAS_MEMORY_RUN_POSTGRES_COGNITIVE_MEMORY_TESTS`,
+`SOFIAS_MEMORY_RUN_COGNITIVE_MEMORY_HTTP_POSTGRES_TESTS`,
+`SOFIAS_MEMORY_RUN_COGNITIVE_MEMORY_RECALL_POSTGRES_TESTS`,
+`SOFIAS_MEMORY_RUN_COGNITIVE_MEMORY_SUPERSEDE_FORGET_POSTGRES_TESTS`)
+adicionadas ao bloco `env:` do passo de pytest, todas compartilhando a
+database principal `sofias_memory` do job (nenhuma database dedicada nova
+necessária -- nenhum dos 4 arquivos declara uma `*_TEST_DATABASE_URL`
+própria).
+
+### CI e Integration workflow (implementation SHA)
+
+```text
+CI run:            34795129743, head_sha d5638a9e6ca28e64d221e5930de327da55980f0b
+                    "Lint, type check, unit/contract/security tests": SUCCESS
+                    "Docker image build + OCI label check": SUCCESS
+Integration run:    #29 (34795435491), manually run by kallbuloso,
+                    head_sha d5638a9e6ca28e64d221e5930de327da55980f0b
+                    Job "Real PostgreSQL + Neo4j integration suite":
+                    SUCCESS em 5m 4s
+                    "Run CI-compatible integration suite": 707 passed,
+                    3 deselected (test_b3_neo4j_gate.py, deselect
+                    intencional), 1 warning, 0 skipped, em 152.79s
+```
+
+### Testes novos (contagem exata)
+
+```text
+test_cognitive_memory_create_get_postgres_integration.py:        +1 teste
+    (test_concurrent_same_key_different_request_one_wins_one_conflicts)
+    -- suite completa: 12 passed
+test_cognitive_memory_supersede_forget_postgres_integration.py:  +3 testes
+    (test_forget_concurrent_same_key_same_request_converges_to_one_winner,
+     test_forget_vs_supersede_cross_race_forget_wins_first_supersede_gets_conflict,
+     test_forget_vs_supersede_cross_race_supersede_wins_first_forgets_only_old)
+    -- suite completa: 32 passed
+test_cognitive_memory_log_privacy_postgres_integration.py:       +2 testes
+    (novo arquivo) -- 2 passed
+test_migration_bootstrap_postgres_integration.py:                +1 teste
+    (test_known_ancestor_upgrade_preserves_legacy_data_and_enables_cognitive_memory)
+test_postgres_schema_guard.py / test_postgres_migration_gate.py: sem novos
+    testes -- REQUIRED_TABLES/EXPECTED_* ampliados (fix de gap)
+test_info.py:                                                    sem novo
+    teste -- assertion existente ampliada (HMAC key)
+Cognitive Memory real-PG total combinado:                        83 passed
+Migration bootstrap real-PG total:                                26 passed,
+                                                                    1 skipped
+                                                                    (local)
+unit + contract + security:                                     2533 passed
+```
+
+Quality gates: `uv lock --check`, `ruff check .`, `ruff format --check .`,
+`mypy sofias_memory scripts`, `git diff --check` todos verdes na
+implementation SHA.
+
+Escopo de release explicitamente **não** tocado nesta gate: nenhum bump de
+versão, nenhum CHANGELOG, nenhum RC/SHA freeze, nenhuma imagem de release
+publicada, nenhuma tag `v0.7.0`, nenhum GitHub Release, nenhuma publicação
+GHCR, nenhuma mudança de status do Feature Contract, exec plan permanece em
+`docs/exec-plans/active/`. Tudo isso pertence a SM-1006.
 
 ---
 

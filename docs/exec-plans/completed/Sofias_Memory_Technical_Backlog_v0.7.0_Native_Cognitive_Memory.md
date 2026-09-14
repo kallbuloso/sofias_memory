@@ -135,7 +135,7 @@ Durante toda a v0.7:
 | G3 | SM-1003 | Typed Cognitive Recall + temporal/current-truth query | SM-1002 | nenhuma nova esperada | DONE |
 | G4 | SM-1004 | Atomic Supersession + destructive precise Forget | SM-1003 | nenhuma nova esperada | DONE |
 | G5 | SM-1005 | Real-PG concurrency/security/privacy/integration hardening | SM-1004 | somente corretiva se inevitável | DONE |
-| G6 | SM-1006 | Release prep + exact-SHA GATE-v0.7.0 + publication/closeout | SM-1005 | valida `0017 -> 0018+` | TODO |
+| G6 | SM-1006 | Release prep + exact-SHA GATE-v0.7.0 + publication/closeout | SM-1005 | valida `0017 -> 0018+` | DONE |
 
 **Regra:** se um gate posterior revelar necessidade de schema não prevista em `0018`, criar revision linear posterior (`0019+`). Não reescrever uma migration já aterrissada/aplicada em gate anterior.
 
@@ -2297,9 +2297,168 @@ Legacy routers preservados:  YES -- todos os 14 routers legados
                              router é estritamente aditivo
 ```
 
-Próximos passos (Phase B): flip do Feature Contract para `Implemented`,
-commit `docs(v0.7): finalize release gate`, novo ciclo de CI + Integration
-exact-SHA sobre esse commit, e só então freeze do `RELEASE_SHA` imutável.
+## SM-1006 — Evidência de fechamento (DONE)
+
+```text
+Phase B release-gate-finalization SHA: e9bb7098e02258eb1ad68c03296c7a3d184ba671
+                                        (docs(v0.7): finalize release gate)
+Immutable RELEASE_SHA:                 e9bb7098e02258eb1ad68c03296c7a3d184ba671
+                                        (idêntico à Phase B SHA -- nenhum
+                                        fix adicional foi necessário antes
+                                        do freeze)
+```
+
+Escopo do commit de finalização: Feature Contract v0.7.0 status
+`APPROVED / FROZEN FOR IMPLEMENTATION` -> `Implemented` (seguindo
+exatamente o precedente textual do Feature Contract v0.6.0, apenas a linha
+de status, nenhum conteúdo normativo alterado); registro no backlog da
+evidência de Phase A (SHA, CI, Integration, acceptance review completa)
+sem marcar SM-1006 como DONE naquele ponto.
+
+```text
+Exact-SHA CI:          run 34799104430, head_sha e9bb709..., SUCCESS
+                        ("Lint, type check, unit/contract/security tests"
+                        + "Docker image build + OCI label check")
+Exact-SHA Integration:  run #31 (34799154841), head_sha e9bb709..., SUCCESS
+```
+
+### Exact-SHA release-image smokes
+
+Build local a partir do RELEASE_SHA exato (nenhum HEAD equivalente),
+`--platform linux/amd64`, `--build-arg APP_VERSION=0.7.0 --build-arg
+VCS_REF=e9bb7098e02258eb1ad68c03296c7a3d184ba671`. OCI labels verificados
+na imagem local antes de qualquer smoke: `version=0.7.0`,
+`revision=e9bb7098e02258eb1ad68c03296c7a3d184ba671`,
+`source=https://github.com/kallbuloso/sofias_memory`,
+`linux/amd64`. Executado contra Docker real (WSL2 Ubuntu-22.04, daemon
+Docker 29.6.1) em uma rede Docker isolada e descartável
+(`sofias-release-smoke`), com um Neo4j real descartável e um mock HTTP
+stdlib-only do endpoint OpenAI-compatible de embeddings (determinístico,
+mesma dimensão configurada) -- nunca reaproveitando a stack de
+desenvolvimento local (`sofias_memory_db_postgres`/`_neo4j`), que
+permaneceu integralmente intocada (confirmado antes/depois). Toda a
+infraestrutura descartável foi removida ao final (containers + rede);
+nenhum artefato de smoke permaneceu.
+
+```text
+Fresh pristine + auto:      PASS -- /health/live alcançável durante o
+                             bootstrap (503 em /health/ready por 3
+                             tentativas), schema atinge 0018
+                             automaticamente, /health/ready = 200 em
+                             seguida. Smoke Create/Get/Recall/Supersede/
+                             Forget/GET tombstone: todos 200, conteúdo e
+                             lifecycle corretos em cada etapa.
+Genuine v0.6 (0017) upgrade
++ auto:                      PASS -- database real preparado via
+                             `alembic upgrade 0017` (não um atalho/
+                             fixture sintético) com uma linha legada real
+                             inserida em `datasets`; a imagem do release
+                             candidate migrou automaticamente 0017 -> 0018
+                             no primeiro boot, a linha legada permaneceu
+                             intacta byte-a-byte, `/info` reportou o
+                             contrato v0.7 completo, e o mesmo smoke
+                             Create/Get/Recall/Supersede/Forget/GET
+                             tombstone passou integralmente.
+verify_only contra 0017:     PASS -- nenhuma migração automática ocorreu;
+                             `alembic_version` permaneceu exatamente
+                             `0017` durante toda a janela de observação
+                             (10 tentativas); `/health/live` permaneceu
+                             200; `/health/ready` permaneceu 503
+                             (not-ready) em todas as 10 tentativas --
+                             ADR-0015 preservado.
+```
+
+### Security e release consistency (RELEASE_SHA)
+
+```text
+Bandit (HIGH, blocking):         0 findings
+pip-audit (runtime deps only):   No known vulnerabilities found
+ci_release_consistency_check.py: PASS -- confirmado via clone limpo em
+                                  WSL (sem .env local, replicando
+                                  exatamente o checkout fresco da CI) na
+                                  RELEASE_SHA exata: "Release consistency
+                                  check OK (canonical version '0.7.0')".
+                                  Uma primeira tentativa, rodada
+                                  diretamente no working tree local
+                                  (que tem seu próprio `.env` pessoal,
+                                  gitignored, com APP_VERSION=0.6.0
+                                  desatualizado), falhou -- não é um
+                                  defeito do release: `docker compose
+                                  config` carrega `.env` automaticamente
+                                  do diretório de trabalho, e esse
+                                  arquivo pessoal nunca existe em um
+                                  checkout fresco de CI. Ambos os runs
+                                  reais de CI (`ci.yml`) nas SHAs de
+                                  Phase A e Phase B já haviam passado
+                                  esse exato script com sucesso --
+                                  confirmado adicionalmente pelo clone
+                                  limpo acima.
+```
+
+### Tag
+
+```text
+Nome:            v0.7.0
+Tipo:            annotated
+Tag object SHA:  1e86a208e0498a1a6b56cff02efa9a44a808eb0e
+Peeled commit:   e9bb7098e02258eb1ad68c03296c7a3d184ba671
+Mensagem:        "Sofias Memory v0.7.0"
+```
+
+`git rev-parse v0.7.0^{}` == `e9bb7098e02258eb1ad68c03296c7a3d184ba671`
+(confirmado, idêntico ao RELEASE_SHA). Nenhuma tag `v0.7.0` existia antes
+desta operação (confirmado local e remotamente, e ausente do GHCR/GitHub
+Releases antes da publicação).
+
+### Release workflow, GHCR, GitHub Release
+
+```text
+Release workflow:  run #13 (34800627410), tag v0.7.0, head_sha
+                    e9bb7098e02258eb1ad68c03296c7a3d184ba671, SUCCESS
+GHCR:               ghcr.io/kallbuloso/sofias-memory:0.7.0 publicada;
+                    labels confirmados no blob de config real:
+                    version=0.7.0, revision=e9bb7098e02258...,
+                    source=https://github.com/kallbuloso/sofias_memory,
+                    licenses=Apache-2.0. Nenhuma tag `latest` publicada
+                    (política preservada).
+GitHub Release:     id 388121543, tag_name=v0.7.0,
+                    name="Sofias Memory v0.7.0", draft=false,
+                    prerelease=false, marcado como `latest`, corpo
+                    extraído exatamente da seção `## [0.7.0]` do
+                    CHANGELOG.md.
+```
+
+### Backward compatibility e migration (confirmado nesta gate)
+
+Legacy APIs (`/remember`, `/recall`, `/forget`, datasets, sessions,
+skills, agents, runs, health, `/info`) permanecem inalteradas -- os 14
+routers legados continuam registrados em `app.py`, `memories_router` é
+estritamente aditivo (confirmado por leitura direta na exact-SHA
+acceptance review, Phase A). Alembic: `v0.6.0` = `0017`, `v0.7.0` = `0018`
+(cria `memory_items`/`memory_provenance`/`cognitive_memory_idempotency`,
+puramente aditivo); upgrade normal via Automatic Serialized Migration
+Bootstrap (ADR-0015, inalterado), nunca exigindo `alembic upgrade head`
+manual -- provado empiricamente pelo smoke de upgrade genuíno acima.
+
+### Escopo deferred confirmado ausente (nenhuma implementação acidental)
+
+```text
+Neo4j Cognitive Memory:  ausente
+cognitive graph_outbox:  ausente
+EPISODIC:                ausente
+PROCEDURAL:               ausente
+importance:               ausente
+PATCH /memories:          ausente
+semantic dedupe:          ausente
+AI conflict resolution:   ausente
+consolidation/decay/
+prefetch:                 ausente
+generic tenancy/ACL:      ausente
+Sofia's Assistant
+Slice 05:                 ausente
+```
+
+**GATE-v0.7.0: PASSED. v0.7.0: RELEASED.**
 
 ---
 

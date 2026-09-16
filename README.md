@@ -1,404 +1,354 @@
 # Sofias Memory
 
-Sofias Memory is a focused, **single-user** semantic memory and knowledge graph
-service. It ingests text, files, and URLs; extracts chunks, entities, and relations;
-and serves them back through retrieval modes ranging from plain vector search to
-graph-grounded, LLM-generated answers with provenance back to the original source.
+> **Durable semantic and cognitive memory infrastructure for applications, automations, and AI agents.**
 
-## Status
+[![Release](https://img.shields.io/github/v/release/kallbuloso/sofias_memory?label=release)](https://github.com/kallbuloso/sofias_memory/releases/latest)
+[![CI](https://github.com/kallbuloso/sofias_memory/actions/workflows/ci.yml/badge.svg)](https://github.com/kallbuloso/sofias_memory/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/container-GHCR-2496ED?logo=docker&logoColor=white)](https://github.com/kallbuloso/sofias_memory/pkgs/container/sofias-memory)
 
-The MVP operational async runtime passed its functional/integration/recovery gate
-(`GATE-B5`, see `docs/exec-plans/completed/Sofias_Memory_Technical_Backlog_B5.md`).
-Remember, Cognify, Recall, Improve, Forget, Dataset lifecycle, and Run
-retry/cancel are all implemented and durable, running through a single internal
-worker with PostgreSQL as the queue and source of truth. **v0.1.0** was the
-first stable MVP release; **v0.1.1** improved Swagger/OpenAPI documentation
-and developer UX; **v0.1.2** fixed a `graph_outbox` UPSERT/DELETE ordering and
-cross-row claim-race defect; **v0.2.0** added durable S3-compatible storage for
-Source originals, startup filesystem→S3 convergence/recovery, and validated
-MinIO/Wasabi interoperability while keeping `filesystem` as the default
-backend; **v0.3.0** adds first-class durable Sessions, append-only
-SessionEntries, Session-aware Recall provenance/context, and Remember/Run
-association; **v0.4.0** adds first-class durable procedural **Skills** —
-management, immutable revisions, archive/restore, standalone `SKILL.md`
-interoperability, and semantic resolve over pgvector; **v0.5.0** adds
-first-class durable **Agent** profiles — management, active/archive
-lifecycle, and explicit Agent↔Skill and Agent↔Session associations;
-**v0.6.0** adds an automatic, serialized, fail-closed **migration
-bootstrap** (`DATABASE_MIGRATION_MODE=auto|verify_only`, default `auto`)
-that migrates an eligible schema forward automatically on ordinary
-application startup, removing the previously-required manual
-`alembic upgrade head` step for the common install/upgrade path while
-preserving fail-closed startup and the manual CLI; **v0.7.0** adds
-first-class, PostgreSQL-authoritative **Native Cognitive Memory** —
-typed `MemoryItem` (`profile`/`semantic`) with `active`/`superseded`/
-`forgotten` lifecycle, first-class provenance, exact-pgvector-cosine
-Typed Recall with historical current-truth semantics, atomic Supersede,
-destructive precise Forget, and HMAC-keyed idempotency, entirely additive
-to the existing knowledge-memory API (see
-`CHANGELOG.md`) — see
-`docs/exec-plans/completed/Sofias_Memory_Release_v0.1.0_Backlog.md` for the
-original release discovery/backlog.
+Sofias Memory is a self-hosted memory service for software that needs to **remember knowledge, facts, preferences, context, procedures, provenance, and temporal truth** without baking memory logic into every application.
 
-## Principal capabilities
+It exposes a REST API for source-backed semantic memory, first-class cognitive memory, sessions, skills, agent profiles, retrieval, lifecycle management, and precise forgetting. PostgreSQL + pgvector is authoritative; Neo4j is used only as a reconstructible knowledge-graph projection.
 
-- **Remember** — ingest text, files, or a single HTTPS URL into a dataset,
-  either as raw storage (`mode=ingest`) or fully processed into chunks, embeddings,
-  entities, and relations (`mode=full`).
-- **Cognify** — process pending or explicitly selected sources into semantic
-  memory, including full dataset rebuilds onto a new generation.
-- **Recall** — retrieve ranked context via vector chunks, lexical, summaries,
-  graph traversal, hybrid rank fusion, or graph-grounded RAG with a generated
-  answer and provenance references.
-- **Improve** — background hygiene: feedback-weighted ranking, entity
-  deduplication, relation embeddings, summaries, graph reconciliation.
-- **Forget** — remove memory by source, dataset, or everything, with explicit
-  confirmation for the destructive "everything" scope.
-- **Dataset management** — create/list/rename/inspect datasets, and
-  administratively and durably delete a dataset namespace (distinct from Forget).
-- **Runs** — every write is a durable, observable `PipelineRun` you can list,
-  inspect, retry, or cancel.
-- **Sessions** — a first-class, durable temporal context boundary: create,
-  archive, and restore a Session; append-only SessionEntries for contextual
-  history; Recall and Remember associate their Query/PipelineRun with a
-  Session and can opt into bounded Session Context for RAG generation.
-- **Skills** — first-class, durable procedural memory: Sofias Memory stores,
-  versions, and semantically resolves Skills; the caller decides what to do
-  with a resolved Skill and executes it themselves — Sofias Memory never
-  invokes a Skill, selects one automatically, or authorizes tool use.
-  Immutable revisions with safe replay, `current_revision` rollback,
-  archive/restore (a discovery filter, not a write barrier), standalone
-  `SKILL.md` import/export, and `POST /api/v1/skills/resolve` (progressive
-  disclosure — metadata and a similarity `score`, never the full
-  `procedure`) are all implemented; see `docs/api.md` and the
-  [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.4.0_Skills.md).
-- **Agents** — first-class, durable Agent profiles: Sofias Memory stores and
-  manages Agent identity/configuration; it never executes an Agent, selects
-  a provider/model on its behalf, or manages a provider session. Create/get/
-  list/update, active/archive/restore lifecycle (archive is a discovery
-  filter, not a management barrier), an explicit Agent↔Skill association
-  with an optional exact-revision pin (or follow-current), and an explicit,
-  **M:N** Agent↔Session association are all implemented. Agent↔Session
-  records only the *current* management association — it is not historical
-  provenance: it never records who caused a given Query/PipelineRun, and a
-  Session with multiple associated Agents has no per-operation Agent
-  discriminator of any kind. See `docs/api.md` and the
-  [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.5.0_Agent_Management.md).
-- **Cognitive Memory** — first-class, PostgreSQL-authoritative
-  `MemoryItem`s (`profile`/`semantic`, never `episodic`/`procedural`),
-  scoped `global` or `project:<key>`, with an `active` -> `superseded` ->
-  `forgotten` lifecycle and first-class provenance. `POST /api/v1/memories`
-  (Create), `GET /api/v1/memories/{memory_id}` (Get), typed
-  `POST /api/v1/memories/recall` (exact pgvector cosine, historical
-  current-truth semantics via `as_of` — separate from the legacy knowledge
-  `/recall`), atomic `POST /api/v1/memories/{memory_id}/supersede`, and
-  destructive `POST /api/v1/memories/{memory_id}/forget` are all
-  implemented; `GET /api/v1/info` negotiates support explicitly via
-  `capabilities`. No `PATCH`, no semantic dedupe, no Neo4j projection. See
-  `docs/api.md` and the
-  [Feature Contract](docs/product/Sofias_Memory_Feature_Contract_v0.7.0_Native_Cognitive_Memory.md).
+**Current stable release:** `v0.7.0` — Native Cognitive Memory.
 
-## Architecture
+[Latest release](https://github.com/kallbuloso/sofias_memory/releases/latest) · [API guide](docs/api.md) · [Operations](docs/operations.md) · [Architecture decisions](docs/adr/) · [Changelog](CHANGELOG.md)
 
-- One FastAPI application; the pipeline worker runs **inside the same process**
-  (no separate worker deployment, no external queue broker).
-- **PostgreSQL + pgvector is the authoritative source of truth** for all
-  datasets, sources, chunks, entities, relations, pipeline run/step state,
-  Sessions/SessionEntries, and the outbox that drives graph projection.
-- **Neo4j is a reconstructible projection**, never authoritative — it can always
-  be rebuilt from PostgreSQL (`scripts/rebuild_graph.py`).
-- Source originals are stored on a local filesystem volume by default, or
-  optionally in S3/an S3-compatible bucket (`STORAGE_BACKEND=s3`) — see
-  `docs/operations.md` §13. S3-compatible source storage has been validated
-  against real MinIO and Wasabi endpoints with no provider-specific code —
-  see `docs/operations.md` §13.16 for scope and evidence.
-- LLM and embedding calls go through any **OpenAI-compatible** endpoint.
-- All private routes require a static `X-API-Key` header.
+---
 
-See the accepted architecture decisions in `docs/adr/` and the canonical product
-specification in `docs/product/Sofias_Memory_PRD_SPECS.md` for the full rationale.
+## Why Sofias Memory?
 
-## Requirements
+Applications often need more than a chat history or a vector database.
 
-- Docker (for PostgreSQL + pgvector and Neo4j; `compose.yaml` pins
-  `pgvector/pgvector:0.8.1-pg17` and `neo4j:5.26-community`), or your own instances
-  of both.
-- An OpenAI-compatible API key for both LLM and embedding calls.
-- Python `>=3.12,<3.13` and [`uv`](https://docs.astral.sh/uv/) if running the
-  application from source (see [Quick start](#quick-start) below).
+They need to answer questions like:
+
+- What durable facts has this system learned?
+- Which information came from which source?
+- What was considered true at a specific point in time?
+- Which memory replaced an older one?
+- Can one exact memory be forgotten without deleting unrelated knowledge?
+- Can documents, graph relationships, user-provided facts, procedures, and session context coexist without becoming one ambiguous metadata blob?
+
+Sofias Memory makes those concerns a dedicated infrastructure layer instead of application-specific glue code.
+
+### One API, two memory planes
+
+| Memory plane | Best for | Core model |
+|---|---|---|
+| **Knowledge Memory** | Documents, files, URLs, extracted entities/relations, RAG, source-grounded answers | Dataset → Source → Document/Chunks → semantic + graph knowledge |
+| **Cognitive Memory** | Durable facts, preferences, persistent semantic context, temporal truth | First-class `MemoryItem` with provenance and lifecycle |
+
+They are intentionally separate. A cognitive fact does not need to pretend to be a document, and a document does not need to pretend to be a personal memory.
+
+---
+
+## What Sofias Memory can do
+
+### Knowledge Memory
+
+- **Remember** text, files, or HTTPS URLs inside logical datasets.
+- **Cognify** source material into chunks, embeddings, entities, relations, summaries, and graph projection.
+- **Recall** through vector, lexical, summary, graph, hybrid, and graph-grounded RAG modes.
+- **Preserve provenance** back to authoritative source material.
+- **Improve** stored knowledge through reconciliation, deduplication, summaries, relation embeddings, and ranking feedback.
+- **Forget** by source, dataset, or complete memory scope with explicit destructive semantics.
+- **Rebuild Neo4j** from PostgreSQL whenever needed because the graph is a projection, never the authority.
+
+### Native Cognitive Memory
+
+- Store first-class `MemoryItem`s of type `profile` or `semantic`.
+- Scope them explicitly as `global` or `project:<key>`.
+- Attach first-class provenance to every memory.
+- Retrieve by exact pgvector cosine similarity.
+- Ask what was true **now** or at an historical `as_of` timestamp.
+- Supersede an old memory atomically with exactly one replacement.
+- Forget one precise memory destructively while preserving only a minimal tombstone.
+- Use HMAC-keyed idempotency for safe replay of write operations.
+- Negotiate support through `/api/v1/info` capabilities instead of guessing from the application version.
+
+### Sessions, Skills, and Agent Profiles
+
+Sofias Memory also provides durable primitives for systems that need richer context around memory:
+
+- **Sessions** — durable temporal context with append-only `SessionEntry` history.
+- **Skills** — versioned procedural memory with immutable revisions, archive/restore, semantic resolve, and `SKILL.md` import/export.
+- **Agent profiles** — durable agent identity/configuration plus explicit Agent↔Skill and Agent↔Session associations.
+- **Runs** — durable, observable asynchronous execution for the source-backed knowledge pipeline, with retry/cancel support.
+
+Sofias Memory stores these primitives; it does not execute agents or skills on behalf of the caller.
+
+---
+
+## Built for more than chatbots
+
+Sofias Memory is designed as reusable infrastructure for any software that can call an HTTP API.
+
+Typical uses include:
+
+- AI agents and assistants
+- workflow automation
+- RAG and knowledge systems
+- CRM and support tooling
+- research systems
+- internal applications
+- long-running autonomous workflows
+- custom SaaS products that need durable memory
+
+Workflow platforms such as **n8n** can integrate with the API through ordinary HTTP today; dedicated connectors or plugins can be layered on top of the same stable contract later.
+
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    A[Applications / Automations / AI Agents] -->|REST + X-API-Key| API[Sofias Memory API]
+
+    API --> KM[Knowledge Memory]
+    API --> CM[Cognitive Memory]
+    API --> CTX[Sessions · Skills · Agent Profiles]
+
+    KM --> PG[(PostgreSQL + pgvector)]
+    CM --> PG
+    CTX --> PG
+
+    PG --> OUTBOX[graph_outbox]
+    OUTBOX --> N4J[(Neo4j projection)]
+
+    KM --> OBJ[Filesystem / S3-compatible source storage]
+    API --> PROVIDERS[OpenAI-compatible LLM / Embeddings]
+```
+
+### Architectural principles
+
+- **PostgreSQL + pgvector is authoritative.** Durable business state, memory, provenance, runs, sessions, skills, agents, and cognitive memory live there.
+- **Neo4j is reconstructible.** It projects the knowledge graph and can be rebuilt from PostgreSQL.
+- **Cognitive Memory is PostgreSQL-only.** It has no Neo4j projection and no graph outbox.
+- **Source originals are durable.** Filesystem is the default backend; S3-compatible object storage is supported.
+- **Providers are replaceable.** LLM and embedding calls use OpenAI-compatible endpoints.
+- **Migrations are operationally safe.** The default serialized migration bootstrap automatically advances eligible schemas at startup and fails closed on ambiguous states.
+- **Memory lifecycle is explicit.** Supersession and forgetting are first-class operations rather than hidden updates.
+- **No external telemetry.** Only the LLM/embedding providers you configure receive external calls.
+
+For the rationale behind these decisions, see [`docs/adr/`](docs/adr/) and the canonical product specification in [`docs/product/Sofias_Memory_PRD_SPECS.md`](docs/product/Sofias_Memory_PRD_SPECS.md).
+
+---
+
+## Key guarantees
+
+### Provenance is first-class
+
+Knowledge can be traced back to source material, while Cognitive Memory carries its own explicit provenance record instead of hiding origin inside arbitrary metadata.
+
+### Historical truth is queryable
+
+Typed Cognitive Recall supports `as_of`, allowing callers to distinguish what is considered current now from what was current at a historical point in time.
+
+### Forget means forget
+
+Cognitive Forget destroys the targeted memory's content, embedding, scope, confidence, validity window, and external provenance references. A minimal identity/lifecycle tombstone remains so the system can preserve idempotency and lineage without retaining the forgotten cognitive payload.
+
+### Idempotency is authoritative
+
+Cognitive write replay is backed by a PostgreSQL `UNIQUE` constraint and a keyed HMAC-SHA-256 digest of the semantic request. The request body itself is never stored in the idempotency ledger.
+
+### Knowledge writes are durable
+
+Remember, Cognify, Improve, legacy Forget, and dataset deletion run through durable `PipelineRun`s stored in PostgreSQL. They can be observed, retried, or cancelled without relying on an external queue broker.
+
+---
 
 ## Quick start
 
-The release image contains its own Alembic migration assets and operational
-scripts, so a full first start needs no source checkout at all. See
-[`docs/operations.md`](docs/operations.md) for the complete, verified
-first-start/migration/upgrade/rollback/backup/restore contract — every command
-there was run for real against disposable infrastructure, including a
-complete non-empty backup, destroy, restore, and Neo4j-rebuild drill.
+### Requirements
 
-> **Default `DATABASE_MIGRATION_MODE=auto` migrates a fresh or known-ancestor
-> schema automatically as part of normal application startup** (ADR-0015) —
-> no separate `alembic upgrade head` step is required for the common
-> install/upgrade path below. The manual command remains fully supported —
-> required under `DATABASE_MIGRATION_MODE=verify_only`, and useful whenever
-> an operator prefers to control migration timing explicitly. See
-> [When do I run migrations?](#when-do-i-run-migrations) below.
+- Docker
+- an OpenAI-compatible LLM/embedding provider
+- the required application secrets
 
-Minimal Compose-based flow (see `docs/operations.md` §2 for the full version):
+Clone the repository and create your local environment:
 
 ```bash
-cp .env.example .env   # set API_KEY, DB_PASSWORD, DB_NEO4J_PASSWORD, LLM_API_KEY
-docker compose up -d postgres neo4j
-docker compose up -d sofias-memory   # migrates automatically (DATABASE_MIGRATION_MODE=auto, default)
-curl http://127.0.0.1:8000/health/ready
-```
-
-**Production deployment** (Portainer, EasyPanel, a published GHCR image, the
-security checklist, and the production smoke test) is covered in
-[`docs/operations.md`](docs/operations.md#12-production-deployment) — this
-section and the rest of this Quick start are the source-build/local path.
-
-Prefer running from a source checkout (e.g. for development)? See
-[`docs/development.md`](docs/development.md). That flow still works and looks
-like this:
-
-```bash
-# 1. Start PostgreSQL + pgvector and Neo4j, reachable from the host.
-docker run -d --name sofias-postgres \
-  -e POSTGRES_DB=sofias_memory \
-  -e POSTGRES_USER=sofias_memory \
-  -e POSTGRES_PASSWORD=change-me \
-  -p 5432:5432 \
-  pgvector/pgvector:0.8.1-pg17
-
-docker run -d --name sofias-neo4j \
-  -e NEO4J_AUTH=neo4j/change-me-too \
-  -p 7687:7687 \
-  neo4j:5.26-community
-
-# 2. Configure the application.
+git clone https://github.com/kallbuloso/sofias_memory.git
+cd sofias_memory
 cp .env.example .env
-uv run python scripts/generate_api_key.py   # paste the result into API_KEY in .env
-# Also set in .env: DATABASE_URL, NEO4J_URI/NEO4J_PASSWORD (pointing at the
-# containers above), LLM_API_KEY, EMBEDDING_API_KEY.
+```
 
-# 3. Install dependencies. DATABASE_MIGRATION_MODE defaults to `auto`, so
-#    the brand-new, empty database started in step 1 migrates automatically
-#    on startup (step 4) -- set DATABASE_MIGRATION_MODE=verify_only in .env
-#    instead if you'd rather run `alembic upgrade head` yourself first.
-uv sync --dev
+At minimum, configure the required values in `.env`:
 
-# 4. Run the application.
-uv run uvicorn sofias_memory.app:create_app --factory --host 127.0.0.1 --port 8000
+```dotenv
+API_KEY=sf-your-generated-api-key
+DB_PASSWORD=your-postgres-password
+DB_NEO4J_PASSWORD=your-neo4j-password
+LLM_API_KEY=your-provider-key
+EMBEDDING_API_KEY=your-provider-key
+COGNITIVE_IDEMPOTENCY_HMAC_KEY=use-a-separate-high-entropy-secret-at-least-32-characters
+```
 
-# 5. Confirm it's ready.
+Then start the stack:
+
+```bash
+docker compose up -d
+```
+
+The default `DATABASE_MIGRATION_MODE=auto` automatically migrates a fresh or known-ancestor PostgreSQL schema to the current Alembic head under a serialized advisory lock.
+
+Check readiness:
+
+```bash
 curl http://127.0.0.1:8000/health/ready
 ```
 
-`compose.yaml` (`sofias-memory` + `postgres` + `neo4j`, application-only
-published by default) is the canonical, portable local/dev stack definition
-— see [Development](docs/development.md) for more on its internal-network
-layout, and Portainer deployments consume it directly today (§F of
-`docs/operations.md`). **EasyPanel deployments use a dedicated variant**,
-[`deploy/easypanel/compose.yaml`](deploy/easypanel/compose.yaml) — see
-[`docs/deployment/easypanel.md`](docs/deployment/easypanel.md) for the
-verified, step-by-step guide.
+For production deployment, backup/restore, S3 storage, migration policy, health semantics, Portainer, and EasyPanel, see [`docs/operations.md`](docs/operations.md).
 
-### When do I run migrations?
+---
 
-`DATABASE_MIGRATION_MODE` (default `auto`) controls this
-([ADR-0015](docs/adr/0015-automatic-serialized-migration-bootstrap.md)).
-Under the default, the application migrates a fresh or known-ancestor
-schema forward to head automatically, at startup, under a serialized
-PostgreSQL advisory lock, with pre- and post-migration verification.
-Manual `alembic upgrade head` remains fully supported and is required in
-exactly these situations:
+## A small Cognitive Memory example
 
-| Situation | Manual `alembic upgrade head` required? |
-|---|---|
-| Fresh install or upgrade, `DATABASE_MIGRATION_MODE=auto` (default) | No — the application migrates itself on startup. |
-| Any state, `DATABASE_MIGRATION_MODE=verify_only` | **Yes** — this mode never invokes Alembic automatically; it only verifies the schema is already at exact head, reporting `not_ready` otherwise. |
-| Inspecting/validating a restored historical backup before deciding whether to advance it (see [Backup and restore](#backup-and-restore)) | Start with `DATABASE_MIGRATION_MODE=verify_only` first — otherwise `auto` migrates the restored schema forward automatically on first boot. |
-| An unversioned-but-non-empty schema, multiple heads, a diverged/foreign revision, or any other fail-closed classification | **Yes**, manual investigation and repair — `auto` never guesses, stamps, or repairs these states automatically, in either mode. |
-
-`alembic current` and `alembic heads` are read-only inspection/verification
-commands — they never mutate the schema and are safe (though not required)
-to run at any time, including on every redeploy, to confirm what revision is
-currently applied.
-
-## Configuration
-
-All settings are environment variables, validated at startup (see
-`sofias_memory/config.py`). The full list with defaults is in `.env.example`;
-grouped by area:
-
-| Area | Examples |
-|---|---|
-| Application/API | `API_KEY`, `HTTP_HOST`, `HTTP_PORT`, `LOG_LEVEL`, `CORS_ALLOWED_ORIGINS`, `MAX_REQUEST_BODY_MB` |
-| PostgreSQL | `DATABASE_URL`, `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW`, `DATABASE_MIGRATION_MODE` (`auto`\|`verify_only`, default `auto` — see [When do I run migrations?](#when-do-i-run-migrations)) |
-| Neo4j | `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` |
-| Storage | `DATA_DIRECTORY`, `TEMP_DIRECTORY`, `MAX_SOURCE_SIZE_MB`, `STORAGE_BACKEND`, `STORAGE_S3_*` (optional — see `docs/operations.md` §13) |
-| LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS` |
-| Embeddings | `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` |
-| Cognitive Memory | `COGNITIVE_IDEMPOTENCY_HMAC_KEY` — **required**, high-entropy (minimum 32 characters), distinct from `API_KEY`; keys the non-reversible idempotency digest for `/memories` writes and never appears in the database, logs, or `/info` |
-| Chunking/retrieval | `CHUNK_MAX_TOKENS`, `RECALL_DEFAULT_TOP_K`, `RECALL_RRF_K` |
-| Session context | `SESSION_CONTEXT_MAX_ENTRIES`, `SESSION_CONTEXT_MAX_CHARS` |
-| Graph/provenance | `GRAPH_SUBGRAPH_MAX_DEPTH`, `PROVENANCE_MAX_EVIDENCE` |
-| Improve | `ENTITY_DEDUP_SIMILARITY_THRESHOLD`, `ENTITY_MERGE_SIMILARITY_THRESHOLD` |
-| Worker | `WORKER_ENABLED`, `WORKER_POLL_INTERVAL_MS`, `WORKER_MAX_CONCURRENT_DATASETS` |
-| Privacy/logging | `STORE_QUERY_CONTENT`, `LOG_DOCUMENT_CONTENT`, `LOG_LLM_PAYLOADS` |
-
-`compose.yaml` passes every one of these through as `${VAR:-default}`
-interpolations in its `sofias-memory` service, so every row above (including
-the Graph/Improve settings) is configurable via the operator's own `.env`
-without editing `compose.yaml` itself.
-
-`compose.yaml` also uses two **infrastructure-only** interpolation variables that
-are never read by the application itself: `DB_PASSWORD` and `DB_NEO4J_PASSWORD`,
-used only to compose `DATABASE_URL`/`NEO4J_PASSWORD`/`NEO4J_AUTH` for the
-containers. This keeps `extra="forbid"` meaningful on the application's own
-`.env` loading — the app only ever sees its own declared Settings.
-
-## Health and readiness
-
-- `GET /health/live` — process liveness only. No dependency checks. Never
-  requires `X-API-Key`.
-- `GET /health/ready` — checks PostgreSQL (reachable, correct schema),
-  Neo4j (reachable), and the internal worker (operational); with
-  `STORAGE_BACKEND=s3` it also checks that startup storage convergence has
-  completed (`docs/operations.md` §13). Never requires `X-API-Key`.
-
-If `WORKER_ENABLED=false`, or the worker's background tasks are unexpectedly
-dead, `/health/live` can stay `ok` while `/health/ready` reports `not_ready`:
-existing reads keep working, but any request that would need to create a new
-durable run is rejected (`503 WORKER_DISABLED`).
-
-## Authentication
-
-Every route under `/api/v1` requires an `X-API-Key` header, compared in constant
-time against the configured `API_KEY`. `/health/live` and `/health/ready` are the
-only exceptions. A valid key has the form `sf-` followed by at least 32 URL-safe
-characters; generate one with:
+Assume:
 
 ```bash
-uv run python scripts/generate_api_key.py
+export SOFIAS_URL=http://127.0.0.1:8000
+export SOFIAS_KEY='sf-...'
 ```
 
-## API overview
+### Store a durable fact
 
-See [`docs/api.md`](docs/api.md) for the full semantic guide — response envelope,
-`ErrorCode` values, `Idempotency-Key` semantics, `wait=true/false`, the
-`PipelineRun` lifecycle, and worked examples for every endpoint family (Remember,
-Recall, Cognify, Improve, Forget, Dataset management, Dataset delete, Sessions,
-Runs).
-The formal schema is served by the running application at `/openapi.json`,
-browsable via Swagger UI at `/docs` — but **only when `APP_ENV=dev` or
-`APP_ENV=development`**; in every other environment (including the
-`production` default) neither route is registered at all (`404`, not an
-auth error) and `/redoc` is never registered in any environment. When
-enabled, both `/docs` and `/openapi.json` are public (alongside `/health/*`)
-so Swagger UI works in a plain browser tab; every `/api/v1/**` route
-underneath still requires `X-API-Key`, entered via the UI's "Authorize"
-button. See `docs/api.md` for details.
+```bash
+curl -X POST "$SOFIAS_URL/api/v1/memories" \
+  -H "X-API-Key: $SOFIAS_KEY" \
+  -H "Idempotency-Key: example-profile-memory-001" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "memory_type": "profile",
+    "scope": "global",
+    "content": "Prefers concise technical explanations.",
+    "provenance": {
+      "origin_kind": "user_asserted",
+      "source_system": "example-app",
+      "source_ref": "profile-form:42"
+    }
+  }'
+```
 
-## Async runs
+### Recall relevant cognitive memory
 
-Every write (Remember, Cognify, Improve, Forget, Dataset delete) creates a durable
-`PipelineRun`. With `wait=false` you get `202 Accepted` as soon as the run is
-durably queued — the run already exists and is observable via
-`GET /api/v1/runs/{run_id}` before you receive the response. `wait=true` polls the
-same run to a terminal state on your behalf; it is convenience only, never a
-separate synchronous code path. A run can be manually retried
-(`POST /api/v1/runs/{run_id}/retry`, creating a new run with `retry_of_run_id` set)
-or cancelled (`POST /api/v1/runs/{run_id}/cancel`, cooperative — an in-flight
-external effect is never interrupted mid-call). See `docs/api.md` for the full
-lifecycle and `Idempotency-Key` contract.
+```bash
+curl -X POST "$SOFIAS_URL/api/v1/memories/recall" \
+  -H "X-API-Key: $SOFIAS_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How should technical explanations be presented?",
+    "scopes": ["global"],
+    "top_k": 5
+  }'
+```
 
-## Persistence
+Cognitive Recall returns the typed memory, cosine relevance, and an explicit `is_current_truth` value.
 
-Three named volumes back the canonical `compose.yaml` stack:
-PostgreSQL data, Neo4j data, and original source files. PostgreSQL and the source
-volume are authoritative; Neo4j is always reconstructible from PostgreSQL. The
-source-files volume (`DATA_DIRECTORY`) remains mandatory even with
-`STORAGE_BACKEND=s3` — it holds durable ingress staging and in-transit
-migration state regardless of where finalized Source originals ultimately
-live (`docs/operations.md` §13.2).
+The full API contract, error envelopes, provenance rules, idempotency behavior, and examples live in [`docs/api.md`](docs/api.md).
 
-## Backup and restore
+---
 
-**Must be backed up:** PostgreSQL and the source files volume — both are
-irreplaceable. **Reconstructible:** Neo4j — it can always be rebuilt from
-PostgreSQL via `scripts/rebuild_graph.py --all`, so backing it up is a
-convenience, not a requirement. The full, verified backup/restore procedure —
-including a real, non-empty backup → destroy → restore → Neo4j-rebuild drill —
-is in [`docs/operations.md`](docs/operations.md#6-backup).
+## API surface
 
-## Upgrade and migrations
+The running service exposes its formal OpenAPI schema at `/openapi.json` and Swagger UI at `/docs` **only in development environments** (`APP_ENV=dev` or `development`). Production does not register those routes.
 
-Alembic remains the sole authority for schema evolution. With the default
-`DATABASE_MIGRATION_MODE=auto`, an eligible schema (fresh, or a known
-ancestor of the application's head) migrates forward automatically as part
-of ordinary application startup, under a session-level PostgreSQL advisory
-lock, with pre- and post-migration verification — see
-[ADR-0015](docs/adr/0015-automatic-serialized-migration-bootstrap.md) for
-the full contract. `DATABASE_MIGRATION_MODE=verify_only` reproduces the
-previous explicit-only contract exactly: the application never invokes
-Alembic itself, and `/health/ready` reports `not_ready` for anything short
-of an exact schema match rather than guessing. In both modes, any
-ambiguous or unrecognized schema state (multiple heads, a diverged/foreign
-revision, an unversioned but non-empty schema) always fails closed — never
-guessed, stamped, or repaired automatically. Downgrades are not guaranteed
-in general — migration `0011`, for example, adds a native PostgreSQL enum
-value and has no safe destructive downgrade (`ALTER TYPE ... DROP VALUE`
-does not exist in PostgreSQL). The full migration/upgrade/rollback
-procedure, including that limitation's exact operational consequence, is in
-[`docs/operations.md`](docs/operations.md#3-migration-policy).
+All `/api/v1/**` endpoints require `X-API-Key`.
 
-## Security notes
+Major API families include:
 
-- Put a TLS-terminating reverse proxy in front of the application; never expose
-  it directly to the internet without one.
-- Only the application port needs to be reachable externally — PostgreSQL and
-  Neo4j should stay on an internal network (this is already the default in
-  `compose.yaml`).
-- Keep all secrets (`API_KEY`, provider keys, database passwords) out of the
-  repository; `.env.example` never contains real values.
-- Rotate `API_KEY` or provider keys by changing the environment variable and
-  restarting — there is no runtime key-management endpoint by design.
-- The application container already runs as a non-root user with a read-only
-  root filesystem and no extra Linux capabilities in `compose.yaml`.
-- No external telemetry is sent beyond the LLM/embedding provider calls you
-  configure.
+- Datasets
+- Remember / Cognify / Recall / Improve / Forget
+- Graph and provenance
+- Runs
+- Sessions
+- Skills
+- Agent profiles
+- Cognitive Memory
+- Capability negotiation through `/api/v1/info`
 
-## Limitations / out of scope
+See [`docs/api.md`](docs/api.md) for semantic documentation.
 
-By design, not because they were forgotten: multi-user accounts, ACL/roles/
-tenancy, a frontend, MCP integration, arbitrary Cypher execution, a runtime
-settings API, cloud sync, external message queues, and a multi-worker/HA
-cluster. S3-compatible remote object storage for Source originals **is**
-supported (`STORAGE_BACKEND=s3`, `docs/operations.md` §13) as an explicit,
-closed, first-party backend — not a generic storage-provider plugin system;
-see `docs/adr/0011-durable-source-object-storage-s3-and-startup-convergence.md`.
-See `docs/product/Sofias_Memory_PRD_SPECS.md` for the full, authoritative
-scope.
+---
 
-## API documentation
+## Deployment and storage
 
-- Schema: `/openapi.json` (Swagger UI at `/docs`) — **development-only**
-  (`APP_ENV=dev`/`development`), public and browser-usable when enabled,
-  `404`/not registered otherwise; `/api/v1/**` always requires `X-API-Key`
-  regardless (see `docs/api.md`).
-- Human-readable semantics guide: [`docs/api.md`](docs/api.md).
+The canonical stack uses:
 
-## Development
+- **PostgreSQL + pgvector** for authoritative state and embeddings
+- **Neo4j** for the reconstructible knowledge-graph projection
+- **filesystem or S3-compatible storage** for original source objects
+- **one FastAPI application process** with the internal durable pipeline worker
 
-See [`docs/development.md`](docs/development.md) for local toolchain setup, running
-checks/tests, running the application on the host, the current local development
-database stack, and operational scripts.
+Published container:
+
+```text
+ghcr.io/kallbuloso/sofias-memory:0.7.0
+```
+
+See:
+
+- [`docs/operations.md`](docs/operations.md) — deployment, migration, backup/restore, storage, recovery
+- [`docs/deployment/easypanel.md`](docs/deployment/easypanel.md) — EasyPanel deployment
+- [`docs/development.md`](docs/development.md) — local development and test workflow
+
+---
+
+## Designed boundaries
+
+Sofias Memory is deliberately focused.
+
+It is currently:
+
+- **self-hosted**
+- **single-user by design**
+- protected by one static `X-API-Key`
+- intentionally free of user accounts, organizations, RBAC, ACLs, and generic tenancy
+- not a frontend application
+- not an agent runtime
+- not a tool-execution engine
+- not a generic message broker
+- not a cloud-sync service
+
+These boundaries keep the project focused on durable memory infrastructure instead of becoming an application framework.
+
+For the authoritative scope, see [`docs/product/Sofias_Memory_PRD_SPECS.md`](docs/product/Sofias_Memory_PRD_SPECS.md).
+
+---
+
+## Documentation
+
+The project separates public usage documentation from engineering authority:
+
+| Need | Source |
+|---|---|
+| API semantics and examples | [`docs/api.md`](docs/api.md) |
+| Installation, operation, backup, migration, recovery | [`docs/operations.md`](docs/operations.md) |
+| Local development and tests | [`docs/development.md`](docs/development.md) |
+| Architecture decisions | [`docs/adr/`](docs/adr/) |
+| Product contracts and specifications | [`docs/product/`](docs/product/) |
+| Completed implementation/release plans | [`docs/exec-plans/completed/`](docs/exec-plans/completed/) |
+| Release history | [`CHANGELOG.md`](CHANGELOG.md) |
+
+A GitHub Wiki is the intended home for progressively friendlier user guides, tutorials, integration recipes, and conceptual documentation. The versioned `docs/` directory remains the engineering and architectural source of truth alongside the code.
+
+---
+
+## Project status
+
+Sofias Memory is actively developed.
+
+Current stable release: **v0.7.0 — Native Cognitive Memory**.
+
+See the [GitHub Releases](https://github.com/kallbuloso/sofias_memory/releases) page for published versions and [`CHANGELOG.md`](CHANGELOG.md) for detailed release history.
+
+---
 
 ## License and upstream acknowledgement
 
-Sofias Memory is licensed under the Apache License 2.0 (see `LICENSE`). It is an
-independent reimplementation referencing concepts from
-[`topoteretes/cognee`](https://github.com/topoteretes/cognee); see `NOTICE.md` for
-the exact upstream baseline and attribution terms.
+Sofias Memory is licensed under the **Apache License 2.0**. See [`LICENSE`](LICENSE).
+
+It is an independent reimplementation referencing concepts from [`topoteretes/cognee`](https://github.com/topoteretes/cognee). See [`NOTICE.md`](NOTICE.md) for the exact upstream baseline and attribution terms.

@@ -8,7 +8,7 @@ It is designed as reusable infrastructure. Any application, automation platform,
 
 **Current stable release:** `v0.7.0 — Native Cognitive Memory`
 
-[Repository](https://github.com/kallbuloso/sofias_memory) · [Latest Release](https://github.com/kallbuloso/sofias_memory/releases/latest) · [Getting Started](Getting-Started) · [Core Concepts](Core-Concepts)
+[Repository](https://github.com/kallbuloso/sofias_memory) · [Latest Release](https://github.com/kallbuloso/sofias_memory/releases/latest) · [Getting Started](Getting-Started) · [Core Concepts](Core-Concepts) · [Cognitive Memory](Cognitive-Memory) · [Knowledge Memory](Knowledge-Memory) · [Integration Guide](Integration-Guide)
 
 ---
 
@@ -40,7 +40,7 @@ Sofias Memory deliberately separates **Knowledge Memory** from **Cognitive Memor
 
 A cognitive fact does not need to pretend to be a document, and a document does not need to pretend to be a personal or application-level memory.
 
-Read [Core Concepts](Core-Concepts) for the full mental model.
+Read [Core Concepts](Core-Concepts) for the full mental model, then continue with [Knowledge Memory](Knowledge-Memory) or [Cognitive Memory](Cognitive-Memory).
 
 ---
 
@@ -51,6 +51,8 @@ Read [Core Concepts](Core-Concepts) for the full mental model.
 Sofias Memory can ingest text, files, and HTTPS URLs into logical datasets, process them into chunks and embeddings, extract entities and relations, preserve source provenance, and retrieve context through vector, lexical, summary, graph, hybrid, and graph-grounded RAG modes.
 
 The knowledge pipeline also supports durable runs, retries, cancellation, improvement/reconciliation workflows, precise source or dataset forgetting, and a reconstructible Neo4j graph projection.
+
+[Read the Knowledge Memory guide →](Knowledge-Memory)
 
 ### Native Cognitive Memory
 
@@ -68,6 +70,8 @@ The API supports:
 - destructive precise Forget;
 - HMAC-keyed idempotency for safe mutation replay;
 - capability negotiation through `/api/v1/info`.
+
+[Read the Cognitive Memory guide →](Cognitive-Memory)
 
 ### Context primitives
 
@@ -115,6 +119,8 @@ Because the public boundary is a REST API, integration does not require a langua
 
 Dedicated connectors can be built later without changing the memory model underneath them.
 
+[Read the Integration Guide →](Integration-Guide)
+
 ---
 
 ## Start here
@@ -123,11 +129,31 @@ New to the project? Follow [Getting Started](Getting-Started) to run the stack a
 
 Then read [Core Concepts](Core-Concepts) before designing a deeper integration. The separation between Knowledge Memory, Cognitive Memory, Sessions, Skills, Agents, provenance, and lifecycle is intentional and is the foundation of the API.
 
+Recommended path:
+
+```text
+Getting Started
+   ↓
+Core Concepts
+   ↓
+Knowledge Memory or Cognitive Memory
+   ↓
+Integration Guide
+```
+
 ---
 
 ## Documentation map
 
 This Wiki is the **user-facing documentation layer**: concepts, tutorials, recipes, and integration guidance.
+
+Current guides:
+
+- [Getting Started](Getting-Started)
+- [Core Concepts](Core-Concepts)
+- [Cognitive Memory](Cognitive-Memory)
+- [Knowledge Memory](Knowledge-Memory)
+- [Integration Guide](Integration-Guide)
 
 The versioned repository remains the engineering source of truth:
 

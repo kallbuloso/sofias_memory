@@ -8,6 +8,8 @@
 
 - [Cognitive Memory](Cognitive-Memory)
 - [Knowledge Memory](Knowledge-Memory)
+- [Datasets & Sources](Datasets-and-Sources)
+- [Provenance & Feedback](Provenance-and-Feedback)
 
 ### Context & Procedures
 
@@ -19,9 +21,11 @@
 - [API Guide](API-Guide)
 - [Integration Guide](Integration-Guide)
 
-### Operations
+### Operations & Reliability
 
+- [Runs & Reliability](Runs-and-Reliability)
 - [Operations & Deployment](Operations-and-Deployment)
+- [Troubleshooting](Troubleshooting)
 
 ### Engineering Reference
 

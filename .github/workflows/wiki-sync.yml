@@ -34,11 +34,13 @@ jobs:
           git -C wiki init
           git -C wiki remote add origin "$WIKI_URL"
 
-          if git -C wiki fetch --depth=1 origin master; then
-            git -C wiki checkout -B master FETCH_HEAD
-          else
-            git -C wiki checkout -B master
+          if ! git -C wiki fetch --depth=1 origin master; then
+            echo '::warning::GitHub Wiki is enabled but not initialized yet.'
+            echo '::warning::Create the first Wiki page once in the GitHub UI; subsequent docs/wiki changes will sync automatically.'
+            exit 0
           fi
+
+          git -C wiki checkout -B master FETCH_HEAD
 
           find wiki -mindepth 1 -maxdepth 1 -type f -name '*.md' -delete
           cp docs/wiki/*.md wiki/

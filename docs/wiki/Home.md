@@ -111,6 +111,8 @@ flowchart LR
 
 The key rule is simple: **PostgreSQL + pgvector is authoritative**. Neo4j is a rebuildable projection for knowledge-graph workloads. Cognitive Memory is PostgreSQL-only and does not create a Cognitive graph projection.
 
+For infrastructure details, read [Configuration Reference](Configuration-Reference), [Security Model](Security-Model), [Storage & S3](Storage-and-S3), and [Graph & Neo4j](Graph-and-Neo4j).
+
 For installation, migrations, backup/restore and production deployment, read [Operations & Deployment](Operations-and-Deployment). For symptom-driven recovery, use [Troubleshooting](Troubleshooting).
 
 ---
@@ -148,6 +150,8 @@ API Guide
    ↓
 Integration Guide
    ↓
+Configuration / Security / Storage / Graph
+   ↓
 Operations & Deployment
    ↓
 Troubleshooting
@@ -157,7 +161,7 @@ Troubleshooting
 
 ## Documentation map
 
-This Wiki is the **user-facing documentation layer**: concepts, tutorials, recipes, integration guidance, and operational guidance.
+This Wiki is the **user-facing documentation layer**: concepts, tutorials, recipes, integration guidance, configuration, security, and operational guidance.
 
 ### Start and concepts
 
@@ -181,10 +185,17 @@ This Wiki is the **user-facing documentation layer**: concepts, tutorials, recip
 - [API Guide](API-Guide)
 - [Integration Guide](Integration-Guide)
 
+### Security and configuration
+
+- [Configuration Reference](Configuration-Reference)
+- [Security Model](Security-Model)
+
 ### Operations and reliability
 
 - [Runs & Reliability](Runs-and-Reliability)
 - [Operations & Deployment](Operations-and-Deployment)
+- [Storage & S3](Storage-and-S3)
+- [Graph & Neo4j](Graph-and-Neo4j)
 - [Troubleshooting](Troubleshooting)
 
 The versioned repository remains the engineering source of truth:

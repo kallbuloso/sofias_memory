@@ -8,7 +8,7 @@ It is designed as reusable infrastructure. Any application, automation platform,
 
 **Current stable release:** `v0.7.0 — Native Cognitive Memory`
 
-[Repository](https://github.com/kallbuloso/sofias_memory) · [Latest Release](https://github.com/kallbuloso/sofias_memory/releases/latest) · [Getting Started](Getting-Started) · [Core Concepts](Core-Concepts) · [Cognitive Memory](Cognitive-Memory) · [Knowledge Memory](Knowledge-Memory) · [Integration Guide](Integration-Guide)
+[Repository](https://github.com/kallbuloso/sofias_memory) · [Latest Release](https://github.com/kallbuloso/sofias_memory/releases/latest) · [Getting Started](Getting-Started) · [Core Concepts](Core-Concepts) · [API Guide](API-Guide) · [Operations & Deployment](Operations-and-Deployment)
 
 ---
 
@@ -73,7 +73,7 @@ The API supports:
 
 [Read the Cognitive Memory guide →](Cognitive-Memory)
 
-### Context primitives
+### Context and procedural primitives
 
 Sofias Memory also provides durable primitives that richer systems can compose around memory:
 
@@ -83,6 +83,8 @@ Sofias Memory also provides durable primitives that richer systems can compose a
 - **Runs** — observable asynchronous execution for the source-backed knowledge pipeline.
 
 Sofias Memory stores and resolves these primitives. It does not execute agents or skills on behalf of the caller.
+
+[Read Sessions →](Sessions) · [Read Skills & Agents →](Skills-and-Agents)
 
 ---
 
@@ -109,6 +111,8 @@ flowchart LR
 
 The key rule is simple: **PostgreSQL + pgvector is authoritative**. Neo4j is a rebuildable projection for knowledge-graph workloads. Cognitive Memory is PostgreSQL-only and does not create a Cognitive graph projection.
 
+For installation, migrations, backup/restore and production deployment, read [Operations & Deployment](Operations-and-Deployment).
+
 ---
 
 ## Where can Sofias Memory fit?
@@ -119,7 +123,7 @@ Because the public boundary is a REST API, integration does not require a langua
 
 Dedicated connectors can be built later without changing the memory model underneath them.
 
-[Read the Integration Guide →](Integration-Guide)
+[Read the API Guide →](API-Guide) · [Read the Integration Guide →](Integration-Guide)
 
 ---
 
@@ -136,9 +140,13 @@ Getting Started
    ↓
 Core Concepts
    ↓
-Knowledge Memory or Cognitive Memory
+Knowledge Memory / Cognitive Memory / Sessions / Skills & Agents
+   ↓
+API Guide
    ↓
 Integration Guide
+   ↓
+Operations & Deployment
 ```
 
 ---
@@ -147,18 +155,34 @@ Integration Guide
 
 This Wiki is the **user-facing documentation layer**: concepts, tutorials, recipes, and integration guidance.
 
-Current guides:
+### Start and concepts
 
 - [Getting Started](Getting-Started)
 - [Core Concepts](Core-Concepts)
+
+### Memory
+
 - [Cognitive Memory](Cognitive-Memory)
 - [Knowledge Memory](Knowledge-Memory)
+
+### Context and procedures
+
+- [Sessions](Sessions)
+- [Skills & Agents](Skills-and-Agents)
+
+### API and integration
+
+- [API Guide](API-Guide)
 - [Integration Guide](Integration-Guide)
+
+### Operations
+
+- [Operations & Deployment](Operations-and-Deployment)
 
 The versioned repository remains the engineering source of truth:
 
-- [API semantics](https://github.com/kallbuloso/sofias_memory/blob/main/docs/api.md)
-- [Operations Guide](https://github.com/kallbuloso/sofias_memory/blob/main/docs/operations.md)
+- [Canonical API semantics](https://github.com/kallbuloso/sofias_memory/blob/main/docs/api.md)
+- [Canonical Operations Guide](https://github.com/kallbuloso/sofias_memory/blob/main/docs/operations.md)
 - [Development Guide](https://github.com/kallbuloso/sofias_memory/blob/main/docs/development.md)
 - [Architecture Decision Records](https://github.com/kallbuloso/sofias_memory/tree/main/docs/adr)
 - [Product contracts and specifications](https://github.com/kallbuloso/sofias_memory/tree/main/docs/product)

@@ -8,7 +8,7 @@ It is designed as reusable infrastructure. Any application, automation platform,
 
 **Current stable release:** `v0.7.0 — Native Cognitive Memory`
 
-[Repository](https://github.com/kallbuloso/sofias_memory) · [Latest Release](https://github.com/kallbuloso/sofias_memory/releases/latest) · [Getting Started](Getting-Started) · [Core Concepts](Core-Concepts) · [API Guide](API-Guide) · [Operations & Deployment](Operations-and-Deployment)
+[Repository](https://github.com/kallbuloso/sofias_memory) · [Latest Release](https://github.com/kallbuloso/sofias_memory/releases/latest) · [Getting Started](Getting-Started) · [Core Concepts](Core-Concepts) · [API Guide](API-Guide) · [Troubleshooting](Troubleshooting)
 
 ---
 
@@ -52,7 +52,7 @@ Sofias Memory can ingest text, files, and HTTPS URLs into logical datasets, proc
 
 The knowledge pipeline also supports durable runs, retries, cancellation, improvement/reconciliation workflows, precise source or dataset forgetting, and a reconstructible Neo4j graph projection.
 
-[Read the Knowledge Memory guide →](Knowledge-Memory)
+[Read Knowledge Memory →](Knowledge-Memory) · [Read Datasets & Sources →](Datasets-and-Sources) · [Read Provenance & Feedback →](Provenance-and-Feedback)
 
 ### Native Cognitive Memory
 
@@ -84,7 +84,7 @@ Sofias Memory also provides durable primitives that richer systems can compose a
 
 Sofias Memory stores and resolves these primitives. It does not execute agents or skills on behalf of the caller.
 
-[Read Sessions →](Sessions) · [Read Skills & Agents →](Skills-and-Agents)
+[Read Sessions →](Sessions) · [Read Skills & Agents →](Skills-and-Agents) · [Read Runs & Reliability →](Runs-and-Reliability)
 
 ---
 
@@ -111,7 +111,7 @@ flowchart LR
 
 The key rule is simple: **PostgreSQL + pgvector is authoritative**. Neo4j is a rebuildable projection for knowledge-graph workloads. Cognitive Memory is PostgreSQL-only and does not create a Cognitive graph projection.
 
-For installation, migrations, backup/restore and production deployment, read [Operations & Deployment](Operations-and-Deployment).
+For installation, migrations, backup/restore and production deployment, read [Operations & Deployment](Operations-and-Deployment). For symptom-driven recovery, use [Troubleshooting](Troubleshooting).
 
 ---
 
@@ -142,18 +142,22 @@ Core Concepts
    ↓
 Knowledge Memory / Cognitive Memory / Sessions / Skills & Agents
    ↓
+Datasets & Sources / Provenance & Feedback / Runs & Reliability
+   ↓
 API Guide
    ↓
 Integration Guide
    ↓
 Operations & Deployment
+   ↓
+Troubleshooting
 ```
 
 ---
 
 ## Documentation map
 
-This Wiki is the **user-facing documentation layer**: concepts, tutorials, recipes, and integration guidance.
+This Wiki is the **user-facing documentation layer**: concepts, tutorials, recipes, integration guidance, and operational guidance.
 
 ### Start and concepts
 
@@ -164,6 +168,8 @@ This Wiki is the **user-facing documentation layer**: concepts, tutorials, recip
 
 - [Cognitive Memory](Cognitive-Memory)
 - [Knowledge Memory](Knowledge-Memory)
+- [Datasets & Sources](Datasets-and-Sources)
+- [Provenance & Feedback](Provenance-and-Feedback)
 
 ### Context and procedures
 
@@ -175,9 +181,11 @@ This Wiki is the **user-facing documentation layer**: concepts, tutorials, recip
 - [API Guide](API-Guide)
 - [Integration Guide](Integration-Guide)
 
-### Operations
+### Operations and reliability
 
+- [Runs & Reliability](Runs-and-Reliability)
 - [Operations & Deployment](Operations-and-Deployment)
+- [Troubleshooting](Troubleshooting)
 
 The versioned repository remains the engineering source of truth:
 

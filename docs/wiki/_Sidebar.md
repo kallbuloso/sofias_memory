@@ -21,10 +21,17 @@
 - [API Guide](API-Guide)
 - [Integration Guide](Integration-Guide)
 
+### Security & Configuration
+
+- [Configuration Reference](Configuration-Reference)
+- [Security Model](Security-Model)
+
 ### Operations & Reliability
 
 - [Runs & Reliability](Runs-and-Reliability)
 - [Operations & Deployment](Operations-and-Deployment)
+- [Storage & S3](Storage-and-S3)
+- [Graph & Neo4j](Graph-and-Neo4j)
 - [Troubleshooting](Troubleshooting)
 
 ### Engineering Reference

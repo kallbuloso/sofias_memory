@@ -1,71 +1,204 @@
 # AGENTS.md — Sofias Memory
 
 > Instruções operacionais para agentes de desenvolvimento.
-> Este arquivo fica na raiz e vale para toda a árvore, salvo quando um `AGENTS.md`
-> mais específico existir em um subdiretório.
+>
+> Este arquivo fica na raiz do repositório e vale para toda a árvore, salvo quando existir um `AGENTS.md` mais específico em um subdiretório.
 
-## 1. Missão
+---
 
-O **Sofias Memory** é uma reimplementação independente, focada e single-user do núcleo
-de memória semântica e knowledge graph do Cognee.
+# 1. Missão
 
-Não trate este projeto como um fork a ser podado. Não copie a arquitetura inteira do
-Cognee nem reintroduza abstrações removidas só porque existem no upstream.
+O **Sofias Memory** é uma implementação independente, focada e single-user de infraestrutura de memória persistente, conhecimento, contexto e recuperação para aplicações, assistentes e agentes.
 
-Baseline funcional do PRD:
+O projeto teve como referência funcional inicial o Cognee, mas sua arquitetura, contratos, evolução e limites são definidos exclusivamente por este repositório e pelos artefatos APPROVED do produto.
 
-- upstream: `topoteretes/cognee`
-- branch: `main`
-- versão: `1.4.1`
-- commit: `38eece5bbb0cb9f5706fed908abd16dba0f5505e`
+Não trate este projeto como um fork a ser podado.
 
-O Cognee é referência funcional e, quando realmente vantajoso, fonte de código
-Apache-2.0. A arquitetura do **Sofias Memory** é definida por este repositório.
+Não:
 
-## 2. Fontes de verdade
+- copie a arquitetura inteira do Cognee;
+- reintroduza abstrações removidas apenas porque existem no upstream;
+- transforme uma referência funcional em autoridade arquitetural;
+- expanda o Sofias Memory para Agent Runtime, orchestration framework ou plataforma genérica sem decisão explícita.
 
-Antes de uma tarefa não trivial:
+Baseline histórico de referência funcional:
+
+```text
+upstream: topoteretes/cognee
+branch: main
+version: 1.4.1
+commit: 38eece5bbb0cb9f5706fed908abd16dba0f5505e
+```
+
+O Cognee pode servir como:
+
+- referência funcional;
+- inspiração;
+- fonte de código Apache-2.0 quando realmente vantajoso.
+
+Ele não define a arquitetura atual do Sofias Memory.
+
+---
+
+# 2. Fontes de verdade
+
+Antes de qualquer tarefa não trivial:
 
 1. leia este `AGENTS.md`;
-2. leia o trecho relevante do PRD;
-3. leia ADRs relacionados;
-4. inspecione código, migrations e testes existentes;
-5. só então altere código.
+2. identifique o Slice ou feature em execução;
+3. leia os artefatos APPROVED relevantes;
+4. leia ADRs relacionados;
+5. inspecione código, migrations e testes existentes;
+6. só então altere código.
 
-Precedência em conflitos:
+Não implemente uma feature apenas a partir de memória, comentário de issue ou suposição sobre intenção futura.
 
-1. instrução explícita do usuário na tarefa atual;
-2. `AGENTS.md` mais específico;
-3. este `AGENTS.md`;
-4. ADR aceito;
-5. PRD/SPECS;
-6. contratos, migrations e testes versionados;
-7. Cognee upstream.
+---
 
-Documento de produto esperado:
+## 2.1 Precedência
+
+Em caso de conflito:
+
+```text
+1. instrução explícita atual do usuário
+2. AGENTS.md mais específico no subdiretório
+3. implementation handoff APPROVED do Slice explicitamente CURRENT
+4. baseline normativa APPROVED da feature: Contract, ADRs, Architecture,
+   Spec/PRD/Product Definition, conforme a responsabilidade de cada artefato
+5. guardrails operacionais e invariantes gerais deste AGENTS.md
+6. baseline geral do projeto e documentação geral
+7. código, migrations e testes como evidência de implementação
+8. Cognee upstream como referência funcional
+```
+
+Regras operacionais da raiz não podem anular silenciosamente uma evolução
+posterior explicitamente APPROVED. O handoff CURRENT especializa a execução do
+Slice; não autoriza mudar o Contract público ou uma decisão arquitetural aprovada.
+O Contract rege nomes e comportamento públicos; ADRs regem decisões duráveis;
+Architecture rege sua composição; Spec/PRD/Product Definition regem os requisitos
+correspondentes. Se dois artefatos APPROVED realmente conflitarem e não houver
+precedência ou amendment explícito que resolva o conflito: STOP e reporte
+`NEEDS HUMAN DECISION`, sem escolher ou reescrever uma decisão silenciosamente.
+
+Quando código existente divergir de uma decisão APPROVED:
+
+> não altere o documento para fazer o código caber.
+
+Diagnostique a divergência.
+
+---
+
+## 2.2 Baseline geral do produto
+
+O baseline histórico principal continua disponível em:
 
 ```text
 docs/product/Sofias_Memory_PRD_SPECS.md
 ```
 
-Se estiver em outro caminho, descubra o arquivo existente. Não crie cópia concorrente.
+Esse documento não é, contudo, a única fonte de verdade para features posteriores.
 
-### Overrides já decididos após o PRD inicial
+Features evoluídas depois do PRD original podem possuir seus próprios:
+
+- Discovery;
+- Product Definition;
+- PRD;
+- Specs;
+- Contracts;
+- Architecture;
+- ADRs;
+- Technical Backlog;
+- Implementation handoffs.
+
+Quando esses documentos estiverem APPROVED, eles complementam e, dentro do escopo da feature, especializam o baseline anterior.
+
+---
+
+## 2.3 Contextual Project Memory — baseline aprovado
+
+Existe uma evolução APPROVED denominada:
+
+```text
+Contextual Project Memory
+```
+
+Os artefatos normativos estão em:
+
+```text
+docs/product-implementation/
+├── 01-SF-Discovery-Memoria-Contextual-Por-Projeto.md
+├── 02-SF-Product-Definition-Memoria-Contextual-Por-Projeto.md
+├── 03-SF-PRD-Memoria-Contextual-Por-Projeto.md
+├── 04-SF-Spec-Memoria-Contextual-Por-Projeto.md
+├── 05-SF-Contract-Memoria-Contextual-Por-Projeto.md
+├── 06-SF-Architecture-Memoria-Contextual-Por-Projeto.md
+├── 07-SF-ADRs-Memoria-Contextual-Por-Projeto.md
+└── 08-SF-Technical-Backlog-Memoria-Contextual-Por-Projeto.md
+```
+
+Implementation handoffs ficam em:
+
+```text
+docs/product-implementation/implementation/
+```
+
+Os documentos `09–16` podem ser lidos para contexto e dependências. Respeite o
+status real de cada arquivo: um handoff `READY FOR REVIEW` ainda exige aprovação.
+Artefatos APPROVED não devem ser reinterpretados durante implementação.
+
+Um implementation handoff APPROVED desta iniciativa satisfaz o requisito de
+execution plan do Slice; não criar um segundo plano duplicado em
+`docs/exec-plans/active/`. Para outras iniciativas longas/multietapas, mantenha um
+plano curto nesse diretório e mova para `completed/` ao finalizar, salvo quando já
+existir handoff APPROVED equivalente.
+
+---
+
+## 2.4 ADRs de Contextual Project Memory
+
+As decisões arquiteturais aprovadas são:
+
+```text
+ADR-0017 — First-Class Contextual Memory Domain and PostgreSQL Authority
+
+ADR-0018 — ContextCheckpoint Revision and Concurrency Model
+
+ADR-0019 — Provenance-Aware Evidence and Synchronous Forget Propagation
+```
+
+Enquanto esses ADRs não estiverem materializados como arquivos independentes em `docs/adr/`, a fonte normativa é:
+
+```text
+docs/product-implementation/
+07-SF-ADRs-Memoria-Contextual-Por-Projeto.md
+```
+
+Não renumerar, reinterpretar ou substituir esses ADRs silenciosamente.
+
+---
+
+# 3. Overrides já decididos
 
 Estas decisões vencem qualquer trecho antigo conflitante:
 
-- package Python em `sofias_memory/` na raiz;
+- package Python fica em `sofias_memory/` na raiz;
 - NÃO usar `src/sofias_memory`;
-- `compose.yaml` é canônico e portável;
+- `compose.yaml` é o deployment canônico e portável;
 - EasyPanel/Portainer não fazem parte da arquitetura da aplicação;
-- arquivos específicos de EasyPanel/Portainer só devem existir quando houver diferença
-  real e documentada em relação ao `compose.yaml` canônico.
+- arquivos específicos de EasyPanel/Portainer só devem existir quando houver diferença real e documentada;
+- PostgreSQL permanece fonte de verdade;
+- Neo4j permanece projeção reconstruível;
+- Sofias Memory permanece single-user por instalação no baseline atual;
+- runtime de Agent permanece fora do Sofias Memory;
+- memória contextual não cria autoridade operacional.
 
 Não reabra essas decisões sem solicitação explícita.
 
-## 3. Invariantes do MVP
+---
 
-Nunca introduza, nem "temporariamente":
+# 4. Invariantes de produto
+
+Nunca introduza, nem temporariamente, sem nova decisão explícita:
 
 - users;
 - login/register;
@@ -78,17 +211,20 @@ Nunca introduza, nem "temporariamente":
 - organizations;
 - multitenancy;
 - API key management;
-- settings persistidos ou por rota;
+- settings persistidos por usuário;
+- configuração mutável por rota;
 - sync entre instâncias;
-- cloud/remote client;
+- cloud/remote client genérico;
 - `serve`/`push`;
 - telemetria externa;
 - providers de banco selecionáveis;
-- optional dependencies;
-- plugin system;
-- frontend;
+- plugin system genérico;
+- frontend no repositório core;
 - MCP no repositório principal;
-- múltiplas réplicas da aplicação no MVP.
+- Agent Runtime;
+- Task Runtime;
+- tool execution;
+- provider session orchestration.
 
 Autenticação HTTP:
 
@@ -102,92 +238,406 @@ Configuração:
 API_KEY=sf-...
 ```
 
-A chave não vai para banco, logs, traces, `/info`, exceptions ou métricas.
+A chave nunca vai para:
 
-## 4. Stack fixa
+- banco;
+- logs;
+- traces;
+- `/info`;
+- exceptions;
+- métricas.
 
-Versão 1:
+---
+
+# 5. Stack fixa
+
+Baseline técnico:
 
 - Python 3.12;
 - FastAPI;
-- Pydantic 2 + pydantic-settings;
+- Pydantic 2;
+- pydantic-settings;
 - SQLAlchemy 2 async;
 - Alembic;
-- PostgreSQL 17 + pgvector;
+- PostgreSQL 17;
+- pgvector;
 - Neo4j 5.x;
 - OpenAI-compatible API para LLM;
 - OpenAI-compatible API para embeddings;
-- armazenamento de Source originals: exatamente dois backends de primeira parte,
-  fechados (ADR-0011 D2/D17) — `filesystem` local (padrão) e `s3` (AWS S3 ou
-  endpoint S3-compatível explicitamente configurado, ex. MinIO), via `boto3`
-  (`[project.dependencies]`, nunca extra opcional). Nenhum backend adicional,
-  nenhum plugin/provider registry — qualquer terceiro backend exige novo ADR
-  explícito;
+- filesystem/S3 para Source originals;
 - worker interno;
 - PostgreSQL como fila/estado dos pipelines.
 
-Não substituir por SQLite, LanceDB, Kuzu, Qdrant, Turso, Redis, Celery, LiteLLM,
-Instructor ou BAML sem decisão arquitetural explícita.
+Armazenamento de Source originals possui exatamente dois backends first-party:
 
-Runtime dependencies ficam em `[project.dependencies]`.
-Dev dependencies ficam em `[dependency-groups].dev`.
-Não criar `[project.optional-dependencies]` no MVP.
+```text
+filesystem
+s3
+```
 
-## 5. Autoridade dos dados
+S3 pode apontar para:
 
-### PostgreSQL
+- AWS S3;
+- endpoint compatível explicitamente configurado.
 
-PostgreSQL é a **fonte de verdade**.
+Implementação via:
 
-Tudo necessário para reconstrução, auditoria, proveniência e deleção precisa ser
-recuperável a partir do PostgreSQL + armazenamento de sources.
+```text
+boto3
+```
 
-Schema previsto:
+Não criar provider registry.
 
-- datasets
-- sources
-- documents
-- chunks
-- entities
-- entity_mentions
-- relations
-- relation_evidence
-- summaries
-- memory_entries
-- queries
-- feedback
-- pipeline_runs
-- pipeline_steps
-- graph_outbox
-- sessions (v0.3.0, ADR-0012)
-- session_entries (v0.3.0, ADR-0012)
+Não substituir por:
 
-`queries.session_id` e `pipeline_runs.session_id` são associações
-first-class (FK nullable, `ON DELETE SET NULL`) com `sessions.id` — nunca
-inferidas de texto legado (`MemoryEntry.session_id`, `Document.metadata`,
-`PipelineRun.input`). Sessions não recebem hard delete público.
+- SQLite;
+- LanceDB;
+- Kuzu;
+- Qdrant;
+- Turso;
+- Redis;
+- Celery;
+- LiteLLM;
+- Instructor;
+- BAML;
 
-### Neo4j
+sem decisão arquitetural explícita.
 
-Neo4j é uma **projeção reconstruível**.
+Runtime dependencies ficam em:
 
-Nunca grave conhecimento exclusivamente no Neo4j.
+```text
+[project.dependencies]
+```
 
-Escritas devem ser:
+Dev dependencies ficam em:
+
+```text
+[dependency-groups].dev
+```
+
+Não criar:
+
+```text
+[project.optional-dependencies]
+```
+
+apenas para acomodar features futuras.
+
+---
+
+# 6. Autoridade dos dados
+
+## 6.1 PostgreSQL
+
+PostgreSQL é a fonte de verdade.
+
+Tudo necessário para:
+
+- reconstrução;
+- auditoria;
+- provenance;
+- lifecycle;
+- Forget;
+- recovery;
+
+deve ser recuperável a partir do PostgreSQL e, quando aplicável, do armazenamento de Source originals.
+
+Domínios existentes incluem:
+
+- datasets;
+- sources;
+- documents;
+- chunks;
+- entities;
+- entity_mentions;
+- relations;
+- relation_evidence;
+- summaries;
+- memory_entries;
+- queries;
+- feedback;
+- pipeline_runs;
+- pipeline_steps;
+- graph_outbox;
+- sessions;
+- session_entries;
+- skills;
+- skill_revisions;
+- agents;
+- agent_skills;
+- agent_sessions;
+- memory_items;
+- memory_provenance;
+- cognitive_memory_idempotency.
+
+Contextual Project Memory adicionará incrementalmente:
+
+- episodes;
+- episode provenance;
+- contextual idempotency;
+- context checkpoints;
+- context statements;
+- contextual Evidence.
+
+Esses recursos, quando implementados no respectivo Slice, terão estado,
+provenance, revisions, Evidence e idempotência autoritativos no PostgreSQL.
+
+Não antecipe tabelas de Slices posteriores.
+
+---
+
+## 6.2 Sessions
+
+`queries.session_id` e `pipeline_runs.session_id` são associações first-class com:
+
+```text
+sessions.id
+```
+
+e usam:
+
+```text
+ON DELETE SET NULL
+```
+
+Nunca inferir Session a partir de:
+
+- texto;
+- metadata antiga;
+- `MemoryEntry`;
+- `Document.metadata`;
+- `PipelineRun.input`.
+
+Sessions não recebem hard delete público.
+
+---
+
+## 6.3 Neo4j
+
+Neo4j é projeção reconstruível.
+
+Nunca grave conhecimento exclusivamente nele.
+
+Escritas projetadas devem ser:
 
 - idempotentes;
-- derivadas de estado confirmado no PostgreSQL;
+- derivadas do PostgreSQL;
 - acionadas pela outbox;
 - recuperáveis;
 - reconstruíveis.
 
-Session e SessionEntry são **exclusivamente PostgreSQL** — nunca projetadas
-para Neo4j, nunca lidas de lá para gestão/histórico de Session (ADR-0012).
+Não implemente distributed transaction PostgreSQL ↔ Neo4j.
 
-APOC e GDS podem existir no ambiente local, mas o core do MVP não deve depender deles
-sem ADR explícito. Prefira Cypher padrão e o driver oficial.
+---
 
-## 6. Estrutura do repositório
+## 6.4 Domínios PostgreSQL-only
+
+São PostgreSQL-only no baseline atual:
+
+```text
+Sessions
+SessionEntries
+Skills
+Agent Profiles
+Native Cognitive Memory
+Contextual Project Memory v1
+```
+
+Contextual Project Memory MUST NOT:
+
+- escrever `graph_outbox`;
+- depender de Neo4j;
+- ler Neo4j como autoridade;
+- exigir Neo4j disponível para suas mutations.
+
+Qualquer futura graph projection contextual exige ADR explícito.
+
+---
+
+# 7. Contextual Project Memory — invariantes
+
+Contextual Project Memory adiciona novos planos de memória sem fundir os existentes.
+
+Modelo conceitual:
+
+```text
+MemoryItem
+    = current profile/semantic cognitive truth
+
+Episode
+    = historical experience
+
+ContextCheckpoint
+    = current continuity state
+
+Session / SessionEntry
+    = temporal interaction history
+
+Knowledge Memory
+    = source-backed knowledge
+```
+
+---
+
+## 7.1 MemoryItem permanece Cognitive Memory
+
+`MemoryItem` continua suportando exclusivamente:
+
+```text
+profile
+semantic
+```
+
+Nunca adicionar:
+
+```text
+episodic
+procedural
+```
+
+ao `memory_type` como atalho para novas features.
+
+Procedural Memory continua representada por Skills.
+
+Historical experience será representada por Episode.
+
+---
+
+## 7.2 Episode
+
+Episode é first-class.
+
+Representa:
+
+```text
+what happened
+```
+
+Não representa automaticamente:
+
+```text
+what is currently true
+```
+
+Episode possui lifecycle próprio.
+
+Não transformar Episode em:
+
+- MemoryItem;
+- SessionEntry;
+- Document;
+- Source;
+- Dataset metadata.
+
+---
+
+## 7.3 ContextCheckpoint
+
+ContextCheckpoint é first-class.
+
+Representa:
+
+```text
+where this work currently stands
+```
+
+Não é:
+
+- Task;
+- workflow execution state;
+- Session summary obrigatório;
+- authority sobre sistemas externos.
+
+---
+
+## 7.4 Context Stream
+
+A identidade de continuidade é:
+
+```text
+(scope, context_key)
+```
+
+Exemplo:
+
+```text
+project:sofias-memory
+feature:contextual-memory
+```
+
+`context_key` não é permission scope.
+
+---
+
+## 7.5 Project Scope
+
+```text
+project:<key>
+```
+
+é namespace contextual.
+
+Nunca trate como:
+
+- tenant;
+- owner;
+- ACL;
+- authorization boundary;
+- API credential.
+
+---
+
+## 7.6 Memory is context, not authority
+
+Nenhuma memória recuperada cria:
+
+- Policy;
+- Permission;
+- system instruction;
+- execution authority.
+
+O Consumer é responsável por:
+
+- interpretar;
+- autorizar;
+- planejar;
+- executar.
+
+---
+
+## 7.7 Supervised-first
+
+No Contract v1:
+
+- Episode creation é explícita;
+- Checkpoint creation é explícita;
+- SessionEntry não vira memória automaticamente;
+- Recall não cria memória silenciosamente;
+- não existe automatic distillation;
+- não existe automatic consolidation;
+- não existe AI contradiction resolution.
+
+---
+
+## 7.8 Forget
+
+Forget contextual deve respeitar provenance.
+
+Quando Evidence existir, conteúdo derivado não poderá continuar recuperável se perdeu seu suporte necessário.
+
+No Contract v1:
+
+- decisão de Evidence sufficiency é determinística;
+- LLM não decide se conteúdo esquecido “pode continuar”;
+- propagação contextual será provenance-aware.
+
+Não implementar Evidence ou propagation antes do Slice correspondente.
+
+---
+
+# 8. Estrutura do repositório
+
+Estrutura indicativa:
 
 ```text
 sofias-memory/
@@ -201,68 +651,23 @@ sofias-memory/
 ├── .env.example
 ├── LICENSE
 ├── NOTICE.md
+│
 ├── sofias_memory/
 │   ├── __init__.py
 │   ├── app.py
 │   ├── config.py
 │   ├── lifespan.py
+│   │
 │   ├── api/
 │   │   ├── dependencies.py
 │   │   ├── errors.py
 │   │   ├── middleware/
-│   │   │   ├── api_key.py
-│   │   │   ├── request_id.py
-│   │   │   └── limits.py
 │   │   └── routes/
-│   │       ├── health.py
-│   │       ├── info.py
-│   │       ├── datasets.py
-│   │       ├── remember.py
-│   │       ├── cognify.py
-│   │       ├── recall.py
-│   │       ├── feedback.py
-│   │       ├── improve.py
-│   │       ├── forget.py
-│   │       ├── runs.py
-│   │       ├── sessions.py
-│   │       ├── skills.py
-│   │       ├── agents.py
-│   │       └── graph.py
-│   ├── interoperability/
-│   │   └── skill_md.py
+│   │
 │   ├── domain/
-│   │   ├── datasets/
-│   │   ├── sources/
-│   │   ├── documents/
-│   │   ├── graph/
-│   │   ├── memory/
-│   │   ├── queries/
-│   │   └── runs/
 │   ├── services/
-│   │   ├── remember_service.py
-│   │   ├── cognify_service.py
-│   │   ├── recall_service.py
-│   │   ├── improve_service.py
-│   │   └── forget_service.py
 │   ├── pipelines/
-│   │   ├── engine.py
-│   │   ├── registry.py
-│   │   ├── context.py
-│   │   ├── remember_pipeline.py
-│   │   ├── cognify_pipeline.py
-│   │   ├── improve_pipeline.py
-│   │   ├── forget_pipeline.py
-│   │   └── steps/
 │   ├── loaders/
-│   │   ├── base.py
-│   │   ├── text.py
-│   │   ├── markdown.py
-│   │   ├── json_loader.py
-│   │   ├── csv_loader.py
-│   │   ├── html.py
-│   │   ├── pdf.py
-│   │   ├── docx.py
-│   │   └── url.py
 │   ├── infrastructure/
 │   │   ├── postgres/
 │   │   ├── neo4j/
@@ -272,12 +677,10 @@ sofias-memory/
 │   │   ├── queue/
 │   │   └── telemetry/
 │   ├── prompts/
-│   │   ├── graph_extraction.v1.md
-│   │   ├── chunk_summary.v1.md
-│   │   ├── answer_rag.v1.md
-│   │   └── answer_graph.v1.md
 │   └── schemas/
+│
 ├── migrations/
+│
 ├── tests/
 │   ├── unit/
 │   ├── integration/
@@ -285,53 +688,69 @@ sofias-memory/
 │   ├── e2e/
 │   ├── security/
 │   └── performance/
+│
 ├── scripts/
-    ├── generate_api_key.py
-    ├── rebuild_graph.py
-    └── verify_installation.py
+│
 └── docs/
     ├── product/
+    ├── product-implementation/
+    │   └── implementation/
     ├── adr/
     ├── exec-plans/
     └── generated/
 ```
 
+Essa árvore é orientativa, não justificativa para criar diretórios vazios ou abstrações futuras.
+
 Regras:
 
 - NÃO criar `src/`;
-- NÃO criar outro package raiz para o core;
-- evite `utils/` genérico como depósito;
-- módulos pequenos, responsabilidade clara;
+- NÃO criar outro package raiz;
+- evitar `utils/` genérico;
+- módulos pequenos;
+- responsabilidade clara;
 - features futuras são código versionado, não plugins dinâmicos.
 
-Para mudanças longas/multietapas, mantenha um plano curto em
-`docs/exec-plans/active/` e mova para `completed/` ao finalizar.
+---
 
-## 7. Dependências entre camadas
+# 9. Dependências entre camadas
 
-Fluxo:
+Fluxo arquitetural:
 
 ```text
-api -> services -> domain/pipelines -> ports -> infrastructure
+api
+ ↓
+services
+ ↓
+domain / pipelines
+ ↓
+ports / repositories
+ ↓
+infrastructure
 ```
 
 Regras:
 
 - routes conhecem schemas e services;
-- routes não executam SQL ou Cypher;
+- routes não executam SQL;
+- routes não executam Cypher;
 - services orquestram casos de uso;
-- domain não depende de FastAPI, SQLAlchemy ou Neo4j;
+- domain não depende de FastAPI;
+- domain não depende de SQLAlchemy;
+- domain não depende de Neo4j;
 - pipelines não resolvem autenticação;
 - loaders não conhecem API;
-- infrastructure implementa persistência/integrações;
-- config é injetada;
+- infrastructure implementa persistência e integrações;
+- configuração é injetada;
 - não use service locator;
 - não use imports dinâmicos controlados por request;
 - não crie provider abstractions para providers inexistentes.
 
-Prefira a solução mais simples que preserve os limites acima.
+Prefira a menor abstração que preserve essas fronteiras.
 
-## 8. Ambiente local atual
+---
+
+# 10. Ambiente local
 
 Existe uma stack de bancos para desenvolvimento:
 
@@ -341,7 +760,9 @@ sofias_memory_db
 
 A aplicação pode rodar diretamente no host apontando para ela.
 
-### PostgreSQL
+---
+
+## 10.1 PostgreSQL
 
 ```text
 host:       127.0.0.1
@@ -358,7 +779,9 @@ Exemplo:
 DATABASE_URL=postgresql+asyncpg://cognee:${DB_PASSWORD}@127.0.0.1:5440/cognee_db
 ```
 
-### Neo4j
+---
+
+## 10.2 Neo4j
 
 ```text
 host:       127.0.0.1
@@ -378,7 +801,9 @@ NEO4J_PASSWORD=${DB_NEO4J_PASSWORD}
 NEO4J_DATABASE=neo4j
 ```
 
-### Inconsistência conhecida da stack recebida
+---
+
+## 10.3 Known local-stack issue
 
 Neo4j usa:
 
@@ -386,39 +811,44 @@ Neo4j usa:
 NEO4J_AUTH=neo4j/${DB_NEO4J_PASSWORD}
 ```
 
-mas o healthcheck original usa:
+O healthcheck também deve usar:
 
 ```text
--p ${DB_PASSWORD}
+DB_NEO4J_PASSWORD
 ```
 
-O healthcheck deve usar:
-
-```text
--p ${DB_NEO4J_PASSWORD}
-```
+e não `DB_PASSWORD`.
 
 Verifique isso antes de diagnosticar falha do Neo4j.
 
-### Nunca hard-code as portas locais
+---
 
-`5440` e `7688` são mapeamentos do host de desenvolvimento.
+## 10.4 Nunca hard-code host mappings
 
-Quando a aplicação estiver no mesmo Compose dos bancos:
+`5440` e `7688` são portas do host de desenvolvimento.
+
+Dentro do Compose:
 
 ```env
 DATABASE_URL=postgresql+asyncpg://...@postgres:5432/...
 NEO4J_URI=bolt://neo4j:7687
 ```
 
-## 9. Tooling
+---
 
-Use `uv`.
+# 11. Tooling
+
+Use:
+
+```text
+uv
+```
 
 Comandos padrão:
 
 ```bash
 uv sync --dev
+
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy sofias_memory
@@ -428,7 +858,10 @@ uv run pytest
 Execução local:
 
 ```bash
-uv run uvicorn sofias_memory.app:app --host 127.0.0.1 --port 8000 --reload
+uv run uvicorn sofias_memory.app:app \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --reload
 ```
 
 Migrations:
@@ -439,35 +872,66 @@ uv run alembic current
 uv run alembic heads
 ```
 
-Não misture Poetry, pipenv ou requirements.txt sem decisão explícita.
+Não introduza:
 
-## 10. Configuração
+- Poetry;
+- pipenv;
+- requirements.txt paralelo;
 
-Centralize configuração em `sofias_memory/config.py` com `pydantic-settings`.
+sem decisão explícita.
 
-A config deve:
+---
+
+# 12. Configuração
+
+Centralize configuração em:
+
+```text
+sofias_memory/config.py
+```
+
+via `pydantic-settings`.
+
+Config deve:
 
 - carregar no startup;
 - validar integralmente;
 - permanecer imutável durante o processo;
-- abortar startup se inválida;
-- tipar/redigir secrets;
-- ser a única camada que interpreta o ambiente.
+- abortar startup quando inválida;
+- tipar secrets;
+- redigir secrets;
+- ser a única camada que interpreta ambiente.
 
-Não espalhe `os.getenv()`.
+Não espalhar:
+
+```python
+os.getenv(...)
+```
+
+pelo código.
 
 `.env` nunca entra no Git.
+
 `.env.example` não contém secrets reais.
 
 Não criar:
 
 - settings no banco;
 - endpoint de configuração;
-- override de banco/model/provider por request.
+- provider override por request;
+- database override por request.
 
-## 11. Convenções de código
+---
 
-Código, tabelas, colunas, classes, funções, endpoints, schemas e variáveis em **inglês**.
+# 13. Convenções de código
+
+Código, tabelas, colunas, classes, funções, endpoints, schemas e variáveis:
+
+```text
+English
+```
+
+Documentação pode permanecer em pt-BR.
 
 Python:
 
@@ -475,28 +939,48 @@ Python:
 - typing em código novo;
 - async ponta a ponta para I/O;
 - `pathlib.Path`;
-- timestamps UTC timezone-aware;
+- UTC timezone-aware;
 - UUID para IDs públicos/persistidos;
 - enums para estados finitos;
-- evite `Any`;
-- não capture `Exception` silenciosamente;
-- não use mutable defaults;
-- não devolva `None` como estado ambíguo quando um resultado explícito for melhor.
+- evitar `Any`;
+- não capturar `Exception` silenciosamente;
+- não usar mutable defaults;
+- evitar `None` quando representa estado ambíguo.
 
 Ruff é autoridade de lint/format.
 
-Logging deve ser estruturado e incluir quando aplicável:
+---
 
-- `request_id`
-- `run_id`
-- `step`
-- `dataset_id`
-- `source_id`
-- `document_id`
+## 13.1 Logging
 
-Nunca logue secrets ou documentos/payloads integrais por padrão.
+Logging deve ser estruturado.
 
-## 12. API e OpenAPI
+Pode incluir, quando aplicável:
+
+- `request_id`;
+- `run_id`;
+- `step`;
+- `dataset_id`;
+- `source_id`;
+- `document_id`;
+- `memory_id`;
+- `episode_id`;
+- `checkpoint_id`;
+- `context_key`.
+
+Nunca logar:
+
+- API keys;
+- HMAC keys;
+- Idempotency-Key;
+- documentos completos;
+- prompts integrais;
+- memory content integral;
+- Episode `summary/situation/reason/outcome` por padrão.
+
+---
+
+# 14. API e OpenAPI
 
 Base:
 
@@ -511,11 +995,15 @@ GET /health/live
 GET /health/ready
 ```
 
-Todas as demais rotas exigem `X-API-Key`.
+Todas as outras rotas exigem:
 
-Use comparação constant-time (`secrets.compare_digest` ou equivalente).
+```http
+X-API-Key
+```
 
-Headers suportados:
+Use comparação constant-time.
+
+Headers reconhecidos:
 
 ```text
 X-API-Key
@@ -523,7 +1011,9 @@ X-Request-Id
 Idempotency-Key
 ```
 
-Sucesso:
+---
+
+## 14.1 Success envelope
 
 ```json
 {
@@ -535,7 +1025,9 @@ Sucesso:
 }
 ```
 
-Erro:
+---
+
+## 14.2 Error envelope
 
 ```json
 {
@@ -550,118 +1042,348 @@ Erro:
 
 Nunca devolver traceback ao cliente.
 
-### Superfícies previstas
+---
 
-Somente as famílias definidas no PRD:
+# 15. Superfícies públicas
 
-- health
-- info
-- datasets
-- remember text/file/url
-- cognify
-- recall
-- feedback
-- improve
-- forget
-- runs/retry/cancel
-- graph
-- provenance
-- sessions/entries/queries (v0.3.0, ADR-0012)
-- skills (first-class durable procedural memory, v0.4.0, ADR-0013)
-  **implemented em sua totalidade**:
-  - management: create/get/list, PATCH (rollback), archive/restore,
-    revisions create/get/list (SM-702);
-  - standalone SKILL.md import/export: `POST /skills/import`,
-    `POST /skills/{skill_uuid}/revisions/import`,
-    `GET /skills/{skill_uuid}/revisions/{revision}/export` (SM-703);
-  - semantic resolve: `POST /skills/resolve` (SM-704) -- discovery/ranking
-    apenas: nunca escolhe uma Skill em nome do caller, nunca carrega
-    `procedure`, nunca executa uma tool;
-  - cross-feature isolation comprovada (SM-705): Forget, Dataset Delete,
-    Session e graph_outbox/Neo4j nunca são afetados por Skills e nunca
-    afetam Skills.
+Somente famílias definidas no **baseline normativo vigente** podem ser expostas.
 
-  Fora de escopo permanentemente (não "ainda não implementado" -- não
-  planejado para v0.4.0): bundled skill packages (`scripts/`/`references/`/
-  `assets/`), execução de Skill, `SkillRun`, e qualquer runtime de Agent.
-- agents (durable Agent Profile management, v0.5.0, ADR-0014)
-  **implementado nesta release como identity/profile management +
-  associação explícita Agent↔Skill + associação explícita Agent↔Session**:
-  - management: create/get/list, PATCH, archive/restore (SM-802);
-  - `GET /agents` sem filtro devolve somente `active` -- default deliberado,
-    diferente de Session/Skill (que devolvem todos os status por default);
-  - `instructions`/`metadata` nunca aparecem na listagem, apenas no detalhe
-    (progressive disclosure);
-  - archive é discovery/availability filter, nunca admission barrier --
-    toda operação de management permanece disponível em um Agent archived;
-  - associação explícita Agent↔Skill (`GET`/`PUT`/`DELETE
-    /agents/{agent_uuid}/skills[/{skill_uuid}]`, SM-803), com pin opcional
-    de `SkillRevision` por número de revisão público (nunca UUID interno);
-    `pinned_revision` omitido/`null` segue `Skill.current_revision_id` ao
-    vivo; um FK composto (`skill_id`, `pinned_revision_id`) reutilizando a
-    candidate key de `skill_revisions(skill_id, id)` torna cross-Skill
-    pinning estruturalmente impossível e rejeita (nunca `SET NULL`) a
-    deleção de uma revisão pinada;
-  - associação explícita Agent↔Session (`GET`/`PUT`/`DELETE
-    /agents/{agent_uuid}/sessions[/{session_uuid}]`, SM-804, tabela
-    `agent_sessions`): **current explicit management association only** --
-    nunca provenance, nunca histórico de participação, nunca atribuição de
-    Query/PipelineRun a um Agent. `created_at` é exclusivamente "quando esta
-    linha de associação foi criada", nunca "primeira participação"; DELETE
-    remove a linha e a idempotência não é audit trail. Cardinalidade M:N
-    (Agent M:N Session, nunca ownership em qualquer direção); ambos os FKs
-    são `ON DELETE CASCADE` (nunca `RESTRICT`) -- correto justamente porque a
-    tabela não carrega peso de auditoria. `queries.session_id` e
-    `pipeline_runs.session_id` (ADR-0012) permanecem inalterados: nenhuma
-    coluna `agent_id` é adicionada a `queries`/`pipeline_runs`/
-    `session_entries`, e a atribuição de uma operação a um Agent específico
-    é estruturalmente impossível quando múltiplos Agents estão associados à
-    mesma Session (non-attribution invariant).
+O baseline é composto pelo produto original mais features posteriores explicitamente APPROVED.
 
-  Um Agent é uma durable Agent Profile identity e management resource,
-  nunca um agent runtime: Sofias Memory nunca executa um Agent, nunca
-  seleciona provider/model em seu nome, nunca gerencia uma provider
-  session, e as associações Agent↔Skill/Agent↔Session nunca são
-  autorização, nunca executam a Skill, nunca carregam `procedure`
-  automaticamente, e nunca criam SessionEntry/Query/PipelineRun.
+Não invente endpoints de conveniência.
 
-  Fora de escopo desta release: `AgentRevision`, `AgentRun`, semantic Agent
-  resolve, Agent-scoped Skill resolve, Agent-scoped Session resolve, listagem
-  reversa `/sessions/{session_uuid}/agents`, e qualquer rota runtime-shaped
-  (`/run`, `/execute`, `/chat`, `/respond`, `/complete`, `/invoke`,
-  `/tools`).
-- memories (Native Cognitive Memory, v0.7.0, ADR-0016) **implementado em
-  sua totalidade**:
-  - `MemoryItem` first-class, tipos `profile`/`semantic` (nunca
-    `episodic`/`procedural`), escopo `global` ou `project:<key>`, lifecycle
-    `active` -> `superseded` -> `forgotten`;
-  - `POST /memories` (Create), `GET /memories/{memory_id}` (Get),
-    `POST /memories/recall` (Typed Recall -- pgvector cosine exato, nunca
-    ANN/HNSW, com semântica histórica de current-truth via `as_of`),
-    `POST /memories/{memory_id}/supersede` (atomic supersession),
-    `POST /memories/{memory_id}/forget` (destructive precise forget --
-    escopo apenas o `memory_id` alvo, nunca cascata para lineage);
-  - first-class provenance (`origin_kind`, `source_system`, referências
-    externas) por `MemoryItem`; `confidence` existe, `importance` nunca;
-  - idempotência via `Idempotency-Key` com digest HMAC-SHA-256 keyed e
-    não-reversível (`COGNITIVE_IDEMPOTENCY_HMAC_KEY`, obrigatório, nunca
-    `API_KEY`);
-  - `/info` anuncia `api_contract_version`/`contracts.cognitive_memory`/
-    `capabilities` (`cognitive_memory.write|get|recall|supersede|forget`)
-    para negociação de compatibilidade explícita pelo Sofia's Assistant.
+---
 
-  Cognitive Memory é **exclusivamente PostgreSQL** -- nunca projetada para
-  Neo4j, nunca lê/escreve `graph_outbox`, nunca cria `PipelineRun`. Fora de
-  escopo permanentemente (não "ainda não implementado"): `PATCH`, semantic
-  dedupe, AI conflict resolution, consolidation, decay, prefetch, generic
-  tenancy/ACL, e qualquer integração direta com o Sofia's Assistant runtime
-  (Slice 05).
+## 15.1 Knowledge Memory e pipelines
 
-Não invente aliases/endpoints de conveniência.
+Famílias existentes incluem:
 
-### Prefixos proibidos
+- health;
+- info;
+- datasets;
+- remember;
+- cognify;
+- recall;
+- feedback;
+- improve;
+- forget;
+- runs;
+- graph;
+- provenance.
 
-O teste de OpenAPI deve falhar se aparecer:
+---
+
+## 15.2 Sessions
+
+Sessions são durable temporal context.
+
+Incluem:
+
+- Session management;
+- SessionEntries;
+- associações first-class com Query/PipelineRun.
+
+SessionEntry permanece temporal.
+
+Nunca promover automaticamente para memória persistente.
+
+---
+
+## 15.3 Skills
+
+Skills representam durable procedural memory.
+
+v0.4.0 implementado.
+
+Management inclui:
+
+- create;
+- get;
+- list;
+- PATCH;
+- archive/restore;
+- revisions;
+- SKILL.md import/export;
+- semantic resolve.
+
+Semantic resolve:
+
+- descobre;
+- ranqueia;
+- não escolhe em nome do caller;
+- não executa tool;
+- não executa procedure.
+
+Fora do domínio:
+
+- `SkillRun`;
+- runtime de Skill;
+- Agent Runtime.
+
+---
+
+## 15.4 Agents
+
+Agent Profile management é durable identity/profile management.
+
+Não é Agent Runtime.
+
+Inclui:
+
+- management;
+- Agent↔Skill;
+- Agent↔Session.
+
+Essas relações:
+
+- não são authorization;
+- não significam execução;
+- não são provenance de participação;
+- não atribuem Query/PipelineRun a Agent.
+
+Fora de escopo:
+
+- AgentRun;
+- `/execute`;
+- `/chat`;
+- `/invoke`;
+- tool authorization;
+- provider session management.
+
+---
+
+## 15.5 Native Cognitive Memory
+
+Native Cognitive Memory v0.7.0 é first-class.
+
+`MemoryItem` suporta:
+
+```text
+profile
+semantic
+```
+
+Scopes:
+
+```text
+global
+project:<key>
+```
+
+Lifecycle:
+
+```text
+active
+superseded
+forgotten
+```
+
+Superfície:
+
+```http
+POST /memories
+GET  /memories/{memory_id}
+POST /memories/recall
+POST /memories/{memory_id}/supersede
+POST /memories/{memory_id}/forget
+```
+
+Características:
+
+- pgvector cosine exato;
+- provenance first-class;
+- `confidence`;
+- temporal truth;
+- idempotência HMAC;
+- PostgreSQL-only;
+- sem graph_outbox;
+- sem PipelineRun.
+
+Não adicionar:
+
+- PATCH;
+- semantic dedupe;
+- auto conflict resolution;
+- consolidation;
+- decay;
+- generic tenancy/ACL.
+
+---
+
+# 16. Contextual Project Memory — public contract
+
+O Contract v1 APPROVED prevê:
+
+```text
+/api/v1/episodes
+/api/v1/context/checkpoints
+/api/v1/context/recall
+```
+
+Isso não significa que todas essas rotas estejam autorizadas a aparecer imediatamente.
+
+A implementação ocorre por Slices.
+
+---
+
+## 16.1 Contract activation gate
+
+Enquanto o activation gate de `SM-CTX-008` não tiver passado, a aplicação MUST NOT anunciar o Contract nem qualquer uma das cinco capabilities contextuais em `GET /api/v1/info`:
+
+```json
+{
+  "contracts": {
+    "contextual_project_memory": "1"
+  }
+}
+```
+
+como Contract completamente implementado.
+
+Os nomes públicos pertencem ao Contract `05`, seção 6; não inventar capabilities
+parciais. `api_contract_version` permanece `"1"` após a ativação.
+
+Não deixe Consumers confundirem:
+
+```text
+partial implementation
+```
+
+com:
+
+```text
+full Contract v1 support
+```
+
+---
+
+## 16.2 Slice gating
+
+Uma rota/contextual capability só pode ser implementada quando estiver incluída no Slice APPROVED atual.
+
+Não implementar antecipadamente APIs de Slices futuros só porque o Contract já as descreve.
+
+---
+
+# 17. Current implementation slice
+
+CURRENT PHASE:
+
+```text
+Implementation
+```
+
+CURRENT ROLE:
+
+```text
+Senior Software Engineer
+```
+
+CURRENT SLICE:
+
+```text
+SM-CTX-001 — First-Class Episodes
+```
+
+Implementation handoff APPROVED:
+
+```text
+docs/product-implementation/implementation/
+09-SF-Implementation-SM-CTX-001-First-Class-Episodes.md
+```
+
+Este documento deve ser lido integralmente antes de modificar código relacionado ao Slice.
+
+---
+
+## 17.1 Único escopo atualmente autorizado
+
+Durante `SM-CTX-001`, implementar somente Episode first-class:
+
+```text
+Episode
+├── create
+├── get
+├── list
+├── internal semantic retrieval
+├── invalidate
+├── direct forget
+├── provenance
+├── idempotency
+└── durable PostgreSQL persistence
+```
+
+---
+
+## 17.2 Explicitamente fora do Slice
+
+MUST NOT implementar em SM-CTX-001:
+
+```text
+Evidence
+ContextCheckpoint
+ContextStatement
+Contextual Recall
+Forget propagation to derived resources
+automatic Episode extraction
+automatic Session distillation
+automatic consolidation
+Neo4j projection
+```
+
+Também não implementar antecipadamente:
+
+```text
+SM-CTX-002+
+```
+
+---
+
+## 17.3 Próximo Slice não é autorização implícita
+
+A existência de:
+
+```text
+SM-CTX-002
+SM-CTX-003
+...
+SM-CTX-008
+```
+
+no Technical Backlog não autoriza sua implementação.
+
+Cada Slice requer seu próprio implementation handoff APPROVED **e** autorização
+explícita como CURRENT. `future handoff existence != authorization`.
+Ler `10–16` para contexto não autoriza implementá-los durante SM-CTX-001.
+
+---
+
+## 17.4 Scope discipline
+
+Boa ideia fora do Slice:
+
+```text
+DEFERRED
+```
+
+Não implemente silenciosamente.
+
+Se uma necessidade exigir mudança em:
+
+- Contract;
+- Architecture;
+- ADR;
+- lifecycle;
+- security;
+- migration semantics;
+
+pare e reporte.
+
+---
+
+# 18. Prefixos e superfícies proibidas
+
+OpenAPI deve falhar se aparecer sem decisão explícita:
 
 ```text
 /auth
@@ -679,111 +1401,171 @@ O teste de OpenAPI deve falhar se aparecer:
 /proposals
 ```
 
-`/skills` (management) existe desde v0.4.0/SM-702 e não é mais proibido.
-`/agents` (management) existe desde v0.5.0/SM-802 e não é mais proibido.
-`SkillRun`/execução de Skill, `AgentRun`/execução de Agent, tool
-authorization, provider session management, e qualquer runtime de Agent
-continuam fora do MVP (ADR-0013, docs/adr/0013-first-class-durable-
-procedural-skills.md; ADR-0014, docs/adr/0014-first-class-durable-agent-
-management.md).
+`/skills`, `/agents`, `/memories` e as superfícies Contextual Project Memory autorizadas por Slice não são proibidas.
 
-## 13. Pydantic schemas
+Continuam proibidos runtime-shaped endpoints como:
+
+```text
+/run-agent
+/execute-agent
+/chat-agent
+/invoke-agent
+/tools/authorize
+```
+
+ou equivalentes que introduzam runtime no Memory.
+
+---
+
+# 19. Pydantic schemas
 
 Separe schemas públicos de persistence models.
 
 Regras:
 
 - nunca exponha SQLAlchemy model diretamente;
-- request/response models explícitos;
-- `extra="forbid"` em request público salvo justificativa;
-- constraints declaradas com `Field`;
+- request/response explícitos;
+- `extra="forbid"` por padrão;
+- validators centralizados quando houver regra compartilhada;
 - enums estáveis;
 - exemplos válidos;
-- compatibilidade dentro da major version;
-- breaking changes exigem decisão explícita.
+- compatibilidade dentro do Contract version;
+- breaking change exige decisão explícita.
 
-Schemas seguem o PRD, não DTOs legados do Cognee.
+Schemas seguem Contract/Spec, não DTO legado do Cognee.
 
-## 14. SQLAlchemy e Alembic
+---
+
+# 20. SQLAlchemy e Alembic
 
 Alembic é a única autoridade de evolução do schema.
 
-Nunca use `Base.metadata.create_all()` como mecanismo de startup/produção.
+Nunca utilizar:
+
+```python
+Base.metadata.create_all()
+```
+
+como mecanismo de produção/startup.
 
 Cada mudança de schema deve:
 
-1. ter migration;
-2. ter upgrade determinístico;
-3. ter downgrade quando seguro;
+1. possuir migration;
+2. upgrade determinístico;
+3. downgrade quando seguro;
 4. ser testada em PostgreSQL real;
-5. criar/remover índices e constraints explicitamente;
-6. preservar dados ou documentar perda.
+5. criar/remover constraints explicitamente;
+6. criar/remover indexes explicitamente;
+7. preservar dados ou documentar perda.
 
-Fundação do schema, em ordem coerente:
+---
 
-1. extensão `vector`;
-2. datasets;
-3. sources;
-4. documents;
-5. chunks;
-6. entities;
-7. entity_mentions;
-8. relations;
-9. relation_evidence;
-10. summaries;
-11. memory_entries;
-12. queries;
-13. feedback;
-14. pipeline_runs;
-15. pipeline_steps;
-16. graph_outbox.
+## 20.1 Migration head
 
-Use campos/constraints/índices do PRD.
+Nunca assuma o número da próxima migration sem verificar o repositório.
 
-É proibido criar:
+Antes de criar migration:
 
-```text
-users roles permissions acl api_keys settings tenants owner_id tenant_id
+```bash
+uv run alembic heads
+uv run alembic current
 ```
 
-A dimensão pgvector deve ser compatível com `EMBEDDING_DIMENSIONS`.
+Se um implementation handoff indicar um head esperado e o repositório tiver avançado:
+
+> use o head real e registre a divergência no Implementation Report.
+
+Não reescreva migration já aplicada em ambiente compartilhado.
+
+---
+
+## 20.2 pgvector
+
+Dimensão deve permanecer compatível com:
+
+```text
+EMBEDDING_DIMENSIONS
+```
+
 Mudança de dimensão exige migration/reindex planejado.
 
-### Automatic serialized migration bootstrap (ADR-0015, v0.6.0+)
+---
 
-`DATABASE_MIGRATION_MODE=auto|verify_only` (default `auto`) controla como o
-Alembic é invocado, nunca se ele é a autoridade:
+## 20.3 Automatic serialized migration bootstrap
 
-- `auto` (default): um schema elegível (pristine fresh ou known ancestor do
-  head) migra automaticamente para head no startup da aplicação, sob um
-  advisory lock PostgreSQL session-level, com verificação antes e depois;
-- `verify_only`: reproduz o contrato anterior a esta ADR exatamente — a
-  aplicação nunca invoca Alembic automaticamente; apenas verifica que o
-  schema já está em exact head.
+`DATABASE_MIGRATION_MODE`:
 
-Em ambos os modos: nenhum estado ambíguo/fail-closed (schema unversioned
-não-vazio, múltiplos heads, revision divergente/estrangeira) é jamais
-reparado, "stampado" ou inferido automaticamente — permanece resolução
-manual, exatamente como antes. A CLI manual (`alembic upgrade head`,
-`current`, `heads`) permanece totalmente suportada e nunca é substituída.
+```text
+auto
+verify_only
+```
 
-## 15. Repositories, transações e outbox
+`auto`:
 
-Não espalhe ORM por routes/pipelines.
+- migra pristine/known ancestor;
+- usa advisory lock;
+- verifica antes/depois;
+- fail-closed em estado ambíguo.
+
+`verify_only`:
+
+- nunca invoca Alembic automaticamente;
+- exige exact head.
+
+Nunca:
+
+- stamp automático de schema desconhecido;
+- inferência de revision;
+- reparo silencioso de multiple heads.
+
+CLI Alembic manual permanece suportada.
+
+---
+
+# 21. Repositories e transações
+
+Não espalhe ORM por:
+
+- routes;
+- pipelines;
+- schemas.
 
 Use repositories e boundaries transacionais claros.
 
-Operação PostgreSQL + Neo4j:
+Repository:
 
-1. persista estado autoritativo no PostgreSQL;
-2. grave `graph_outbox` na mesma transação;
-3. commit;
-4. worker projeta no Neo4j;
-5. marque evento como processado.
+- persiste;
+- consulta;
+- não decide regra de produto.
 
-Não implemente distributed transaction entre PostgreSQL e Neo4j.
+Service:
 
-## 16. Pipeline engine
+- coordena caso de uso;
+- aplica lifecycle;
+- aplica idempotência;
+- controla boundary transacional.
+
+---
+
+## 21.1 PostgreSQL + Neo4j
+
+Quando uma feature realmente usar projeção:
+
+```text
+1. persistir PostgreSQL
+2. gravar graph_outbox na mesma transaction
+3. commit
+4. worker projeta Neo4j
+5. marcar evento
+```
+
+Não utilizar distributed transaction.
+
+Contextual Project Memory v1 não usa esse fluxo porque não possui graph projection.
+
+---
+
+# 22. Pipeline engine
 
 Estados:
 
@@ -806,44 +1588,57 @@ Requisitos:
 - lock por dataset;
 - stale recovery;
 - cancelamento cooperativo;
-- uma escrita simultânea por dataset;
-- progresso persistido;
-- generation nova só ativa após conclusão consistente.
+- progresso persistido.
 
-Não adicione Redis/Celery.
+Não adicionar:
 
-## 17. Memória
+- Redis;
+- Celery.
 
-### Remember/full
+Contextual Project Memory mutations v1 não são PipelineRuns.
+
+---
+
+# 23. Knowledge Memory
+
+## 23.1 Remember/full
 
 Fluxo:
 
 ```text
 validate
--> persist source
--> extract/normalize
--> chunk
--> embeddings
--> summaries
--> entities/relations
--> canonicalize
--> persist PostgreSQL
--> graph outbox/projection
--> activate generation
+→ persist source
+→ extract/normalize
+→ chunk
+→ embeddings
+→ summaries
+→ entities/relations
+→ canonicalize
+→ persist PostgreSQL
+→ graph outbox
+→ projection
+→ activate generation
 ```
 
-### Remember/ingest
+---
+
+## 23.2 Remember/ingest
 
 Persiste conteúdo normalizado para cognify posterior.
 
-### Cognify
+---
 
-Processa sources pendentes/selecionadas.
-Config de pipeline não pode vir do request.
+## 23.3 Cognify
 
-### Recall MVP
+Processa Sources pendentes/selecionadas.
 
-Modos:
+Config de pipeline não deve vir do request.
+
+---
+
+## 23.4 Recall
+
+Modos existentes:
 
 ```text
 chunks
@@ -854,121 +1649,312 @@ hybrid
 triplets
 ```
 
-Não implementar no MVP:
+Não introduzir arbitrariamente:
 
-```text
-arbitrary Cypher
-agentic completion
-skills/tools
-code graph
-specialized temporal graph
-LLM feeling-lucky router
-```
+- Cypher público;
+- agentic completion;
+- automatic tool execution;
+- generic LLM router.
 
-### Improve
+---
 
-É explícito. Não rodar escondido em session end ou request lifecycle.
+## 23.5 Improve
 
-### Forget
+É explícito.
 
-Deve suportar source, memory-only, dataset e everything, incluindo cleanup de derivados,
-órfãos e recuperação de delete parcial.
+Não executar escondido em:
 
-## 18. Proveniência e integridade
+- session end;
+- request lifecycle.
 
-Todo conhecimento derivado deve ser rastreável:
+---
+
+## 23.6 Forget
+
+Deve respeitar lifecycle e cleanup aprovado.
+
+A integração futura com Contextual Evidence está definida por ADR-0019 e pelo Slice correspondente.
+
+Não antecipar em SM-CTX-001.
+
+---
+
+# 24. Provenance e integridade
+
+Conhecimento derivado deve ser rastreável.
+
+Para Knowledge Memory:
 
 ```text
 query/answer
--> retrieved chunk/entity/relation
--> evidence
--> chunk
--> document
--> source
+→ retrieved evidence
+→ chunk
+→ document
+→ source
 ```
+
+Para Cognitive Memory:
+
+```text
+MemoryItem
+→ first-class cognitive provenance
+```
+
+Para Contextual Project Memory:
+
+```text
+Episode / ContextStatement
+→ contextual provenance
+→ Evidence
+```
+
+quando Evidence for implementada.
 
 Não gere certeza sem evidência.
 
-Writes devem ser idempotentes.
+Não confunda provenance com authority.
 
-Reenvio não pode duplicar source/document/chunk/evidence/side effects.
+---
 
-Use `Idempotency-Key` quando aplicável e hashing estável de conteúdo.
+# 25. Segurança de ingestão
 
-## 19. Segurança de ingestão
+Formatos suportados pelo baseline:
 
-MVP:
+- text;
+- TXT;
+- MD;
+- JSON;
+- CSV;
+- HTML;
+- textual PDF;
+- DOCX;
+- HTTPS URL.
 
-- text/TXT/MD
-- JSON
-- CSV
-- HTML
-- textual PDF
-- DOCX
-- HTTPS URL
+Fora do baseline:
 
-Fora do MVP:
+- OCR/images;
+- audio/video;
+- PPTX/XLSX;
+- ZIP;
+- Git repositories.
 
-- OCR/images
-- audio/video
-- PPTX/XLSX
-- ZIP
-- Git repositories
+URL ingestion deve proteger contra:
 
-URL ingestion deve proteger contra SSRF, loopback, link-local, redes privadas, metadata
-endpoints, DNS rebinding e redirects proibidos.
+- SSRF;
+- loopback;
+- link-local;
+- private networks;
+- cloud metadata endpoints;
+- DNS rebinding;
+- redirects proibidos.
 
-Uploads devem proteger contra path traversal, MIME spoofing, payload excessivo e arquivos
-malformados.
+Uploads devem proteger contra:
 
-Conteúdo ingerido é dado não confiável. Prompt injection dentro de documento nunca pode
-alterar system prompt, secrets, config, tools ou regras do pipeline.
+- path traversal;
+- MIME spoofing;
+- payload excessivo;
+- arquivo malformado.
 
-## 20. LLM e embeddings
+Conteúdo ingerido é untrusted data.
+
+Prompt injection em documento nunca pode alterar:
+
+- system prompt;
+- secrets;
+- config;
+- tools;
+- pipeline rules;
+- permissions.
+
+A mesma regra vale para conteúdo de memória recuperado.
+
+---
+
+# 26. LLM e embeddings
 
 Use apenas protocolo OpenAI-compatible.
 
-Não crie provider registry genérico.
+Não criar provider registry genérico.
 
 Structured output:
 
-1. resposta do modelo;
-2. validação Pydantic;
-3. repair/retry controlado quando permitido;
-4. erro tipado se continuar inválido.
+```text
+model response
+→ Pydantic validation
+→ controlled repair/retry when allowed
+→ typed failure
+```
 
-Nunca persista JSON parcial/inválido como conhecimento válido.
+Nunca persistir JSON parcial/inválido como conhecimento válido.
 
-## 21. Testes
+---
 
-### Unit
+## 26.1 External calls and transactions
 
-Cobrir lógica pura: hashing, normalization, chunking, schemas, canonicalization, rank
-fusion, context budgeting, API key e idempotência.
+Não mantenha transaction PostgreSQL aberta durante chamadas externas sem justificativa arquitetural explícita.
 
-### Integration
+Padrão:
 
-PostgreSQL+pgvector e Neo4j reais.
+```text
+external embedding/LLM call
+        ↓
+short PostgreSQL transaction
+```
 
-Cobrir migrations, repositories, outbox, projection/rebuild, retrieval, deletion e
-recovery.
+quando possível.
 
-Localmente a stack `sofias_memory_db` pode ser usada quando explicitamente configurada.
-CI não pode assumir `5440`/`7688`; prefira Testcontainers.
+Native Cognitive Memory já usa esse padrão.
 
-### Contract/OpenAPI
+Contextual Episodes deve seguir o mesmo princípio.
+
+---
+
+# 27. Idempotência
+
+Writes relevantes devem ser idempotentes quando Contract exigir.
+
+Não confundir:
+
+```text
+idempotency
+```
+
+com:
+
+```text
+semantic dedupe
+```
+
+Conteúdo idêntico não implica necessariamente identidade de recurso.
+
+---
+
+## 27.1 Idempotency-Key
+
+Quando obrigatório pelo Contract:
+
+```http
+Idempotency-Key
+```
+
+deve proteger retry.
+
+Same key + same semantic request:
+
+```text
+same logical result
+```
+
+Same key + different semantic request:
+
+```text
+IDEMPOTENCY_CONFLICT
+```
+
+Correctness deve ser database-authoritative.
+
+Um pre-check não substitui:
+
+```text
+UNIQUE constraint / authoritative claim
+```
+
+---
+
+## 27.2 HMAC
+
+Request digest sensível deve usar:
+
+```text
+HMAC-SHA-256
+```
+
+ou propriedade criptográfica equivalente aprovada.
+
+Nunca persistir:
+
+- raw request;
+- raw semantic content;
+- raw Idempotency-Key-derived content hash.
+
+Não utilizar SHA-256 não keyed para request digest sensível.
+
+---
+
+# 28. Testes
+
+Testes existem para proteger comportamento real, não para aumentar contagem.
+
+---
+
+## 28.1 Unit
+
+Cobrir lógica pura quando relevante:
+
+- normalization;
+- schemas;
+- lifecycle;
+- canonicalization;
+- HMAC/idempotency;
+- ranking;
+- context budgeting;
+- state transition;
+- dependency evaluation.
+
+---
+
+## 28.2 Integration
+
+Usar PostgreSQL+pgvector real onde comportamento depende do banco.
+
+Neo4j real somente quando a feature realmente usa Neo4j.
+
+Contextual Project Memory PostgreSQL-only não deve adquirir dependência artificial de Neo4j em seus testes.
+
+Cobrir:
+
+- migrations;
+- repositories;
+- transactions;
+- constraints;
+- concurrency;
+- restart;
+- Forget;
+- recovery.
+
+---
+
+## 28.3 Contract/OpenAPI
 
 Testar:
 
-- OpenAPI;
-- rotas implementadas da fase;
-- prefixos proibidos;
-- exemplos;
+- rotas da fase/Slice;
+- métodos exatos;
+- forbidden routes;
 - envelopes;
 - headers;
+- stable errors;
 - breaking changes.
 
-### Antes de concluir
+Uma rota não autorizada pelo Slice deve ser tratada como possível scope leak.
+
+---
+
+## 28.4 Testes PostgreSQL opt-in
+
+Use banco dedicado.
+
+Não execute testes destrutivos contra banco de desenvolvimento compartilhado.
+
+Quando criar nova suite opt-in:
+
+- use env flag claro;
+- use DATABASE_URL dedicado;
+- documente execução.
+
+---
+
+## 28.5 Antes de concluir
 
 Execute o conjunto aplicável:
 
@@ -979,7 +1965,7 @@ uv run mypy sofias_memory
 uv run pytest
 ```
 
-Se houver migration, valide ao menos:
+Quando houver migration:
 
 ```bash
 uv run alembic upgrade head
@@ -987,15 +1973,39 @@ uv run alembic downgrade -1
 uv run alembic upgrade head
 ```
 
-Se algum check não puder rodar, informe qual, por quê e o risco residual.
+Se algum check não puder rodar:
 
-## 22. Docker/deployment
+- diga qual;
+- diga por quê;
+- diga o risco residual.
 
-### `compose.yaml`
+Nunca marque teste não executado como PASS.
+
+---
+
+# 29. Human Validation
+
+Tests green não significam, sozinhos, feature pronta.
+
+Quando o implementation handoff exigir Human Validation, prove comportamento através da API/ambiente real relevante.
+
+Human Validation deve verificar o valor prometido pelo Slice.
+
+Não substituir por:
+
+- mocks;
+- unit tests;
+- inspection do código.
+
+---
+
+# 30. Docker e deployment
+
+## 30.1 `compose.yaml`
 
 Fonte canônica e portável.
 
-Serviços obrigatórios:
+Serviços baseline:
 
 ```text
 sofias-memory
@@ -1003,192 +2013,321 @@ postgres
 neo4j
 ```
 
-Sem profiles opcionais no MVP.
+Ausência de dependência funcional contextual de Neo4j não significa remover Neo4j do produto-base.
 
-### EasyPanel
+---
 
-Use `compose.yaml` diretamente quando não houver diferença real e documentada para
-EasyPanel. Crie um arquivo específico somente para adaptações necessárias e não
-especulativas.
+## 30.2 EasyPanel
 
-### Portainer
+Use `compose.yaml` diretamente quando possível.
 
-Use `compose.yaml` diretamente quando não houver diferença real e documentada para
-Portainer. Crie um arquivo específico somente para adaptações necessárias e não
-especulativas.
+Arquivo específico somente quando houver diferença necessária e documentada.
 
-Não pode haver diferença funcional entre os deployments.
+---
 
-Regras:
+## 30.3 Portainer
 
-- apenas API publicada externamente no deployment normal;
+Mesma regra.
+
+Não criar divergência funcional entre deployments.
+
+---
+
+## 30.4 Regras
+
+- apenas API publicada externamente em deployment normal;
 - bancos em rede interna;
 - volumes persistentes;
 - healthchecks;
 - app non-root;
 - secrets fora do Git;
-- tags de produção imutáveis;
-- `compose.yaml` deve passar em `docker compose config`;
-- arquivos específicos de plataforma, quando existirem, também devem passar em
-  `docker compose config`.
+- production tags imutáveis;
+- `docker compose config` deve passar.
 
-## 23. Licença/Cognee upstream
+---
+
+# 31. Licença e Cognee upstream
 
 Cognee é Apache-2.0.
 
 Ao copiar/adaptar código:
 
-- registre origem;
-- preserve licença/notices aplicáveis;
-- documente modificações relevantes;
-- não copie módulos desnecessários;
-- adapte naming;
-- elimine auth/multitenancy de verdade; não esconda com defaults;
-- mantenha `LICENSE` e `NOTICE.md` corretos.
+- registrar origem quando aplicável;
+- preservar notices/licenças necessários;
+- documentar modificação relevante;
+- não copiar módulo desnecessário;
+- adaptar naming;
+- remover autenticação/multitenancy de fato quando incompatível com Sofias Memory;
+- manter `LICENSE`;
+- manter `NOTICE.md`.
 
-Use preferencialmente o commit baseline do PRD.
-Não acompanhe upstream novo silenciosamente durante uma feature.
+Não acompanhar upstream novo silenciosamente durante uma feature.
 
-## 24. Git e escopo
+---
 
-Não faça sem solicitação:
+# 32. Git e escopo
+
+Não fazer sem solicitação explícita:
 
 - commit;
 - push;
-- PR.
+- PR;
+- merge.
 
-Não:
+Também não:
 
 - reformate arquivos não relacionados;
-- atualize deps sem relação com a tarefa;
-- reescreva migration já aplicada em ambiente compartilhado;
-- altere PRD para fazer o código caber;
-- mude teste para esconder incompatibilidade.
+- atualize dependencies sem relação com a tarefa;
+- reescreva migration aplicada;
+- altere PRD/Contract para fazer código caber;
+- altere teste para esconder incompatibilidade;
+- inclua feature futura no Slice atual.
 
-Faça diffs pequenos, testes de regressão e ADR para decisão estrutural nova.
+Faça diffs pequenos e intencionais.
 
-## 25. Fluxo de trabalho do agente
+---
+
+# 33. Fluxo de trabalho do agente
 
 Em tarefa não trivial:
 
-1. identifique requisito/FR;
-2. leia PRD/ADR relevante;
-3. inspecione módulos e migrations;
-4. liste invariantes;
-5. implemente o menor corte vertical completo;
-6. ajuste testes/contratos;
-7. rode checks;
-8. revise diff;
-9. reporte mudanças, migrations, contratos, testes e riscos reais.
-
-Não entregue fake success, scaffold enganoso ou TODO crítico escondido.
-
-## 26. Fase atual e backlog inicial
-
-Estamos na fundação. Salvo tarefa explícita em contrário, trabalhe nesta ordem:
-
-### B0 — Repository foundation
-
-- estrutura raiz sem `src/`;
-- docs/product, docs/adr, docs/exec-plans;
-- `pyproject.toml`;
-- `uv.lock`;
-- Ruff/mypy/pytest;
-- `.gitignore`;
-- `.env.example`;
-- LICENSE/NOTICE.
-
-### B1 — Application foundation
-
-- typed Settings;
-- secret validation;
-- logging estruturado;
-- request ID;
-- API key middleware;
-- exception handlers;
-- FastAPI app/lifespan;
-- live/ready/info.
-
-### B2 — PostgreSQL foundation
-
-- async engine/session;
-- Alembic;
-- pgvector extension;
-- core schema do PRD;
-- indexes/constraints;
-- repositories;
-- migration tests.
-
-### B3 — Neo4j foundation
-
-- driver lifecycle;
-- readiness;
-- constraints;
-- projection interface;
-- graph outbox consumer skeleton;
-- rebuild contract.
-
-### B4 — Pydantic/OpenAPI foundation
-
-- schemas públicos;
-- envelopes;
-- stable error codes;
-- contratos das rotas do PRD;
-- OpenAPI metadata/examples;
-- contract snapshot/tests;
-- forbidden-route test.
-
-### B5 — Pipeline engine
-
-- run/step models;
-- queue claim;
-- heartbeat;
-- retries;
-- cancellation;
-- stale recovery;
-- dataset lock.
-
-Depois:
-
 ```text
-ingestion -> cognify -> recall -> improve -> forget -> hardening/release
+1. identify current phase/slice
+2. read AGENTS.md
+3. read approved implementation handoff
+4. read relevant approved baseline
+5. inspect current code/migrations/tests
+6. establish repository state
+7. list invariants
+8. implement smallest complete vertical path
+9. integrate real boundaries
+10. add required protection/tests
+11. run applicable checks
+12. inspect diff
+13. report facts, findings and risks
 ```
 
-Não pule para graph-RAG antes de schema, migrations, provenance e contratos estarem sólidos.
+Não entregue:
 
-## 27. Definition of Done
+- fake success;
+- scaffold que pareça funcional;
+- TODO crítico escondido;
+- teste não executado como PASS;
+- feature futura misturada.
 
-Uma feature está pronta quando, conforme aplicável:
+---
 
-- comportamento implementado;
-- typing/lint/format verdes;
-- unit/integration tests verdes;
-- migration criada e validada;
-- OpenAPI atualizado;
-- erros estáveis;
-- logs/métricas relevantes;
-- segurança revisada;
-- idempotência considerada;
-- rollback/recovery considerado;
-- docs/exemplo atualizados;
-- nenhum conceito proibido reintroduzido;
-- diff revisado.
+# 34. Implementation Slices
 
-## 28. Regra final
+Contextual Project Memory é implementada nesta sequência APPROVED:
+
+```text
+SM-CTX-001 — First-Class Episodes
+
+SM-CTX-002 — Context Streams and Initial Checkpoints
+
+SM-CTX-003 — Checkpoint Revision, Supersession and Concurrency
+
+SM-CTX-004 — First-Class Evidence and Deterministic Support
+
+SM-CTX-005 — Provenance-Aware Forget Propagation
+
+SM-CTX-006 — Contextual Recall Core
+
+SM-CTX-007 — Explain, History and Knowledge Integration
+
+SM-CTX-008 — Contract Hardening and Longitudinal Validation
+```
+
+Essa lista representa planejamento.
+
+Não representa autorização automática.
+
+Somente o Slice explicitamente CURRENT cujo implementation handoff estiver
+APPROVED pode ser executado. Atualmente é apenas `SM-CTX-001`, handoff `09`.
+Esta autorização de implementação não substitui o escopo da tarefa atual do
+usuário: uma auditoria documentation-only não autoriza executar Slice algum.
+
+---
+
+# 35. SM-CTX-001 guardrails
+
+Durante o Slice atual:
+
+```text
+SM-CTX-001
+```
+
+MUST:
+
+- criar Episode first-class;
+- usar PostgreSQL + pgvector;
+- manter embedding boundary fora da transaction;
+- implementar lifecycle;
+- implementar provenance;
+- implementar idempotência;
+- implementar direct Forget;
+- garantir tombstone;
+- implementar exact cosine retrieval interno;
+- manter API bounded;
+- sobreviver a restart.
+
+MUST NOT:
+
+- implementar Evidence;
+- implementar Checkpoints;
+- implementar Contextual Recall;
+- criar graph projection;
+- criar PipelineRun;
+- criar new datastore;
+- adicionar `memory_type=episodic`;
+- alterar Session semantics;
+- criar automatic promotion.
+
+O implementation handoff detalhado é autoridade:
+
+```text
+docs/product-implementation/implementation/
+09-SF-Implementation-SM-CTX-001-First-Class-Episodes.md
+```
+
+---
+
+# 36. Findings
+
+Durante implementação, classifique descobertas.
+
+## BLOCKER
+
+Impede fechamento do Slice.
+
+Exemplos:
+
+- Contract impossível;
+- migration insegura;
+- lifecycle incorreto;
+- idempotency race;
+- Forget leakage;
+- regression crítica.
+
+---
+
+## IMPORTANT
+
+Afeta diretamente o objetivo atual e merece correção no Slice quando localizada e coerente com o escopo.
+
+---
+
+## MINOR
+
+Não impede o valor prometido.
+
+---
+
+## DEFERRED
+
+Fora do Slice.
+
+Não expanda escopo para “resolver” DEFERRED.
+
+---
+
+# 37. Quando voltar ao usuário
+
+Não interrompa por detalhes locais e reversíveis.
+
+Decida autonomamente:
+
+- naming interno coerente;
+- organização de arquivos;
+- refactor pequeno;
+- helper local;
+- teste necessário;
+- implementação equivalente.
+
+Volte ao usuário quando surgir necessidade de:
+
+- mudar scope;
+- mudar requisito APPROVED;
+- mudar public Contract;
+- nova arquitetura durável;
+- novo datastore;
+- nova dependência operacional relevante;
+- novo required secret;
+- impacto de security/authority;
+- migration destrutiva;
+- alterar lifecycle aprovado;
+- alterar Forget semantics;
+- introduzir Neo4j em Contextual Memory;
+- introduzir automatic behavior;
+- implementar Slice futuro.
+
+---
+
+# 38. Definition of Done de um Slice
+
+Um Slice só está DONE quando, conforme aplicável:
+
+- objective implementado;
+- acceptance criteria satisfeitos;
+- required tests executados;
+- tests relevantes PASS;
+- migration validada;
+- OpenAPI coerente;
+- error semantics coerentes;
+- idempotência validada;
+- concurrency validada;
+- restart/recovery validado;
+- Human Validation concluída quando exigida;
+- nenhum BLOCKER;
+- remaining findings classificados;
+- valor prometido realmente utilizável.
+
+Quantidade de código ou testes não é medida de conclusão.
+
+---
+
+# 39. Implementation Report
+
+Ao finalizar um Slice, reporte fatos.
+
+Formato esperado deve seguir o implementation handoff.
+
+No mínimo:
+
+```text
+Implemented
+Changed files
+Database
+Verified
+Acceptance Criteria
+Findings
+Known issues
+Human validation
+Git
+```
+
+Não avançar para o próximo Slice automaticamente.
+
+---
+
+# 40. Regra final
 
 Entre duas soluções, prefira a que:
 
-1. mantém single-user;
-2. reduz caminhos de execução;
-3. preserva PostgreSQL como fonte de verdade;
-4. mantém Neo4j reconstruível;
-5. aumenta proveniência;
-6. torna falhas recuperáveis;
-7. é testável com infraestrutura real;
-8. evita abstrações especulativas;
-9. respeita PRD/ADRs;
-10. reduz a chance de recriar o Cognee inteiro por acidente.
+1. respeita o Slice APPROVED;
+2. mantém PostgreSQL como fonte de verdade;
+3. mantém Neo4j reconstruível;
+4. reduz caminhos de execução;
+5. aumenta provenance;
+6. mantém lifecycle explícito;
+7. torna falhas recuperáveis;
+8. preserva idempotência;
+9. é testável com infraestrutura real;
+10. evita abstrações especulativas;
+11. não transforma Memory em Agent Runtime;
+12. não antecipa features futuras.
 
-O objetivo não é o sistema mais genérico.
+O objetivo não é construir o sistema mais genérico.
 
-O objetivo é o **Sofias Memory correto**.
+O objetivo é construir o **Sofias Memory correto**, um Slice verificável de cada vez.

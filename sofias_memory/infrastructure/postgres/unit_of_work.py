@@ -13,10 +13,13 @@ from sofias_memory.infrastructure.postgres.repositories import (
     AgentSkillRepository,
     ChunkRepository,
     CognitiveMemoryIdempotencyRepository,
+    ContextualMemoryIdempotencyRepository,
     DatasetRepository,
     DocumentRepository,
     EntityMentionRepository,
     EntityRepository,
+    EpisodeProvenanceRepository,
+    EpisodeRepository,
     FeedbackRepository,
     GraphOutboxRepository,
     MemoryItemRepository,
@@ -68,6 +71,9 @@ class PostgresUnitOfWork:
         self._memory_items: MemoryItemRepository | None = None
         self._memory_provenance: MemoryProvenanceRepository | None = None
         self._cognitive_memory_idempotency: CognitiveMemoryIdempotencyRepository | None = None
+        self._episodes: EpisodeRepository | None = None
+        self._episode_provenance: EpisodeProvenanceRepository | None = None
+        self._contextual_memory_idempotency: ContextualMemoryIdempotencyRepository | None = None
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -101,6 +107,9 @@ class PostgresUnitOfWork:
         self._memory_items = MemoryItemRepository(session)
         self._memory_provenance = MemoryProvenanceRepository(session)
         self._cognitive_memory_idempotency = CognitiveMemoryIdempotencyRepository(session)
+        self._episodes = EpisodeRepository(session)
+        self._episode_provenance = EpisodeProvenanceRepository(session)
+        self._contextual_memory_idempotency = ContextualMemoryIdempotencyRepository(session)
         return self
 
     async def __aexit__(
@@ -261,6 +270,24 @@ class PostgresUnitOfWork:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._cognitive_memory_idempotency
 
+    @property
+    def episodes(self) -> EpisodeRepository:
+        if self._episodes is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._episodes
+
+    @property
+    def episode_provenance(self) -> EpisodeProvenanceRepository:
+        if self._episode_provenance is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._episode_provenance
+
+    @property
+    def contextual_memory_idempotency(self) -> ContextualMemoryIdempotencyRepository:
+        if self._contextual_memory_idempotency is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._contextual_memory_idempotency
+
     def savepoint(self) -> AsyncSessionTransaction:
         """A nested transaction (SAVEPOINT) inside this unit of work.
 
@@ -325,3 +352,6 @@ class PostgresUnitOfWork:
         self._memory_items = None
         self._memory_provenance = None
         self._cognitive_memory_idempotency = None
+        self._episodes = None
+        self._episode_provenance = None
+        self._contextual_memory_idempotency = None

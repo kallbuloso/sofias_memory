@@ -33,6 +33,7 @@ from sofias_memory.api.middleware import (
 from sofias_memory.api.routes.agents import router as agents_router
 from sofias_memory.api.routes.cognify import router as cognify_router
 from sofias_memory.api.routes.datasets import router as datasets_router
+from sofias_memory.api.routes.episodes import router as episodes_router
 from sofias_memory.api.routes.feedback import router as feedback_router
 from sofias_memory.api.routes.forget import router as forget_router
 from sofias_memory.api.routes.graph import router as graph_router
@@ -200,6 +201,14 @@ TAG_METADATA: list[dict[str, str]] = [
             "Create and retrieve native Cognitive Memory items (durable typed "
             "facts/preferences), independent of Dataset/Source/Document/Chunk "
             "and independent of Session history."
+        ),
+    },
+    {
+        "name": "episodes",
+        "description": (
+            "Explicitly preserve, list, invalidate and forget first-class contextual "
+            "Episodes (historical experience of a Project Scope) -- never current truth, "
+            "never a MemoryItem or SessionEntry. PostgreSQL-only; no graph projection."
         ),
     },
 ]
@@ -423,6 +432,7 @@ def create_app(
     application.include_router(skills_router, prefix="/api/v1")
     application.include_router(agents_router, prefix="/api/v1")
     application.include_router(memories_router, prefix="/api/v1")
+    application.include_router(episodes_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

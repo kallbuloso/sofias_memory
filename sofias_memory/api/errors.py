@@ -15,6 +15,15 @@ from sofias_memory.schemas.common import ErrorBody, ErrorCode, ErrorEnvelope, JS
 REQUEST_VALIDATION_STATUS_CODE = HTTPStatus.UNPROCESSABLE_ENTITY
 INTERNAL_ERROR_MESSAGE = "Internal server error."
 
+SPECIFIC_VALIDATION_ERROR_CODES: Mapping[str, ErrorCode] = {
+    "invalid_scope": ErrorCode.INVALID_SCOPE,
+    "invalid_context_key": ErrorCode.INVALID_CONTEXT_KEY,
+    "invalid_episode_kind": ErrorCode.INVALID_EPISODE_KIND,
+}
+"""Pydantic custom error ``type`` values raised only by the Contextual Project
+Memory schemas (``schemas.episodes``) -> the stable Contract v1 SS 62
+validation code. Every other validation error stays ``INVALID_REQUEST``."""
+
 
 class SofiasMemoryError(Exception):
     def __init__(
@@ -108,15 +117,17 @@ async def request_validation_error_handler(
 ) -> JSONResponse:
     del request
     request_id = current_request_id()
-    details: JSONDetails = {"errors": sanitize_validation_errors(_validation_error_mappings(exc))}
+    error_mappings = _validation_error_mappings(exc)
+    code = validation_error_code(error_mappings)
+    details: JSONDetails = {"errors": sanitize_validation_errors(error_mappings)}
     get_logger(__name__).warning(
         "request_validation_error",
-        error_code=ErrorCode.INVALID_REQUEST.value,
+        error_code=code.value,
         status_code=REQUEST_VALIDATION_STATUS_CODE,
     )
     return error_json_response(
         status_code=REQUEST_VALIDATION_STATUS_CODE,
-        code=ErrorCode.INVALID_REQUEST,
+        code=code,
         message="Invalid request.",
         details=details,
         request_id=request_id,
@@ -168,6 +179,20 @@ def current_request_id() -> UUID:
         except ValueError:
             return uuid4()
     return uuid4()
+
+
+def validation_error_code(errors: list[Mapping[str, object]]) -> ErrorCode:
+    """A specific validation code only when every error maps to that same
+    specific code; any mixture (or any generic error) stays
+    ``INVALID_REQUEST``. The full sanitized error list is always in
+    ``details`` either way."""
+
+    codes = {SPECIFIC_VALIDATION_ERROR_CODES.get(str(error.get("type"))) for error in errors}
+    if len(codes) == 1:
+        (code,) = codes
+        if code is not None:
+            return code
+    return ErrorCode.INVALID_REQUEST
 
 
 def sanitize_validation_errors(errors: list[Mapping[str, object]]) -> list[JSONValue]:

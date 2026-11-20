@@ -7,10 +7,15 @@ from sofias_memory.infrastructure.postgres.models.chunk import Chunk
 from sofias_memory.infrastructure.postgres.models.cognitive_memory_idempotency import (
     CognitiveMemoryIdempotency,
 )
+from sofias_memory.infrastructure.postgres.models.contextual_memory_idempotency import (
+    ContextualMemoryIdempotency,
+)
 from sofias_memory.infrastructure.postgres.models.dataset import Dataset
 from sofias_memory.infrastructure.postgres.models.document import Document
 from sofias_memory.infrastructure.postgres.models.entity import Entity
 from sofias_memory.infrastructure.postgres.models.entity_mention import EntityMention
+from sofias_memory.infrastructure.postgres.models.episode import Episode
+from sofias_memory.infrastructure.postgres.models.episode_provenance import EpisodeProvenance
 from sofias_memory.infrastructure.postgres.models.feedback import Feedback
 from sofias_memory.infrastructure.postgres.models.graph_outbox import GraphOutbox
 from sofias_memory.infrastructure.postgres.models.memory_entry import MemoryEntry
@@ -34,10 +39,13 @@ __all__ = [
     "AgentSkill",
     "Chunk",
     "CognitiveMemoryIdempotency",
+    "ContextualMemoryIdempotency",
     "Dataset",
     "Document",
     "Entity",
     "EntityMention",
+    "Episode",
+    "EpisodeProvenance",
     "Feedback",
     "GraphOutbox",
     "MemoryEntry",

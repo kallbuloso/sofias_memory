@@ -156,6 +156,54 @@ class CognitiveMemoryOriginKind(StrEnum):
     ASSISTANT_GENERATED = "assistant_generated"
 
 
+class EpisodeKind(StrEnum):
+    """Contextual Project Memory Episode kind (Contract v1 SS 15).
+
+    Exactly the nine approved v1 kinds -- never extend without an explicit
+    Contract evolution."""
+
+    DECISION = "decision"
+    INVESTIGATION = "investigation"
+    EXPERIMENT = "experiment"
+    INCIDENT = "incident"
+    DISCOVERY = "discovery"
+    CHANGE = "change"
+    OUTCOME = "outcome"
+    LEARNING = "learning"
+    MILESTONE = "milestone"
+
+
+class EpisodeLifecycle(StrEnum):
+    """Contextual Project Memory Episode lifecycle (Contract v1 SS 16).
+
+    Allowed transitions: ``active -> invalidated``, ``active -> forgotten``,
+    ``invalidated -> forgotten``. ``forgotten`` is terminal. There is no
+    ``superseded``, restore, or unforget for Episodes."""
+
+    ACTIVE = "active"
+    INVALIDATED = "invalidated"
+    FORGOTTEN = "forgotten"
+
+
+class ContextualMemoryOperation(StrEnum):
+    """``contextual_memory_idempotency`` ledger operation identity.
+
+    Resource-generic on purpose: the ledger is shared by every Contextual
+    Project Memory mutation. The ``checkpoint_*`` values exist only as schema
+    readiness for later Slices (SM-CTX-002/003) so the PostgreSQL enum does
+    not churn -- SM-CTX-001 executes only the ``episode_*`` operations.
+    Independent of ``PipelineType``: contextual mutations never create a
+    PipelineRun."""
+
+    EPISODE_CREATE = "episode_create"
+    EPISODE_INVALIDATE = "episode_invalidate"
+    EPISODE_FORGET = "episode_forget"
+    CHECKPOINT_CREATE = "checkpoint_create"
+    CHECKPOINT_SUPERSEDE = "checkpoint_supersede"
+    CHECKPOINT_INVALIDATE = "checkpoint_invalidate"
+    CHECKPOINT_FORGET = "checkpoint_forget"
+
+
 class CognitiveMemoryOperation(StrEnum):
     """``cognitive_memory_idempotency`` ledger operation identity.
     Independent of ``PipelineType`` -- Cognitive Memory mutations are never

@@ -9,12 +9,19 @@ from sofias_memory.infrastructure.postgres.repositories.chunks import ChunkRepos
 from sofias_memory.infrastructure.postgres.repositories.cognitive_memory_idempotency import (
     CognitiveMemoryIdempotencyRepository,
 )
+from sofias_memory.infrastructure.postgres.repositories.contextual_memory_idempotency import (
+    ContextualMemoryIdempotencyRepository,
+)
 from sofias_memory.infrastructure.postgres.repositories.datasets import DatasetRepository
 from sofias_memory.infrastructure.postgres.repositories.documents import DocumentRepository
 from sofias_memory.infrastructure.postgres.repositories.entities import EntityRepository
 from sofias_memory.infrastructure.postgres.repositories.entity_mentions import (
     EntityMentionRepository,
 )
+from sofias_memory.infrastructure.postgres.repositories.episode_provenance import (
+    EpisodeProvenanceRepository,
+)
+from sofias_memory.infrastructure.postgres.repositories.episodes import EpisodeRepository
 from sofias_memory.infrastructure.postgres.repositories.feedback import FeedbackRepository
 from sofias_memory.infrastructure.postgres.repositories.graph_outbox import GraphOutboxRepository
 from sofias_memory.infrastructure.postgres.repositories.graph_rebuild import GraphRebuildRepository
@@ -46,10 +53,13 @@ __all__ = [
     "AgentSkillRepository",
     "ChunkRepository",
     "CognitiveMemoryIdempotencyRepository",
+    "ContextualMemoryIdempotencyRepository",
     "DatasetRepository",
     "DocumentRepository",
     "EntityMentionRepository",
     "EntityRepository",
+    "EpisodeProvenanceRepository",
+    "EpisodeRepository",
     "FeedbackRepository",
     "GraphOutboxRepository",
     "GraphRebuildRepository",

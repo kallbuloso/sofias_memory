@@ -522,16 +522,19 @@ async def assert_last_migration_downgraded(
         constraints = await constraints_by_name(connection, schema=schema)
 
     assert revisions == frozenset({expected_revision})
-    # 0018 (SM-1001) is purely additive (memory_items, memory_provenance,
-    # cognitive_memory_idempotency): downgrading it removes exactly those
-    # three tables, never any earlier table or constraint (0017's Agent<->
-    # Session association, 0016's Agent<->Skill association, 0015's Agent
-    # foundation, 0014's Skills foundation, 0013's SM-603 constraint, or
-    # anything earlier).
-    assert "memory_items" not in tables
-    assert "memory_provenance" not in tables
-    assert "cognitive_memory_idempotency" not in tables
+    # 0019 (SM-CTX-001) is purely additive (episodes, episode_provenance,
+    # contextual_memory_idempotency): downgrading it removes exactly those
+    # three tables, never any earlier table or constraint (0018's Native
+    # Cognitive Memory foundation, 0017's Agent<->Session association, 0016's
+    # Agent<->Skill association, 0015's Agent foundation, 0014's Skills
+    # foundation, 0013's SM-603 constraint, or anything earlier).
+    assert "episodes" not in tables
+    assert "episode_provenance" not in tables
+    assert "contextual_memory_idempotency" not in tables
     assert {
+        "memory_items",
+        "memory_provenance",
+        "cognitive_memory_idempotency",
         "agents",
         "agent_skills",
         "agent_sessions",
@@ -546,8 +549,13 @@ async def assert_last_migration_downgraded(
         "pipeline_steps",
         "graph_outbox",
     } <= tables
-    # 0017's own table must survive a 0018-only downgrade -- proves the
-    # downgrade removed exactly the 0018 objects, not anything from 0017.
+    # 0018's own constraints must survive a 0019-only downgrade -- proves the
+    # downgrade removed exactly the 0019 objects, not anything from 0018
+    # (including the cognitive_memory_origin_kind enum 0019 only references).
+    assert "ck_memory_items_forgotten_requires_tombstone_shape" in constraints
+    assert "uq_cognitive_memory_idempotency_idempotency_key" in constraints
+    assert "fk_memory_provenance_memory_id_memory_items" in constraints
+    # 0017's own table must survive too.
     assert "fk_agent_sessions_agent_id_agents" in constraints
     assert "fk_agent_sessions_session_id_sessions" in constraints
     # 0016's own table must survive too.
@@ -561,7 +569,7 @@ async def assert_last_migration_downgraded(
     assert "ck_skill_revisions_procedure_not_blank" in constraints
     assert "ck_skill_revisions_content_sha256_hex" in constraints
     # 0013's own additive constraint must survive too, transitively proving
-    # no migration older than 0018 was touched.
+    # no migration older than 0019 was touched.
     assert "ck_session_entries_external_id_trimmed" in constraints
     assert "ck_session_entries_external_id_not_blank" in constraints
     assert "ck_session_entries_external_id_max_length" in constraints

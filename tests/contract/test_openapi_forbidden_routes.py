@@ -778,6 +778,89 @@ def test_memory_item_result_never_exposes_embedding() -> None:
     assert "embedding" not in memory_provenance_result["properties"]
 
 
+EXPECTED_EPISODE_ROUTES = {
+    "/api/v1/episodes": {"get", "post"},
+    "/api/v1/episodes/{episode_id}": {"get"},
+    "/api/v1/episodes/{episode_id}/invalidate": {"post"},
+    "/api/v1/episodes/{episode_id}/forget": {"post"},
+}
+"""SM-CTX-001: exactly the five approved Episode operations (Contract v1
+SS 75); no PATCH/PUT/DELETE (SS 22/76), no restore/supersede/unforget."""
+
+
+def test_episode_routes_present_with_exact_methods() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    episode_paths = {path for path in paths if path.startswith("/api/v1/episodes")}
+    assert episode_paths == set(EXPECTED_EPISODE_ROUTES)
+    for path, methods in EXPECTED_EPISODE_ROUTES.items():
+        assert set(paths[path]) == methods, path
+        assert not {"patch", "put", "delete"} & set(paths[path])
+
+
+def test_no_future_contextual_routes_or_contract_advertisement_in_sm_ctx_001() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    assert not [path for path in paths if path.startswith("/api/v1/context")]
+    for forbidden in (
+        "/api/v1/episodes/{episode_id}/restore",
+        "/api/v1/episodes/{episode_id}/supersede",
+        "/api/v1/episodes/{episode_id}/unforget",
+        "/api/v1/episodes/recall",
+        "/api/v1/episodes/search",
+    ):
+        assert forbidden not in paths
+    assert "contextual_project_memory" not in json.dumps(schema)
+
+
+def test_episode_mutations_require_idempotency_key_and_reads_do_not_accept_it() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    for path in (
+        "/api/v1/episodes",
+        "/api/v1/episodes/{episode_id}/invalidate",
+        "/api/v1/episodes/{episode_id}/forget",
+    ):
+        parameters = paths[path]["post"].get("parameters", [])
+        header = next(p for p in parameters if p.get("name") == "Idempotency-Key")
+        assert header["required"] is True
+    for path in ("/api/v1/episodes", "/api/v1/episodes/{episode_id}"):
+        names = {p.get("name") for p in paths[path]["get"].get("parameters", [])}
+        assert "Idempotency-Key" not in names
+
+
+def test_episode_result_never_exposes_embedding_and_create_has_no_support() -> None:
+    schema = openapi_schema()
+    components = schema["components"]
+    assert isinstance(components, dict)
+    schemas = components["schemas"]
+    assert isinstance(schemas, dict)
+
+    result = schemas["EpisodeResult"]
+    assert "embedding" not in result["properties"]
+    assert "invalidation_reason" not in result["properties"]
+    create = schemas["EpisodeCreateRequest"]
+    assert set(create["properties"]) == {
+        "scope",
+        "context_key",
+        "kind",
+        "summary",
+        "situation",
+        "reason",
+        "outcome",
+        "occurred_at",
+        "confidence",
+        "provenance",
+    }
+    assert set(create["required"]) == {"scope", "kind", "summary", "occurred_at", "provenance"}
+
+
 def test_no_provider_or_database_configuration_schema_exposed() -> None:
     schema = openapi_schema()
     components = schema.get("components", {})

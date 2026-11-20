@@ -128,6 +128,7 @@ def test_sources_documents_revision_is_current_head() -> None:
         "0016_create_agent_skills.py",
         "0017_create_agent_sessions.py",
         "0018_create_native_cognitive_memory.py",
+        "0019_create_contextual_episodes.py",
     ]
 
 

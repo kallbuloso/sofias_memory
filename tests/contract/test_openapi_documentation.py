@@ -43,6 +43,17 @@ IDEMPOTENCY_KEY_OPERATIONS = {
     ("post", "/api/v1/memories"),
     ("post", "/api/v1/memories/{memory_id}/supersede"),
     ("post", "/api/v1/memories/{memory_id}/forget"),
+    ("post", "/api/v1/episodes"),
+    ("post", "/api/v1/episodes/{episode_id}/invalidate"),
+    ("post", "/api/v1/episodes/{episode_id}/forget"),
+}
+
+# Contextual Project Memory Contract v1 SS 36: every contextual mutation
+# REQUIRES Idempotency-Key (unlike every older surface, where it is optional).
+REQUIRED_IDEMPOTENCY_KEY_OPERATIONS = {
+    ("post", "/api/v1/episodes"),
+    ("post", "/api/v1/episodes/{episode_id}/invalidate"),
+    ("post", "/api/v1/episodes/{episode_id}/forget"),
 }
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete")
@@ -194,7 +205,8 @@ def test_idempotency_key_has_meaningful_description_where_accepted() -> None:
             None,
         )
         assert header_param is not None, f"{method.upper()} {path} is missing Idempotency-Key"
-        assert header_param.get("required") is not True
+        expected_required = (method, path) in REQUIRED_IDEMPOTENCY_KEY_OPERATIONS
+        assert (header_param.get("required") is True) is expected_required
         description = header_param["schema"].get("description", header_param.get("description", ""))
         assert len(description) > 50
 

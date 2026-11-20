@@ -115,6 +115,11 @@ The stable, closed set of error codes you may see:
 | `DATASET_DELETING` | Operation rejected because the target dataset has an in-flight administrative delete. |
 | `DATASET_DELETED` | Operation rejected because the target dataset is already a tombstone. |
 | `SESSION_ARCHIVED` | New Session activity (SessionEntry append, Recall, Remember) rejected because the Session is archived. Safe replay, manual retry, reads, restore, and `PATCH` are never blocked by this. |
+| `INVALID_SCOPE` | (Episodes, `422`) `scope` is not a canonical `project:<key>` (`global` is rejected for contextual resources). |
+| `INVALID_CONTEXT_KEY` | (Episodes, `422`) `context_key` does not match `[a-z0-9][a-z0-9._:-]{0,127}`. |
+| `INVALID_EPISODE_KIND` | (Episodes, `422`) `kind` is not one of the nine v1 Episode kinds. |
+| `EPISODE_NOT_FOUND` | (Episodes, `404`) The target Episode does not exist. |
+| `EPISODE_STATE_CONFLICT` | (Episodes, `409`) The Episode is FORGOTTEN, so it cannot be invalidated. |
 
 Example — missing key:
 
@@ -1113,3 +1118,82 @@ happens only through Supersede (preserving history) or a new Create.
 Cognitive Memory never creates a `PipelineRun`, never projects to Neo4j,
 and never emits a `graph_outbox` event, for any of Create/Get/Recall/
 Supersede/Forget.
+
+## 21. Contextual Episodes (partial Contextual Project Memory)
+
+First-class **Episodes** — explicitly preserved historical experience (*what
+happened*) of a Project Scope. An Episode is never current truth: it never
+creates or supersedes a `MemoryItem`, never becomes a `SessionEntry`, and is
+never extracted automatically. PostgreSQL is authoritative; there is no Neo4j
+projection, no `graph_outbox` event and no `PipelineRun`.
+
+This is only the Episode part of the Contextual Project Memory Contract.
+Checkpoints, Evidence, Forget propagation and Contextual Recall do not exist
+yet, and `GET /api/v1/info` deliberately does **not** advertise
+`contracts.contextual_project_memory` or any `contextual_project_memory.*`
+capability.
+
+```bash
+# Create (Idempotency-Key is REQUIRED on every Episode mutation)
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/episodes" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+        "scope": "project:sofias-memory",
+        "context_key": "feature:contextual-memory",
+        "kind": "decision",
+        "summary": "Episode was chosen as a first-class aggregate.",
+        "occurred_at": "2026-11-17T21:00:00Z",
+        "provenance": {"origin_kind": "user_asserted", "source_system": "sofias-assistant"}
+      }'
+
+# List (scope required; default lifecycle=active; keyset pagination)
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/episodes?scope=project:sofias-memory&limit=20" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Get / invalidate / forget
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/episodes/$EPISODE_ID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/episodes/$EPISODE_ID/invalidate" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" -d '{"reason": "Found to be inaccurate."}'
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/episodes/$EPISODE_ID/forget" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Idempotency-Key: $(uuidgen)"
+```
+
+- `scope`: `project:<key>` only (Cognitive Memory grammar; `global` → `422 INVALID_SCOPE`).
+  Project scope is a contextual namespace, never an ACL/tenant boundary.
+- `context_key`: optional. Omitted means a **project-wide** Episode and stays
+  `null` — it is never defaulted to `main`.
+- `kind`: `decision`, `investigation`, `experiment`, `incident`, `discovery`,
+  `change`, `outcome`, `learning`, `milestone`.
+- `summary` required; `situation`/`reason`/`outcome` optional; text fields must
+  be non-blank (CRLF/CR→LF, edges trimmed). No other length limit beyond the
+  global request-body limit.
+- `occurred_at`: caller-supplied, timezone-aware (normalized to UTC), may be in
+  the past, rejected beyond a 5-minute clock-skew tolerance in the future;
+  independent of server-generated `created_at`.
+- `confidence`: nullable `[0,1]`, required when `origin_kind` is `inferred`.
+- `provenance`: `origin_kind` (same five values as Cognitive Memory),
+  `source_system` (required, non-blank), optional opaque `conversation_ref`/
+  `turn_ref`. Provenance is not Evidence. `support` is not accepted yet.
+- The embedding is computed before the short PostgreSQL transaction from
+  `summary`/`situation`/`reason`/`outcome` only; on provider failure → `503
+  DEPENDENCY_UNAVAILABLE` and nothing is persisted. It is never returned.
+
+Lifecycle: `active → invalidated`, `active|invalidated → forgotten`;
+`forgotten` is terminal. Invalidate on an already-invalidated Episode and Forget
+on an already-forgotten Episode are `200` state no-ops; Invalidate on a
+forgotten Episode is `409 EPISODE_STATE_CONFLICT`. An optional
+`replacement_episode_id` must exist, not be forgotten and share the Project
+Scope (otherwise `422 INVALID_REQUEST`); it is never created automatically.
+Forget is destructive and direct: every semantic field, the embedding and the
+external provenance refs are scrubbed, leaving only `episode_id`, `lifecycle`,
+timestamps and `origin_kind`/`source_system`. A forgotten Episode no longer
+belongs to any Project Scope, so it never appears in listings; read it by id.
+There is no `PATCH`/`PUT`/`DELETE`, restore or unforget.
+
+Idempotency: same key + same request replays the original result (resolved
+before any lifecycle rejection); same key + different request (or another
+operation/target) → `409 IDEMPOTENCY_CONFLICT`; `sys:`-prefixed keys → `400`;
+a missing header → `422 INVALID_REQUEST`. Keys are stored only as a keyed
+HMAC lookup identity, never in plain text.

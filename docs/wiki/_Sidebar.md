@@ -1,0 +1,44 @@
+### Sofias Memory
+
+- [Home](Home)
+- [Getting Started](Getting-Started)
+- [Core Concepts](Core-Concepts)
+
+### Memory
+
+- [Cognitive Memory](Cognitive-Memory)
+- [Knowledge Memory](Knowledge-Memory)
+- [Datasets & Sources](Datasets-and-Sources)
+- [Provenance & Feedback](Provenance-and-Feedback)
+
+### Context & Procedures
+
+- [Sessions](Sessions)
+- [Skills & Agents](Skills-and-Agents)
+
+### API & Integrations
+
+- [API Guide](API-Guide)
+- [Integration Guide](Integration-Guide)
+
+### Security & Configuration
+
+- [Configuration Reference](Configuration-Reference)
+- [Security Model](Security-Model)
+
+### Operations & Reliability
+
+- [Runs & Reliability](Runs-and-Reliability)
+- [Operations & Deployment](Operations-and-Deployment)
+- [Storage & S3](Storage-and-S3)
+- [Graph & Neo4j](Graph-and-Neo4j)
+- [Troubleshooting](Troubleshooting)
+
+### Engineering Reference
+
+- [Canonical API Contract](https://github.com/kallbuloso/sofias_memory/blob/main/docs/api.md)
+- [Canonical Operations Guide](https://github.com/kallbuloso/sofias_memory/blob/main/docs/operations.md)
+- [Development Guide](https://github.com/kallbuloso/sofias_memory/blob/main/docs/development.md)
+- [Architecture Decisions](https://github.com/kallbuloso/sofias_memory/tree/main/docs/adr)
+- [Product Contracts](https://github.com/kallbuloso/sofias_memory/tree/main/docs/product)
+- [Changelog](https://github.com/kallbuloso/sofias_memory/blob/main/CHANGELOG.md)

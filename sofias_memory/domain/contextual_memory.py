@@ -284,28 +284,29 @@ _CHECKPOINT_INVALIDATE_TRANSITIONS: dict[ContextCheckpointLifecycle, CheckpointT
     ContextCheckpointLifecycle.ACTIVE: CheckpointTransition.APPLY,
     ContextCheckpointLifecycle.INVALIDATED: CheckpointTransition.NO_OP,
     ContextCheckpointLifecycle.FORGOTTEN: CheckpointTransition.CONFLICT,
-    # Unreachable in SM-CTX-002 (nothing produces SUPERSEDED yet); the
-    # Contract SS 33 SUPERSEDED -> INVALIDATED transition is enabled by SM-CTX-003.
-    ContextCheckpointLifecycle.SUPERSEDED: CheckpointTransition.CONFLICT,
+    # Contract SS 33 / handoff 11 SS 24: historical lineage
+    # (superseded_at/superseded_by) is preserved on the INVALIDATED row.
+    ContextCheckpointLifecycle.SUPERSEDED: CheckpointTransition.APPLY,
 }
 
 _CHECKPOINT_FORGET_TRANSITIONS: dict[ContextCheckpointLifecycle, CheckpointTransition] = {
     ContextCheckpointLifecycle.ACTIVE: CheckpointTransition.APPLY,
     ContextCheckpointLifecycle.INVALIDATED: CheckpointTransition.APPLY,
     ContextCheckpointLifecycle.FORGOTTEN: CheckpointTransition.NO_OP,
-    # Unreachable in SM-CTX-002; SUPERSEDED -> FORGOTTEN arrives with SM-CTX-003.
-    ContextCheckpointLifecycle.SUPERSEDED: CheckpointTransition.CONFLICT,
+    # Contract SS 34 / handoff 11 SS 26: structural lineage survives Forget.
+    ContextCheckpointLifecycle.SUPERSEDED: CheckpointTransition.APPLY,
 }
 
 
 def checkpoint_invalidate_transition(lifecycle: ContextCheckpointLifecycle) -> CheckpointTransition:
-    """Handoff 10 SS 59: ACTIVE -> INVALIDATED, INVALIDATED -> 200 no-op,
-    FORGOTTEN -> CHECKPOINT_STATE_CONFLICT."""
+    """Contract v1 SS 33: ACTIVE|SUPERSEDED -> INVALIDATED, INVALIDATED -> 200
+    no-op, FORGOTTEN -> CHECKPOINT_STATE_CONFLICT."""
 
     return _CHECKPOINT_INVALIDATE_TRANSITIONS[lifecycle]
 
 
 def checkpoint_forget_transition(lifecycle: ContextCheckpointLifecycle) -> CheckpointTransition:
-    """Handoff 10 SS 62: ACTIVE|INVALIDATED -> FORGOTTEN, FORGOTTEN -> 200 no-op."""
+    """Contract v1 SS 34: ACTIVE|SUPERSEDED|INVALIDATED -> FORGOTTEN, FORGOTTEN ->
+    200 no-op."""
 
     return _CHECKPOINT_FORGET_TRANSITIONS[lifecycle]

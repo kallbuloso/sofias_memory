@@ -14,8 +14,11 @@ tombstones keep participating in ``UNIQUE(scope, context_key, revision)`` and in
 ``invalidation_reason`` (scrubbed on Forget).
 
 The partial unique index ``uq_context_checkpoints_active_stream`` is the
-structural single-ACTIVE guarantee. Supersession columns are schema
-readiness for SM-CTX-003 only; SM-CTX-002 never writes them.
+structural single-ACTIVE guarantee. Supersession lineage (SM-CTX-003, 0021):
+``superseded_by`` is unique when non-null (one direct predecessor per
+replacement) and its FK is ``DEFERRABLE INITIALLY IMMEDIATE`` -- only the
+supersede transaction defers it, and it is still checked at COMMIT. SUPERSEDED
+-> INVALIDATED/FORGOTTEN keep ``superseded_at``/``superseded_by``.
 """
 
 from __future__ import annotations
@@ -34,6 +37,8 @@ from sofias_memory.infrastructure.postgres.base import Base
 
 ACTIVE_STREAM_UNIQUE_INDEX = "uq_context_checkpoints_active_stream"
 STREAM_REVISION_UNIQUE_CONSTRAINT = "uq_context_checkpoints_scope_context_key_revision"
+SUPERSEDED_BY_UNIQUE_INDEX = "uq_context_checkpoints_superseded_by"
+LINEAGE_FOREIGN_KEY = "fk_context_checkpoints_superseded_by_context_checkpoints"
 
 
 def _lifecycle_values(enum_type: type[ContextCheckpointLifecycle]) -> list[str]:
@@ -113,6 +118,12 @@ class ContextCheckpoint(Base):
             postgresql_where=sql_text("lifecycle = 'active'"),
         ),
         Index(
+            SUPERSEDED_BY_UNIQUE_INDEX,
+            "superseded_by",
+            unique=True,
+            postgresql_where=sql_text("superseded_by IS NOT NULL"),
+        ),
+        Index(
             "ix_context_checkpoints_scope_context_key_lifecycle",
             "scope",
             "context_key",
@@ -143,7 +154,12 @@ class ContextCheckpoint(Base):
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     superseded_by: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
-        ForeignKey("context_checkpoints.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "context_checkpoints.id",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="IMMEDIATE",
+        ),
         nullable=True,
     )
     invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -78,11 +78,10 @@ class ContextCheckpointProvenanceCreateRequest(BaseModel):
         return _optional_text(value, "turn_ref")
 
 
-class ContextCheckpointCreateRequest(BaseModel):
-    """``POST /api/v1/context/checkpoints`` body (Contract v1 SS 25/27).
-
-    Creates a new ACTIVE checkpoint only when the Context Stream currently has
-    no ACTIVE checkpoint. Collection order is semantically relevant and kept."""
+class ContextCheckpointSnapshotFields(BaseModel):
+    """Complete checkpoint snapshot shared by Create and Supersede (Contract v1
+    SS 25/27.2/31.2). Never a partial update: omitted optionals mean *absent*
+    in the new revision, never inherited. Collection order is semantic."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -101,6 +100,20 @@ class ContextCheckpointCreateRequest(BaseModel):
     blockers: list[ContextStatementCreateRequest] = Field(default_factory=list)
     next_action: ContextStatementCreateRequest | None = None
     provenance: ContextCheckpointProvenanceCreateRequest
+
+
+class ContextCheckpointCreateRequest(ContextCheckpointSnapshotFields):
+    """``POST /api/v1/context/checkpoints`` body (Contract v1 SS 25/27).
+
+    Creates a new ACTIVE checkpoint only when the Context Stream currently has
+    no ACTIVE checkpoint."""
+
+
+class ContextCheckpointSupersedeRequest(ContextCheckpointSnapshotFields):
+    """``POST /api/v1/context/checkpoints/{checkpoint_id}/supersede`` body
+    (Contract v1 SS 31.2): the complete replacement snapshot. ``scope`` and the
+    resolved ``context_key`` (default ``main``) must equal the target's stream;
+    ``current_state`` stays required."""
 
 
 class ContextCheckpointInvalidateRequest(BaseModel):

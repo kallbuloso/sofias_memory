@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sofias_memory.domain import ContextCheckpointLifecycle
 from sofias_memory.infrastructure.postgres.models import ContextCheckpoint
+from sofias_memory.infrastructure.postgres.models.context_checkpoint import LINEAGE_FOREIGN_KEY
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +48,16 @@ class ContextCheckpointRepository:
         await self._session.execute(
             text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key}
         )
+
+    async def defer_lineage_foreign_key(self) -> None:
+        """Defers the ``superseded_by`` FK until COMMIT for the *current
+        transaction only* (it is ``DEFERRABLE INITIALLY IMMEDIATE``). Lets the
+        supersede transaction mark the old ACTIVE SUPERSEDED (CHECK requires a
+        non-null ``superseded_by``) before inserting the replacement ACTIVE (the
+        single-ACTIVE index is not deferrable). The FK is still enforced at
+        COMMIT."""
+
+        await self._session.execute(text(f"SET CONSTRAINTS {LINEAGE_FOREIGN_KEY} DEFERRED"))
 
     async def add(self, checkpoint: ContextCheckpoint) -> ContextCheckpoint:
         self._session.add(checkpoint)

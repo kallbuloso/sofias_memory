@@ -227,7 +227,8 @@ def test_orm_models_mirror_migration_checks_and_indexes() -> None:
     model_indexes = {
         index.name for index in ContextCheckpoint.__table__.indexes if isinstance(index, Index)
     }
-    assert model_indexes == set(spy.created_indexes)
+    # 0021 (SM-CTX-003) adds uq_context_checkpoints_superseded_by on top of 0020.
+    assert model_indexes == set(spy.created_indexes) | {"uq_context_checkpoints_superseded_by"}
 
 
 def test_every_declared_identifier_fits_postgresql_63_byte_limit() -> None:

@@ -47,6 +47,7 @@ IDEMPOTENCY_KEY_OPERATIONS = {
     ("post", "/api/v1/episodes/{episode_id}/invalidate"),
     ("post", "/api/v1/episodes/{episode_id}/forget"),
     ("post", "/api/v1/context/checkpoints"),
+    ("post", "/api/v1/context/checkpoints/{checkpoint_id}/supersede"),
     ("post", "/api/v1/context/checkpoints/{checkpoint_id}/invalidate"),
     ("post", "/api/v1/context/checkpoints/{checkpoint_id}/forget"),
 }
@@ -58,6 +59,7 @@ REQUIRED_IDEMPOTENCY_KEY_OPERATIONS = {
     ("post", "/api/v1/episodes/{episode_id}/invalidate"),
     ("post", "/api/v1/episodes/{episode_id}/forget"),
     ("post", "/api/v1/context/checkpoints"),
+    ("post", "/api/v1/context/checkpoints/{checkpoint_id}/supersede"),
     ("post", "/api/v1/context/checkpoints/{checkpoint_id}/invalidate"),
     ("post", "/api/v1/context/checkpoints/{checkpoint_id}/forget"),
 }

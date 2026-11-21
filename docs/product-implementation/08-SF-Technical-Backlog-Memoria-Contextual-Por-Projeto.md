@@ -449,6 +449,38 @@ Registrar:
 
 ---
 
+## SM-CTX-001 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-21)
+Baseline:                main @ 6a7c698555a64f6b14b4f547fb585512163f1f71
+Implementation SHA:      f61e5bfff4078b25fb4630d21495cf2e5565b018
+Operational closeout:    35ea170435fc120c24bb45e24e53cb6084b332de
+                          (docs(context): record SM-CTX-001 operational closeout)
+Merge into main:         b616f216c2203c7d00d6cd952d6d3d4f4c494b58 (--no-ff)
+Alembic head:            0019 (down_revision = 0018)
+```
+
+- Entregue: Episode first-class (create/get/list/internal semantic retrieval/
+  invalidate/direct Forget com tombstone), provenance, ledger genérico
+  `contextual_memory_idempotency` (HMAC com domain separation) e persistência
+  PostgreSQL + pgvector. Sem Neo4j, graph_outbox ou PipelineRun contextual.
+- Testes: suíte local PASS; integração do Slice 19/19 PASS no banco dedicado
+  `sofias_memory_ctx_episodes_test`; regressão PostgreSQL relevante PASS.
+- Human Validation A–G: PASS (provider de embedding real, banco dedicado).
+- Temporal regression gate (pós-correção NTP do host): 20/20 PASS em Create +
+  Recall Cognitive imediato com `as_of` padrão; controles negativos sem
+  vazamento.
+- Achados operacionais e DEFERRED registrados em
+  `CONTEXTUAL-PROJECT-MEMORY-DOCUMENT-AUDIT.md`:
+  - política transversal de fontes de tempo (`now()` PostgreSQL vs.
+    `utc_now()` da aplicação) — risco residual MINOR;
+  - fixtures de integração Skills/Agents sem `cognitive_idempotency_hmac_key`;
+  - cleanup dos testes de integração de Episodes (tombstones/ledger residuais);
+  - rastreabilidade de migrations em desenvolvimento (`verify_only`, logs DDL).
+
+---
+
 # 7. SM-CTX-002 — Context Streams and Initial Checkpoints
 
 ## Objective

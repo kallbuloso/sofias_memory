@@ -1198,6 +1198,77 @@ Confirmar que Evidence é associada ao statement correto.
 
 ---
 
+## SM-CTX-004 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-21)
+Baseline:                main @ 5cedcc3e3f5779fc9e5b134511cba55d9d783106
+Implementation SHA:      d50fdd900c0bf93a4ff53701df97c5582ab5112b
+                          (feat(context): add first-class evidence and deterministic support)
+Merge into main:         ffe7ad7acf85e9b5db28e0e79d15f4dc03815319 (--no-ff)
+Alembic head:            0022 (down_revision = 0021)
+```
+
+- Entregue: Evidence first-class com identidade canônica
+  `contextual_evidence_refs` (`UNIQUE(source_type, source_id)`, compartilhada
+  entre owners); links `episode_evidence_refs`/`context_statement_evidence_refs`
+  (owner `ON DELETE CASCADE`, Evidence `ON DELETE RESTRICT`); `support_mode`
+  nullable em Episodes e ContextStatements; support opcional em Episode
+  Create/Result e statement-level em Checkpoint Create/Supersede/Result;
+  exatamente os seis source types e os modos `all_required`/`any_sufficient`.
+- Isolamento Provenance/Evidence: nenhuma Evidence é inferida de provenance,
+  Session, scope, texto ou tempo; recursos pré-SM-CTX-004 permanecem
+  `support: null` (sem backfill).
+- Disponibilidade sempre resolvida do estado autoritativo da fonte (sem cache
+  persistido); Knowledge usa a regra de elegibilidade do Knowledge Recall;
+  leitura nunca muta lifecycle.
+- Fronteira de projeto explícita (Episode e MemoryItem de projeto do mesmo
+  projeto; MemoryItem `global` só por referência explícita; SessionEntry e
+  Knowledge sem ownership inventado); avaliação de suporte determinística;
+  rejeição de self-reference e ciclos indiretos sem escrita parcial; sem
+  propagação automática de Forget (SM-CTX-005).
+- Acceptance Criteria AC-004.1–AC-004.26: PASS.
+- Human Validation A–I: PASS — pela API real (uvicorn + banco dedicado
+  `sofias_memory_ctx_episodes_test`, `DATABASE_MIGRATION_MODE=verify_only`,
+  embeddings reais com conteúdo sintético).
+- Knowledge pipeline real (Remember `mode=full` → cognify → ativação) e Recall
+  `rag`/`only_context`: PASS, executados em instância real com **Neo4j
+  desabilitado** (`create_app(enable_neo4j=False)`); Forget real da Source
+  refletido como `forgotten` na Evidence sem mutação do dependente.
+  **Projeção/reconciliação Neo4j NÃO foi validada.**
+- Concorrência PostgreSQL C1–C7 (transações reais, ambas as ordens): mudança
+  só em ancestrais (Source/Dataset/geração) equivale a Create-antes-do-Forget;
+  mudança na linha referenciada serializa via `FOR SHARE`; origem Episode
+  esquecida em concorrência é consistente nas duas ordens; nenhuma validação
+  obsoleta.
+- Idempotência: digests históricos sem support (Episode Create, Checkpoint
+  Create, Supersede) idênticos byte a byte aos de `main@5cedcc3`; ordem da
+  Evidence não altera o digest; duplicatas rejeitadas; replay concluído
+  precede revalidação; key nova revalida; falhas de validação não deixam
+  outcome no ledger.
+- Testes: verificação focada final 372 passed; suíte local 2855 passed (723
+  skipped opt-in) e regressão de integração PostgreSQL 286 passed, ambas da
+  execução anterior sem mudança de código de produção depois.
+- Migration 0022: upgrade/downgrade/upgrade PASS no banco dedicado; migration
+  gate PASS; 0001–0021 inalteradas. `cognee_db` permanece em 0019; Neo4j
+  compartilhado não foi tocado.
+- CI GitHub Actions: não verificado (sem evidência coletada).
+- MINOR:
+  - no caso concorrente C3 (READ COMMITTED), o detalhe do conflito pode
+    descrever uma fonte `forgotten` como `unavailable` (a rejeição é correta);
+  - o banco de teste dedicado contém recursos sintéticos de Knowledge e 15
+    eventos de grafo `pending` da validação com Neo4j desabilitado;
+  - `ruff format --check .` ainda acusa divergências CRLF pré-existentes.
+- DEFERRED:
+  - política de locks dos ancestrais Source/Dataset para a propagação de
+    Forget do SM-CTX-005;
+  - garbage collection de EvidenceRef canônica órfã;
+  - política de relógio aplicação vs. PostgreSQL;
+  - mutations rejeitadas não registradas no ledger (padrão aprovado);
+  - fixtures legadas de Skills/Agents.
+
+---
+
 # 10. SM-CTX-005 — Provenance-Aware Forget Propagation
 
 ## Objective

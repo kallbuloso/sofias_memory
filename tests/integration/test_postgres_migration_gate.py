@@ -522,11 +522,14 @@ async def assert_last_migration_downgraded(
         constraints = await constraints_by_name(connection, schema=schema)
 
     assert revisions == frozenset({expected_revision})
-    # 0021 (SM-CTX-003) only adds the superseded_by partial unique index and
-    # makes the lineage FK DEFERRABLE INITIALLY IMMEDIATE: downgrading it
-    # removes exactly that, never 0020's checkpoint tables/constraints, 0019's
-    # Episodes foundation, 0018's Native Cognitive Memory foundation, or
-    # anything earlier.
+    # 0022 (SM-CTX-004) is additive: downgrading it removes exactly the Evidence
+    # tables, the support_mode columns and ck_episodes_forgotten_has_no_support,
+    # never 0021's lineage hardening, 0020's checkpoint tables, 0019's Episodes
+    # foundation, or anything earlier.
+    assert "contextual_evidence_refs" not in tables
+    assert "episode_evidence_refs" not in tables
+    assert "context_statement_evidence_refs" not in tables
+    assert "ck_episodes_forgotten_has_no_support" not in constraints
     assert {
         "context_checkpoints",
         "context_checkpoint_statements",
@@ -556,8 +559,8 @@ async def assert_last_migration_downgraded(
         "pipeline_steps",
         "graph_outbox",
     } <= tables
-    # 0018's own constraints must survive a 0021-only downgrade -- proves the
-    # downgrade removed exactly the 0021 objects, not anything from 0018
+    # 0018's own constraints must survive a 0022-only downgrade -- proves the
+    # downgrade removed exactly the 0022 objects, not anything from 0018
     # (including the cognitive_memory_origin_kind enum 0020 only references).
     assert "ck_memory_items_forgotten_requires_tombstone_shape" in constraints
     assert "uq_cognitive_memory_idempotency_idempotency_key" in constraints
@@ -576,7 +579,7 @@ async def assert_last_migration_downgraded(
     assert "ck_skill_revisions_procedure_not_blank" in constraints
     assert "ck_skill_revisions_content_sha256_hex" in constraints
     # 0013's own additive constraint must survive too, transitively proving
-    # no migration older than 0021 was touched.
+    # no migration older than 0022 was touched.
     assert "ck_session_entries_external_id_trimmed" in constraints
     assert "ck_session_entries_external_id_not_blank" in constraints
     assert "ck_session_entries_external_id_max_length" in constraints

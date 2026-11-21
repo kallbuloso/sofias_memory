@@ -19,6 +19,8 @@ SPECIFIC_VALIDATION_ERROR_CODES: Mapping[str, ErrorCode] = {
     "invalid_scope": ErrorCode.INVALID_SCOPE,
     "invalid_context_key": ErrorCode.INVALID_CONTEXT_KEY,
     "invalid_episode_kind": ErrorCode.INVALID_EPISODE_KIND,
+    "invalid_evidence_reference": ErrorCode.INVALID_EVIDENCE_REFERENCE,
+    "invalid_support_policy": ErrorCode.INVALID_SUPPORT_POLICY,
 }
 """Pydantic custom error ``type`` values raised only by the Contextual Project
 Memory schemas (``schemas.episodes``) -> the stable Contract v1 SS 62

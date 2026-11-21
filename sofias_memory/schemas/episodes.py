@@ -38,6 +38,7 @@ from sofias_memory.domain import (
     validate_context_key,
 )
 from sofias_memory.schemas.common import utc_now
+from sofias_memory.schemas.contextual_evidence import SupportRequest, SupportResult
 
 EPISODE_PAGE_DEFAULT_LIMIT = 50
 EPISODE_PAGE_MAX_LIMIT = 100
@@ -141,6 +142,13 @@ class EpisodeCreateRequest(BaseModel):
         default=None, description="Nullable, [0,1]; required when origin_kind is 'inferred'."
     )
     provenance: EpisodeProvenanceCreateRequest
+    support: SupportRequest | None = Field(
+        default=None,
+        description=(
+            "Optional explicit Evidence support (SM-CTX-004). Omitted means an independent "
+            "assertion with no declared dependency -- never inferred from provenance."
+        ),
+    )
 
     @pydantic_field_validator("summary")
     @classmethod
@@ -224,6 +232,7 @@ class EpisodeResult(BaseModel):
     lifecycle: EpisodeLifecycle
     confidence: float | None
     provenance: EpisodeProvenanceResult
+    support: SupportResult | None = None
     created_at: datetime
     invalidated_at: datetime | None
     forgotten_at: datetime | None

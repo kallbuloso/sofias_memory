@@ -280,6 +280,8 @@ def test_orm_models_mirror_migration_constraint_names() -> None:
     for model in (Episode, EpisodeProvenance, ContextualMemoryIdempotency):
         table = Base.metadata.tables[model.__tablename__]
         orm_checks = {c.name for c in table.constraints if isinstance(c, CheckConstraint)}
+        # 0022 (SM-CTX-004) adds ck_episodes_forgotten_has_no_support on top of 0019.
+        orm_checks.discard("ck_episodes_forgotten_has_no_support")
         assert orm_checks == set(checks(spy.created_tables[model.__tablename__]))
     ledger = Base.metadata.tables["contextual_memory_idempotency"]
     assert not ledger.foreign_keys

@@ -16,6 +16,7 @@ from sofias_memory.infrastructure.postgres.repositories import (
     ContextCheckpointProvenanceRepository,
     ContextCheckpointRepository,
     ContextCheckpointStatementRepository,
+    ContextualEvidenceRepository,
     ContextualMemoryIdempotencyRepository,
     DatasetRepository,
     DocumentRepository,
@@ -80,6 +81,7 @@ class PostgresUnitOfWork:
         self._context_checkpoints: ContextCheckpointRepository | None = None
         self._context_checkpoint_statements: ContextCheckpointStatementRepository | None = None
         self._context_checkpoint_provenance: ContextCheckpointProvenanceRepository | None = None
+        self._contextual_evidence: ContextualEvidenceRepository | None = None
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -119,6 +121,7 @@ class PostgresUnitOfWork:
         self._context_checkpoints = ContextCheckpointRepository(session)
         self._context_checkpoint_statements = ContextCheckpointStatementRepository(session)
         self._context_checkpoint_provenance = ContextCheckpointProvenanceRepository(session)
+        self._contextual_evidence = ContextualEvidenceRepository(session)
         return self
 
     async def __aexit__(
@@ -315,6 +318,12 @@ class PostgresUnitOfWork:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._context_checkpoint_provenance
 
+    @property
+    def contextual_evidence(self) -> ContextualEvidenceRepository:
+        if self._contextual_evidence is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._contextual_evidence
+
     def savepoint(self) -> AsyncSessionTransaction:
         """A nested transaction (SAVEPOINT) inside this unit of work.
 
@@ -385,3 +394,4 @@ class PostgresUnitOfWork:
         self._context_checkpoints = None
         self._context_checkpoint_statements = None
         self._context_checkpoint_provenance = None
+        self._contextual_evidence = None

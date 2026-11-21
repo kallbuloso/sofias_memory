@@ -31,7 +31,7 @@ from http import HTTPStatus
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import Settings
@@ -43,6 +43,7 @@ from sofias_memory.domain import (
     EpisodeTransition,
     build_contextual_canonical_request,
     build_episode_embedding_text,
+    canonical_support_payload,
     compute_contextual_request_digest,
     episode_forget_transition,
     episode_invalidate_transition,
@@ -62,6 +63,7 @@ from sofias_memory.infrastructure.postgres.types import AsyncSessionFactory
 from sofias_memory.infrastructure.postgres.unit_of_work import PostgresUnitOfWork
 from sofias_memory.observability.logging import get_logger
 from sofias_memory.schemas.common import ErrorCode, utc_now
+from sofias_memory.schemas.contextual_evidence import SupportResult
 from sofias_memory.schemas.episodes import (
     EpisodeCreateRequest,
     EpisodeInvalidateRequest,
@@ -70,6 +72,14 @@ from sofias_memory.schemas.episodes import (
     EpisodeResult,
 )
 from sofias_memory.services.cognitive_memory import EmbeddingClient
+from sofias_memory.services.contextual_evidence import (
+    canonical_keys_or_empty,
+    hydrate_episode_support,
+    lock_and_resolve,
+    persist_episode_support,
+    raise_if_transient_conflict,
+    validate_new_support,
+)
 from sofias_memory.services.pipeline_submission import (
     idempotency_conflict_error,
     reserved_idempotency_key_namespace_error,
@@ -168,10 +178,15 @@ def decode_episode_cursor(cursor: str) -> EpisodePosition:
         raise _invalid_cursor_error() from error
 
 
-def episode_result(episode: Episode, provenance: EpisodeProvenance) -> EpisodeResult:
+def episode_result(
+    episode: Episode,
+    provenance: EpisodeProvenance,
+    support: SupportResult | None = None,
+) -> EpisodeResult:
     """The one Episode+provenance -> public shape conversion (Create/Get/List/
     lifecycle mutations/internal retrieval). Never exposes the embedding, the
-    invalidation reason, or any ledger value."""
+    invalidation reason, or any ledger value. ``support`` carries current
+    Evidence availability (SM-CTX-004) or ``None`` when none is declared."""
 
     return EpisodeResult(
         episode_id=episode.id,
@@ -191,6 +206,7 @@ def episode_result(episode: Episode, provenance: EpisodeProvenance) -> EpisodeRe
             conversation_ref=provenance.conversation_ref,
             turn_ref=provenance.turn_ref,
         ),
+        support=support,
         created_at=episode.created_at,
         invalidated_at=episode.invalidated_at,
         forgotten_at=episode.forgotten_at,
@@ -203,9 +219,14 @@ def _timestamp(value: datetime) -> str:
 
 def _canonical_create_payload(request: EpisodeCreateRequest) -> dict[str, object]:
     """Every semantic Create field (handoff 09 SS 32) -- never the embedding,
-    a generated id, created_at, transport metadata, or a secret."""
+    a generated id, created_at, transport metadata, or a secret.
 
-    return {
+    SM-CTX-004 (handoff 12 SS 71/72): ``support`` is added *only when declared*,
+    as mode + canonical Evidence set, so a request without support keeps the
+    exact pre-SM-CTX-004 canonical form (and digest) and Evidence order never
+    changes it."""
+
+    payload: dict[str, object] = {
         "scope": request.scope,
         "context_key": request.context_key,
         "kind": request.kind.value,
@@ -222,6 +243,9 @@ def _canonical_create_payload(request: EpisodeCreateRequest) -> dict[str, object
             "turn_ref": request.provenance.turn_ref,
         },
     }
+    if request.support is not None:
+        payload["support"] = canonical_support_payload(request.support.mode, request.support.keys())
+    return payload
 
 
 def _canonical_invalidate_payload(request: EpisodeInvalidateRequest) -> dict[str, object]:
@@ -272,7 +296,16 @@ class EpisodeService:
 
     # --- Create -------------------------------------------------------------
 
-    async def create(self, request: EpisodeCreateRequest, *, idempotency_key: str) -> EpisodeResult:
+    async def create(
+        self,
+        request: EpisodeCreateRequest,
+        *,
+        idempotency_key: str,
+        episode_id: UUID | None = None,
+    ) -> EpisodeResult:
+        """``episode_id`` is an internal/test hook only (never exposed over HTTP):
+        it lets the Evidence cycle invariant be exercised (handoff 12 SS 57/104)."""
+
         protected_key = self._protected_key(idempotency_key)
         operation = ContextualMemoryOperation.EPISODE_CREATE
         digest = self._digest(operation, None, _canonical_create_payload(request))
@@ -280,6 +313,21 @@ class EpisodeService:
         replay = await self._pre_check(protected_key, operation, digest)
         if replay is not None:
             return replay
+
+        new_id = episode_id or uuid4()
+        evidence_keys = canonical_keys_or_empty(request.support)
+        if evidence_keys:
+            # Fail fast before the paid embedding call; the authoritative,
+            # locked validation is repeated inside the write transaction.
+            async with self._unit_of_work_factory() as uow:
+                resolutions = await lock_and_resolve(uow, evidence_keys, lock=False)
+                await validate_new_support(
+                    uow,
+                    owner_scope=request.scope,
+                    supports=[request.support],
+                    resolutions=resolutions,
+                    owner_episode_id=new_id,
+                )
 
         embedding = await self._embed(
             build_episode_embedding_text(
@@ -290,56 +338,82 @@ class EpisodeService:
             )
         )
 
-        async with self._unit_of_work_factory() as uow:
-            episode = Episode(
-                id=uuid4(),
-                scope=request.scope,
-                context_key=request.context_key,
-                kind=request.kind,
-                summary=request.summary,
-                situation=request.situation,
-                reason=request.reason,
-                outcome=request.outcome,
-                occurred_at=request.occurred_at,
-                embedding=embedding,
-                lifecycle=EpisodeLifecycle.ACTIVE,
-                confidence=request.confidence,
-            )
-            provenance = EpisodeProvenance(
-                episode_id=episode.id,
-                origin_kind=request.provenance.origin_kind,
-                source_system=request.provenance.source_system,
-                conversation_ref=request.provenance.conversation_ref,
-                turn_ref=request.provenance.turn_ref,
-            )
-            ledger_entry = ContextualMemoryIdempotency(
-                id=uuid4(),
-                idempotency_key=protected_key,
-                operation=operation,
-                request_digest=digest,
-                target_resource_id=None,
-                result_resource_id=episode.id,
-            )
-            try:
-                async with uow.savepoint():
-                    await uow.episodes.add(episode)
-                    await uow.episode_provenance.add(provenance)
-                    await uow.contextual_memory_idempotency.add(ledger_entry)
-            except IntegrityError as error:
-                if not _is_contextual_idempotency_key_unique_violation(error):
-                    raise
-                result = await self._resolve_winner(uow, protected_key, operation, digest)
-                await uow.commit()
-                return result
+        try:
+            async with self._unit_of_work_factory() as uow:
+                # 1. Lock Evidence rows (FOR SHARE) before the ledger.
+                resolutions = await lock_and_resolve(uow, evidence_keys)
+                # 2. A committed same-key winner replays before any revalidation.
+                winner = await self._find_snapshot(uow, protected_key)
+                if winner is not None:
+                    result = await self._replay_from_snapshot(uow, winner, operation, digest)
+                    await uow.commit()
+                    return result
+                # 3. Authoritative Evidence validation under the share locks.
+                if request.support is not None:
+                    await validate_new_support(
+                        uow,
+                        owner_scope=request.scope,
+                        supports=[request.support],
+                        resolutions=resolutions,
+                        owner_episode_id=new_id,
+                    )
 
-            result = episode_result(episode, provenance)
-            await uow.commit()
+                episode = Episode(
+                    id=new_id,
+                    scope=request.scope,
+                    context_key=request.context_key,
+                    kind=request.kind,
+                    summary=request.summary,
+                    situation=request.situation,
+                    reason=request.reason,
+                    outcome=request.outcome,
+                    occurred_at=request.occurred_at,
+                    embedding=embedding,
+                    lifecycle=EpisodeLifecycle.ACTIVE,
+                    confidence=request.confidence,
+                    support_mode=request.support.mode if request.support else None,
+                )
+                provenance = EpisodeProvenance(
+                    episode_id=episode.id,
+                    origin_kind=request.provenance.origin_kind,
+                    source_system=request.provenance.source_system,
+                    conversation_ref=request.provenance.conversation_ref,
+                    turn_ref=request.provenance.turn_ref,
+                )
+                ledger_entry = ContextualMemoryIdempotency(
+                    id=uuid4(),
+                    idempotency_key=protected_key,
+                    operation=operation,
+                    request_digest=digest,
+                    target_resource_id=None,
+                    result_resource_id=episode.id,
+                )
+                try:
+                    async with uow.savepoint():
+                        await uow.episodes.add(episode)
+                        await uow.episode_provenance.add(provenance)
+                        if request.support is not None:
+                            await persist_episode_support(uow, episode.id, request.support)
+                        await uow.contextual_memory_idempotency.add(ledger_entry)
+                except IntegrityError as error:
+                    if not _is_contextual_idempotency_key_unique_violation(error):
+                        raise
+                    result = await self._resolve_winner(uow, protected_key, operation, digest)
+                    await uow.commit()
+                    return result
+
+                result = await self._hydrate(uow, episode.id, missing_is_internal=True)
+                await uow.commit()
+        except DBAPIError as error:
+            raise_if_transient_conflict(error)
+            raise
 
         _logger.info(
             "episode_created",
             operation=operation.value,
             episode_id=str(result.episode_id),
             lifecycle=result.lifecycle.value,
+            support_mode=result.support.mode.value if result.support else None,
         )
         return result
 
@@ -372,7 +446,13 @@ class EpisodeService:
                 limit=limit + 1,
             )
             page = rows[:limit]
-            items = [episode_result(row.episode, row.provenance) for row in page]
+            supports = await hydrate_episode_support(
+                uow, {row.episode.id: row.episode.support_mode for row in page}
+            )
+            items = [
+                episode_result(row.episode, row.provenance, supports[row.episode.id])
+                for row in page
+            ]
 
         next_cursor: str | None = None
         if len(rows) > limit and items:
@@ -411,9 +491,13 @@ class EpisodeService:
                 query_embedding=query_embedding,
                 limit=limit,
             )
+            supports = await hydrate_episode_support(
+                uow, {hit.episode.id: hit.episode.support_mode for hit in hits}
+            )
             return [
                 EpisodeSearchHit(
-                    episode=episode_result(hit.episode, hit.provenance), relevance=hit.relevance
+                    episode=episode_result(hit.episode, hit.provenance, supports[hit.episode.id]),
+                    relevance=hit.relevance,
                 )
                 for hit in hits
             ]
@@ -531,6 +615,10 @@ class EpisodeService:
                 episode.confidence = None
                 episode.invalidation_reason = None
                 episode.replacement_episode_id = None
+                # SM-CTX-004: the Episode's own outgoing support is scrubbed;
+                # inbound refs from other owners stay resolvable (FORGOTTEN).
+                await uow.contextual_evidence.delete_episode_links(episode_id)
+                episode.support_mode = None
                 episode.lifecycle = EpisodeLifecycle.FORGOTTEN
                 episode.forgotten_at = utc_now()
                 provenance.conversation_ref = None
@@ -669,7 +757,8 @@ class EpisodeService:
             if missing_is_internal:
                 raise _internal_error("Contextual idempotency ledger references a missing Episode.")
             raise episode_not_found_error(episode_id)
-        return episode_result(episode, provenance)
+        supports = await hydrate_episode_support(uow, {episode.id: episode.support_mode})
+        return episode_result(episode, provenance, supports[episode.id])
 
     async def _embed(self, text: str) -> list[float]:
         try:

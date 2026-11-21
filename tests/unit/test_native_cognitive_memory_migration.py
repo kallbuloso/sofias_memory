@@ -160,6 +160,7 @@ def test_sm1001_revision_is_current_head() -> None:
         "0019_create_contextual_episodes.py",
         "0020_create_context_checkpoints.py",
         "0021_harden_context_checkpoint_supersession.py",
+        "0022_create_contextual_evidence.py",
     ]
 
 

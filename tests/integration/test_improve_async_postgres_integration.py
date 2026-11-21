@@ -72,7 +72,7 @@ EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 # Real dev-stack Neo4j credential (see AGENTS.md SS 8 / .env) -- only used
 # when a test explicitly opts into real Neo4j (build_harness_with_real_neo4j);
 # every other harness in this file never talks to Neo4j at all.
-NEO4J_PASSWORD_FALLBACK = "8P7nanOVz6vfmrg"
+NEO4J_PASSWORD_FALLBACK = "unused-test-neo4j-password"  # synthetic, not a credential
 LLM_API_KEY = "sk-fake-test-key"
 
 EMBEDDING_DIMENSIONS = 3072

@@ -37,7 +37,7 @@ from tests.unit._app_factory import create_app
 POSTGRES_SKILLS_HTTP_ENV = "SOFIAS_MEMORY_RUN_SKILLS_HTTP_POSTGRES_TESTS"
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-NEO4J_PASSWORD_FALLBACK = "8P7nanOVz6vfmrg"
+NEO4J_PASSWORD_FALLBACK = "unused-test-neo4j-password"  # synthetic, not a credential
 LLM_API_KEY = "sk-fake-test-key"
 EMBEDDING_DIMENSIONS = 3072
 

@@ -32,6 +32,7 @@ from sofias_memory.api.middleware import (
 )
 from sofias_memory.api.routes.agents import router as agents_router
 from sofias_memory.api.routes.cognify import router as cognify_router
+from sofias_memory.api.routes.context_checkpoints import router as context_checkpoints_router
 from sofias_memory.api.routes.datasets import router as datasets_router
 from sofias_memory.api.routes.episodes import router as episodes_router
 from sofias_memory.api.routes.feedback import router as feedback_router
@@ -209,6 +210,15 @@ TAG_METADATA: list[dict[str, str]] = [
             "Explicitly preserve, list, invalidate and forget first-class contextual "
             "Episodes (historical experience of a Project Scope) -- never current truth, "
             "never a MemoryItem or SessionEntry. PostgreSQL-only; no graph projection."
+        ),
+    },
+    {
+        "name": "context-checkpoints",
+        "description": (
+            "Persist and recover the current state of a logical Context Stream "
+            "(scope, context_key): explicit create when no checkpoint is current, current "
+            "lookup, history listing, invalidate and direct forget. PostgreSQL-only; no "
+            "embedding, no graph projection, never owned by a Session."
         ),
     },
 ]
@@ -433,6 +443,7 @@ def create_app(
     application.include_router(agents_router, prefix="/api/v1")
     application.include_router(memories_router, prefix="/api/v1")
     application.include_router(episodes_router, prefix="/api/v1")
+    application.include_router(context_checkpoints_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

@@ -204,6 +204,34 @@ class ContextualMemoryOperation(StrEnum):
     CHECKPOINT_FORGET = "checkpoint_forget"
 
 
+class ContextCheckpointLifecycle(StrEnum):
+    """Contextual Project Memory ContextCheckpoint lifecycle (Contract v1 SS 26).
+
+    The full approved enum exists from SM-CTX-002 on. ``superseded`` is
+    schema readiness only: no SM-CTX-002 operation produces it (functional
+    supersession belongs to SM-CTX-003). ``forgotten`` is terminal."""
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    INVALIDATED = "invalidated"
+    FORGOTTEN = "forgotten"
+
+
+class ContextStatementType(StrEnum):
+    """Semantic unit type of a ContextCheckpoint (handoff 10 SS 17).
+
+    ``objective``/``current_state``/``next_action`` are scalar (at most one
+    per checkpoint); the others are ordered collections."""
+
+    OBJECTIVE = "objective"
+    CURRENT_STATE = "current_state"
+    APPROVED_DECISION = "approved_decision"
+    PENDING_WORK = "pending_work"
+    OPEN_ITEM = "open_item"
+    BLOCKER = "blocker"
+    NEXT_ACTION = "next_action"
+
+
 class CognitiveMemoryOperation(StrEnum):
     """``cognitive_memory_idempotency`` ledger operation identity.
     Independent of ``PipelineType`` -- Cognitive Memory mutations are never

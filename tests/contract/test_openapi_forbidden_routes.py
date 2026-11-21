@@ -800,21 +800,127 @@ def test_episode_routes_present_with_exact_methods() -> None:
         assert not {"patch", "put", "delete"} & set(paths[path])
 
 
-def test_no_future_contextual_routes_or_contract_advertisement_in_sm_ctx_001() -> None:
+def test_no_future_contextual_routes_or_contract_advertisement() -> None:
     schema = openapi_schema()
     paths = schema["paths"]
     assert isinstance(paths, dict)
 
-    assert not [path for path in paths if path.startswith("/api/v1/context")]
+    # SM-CTX-002: only the checkpoint routes exist under /api/v1/context.
+    context_paths = {path for path in paths if path.startswith("/api/v1/context")}
+    assert context_paths == set(EXPECTED_CHECKPOINT_ROUTES)
     for forbidden in (
         "/api/v1/episodes/{episode_id}/restore",
         "/api/v1/episodes/{episode_id}/supersede",
         "/api/v1/episodes/{episode_id}/unforget",
         "/api/v1/episodes/recall",
         "/api/v1/episodes/search",
+        "/api/v1/context/checkpoints/{checkpoint_id}/supersede",
+        "/api/v1/context/checkpoints/{checkpoint_id}/restore",
+        "/api/v1/context/checkpoints/{checkpoint_id}/unforget",
+        "/api/v1/context/checkpoints/search",
+        "/api/v1/context/recall",
+        "/api/v1/context/streams",
+        "/api/v1/projects",
     ):
         assert forbidden not in paths
     assert "contextual_project_memory" not in json.dumps(schema)
+
+
+EXPECTED_CHECKPOINT_ROUTES = {
+    "/api/v1/context/checkpoints": {"get", "post"},
+    "/api/v1/context/checkpoints/current": {"get"},
+    "/api/v1/context/checkpoints/{checkpoint_id}": {"get"},
+    "/api/v1/context/checkpoints/{checkpoint_id}/invalidate": {"post"},
+    "/api/v1/context/checkpoints/{checkpoint_id}/forget": {"post"},
+}
+"""SM-CTX-002: exactly the six approved checkpoint operations (handoff 10 SS 6);
+no PATCH/PUT/DELETE (SS 64), no supersede (SM-CTX-003)."""
+
+
+def test_checkpoint_routes_present_with_exact_methods() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    for path, methods in EXPECTED_CHECKPOINT_ROUTES.items():
+        assert set(paths[path]) == methods, path
+        assert not {"patch", "put", "delete"} & set(paths[path])
+    assert paths["/api/v1/context/checkpoints"]["post"]["responses"].keys() >= {"201", "409"}
+
+
+def test_checkpoint_mutations_require_idempotency_key_and_reads_do_not_accept_it() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    assert isinstance(paths, dict)
+
+    for path in (
+        "/api/v1/context/checkpoints",
+        "/api/v1/context/checkpoints/{checkpoint_id}/invalidate",
+        "/api/v1/context/checkpoints/{checkpoint_id}/forget",
+    ):
+        parameters = paths[path]["post"].get("parameters", [])
+        header = next(p for p in parameters if p.get("name") == "Idempotency-Key")
+        assert header["required"] is True
+    for path in (
+        "/api/v1/context/checkpoints",
+        "/api/v1/context/checkpoints/current",
+        "/api/v1/context/checkpoints/{checkpoint_id}",
+    ):
+        names = {p.get("name") for p in paths[path]["get"].get("parameters", [])}
+        assert "Idempotency-Key" not in names
+
+
+def test_checkpoint_schemas_separate_input_from_result_and_have_no_evidence() -> None:
+    schema = openapi_schema()
+    schemas = schema["components"]["schemas"]
+    assert isinstance(schemas, dict)
+
+    create = schemas["ContextCheckpointCreateRequest"]
+    assert set(create["properties"]) == {
+        "scope",
+        "context_key",
+        "objective",
+        "current_state",
+        "approved_decisions",
+        "pending_work",
+        "open_items",
+        "blockers",
+        "next_action",
+        "provenance",
+    }
+    assert set(create["required"]) == {"scope", "current_state", "provenance"}
+    assert set(schemas["ContextStatementCreateRequest"]["properties"]) == {"text"}
+
+    result = schemas["ContextCheckpointResult"]
+    assert set(result["properties"]) == {
+        "checkpoint_id",
+        "scope",
+        "context_key",
+        "revision",
+        "lifecycle",
+        "objective",
+        "current_state",
+        "approved_decisions",
+        "pending_work",
+        "open_items",
+        "blockers",
+        "next_action",
+        "provenance",
+        "created_at",
+        "superseded_at",
+        "superseded_by",
+        "invalidated_at",
+        "forgotten_at",
+    }
+    current_state = json.dumps(result["properties"]["current_state"])
+    assert "null" in current_state
+    assert set(schemas["ContextStatementResult"]["properties"]) == {"statement_id", "text"}
+    rendered = json.dumps(
+        {name: value for name, value in schemas.items() if name.startswith("ContextCheckpoint")}
+        | {name: value for name, value in schemas.items() if name.startswith("ContextStatement")}
+    ).lower()
+    for forbidden in ("embedding", "support_mode", "evidence_id", "invalidation_reason"):
+        assert forbidden not in rendered
 
 
 def test_episode_mutations_require_idempotency_key_and_reads_do_not_accept_it() -> None:

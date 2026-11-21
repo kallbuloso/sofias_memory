@@ -13,6 +13,9 @@ from sofias_memory.infrastructure.postgres.repositories import (
     AgentSkillRepository,
     ChunkRepository,
     CognitiveMemoryIdempotencyRepository,
+    ContextCheckpointProvenanceRepository,
+    ContextCheckpointRepository,
+    ContextCheckpointStatementRepository,
     ContextualMemoryIdempotencyRepository,
     DatasetRepository,
     DocumentRepository,
@@ -74,6 +77,9 @@ class PostgresUnitOfWork:
         self._episodes: EpisodeRepository | None = None
         self._episode_provenance: EpisodeProvenanceRepository | None = None
         self._contextual_memory_idempotency: ContextualMemoryIdempotencyRepository | None = None
+        self._context_checkpoints: ContextCheckpointRepository | None = None
+        self._context_checkpoint_statements: ContextCheckpointStatementRepository | None = None
+        self._context_checkpoint_provenance: ContextCheckpointProvenanceRepository | None = None
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -110,6 +116,9 @@ class PostgresUnitOfWork:
         self._episodes = EpisodeRepository(session)
         self._episode_provenance = EpisodeProvenanceRepository(session)
         self._contextual_memory_idempotency = ContextualMemoryIdempotencyRepository(session)
+        self._context_checkpoints = ContextCheckpointRepository(session)
+        self._context_checkpoint_statements = ContextCheckpointStatementRepository(session)
+        self._context_checkpoint_provenance = ContextCheckpointProvenanceRepository(session)
         return self
 
     async def __aexit__(
@@ -288,6 +297,24 @@ class PostgresUnitOfWork:
             raise RuntimeError("PostgresUnitOfWork is not active")
         return self._contextual_memory_idempotency
 
+    @property
+    def context_checkpoints(self) -> ContextCheckpointRepository:
+        if self._context_checkpoints is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._context_checkpoints
+
+    @property
+    def context_checkpoint_statements(self) -> ContextCheckpointStatementRepository:
+        if self._context_checkpoint_statements is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._context_checkpoint_statements
+
+    @property
+    def context_checkpoint_provenance(self) -> ContextCheckpointProvenanceRepository:
+        if self._context_checkpoint_provenance is None:
+            raise RuntimeError("PostgresUnitOfWork is not active")
+        return self._context_checkpoint_provenance
+
     def savepoint(self) -> AsyncSessionTransaction:
         """A nested transaction (SAVEPOINT) inside this unit of work.
 
@@ -355,3 +382,6 @@ class PostgresUnitOfWork:
         self._episodes = None
         self._episode_provenance = None
         self._contextual_memory_idempotency = None
+        self._context_checkpoints = None
+        self._context_checkpoint_statements = None
+        self._context_checkpoint_provenance = None

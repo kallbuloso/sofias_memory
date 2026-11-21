@@ -7,6 +7,13 @@ from sofias_memory.infrastructure.postgres.models.chunk import Chunk
 from sofias_memory.infrastructure.postgres.models.cognitive_memory_idempotency import (
     CognitiveMemoryIdempotency,
 )
+from sofias_memory.infrastructure.postgres.models.context_checkpoint import ContextCheckpoint
+from sofias_memory.infrastructure.postgres.models.context_checkpoint_provenance import (
+    ContextCheckpointProvenance,
+)
+from sofias_memory.infrastructure.postgres.models.context_checkpoint_statement import (
+    ContextCheckpointStatement,
+)
 from sofias_memory.infrastructure.postgres.models.contextual_memory_idempotency import (
     ContextualMemoryIdempotency,
 )
@@ -39,6 +46,9 @@ __all__ = [
     "AgentSkill",
     "Chunk",
     "CognitiveMemoryIdempotency",
+    "ContextCheckpoint",
+    "ContextCheckpointProvenance",
+    "ContextCheckpointStatement",
     "ContextualMemoryIdempotency",
     "Dataset",
     "Document",

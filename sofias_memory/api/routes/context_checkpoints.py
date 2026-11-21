@@ -1,8 +1,8 @@
-"""ContextCheckpoint API routes (SM-CTX-002, Contract v1 Contextual Project
-Memory SS 27-35/75, handoff 10 SS 48-64/79).
+"""ContextCheckpoint API routes (SM-CTX-002/SM-CTX-003, Contract v1 Contextual
+Project Memory SS 27-35/75, handoff 10 SS 48-64/79, handoff 11 SS 28/76).
 
-Exactly the six SM-CTX-002 operations -- no PATCH/PUT/DELETE, no supersede
-(SM-CTX-003), no Contextual Recall. Pure HTTP boundary: no SQL, no locking, no
+Exactly the six SM-CTX-002 operations plus supersede (SM-CTX-003) -- no
+PATCH/PUT/DELETE, no Contextual Recall. Pure HTTP boundary: no SQL, no locking, no
 lifecycle/revision/idempotency logic (all in ``services.context_checkpoints``).
 Every mutation requires ``Idempotency-Key``; a missing header is a 422
 ``INVALID_REQUEST``. Mutations are synchronous: no PipelineRun, no graph_outbox,
@@ -32,6 +32,7 @@ from sofias_memory.schemas.context_checkpoints import (
     ContextCheckpointInvalidateRequest,
     ContextCheckpointListResult,
     ContextCheckpointResult,
+    ContextCheckpointSupersedeRequest,
 )
 from sofias_memory.schemas.episodes import ContextKey, ContextualScope
 from sofias_memory.services.context_checkpoints import ContextCheckpointService
@@ -64,6 +65,12 @@ _CREATE_CONFLICT_409 = error_response(
 _INVALIDATE_CONFLICT_409 = error_response(
     "Conflict. ErrorEnvelope with error.code one of: IDEMPOTENCY_CONFLICT or "
     "CHECKPOINT_STATE_CONFLICT (the checkpoint is FORGOTTEN)."
+)
+_SUPERSEDE_CONFLICT_409 = error_response(
+    "Conflict. ErrorEnvelope with error.code one of: IDEMPOTENCY_CONFLICT (the same "
+    "Idempotency-Key was already used for different work) or CONTEXT_STATE_CONFLICT "
+    "(stale writer: the target is not the current ACTIVE checkpoint of the payload's "
+    "Context Stream; details carry expected_checkpoint_id and current_checkpoint_id)."
 )
 _FORGET_CONFLICT_409 = error_response(
     "Conflict. ErrorEnvelope with error.code one of: IDEMPOTENCY_CONFLICT or "
@@ -191,13 +198,49 @@ async def get_checkpoint(
 
 
 @router.post(
+    "/context/checkpoints/{checkpoint_id}/supersede",
+    response_model=SuccessEnvelope[ContextCheckpointResult],
+    status_code=HTTPStatus.CREATED,
+    summary="Supersede the current checkpoint",
+    description=(
+        "Atomically replaces the ACTIVE checkpoint {checkpoint_id} (the caller's expected "
+        "current) with a complete new snapshot: the target becomes SUPERSEDED with "
+        "superseded_by pointing to the replacement, and the replacement is the new ACTIVE "
+        "with revision = target revision + 1, new statement ids and new provenance. Not a "
+        "patch: omitted optional fields are absent from the new revision. scope and the "
+        "resolved context_key must match the target. A stale target (not ACTIVE) returns "
+        "409 CONTEXT_STATE_CONFLICT and creates nothing; there is no automatic merge or "
+        "retry. Returns the replacement."
+    ),
+    responses={
+        HTTPStatus.BAD_REQUEST: RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
+        HTTPStatus.NOT_FOUND: _CHECKPOINT_NOT_FOUND_404,
+        HTTPStatus.CONFLICT: _SUPERSEDE_CONFLICT_409,
+        HTTPStatus.UNPROCESSABLE_ENTITY: _VALIDATION_422,
+    },
+)
+async def supersede_checkpoint(
+    checkpoint_id: UUID,
+    payload: ContextCheckpointSupersedeRequest,
+    request: Request,
+    idempotency_key: IdempotencyKey,
+) -> SuccessEnvelope[ContextCheckpointResult]:
+    result = await _service(request).supersede(
+        checkpoint_id, payload, idempotency_key=idempotency_key
+    )
+    return _envelope(result)
+
+
+@router.post(
     "/context/checkpoints/{checkpoint_id}/invalidate",
     response_model=SuccessEnvelope[ContextCheckpointResult],
     summary="Invalidate a checkpoint",
     description=(
-        "ACTIVE -> INVALIDATED (content preserved; the stream then has no current checkpoint "
-        "until a new explicit Create). Already INVALIDATED is a 200 state no-op; FORGOTTEN is "
-        "409 CHECKPOINT_STATE_CONFLICT. The reason is persisted for audit."
+        "ACTIVE or SUPERSEDED -> INVALIDATED (content and supersession lineage preserved). "
+        "Invalidating the ACTIVE leaves the stream without a current checkpoint until a new "
+        "explicit Create; invalidating history never affects its replacement. Already "
+        "INVALIDATED is a 200 state no-op; FORGOTTEN is 409 CHECKPOINT_STATE_CONFLICT. The "
+        "reason is persisted for audit."
     ),
     responses={
         HTTPStatus.BAD_REQUEST: RESERVED_IDEMPOTENCY_KEY_NAMESPACE_400,
@@ -223,9 +266,10 @@ async def invalidate_checkpoint(
     response_model=SuccessEnvelope[ContextCheckpointResult],
     summary="Forget a checkpoint",
     description=(
-        "Destructive direct Forget: ACTIVE|INVALIDATED -> FORGOTTEN, deleting every statement "
-        "and scrubbing external provenance refs and the invalidation reason. The tombstone "
-        "keeps scope, context_key and revision, so revisions are never reused. Already "
+        "Destructive direct Forget: ACTIVE|SUPERSEDED|INVALIDATED -> FORGOTTEN, deleting "
+        "every statement and scrubbing external provenance refs and the invalidation reason. "
+        "The tombstone keeps scope, context_key, revision and supersession lineage, so "
+        "revisions are never reused. Never follows lineage to other checkpoints. Already "
         "FORGOTTEN is a 200 state no-op. No automatic fallback, no restore."
     ),
     responses={

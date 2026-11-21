@@ -127,6 +127,13 @@ def build_app(
             self._maybe_raise()
             return fake_result(checkpoint_id)
 
+        async def supersede(
+            self, checkpoint_id: UUID, request: Any, *, idempotency_key: str
+        ) -> Any:
+            calls["supersede"] = (checkpoint_id, request, idempotency_key)
+            self._maybe_raise()
+            return fake_result(context_key=request.context_key)
+
         async def forget(self, checkpoint_id: UUID, *, idempotency_key: str) -> Any:
             calls["forget"] = (checkpoint_id, idempotency_key)
             self._maybe_raise()
@@ -270,10 +277,13 @@ async def test_get_invalidate_forget_and_no_patch_put_delete(
             await http.request(method, f"{BASE}/{checkpoint_id}", headers=KEYED)
             for method in ("PATCH", "PUT", "DELETE")
         ]
-        supersede = await http.post(f"{BASE}/{checkpoint_id}/supersede", json={}, headers=KEYED)
+        supersede = await http.post(
+            f"{BASE}/{checkpoint_id}/supersede", json=CREATE_BODY, headers=KEYED
+        )
     assert got.status_code == 200 and calls["get"] == checkpoint_id
     assert invalidated.status_code == 200 and calls["invalidate"][1].reason == "r"
     assert forgotten.status_code == 200 and calls["forget"] == (checkpoint_id, "key-1")
     assert bad_id.status_code == 422
     assert all(response.status_code == 405 for response in methods)
-    assert supersede.status_code in {404, 405}
+    assert supersede.status_code == 201
+    assert calls["supersede"][0] == checkpoint_id and calls["supersede"][2] == "key-1"

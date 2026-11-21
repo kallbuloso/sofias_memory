@@ -814,7 +814,6 @@ def test_no_future_contextual_routes_or_contract_advertisement() -> None:
         "/api/v1/episodes/{episode_id}/unforget",
         "/api/v1/episodes/recall",
         "/api/v1/episodes/search",
-        "/api/v1/context/checkpoints/{checkpoint_id}/supersede",
         "/api/v1/context/checkpoints/{checkpoint_id}/restore",
         "/api/v1/context/checkpoints/{checkpoint_id}/unforget",
         "/api/v1/context/checkpoints/search",
@@ -830,11 +829,12 @@ EXPECTED_CHECKPOINT_ROUTES = {
     "/api/v1/context/checkpoints": {"get", "post"},
     "/api/v1/context/checkpoints/current": {"get"},
     "/api/v1/context/checkpoints/{checkpoint_id}": {"get"},
+    "/api/v1/context/checkpoints/{checkpoint_id}/supersede": {"post"},
     "/api/v1/context/checkpoints/{checkpoint_id}/invalidate": {"post"},
     "/api/v1/context/checkpoints/{checkpoint_id}/forget": {"post"},
 }
-"""SM-CTX-002: exactly the six approved checkpoint operations (handoff 10 SS 6);
-no PATCH/PUT/DELETE (SS 64), no supersede (SM-CTX-003)."""
+"""SM-CTX-002 six operations + SM-CTX-003 supersede (handoff 11 SS 28/76/102);
+no PATCH/PUT/DELETE, no Contextual Recall."""
 
 
 def test_checkpoint_routes_present_with_exact_methods() -> None:
@@ -846,6 +846,10 @@ def test_checkpoint_routes_present_with_exact_methods() -> None:
         assert set(paths[path]) == methods, path
         assert not {"patch", "put", "delete"} & set(paths[path])
     assert paths["/api/v1/context/checkpoints"]["post"]["responses"].keys() >= {"201", "409"}
+    supersede = paths["/api/v1/context/checkpoints/{checkpoint_id}/supersede"]["post"]
+    assert supersede["responses"].keys() >= {"201", "404", "409", "422"}
+    body_ref = supersede["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+    assert body_ref.endswith("/ContextCheckpointSupersedeRequest")
 
 
 def test_checkpoint_mutations_require_idempotency_key_and_reads_do_not_accept_it() -> None:
@@ -855,6 +859,7 @@ def test_checkpoint_mutations_require_idempotency_key_and_reads_do_not_accept_it
 
     for path in (
         "/api/v1/context/checkpoints",
+        "/api/v1/context/checkpoints/{checkpoint_id}/supersede",
         "/api/v1/context/checkpoints/{checkpoint_id}/invalidate",
         "/api/v1/context/checkpoints/{checkpoint_id}/forget",
     ):

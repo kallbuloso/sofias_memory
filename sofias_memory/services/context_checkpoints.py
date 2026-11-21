@@ -1,5 +1,5 @@
-"""ContextCheckpoint service (SM-CTX-002, ADR-0017/ADR-0018, Contract v1
-Contextual Project Memory SS 9/23-36/64/66-67, handoff 10).
+"""ContextCheckpoint service (SM-CTX-002/SM-CTX-003, ADR-0017/ADR-0018,
+Contract v1 Contextual Project Memory SS 9/23-36/64/66-67, handoffs 10/11).
 
 Every mutation is synchronous and PostgreSQL-authoritative: one short
 transaction holds the resource change *and* its idempotency outcome. There is
@@ -27,14 +27,41 @@ Create current (``create_current``)
     ``CONTEXT_STATE_CONFLICT``, never as a second winner. Recovery Create never
     touches historical rows -- no reactivation, no supersession lineage.
 
-Invalidate/Forget
-    Row-lock the target, claim the ledger in a SAVEPOINT (replay before any
-    lifecycle rejection), then apply the transition. Forget hard-deletes the
-    semantic statements, scrubs external provenance refs and the invalidation
-    reason, and keeps ``scope``/``context_key``/``revision``/timestamps (Contract SS 67).
+Supersede (``supersede``, SM-CTX-003)
+    The path id is the caller's ``expected_current_checkpoint_id``. Order inside
+    one transaction (handoff 11 SS 33/44):
 
-Supersession (SM-CTX-003), Evidence (SM-CTX-004) and Forget propagation
-(SM-CTX-005) are intentionally absent.
+    1. claim the idempotency key in a SAVEPOINT *before* touching the target --
+       a same-key replay (or IDEMPOTENCY_CONFLICT) always wins over any
+       lifecycle/staleness rejection, even after the target became SUPERSEDED;
+    2. row-lock the target (``SELECT ... FOR UPDATE``): concurrent supersedes,
+       invalidates and forgets of the same checkpoint are serialized, and a
+       loser re-reads the committed lifecycle after the winner's COMMIT;
+    3. target missing -> 404; not ACTIVE or another stream than the payload's
+       -> 409 ``CONTEXT_STATE_CONFLICT`` (expected/current ids in details); the
+       whole transaction rolls back, including the claim -- a stale writer
+       leaves no checkpoint, statement, provenance or ledger row;
+    4. defer the lineage FK for this transaction, mark the target SUPERSEDED
+       (``superseded_at``, ``superseded_by`` = pre-generated replacement id) and
+       flush, then insert the replacement ACTIVE (``revision = old + 1``), its
+       new statements and new provenance; COMMIT checks the FK.
+
+    Old transition and replacement creation are therefore atomic. No retry or
+    merge against the new current is ever attempted.
+
+Invalidate/Forget
+    Claim the ledger in a SAVEPOINT (replay before any lifecycle rejection),
+    then row-lock the target, then apply the transition -- the same
+    key-then-row acquisition order as Supersede (handoff 10 SS 73-74,
+    handoff 11 SS 33), so mutations sharing a key cannot deadlock. ACTIVE and SUPERSEDED can
+    be invalidated or forgotten; ``superseded_at``/``superseded_by`` lineage is
+    kept on both. Forget hard-deletes the semantic statements, scrubs external
+    provenance refs and the invalidation reason, and keeps
+    ``scope``/``context_key``/``revision``/timestamps/lineage (Contract SS 67).
+    Neither follows lineage: descendants are never invalidated or forgotten.
+
+Evidence (SM-CTX-004) and Forget propagation (SM-CTX-005) are intentionally
+absent; lineage is not Evidence.
 """
 
 from __future__ import annotations
@@ -78,6 +105,7 @@ from sofias_memory.infrastructure.postgres.models import (
 from sofias_memory.infrastructure.postgres.models.context_checkpoint import (
     ACTIVE_STREAM_UNIQUE_INDEX,
     STREAM_REVISION_UNIQUE_CONSTRAINT,
+    SUPERSEDED_BY_UNIQUE_INDEX,
 )
 from sofias_memory.infrastructure.postgres.repositories.context_checkpoints import (
     ContextCheckpointPosition,
@@ -92,6 +120,8 @@ from sofias_memory.schemas.context_checkpoints import (
     ContextCheckpointListResult,
     ContextCheckpointProvenanceResult,
     ContextCheckpointResult,
+    ContextCheckpointSnapshotFields,
+    ContextCheckpointSupersedeRequest,
     ContextStatementCreateRequest,
     ContextStatementResult,
 )
@@ -104,9 +134,10 @@ CONTEXTUAL_IDEMPOTENCY_KEY_UNIQUE_CONSTRAINT = "uq_contextual_memory_idempotency
 """The one constraint whose violation is reinterpreted as an idempotency race."""
 
 _STREAM_SAFETY_NET_CONSTRAINTS = frozenset(
-    {ACTIVE_STREAM_UNIQUE_INDEX, STREAM_REVISION_UNIQUE_CONSTRAINT}
+    {ACTIVE_STREAM_UNIQUE_INDEX, STREAM_REVISION_UNIQUE_CONSTRAINT, SUPERSEDED_BY_UNIQUE_INDEX}
 )
-"""Structural single-ACTIVE/revision guarantees; reported as CONTEXT_STATE_CONFLICT."""
+"""Structural single-ACTIVE/revision/linear-lineage guarantees; reported as
+CONTEXT_STATE_CONFLICT, never as a second winner."""
 
 _CURSOR_VERSION = 1
 
@@ -148,16 +179,29 @@ def current_checkpoint_not_found_error(scope: str, context_key: str) -> SofiasMe
     )
 
 
-def context_state_conflict_error(current_checkpoint_id: UUID | None) -> SofiasMemoryError:
+def context_state_conflict_error(
+    current_checkpoint_id: UUID | None,
+    *,
+    expected_checkpoint_id: UUID | None = None,
+) -> SofiasMemoryError:
+    """Create: the stream already has a current checkpoint. Supersede (stale
+    writer): ``expected_checkpoint_id`` is not the stream's current checkpoint;
+    ``current_checkpoint_id`` is ``null`` when the stream has none. Only ids --
+    never semantic content."""
+
     details: dict[str, str | None] = {
         "current_checkpoint_id": (
             str(current_checkpoint_id) if current_checkpoint_id is not None else None
         )
     }
+    message = "The Context Stream already has a current checkpoint."
+    if expected_checkpoint_id is not None:
+        details["expected_checkpoint_id"] = str(expected_checkpoint_id)
+        message = "The expected checkpoint is not the current checkpoint of its Context Stream."
     return SofiasMemoryError(
         code=ErrorCode.CONTEXT_STATE_CONFLICT,
         status_code=HTTPStatus.CONFLICT,
-        message="The Context Stream already has a current checkpoint.",
+        message=message,
         details=details,
     )
 
@@ -286,7 +330,7 @@ def checkpoint_result(
     )
 
 
-def canonical_create_payload(request: ContextCheckpointCreateRequest) -> dict[str, object]:
+def canonical_create_payload(request: ContextCheckpointSnapshotFields) -> dict[str, object]:
     """Every semantic Create field (handoff 10 SS 66) with the *resolved*
     ``context_key`` and arrays in caller order (order is semantic, SS 67).
     Never a generated id, ``created_at``, the server-allocated revision,
@@ -315,7 +359,7 @@ def canonical_create_payload(request: ContextCheckpointCreateRequest) -> dict[st
 
 
 def build_checkpoint_statements(
-    checkpoint_id: UUID, request: ContextCheckpointCreateRequest
+    checkpoint_id: UUID, request: ContextCheckpointSnapshotFields
 ) -> list[ContextCheckpointStatement]:
     """Scalars at ordinal 0; collections keep the caller order as 0..n-1."""
 
@@ -513,6 +557,112 @@ class ContextCheckpointService:
             )
         return ContextCheckpointListResult(items=items, limit=limit, next_cursor=next_cursor)
 
+    # --- Supersede (SM-CTX-003) -----------------------------------------------
+
+    async def supersede(
+        self,
+        checkpoint_id: UUID,
+        request: ContextCheckpointSupersedeRequest,
+        *,
+        idempotency_key: str,
+    ) -> ContextCheckpointResult:
+        """Atomically replace the ACTIVE ``checkpoint_id`` (the caller's expected
+        current) by a complete new snapshot with ``revision = old + 1``."""
+
+        protected_key = self._protected_key(idempotency_key)
+        operation = ContextualMemoryOperation.CHECKPOINT_SUPERSEDE
+        digest = self._digest(operation, checkpoint_id, canonical_create_payload(request))
+
+        replay = await self._pre_check(protected_key, operation, digest)
+        if replay is not None:
+            return replay
+
+        replacement_id = uuid4()
+        async with self._unit_of_work_factory() as uow:
+            # 1. Idempotency first: replay/IDEMPOTENCY_CONFLICT beat lifecycle.
+            replayed = await self._claim(
+                uow,
+                protected_key,
+                operation,
+                digest,
+                checkpoint_id,
+                result_resource_id=replacement_id,
+            )
+            if replayed is not None:
+                await uow.commit()
+                return replayed
+
+            # 2. Serialize every lifecycle mutation of the expected current.
+            target = await uow.context_checkpoints.get_by_id_for_update(checkpoint_id)
+            if target is None:
+                raise checkpoint_not_found_error(checkpoint_id)
+
+            # 3. Expected-current: must be ACTIVE and in the payload's stream.
+            if (
+                target.lifecycle is not ContextCheckpointLifecycle.ACTIVE
+                or target.scope != request.scope
+                or target.context_key != request.context_key
+            ):
+                current = await uow.context_checkpoints.get_active(
+                    scope=target.scope, context_key=target.context_key
+                )
+                current_id = current.id if current is not None else None
+                _logger.info(
+                    "checkpoint_conflict",
+                    operation=operation.value,
+                    expected_checkpoint_id=str(checkpoint_id),
+                    current_checkpoint_id=str(current_id) if current_id else None,
+                )
+                raise context_state_conflict_error(current_id, expected_checkpoint_id=checkpoint_id)
+
+            # 4. Atomic transition + replacement (FK checked at COMMIT).
+            old_revision = target.revision
+            replacement = ContextCheckpoint(
+                id=replacement_id,
+                scope=target.scope,
+                context_key=target.context_key,
+                revision=old_revision + 1,
+                lifecycle=ContextCheckpointLifecycle.ACTIVE,
+            )
+            provenance = ContextCheckpointProvenance(
+                checkpoint_id=replacement_id,
+                origin_kind=request.provenance.origin_kind,
+                source_system=request.provenance.source_system,
+                conversation_ref=request.provenance.conversation_ref,
+                turn_ref=request.provenance.turn_ref,
+            )
+            statements = build_checkpoint_statements(replacement_id, request)
+            try:
+                async with uow.savepoint():
+                    await uow.context_checkpoints.defer_lineage_foreign_key()
+                    target.lifecycle = ContextCheckpointLifecycle.SUPERSEDED
+                    target.superseded_at = utc_now()
+                    target.superseded_by = replacement_id
+                    await uow.flush()
+                    await uow.context_checkpoints.add(replacement)
+                    await uow.context_checkpoint_provenance.add(provenance)
+                    await uow.context_checkpoint_statements.add_all(statements)
+            except IntegrityError as error:
+                if _constraint_name(error) in _STREAM_SAFETY_NET_CONSTRAINTS:
+                    _logger.info("checkpoint_conflict", operation=operation.value)
+                    raise context_state_conflict_error(
+                        None, expected_checkpoint_id=checkpoint_id
+                    ) from error
+                raise
+
+            result = checkpoint_result(replacement, provenance, statements)
+            await uow.commit()
+
+        _logger.info(
+            "checkpoint_superseded",
+            operation=operation.value,
+            target_checkpoint_id=str(checkpoint_id),
+            replacement_checkpoint_id=str(result.checkpoint_id),
+            old_revision=old_revision,
+            new_revision=result.revision,
+        )
+        return result
+
     # --- Invalidate -----------------------------------------------------------
 
     async def invalidate(
@@ -531,14 +681,15 @@ class ContextCheckpointService:
             return replay
 
         async with self._unit_of_work_factory() as uow:
-            checkpoint = await uow.context_checkpoints.get_by_id_for_update(checkpoint_id)
-            if checkpoint is None:
-                raise checkpoint_not_found_error(checkpoint_id)
-
+            # Global acquisition order (see _claim): ledger key, then row lock.
             replayed = await self._claim(uow, protected_key, operation, digest, checkpoint_id)
             if replayed is not None:
                 await uow.commit()
                 return replayed
+
+            checkpoint = await uow.context_checkpoints.get_by_id_for_update(checkpoint_id)
+            if checkpoint is None:
+                raise checkpoint_not_found_error(checkpoint_id)
 
             transition = checkpoint_invalidate_transition(checkpoint.lifecycle)
             if transition is CheckpointTransition.CONFLICT:
@@ -581,6 +732,12 @@ class ContextCheckpointService:
             return replay
 
         async with self._unit_of_work_factory() as uow:
+            # Global acquisition order (see _claim): ledger key, then row locks.
+            replayed = await self._claim(uow, protected_key, operation, digest, checkpoint_id)
+            if replayed is not None:
+                await uow.commit()
+                return replayed
+
             checkpoint = await uow.context_checkpoints.get_by_id_for_update(checkpoint_id)
             if checkpoint is None:
                 raise checkpoint_not_found_error(checkpoint_id)
@@ -589,11 +746,6 @@ class ContextCheckpointService:
             )
             if provenance is None:
                 raise _internal_error("Context checkpoint provenance is missing.")
-
-            replayed = await self._claim(uow, protected_key, operation, digest, checkpoint_id)
-            if replayed is not None:
-                await uow.commit()
-                return replayed
 
             transition = checkpoint_forget_transition(checkpoint.lifecycle)
             if transition is CheckpointTransition.CONFLICT:
@@ -708,9 +860,20 @@ class ContextCheckpointService:
         operation: ContextualMemoryOperation,
         digest: str,
         checkpoint_id: UUID,
+        *,
+        result_resource_id: UUID | None = None,
     ) -> ContextCheckpointResult | None:
         """Authoritative claim for a targeted mutation, in its own SAVEPOINT.
-        Returns the replayed winner when the key was already claimed."""
+        Returns the replayed winner when the key was already claimed. The claim
+        is only durable if the surrounding transaction commits: any later
+        rejection rolls it back with everything else.
+
+        Lock-order policy: every checkpoint mutation (supersede, invalidate,
+        forget) calls this *before* taking any checkpoint row lock. No
+        transaction therefore ever holds a checkpoint row lock while waiting
+        for a ledger key held by another transaction, which removes the
+        same-key cross-operation deadlock cycle. Create holds only its stream
+        advisory lock (never a checkpoint row lock) while it writes its key."""
 
         ledger_entry = ContextualMemoryIdempotency(
             id=uuid4(),
@@ -718,7 +881,7 @@ class ContextCheckpointService:
             operation=operation,
             request_digest=digest,
             target_resource_id=checkpoint_id,
-            result_resource_id=checkpoint_id,
+            result_resource_id=result_resource_id or checkpoint_id,
         )
         try:
             async with uow.savepoint():

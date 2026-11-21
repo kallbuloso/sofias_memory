@@ -132,6 +132,7 @@ def test_sm211_revision_is_current_head() -> None:
         "0018_create_native_cognitive_memory.py",
         "0019_create_contextual_episodes.py",
         "0020_create_context_checkpoints.py",
+        "0021_harden_context_checkpoint_supersession.py",
     ]
 
 

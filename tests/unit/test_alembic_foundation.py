@@ -111,6 +111,7 @@ def test_versions_directory_contains_expected_foundation_revisions() -> None:
         "0018_create_native_cognitive_memory.py",
         "0019_create_contextual_episodes.py",
         "0020_create_context_checkpoints.py",
+        "0021_harden_context_checkpoint_supersession.py",
     ]
 
 

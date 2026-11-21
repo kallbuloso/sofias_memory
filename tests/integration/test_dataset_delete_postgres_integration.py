@@ -95,7 +95,7 @@ def require_real_neo4j() -> None:
 
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-NEO4J_PASSWORD_FALLBACK = "8P7nanOVz6vfmrg"
+NEO4J_PASSWORD_FALLBACK = "unused-test-neo4j-password"  # synthetic, not a credential
 LLM_API_KEY = "sk-fake-test-key"
 POLL_INTERVAL_MS = 20
 

@@ -63,7 +63,7 @@ isolation mechanism destructive validation is meant to use, never
 
 EXPECTED_API_KEY = "sf-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 LLM_API_KEY = "sk-fake-test-key"
-NEO4J_PASSWORD_FALLBACK = "8P7nanOVz6vfmrg"
+NEO4J_PASSWORD_FALLBACK = "unused-test-neo4j-password"  # synthetic, not a credential
 
 VALIDATION_PREFIX = "validation/storage009-final-20260901"
 """New, unique prefix for this closure pass -- never the empty root prefix,

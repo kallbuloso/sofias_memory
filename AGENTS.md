@@ -858,10 +858,7 @@ uv run pytest
 Execução local:
 
 ```bash
-uv run uvicorn sofias_memory.app:app \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --reload
+uv run uvicorn sofias_memory.app:create_app --factory --host 127.0.0.1 --port 8000 --reload
 ```
 
 Migrations:

@@ -90,6 +90,22 @@ preservation tests for Forget and Dataset Delete live inside those two
 features' own existing suites, reusing their existing dedicated-database
 harness rather than a separate Agent-specific file.
 
+### Contextual Episodes integration tests
+
+`tests/integration/test_contextual_episodes_postgres_integration.py` (SM-CTX-001,
+first-class Episodes) gates on `SOFIAS_MEMORY_RUN_CONTEXTUAL_EPISODES_POSTGRES_TESTS=1`
+plus the plain `DATABASE_URL` pointing at a dedicated, discardable PostgreSQL
+database already migrated to head (`uv run alembic upgrade head` against that same
+URL). Only the embedding provider is faked; Neo4j is never required — Contextual
+Project Memory is PostgreSQL-only. Each test uses its own random `project:<key>`
+scope and deletes the rows it created.
+
+```bash
+DATABASE_URL=postgresql+asyncpg://...@127.0.0.1:5440/<dedicated_test_db> \
+SOFIAS_MEMORY_RUN_CONTEXTUAL_EPISODES_POSTGRES_TESTS=1 \
+  uv run pytest tests/integration/test_contextual_episodes_postgres_integration.py
+```
+
 ### Migration bootstrap integration tests
 
 A single opt-in flag/dedicated-database pair gates every real-PostgreSQL

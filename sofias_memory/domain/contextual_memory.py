@@ -18,6 +18,7 @@ operational boundary.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -28,11 +29,33 @@ from sofias_memory.domain.cognitive_memory_scope import (
     InvalidCognitiveMemoryScopeError,
     normalize_cognitive_memory_scope,
 )
-from sofias_memory.domain.enums import EpisodeKind, EpisodeLifecycle
+from sofias_memory.domain.enums import (
+    ContextCheckpointLifecycle,
+    ContextStatementType,
+    EpisodeKind,
+    EpisodeLifecycle,
+)
 
 CONTEXT_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
 """Contract v1 SS 9.1: 1..128 ASCII lowercase chars, ``a-z0-9._:-``, first
 char a lowercase letter or digit, exact comparison, no whitespace."""
+
+DEFAULT_CONTEXT_KEY = "main"
+"""Contract v1 SS 9.2: omitted ``context_key`` resolves to ``main`` for
+ContextCheckpoints (never for Episodes, where omission means project-wide)."""
+
+SCALAR_CONTEXT_STATEMENT_TYPES = frozenset(
+    {
+        ContextStatementType.OBJECTIVE,
+        ContextStatementType.CURRENT_STATE,
+        ContextStatementType.NEXT_ACTION,
+    }
+)
+"""At most one statement of each of these types per checkpoint (handoff 10 SS 18)."""
+
+CONTEXT_STREAM_LOCK_DOMAIN = "sofias-memory.context-stream.create-lock.v1"
+"""Domain separator of :func:``context_stream_lock_key``. Changing it changes
+every derived lock key, so it is versioned and must never be edited in place."""
 
 EPISODE_OCCURRED_AT_FUTURE_TOLERANCE = timedelta(minutes=5)
 """Contract v1 SS 65 leaves the future-timestamp tolerance to the
@@ -194,3 +217,95 @@ def episode_forget_transition(lifecycle: EpisodeLifecycle) -> EpisodeTransition:
     """Contract v1 SS 21: ACTIVE|INVALIDATED -> FORGOTTEN, FORGOTTEN -> 200 no-op."""
 
     return _FORGET_TRANSITIONS[lifecycle]
+
+
+# --- ContextCheckpoint primitives (SM-CTX-002) ----------------------------------
+
+
+class InvalidContextStatementTextError(ValueError):
+    """A caller-supplied ContextStatement/checkpoint text field is blank."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Invalid context statement text: {reason}")
+
+
+def resolve_context_key(value: str | None) -> str:
+    """Omitted (``None``) -> ``main``; otherwise validate-only (exact)."""
+
+    if value is None:
+        return DEFAULT_CONTEXT_KEY
+    return validate_context_key(value)
+
+
+def normalize_context_statement_text(value: str, *, field: str) -> str:
+    """CRLF/CR -> LF, trim edges, require non-blank. No length limit and no
+    silent truncation (handoff 10 SS 23)."""
+
+    normalized = normalize_newlines(value).strip()
+    if not normalized:
+        raise InvalidContextStatementTextError(f"{field} must not be blank")
+    return normalized
+
+
+def next_checkpoint_revision(max_existing_revision: int | None) -> int:
+    """Revision belongs to the Context Stream and is never reused
+    (Contract v1 SS 66): a brand-new stream gets 1, a historical stream
+    without ACTIVE gets ``MAX(existing revision) + 1`` -- tombstones included."""
+
+    return 1 if max_existing_revision is None else max_existing_revision + 1
+
+
+def context_stream_lock_key(scope: str, context_key: str) -> int:
+    """Stable signed 64-bit key for ``pg_advisory_xact_lock(bigint)``.
+
+    Derived from SHA-256 over a versioned domain separator plus the already
+    canonical ``(scope, context_key)`` -- deterministic across processes,
+    restarts and PostgreSQL versions (unlike ``hashtext``). A 64-bit collision
+    between two different streams would only serialize their Creates
+    needlessly; correctness never depends on the absence of collisions
+    because the single-ACTIVE index and the revision unique constraint stay
+    the structural safety nets. The NUL separator cannot appear in either
+    grammar, so distinct pairs always produce distinct hash input."""
+
+    material = "\x00".join((CONTEXT_STREAM_LOCK_DOMAIN, scope, context_key)).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big", signed=True)
+
+
+class CheckpointTransition(StrEnum):
+    """What a lifecycle mutation does to a ContextCheckpoint in its current state."""
+
+    APPLY = "apply"
+    NO_OP = "no_op"
+    CONFLICT = "conflict"
+
+
+_CHECKPOINT_INVALIDATE_TRANSITIONS: dict[ContextCheckpointLifecycle, CheckpointTransition] = {
+    ContextCheckpointLifecycle.ACTIVE: CheckpointTransition.APPLY,
+    ContextCheckpointLifecycle.INVALIDATED: CheckpointTransition.NO_OP,
+    ContextCheckpointLifecycle.FORGOTTEN: CheckpointTransition.CONFLICT,
+    # Unreachable in SM-CTX-002 (nothing produces SUPERSEDED yet); the
+    # Contract SS 33 SUPERSEDED -> INVALIDATED transition is enabled by SM-CTX-003.
+    ContextCheckpointLifecycle.SUPERSEDED: CheckpointTransition.CONFLICT,
+}
+
+_CHECKPOINT_FORGET_TRANSITIONS: dict[ContextCheckpointLifecycle, CheckpointTransition] = {
+    ContextCheckpointLifecycle.ACTIVE: CheckpointTransition.APPLY,
+    ContextCheckpointLifecycle.INVALIDATED: CheckpointTransition.APPLY,
+    ContextCheckpointLifecycle.FORGOTTEN: CheckpointTransition.NO_OP,
+    # Unreachable in SM-CTX-002; SUPERSEDED -> FORGOTTEN arrives with SM-CTX-003.
+    ContextCheckpointLifecycle.SUPERSEDED: CheckpointTransition.CONFLICT,
+}
+
+
+def checkpoint_invalidate_transition(lifecycle: ContextCheckpointLifecycle) -> CheckpointTransition:
+    """Handoff 10 SS 59: ACTIVE -> INVALIDATED, INVALIDATED -> 200 no-op,
+    FORGOTTEN -> CHECKPOINT_STATE_CONFLICT."""
+
+    return _CHECKPOINT_INVALIDATE_TRANSITIONS[lifecycle]
+
+
+def checkpoint_forget_transition(lifecycle: ContextCheckpointLifecycle) -> CheckpointTransition:
+    """Handoff 10 SS 62: ACTIVE|INVALIDATED -> FORGOTTEN, FORGOTTEN -> 200 no-op."""
+
+    return _CHECKPOINT_FORGET_TRANSITIONS[lifecycle]

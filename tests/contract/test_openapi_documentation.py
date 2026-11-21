@@ -46,6 +46,9 @@ IDEMPOTENCY_KEY_OPERATIONS = {
     ("post", "/api/v1/episodes"),
     ("post", "/api/v1/episodes/{episode_id}/invalidate"),
     ("post", "/api/v1/episodes/{episode_id}/forget"),
+    ("post", "/api/v1/context/checkpoints"),
+    ("post", "/api/v1/context/checkpoints/{checkpoint_id}/invalidate"),
+    ("post", "/api/v1/context/checkpoints/{checkpoint_id}/forget"),
 }
 
 # Contextual Project Memory Contract v1 SS 36: every contextual mutation
@@ -54,6 +57,9 @@ REQUIRED_IDEMPOTENCY_KEY_OPERATIONS = {
     ("post", "/api/v1/episodes"),
     ("post", "/api/v1/episodes/{episode_id}/invalidate"),
     ("post", "/api/v1/episodes/{episode_id}/forget"),
+    ("post", "/api/v1/context/checkpoints"),
+    ("post", "/api/v1/context/checkpoints/{checkpoint_id}/invalidate"),
+    ("post", "/api/v1/context/checkpoints/{checkpoint_id}/forget"),
 }
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete")

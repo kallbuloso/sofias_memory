@@ -9,6 +9,15 @@ from sofias_memory.infrastructure.postgres.repositories.chunks import ChunkRepos
 from sofias_memory.infrastructure.postgres.repositories.cognitive_memory_idempotency import (
     CognitiveMemoryIdempotencyRepository,
 )
+from sofias_memory.infrastructure.postgres.repositories.context_checkpoint_provenance import (
+    ContextCheckpointProvenanceRepository,
+)
+from sofias_memory.infrastructure.postgres.repositories.context_checkpoint_statements import (
+    ContextCheckpointStatementRepository,
+)
+from sofias_memory.infrastructure.postgres.repositories.context_checkpoints import (
+    ContextCheckpointRepository,
+)
 from sofias_memory.infrastructure.postgres.repositories.contextual_memory_idempotency import (
     ContextualMemoryIdempotencyRepository,
 )
@@ -53,6 +62,9 @@ __all__ = [
     "AgentSkillRepository",
     "ChunkRepository",
     "CognitiveMemoryIdempotencyRepository",
+    "ContextCheckpointProvenanceRepository",
+    "ContextCheckpointRepository",
+    "ContextCheckpointStatementRepository",
     "ContextualMemoryIdempotencyRepository",
     "DatasetRepository",
     "DocumentRepository",

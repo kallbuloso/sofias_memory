@@ -23,8 +23,9 @@ from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from sofias_memory.domain import ContextStatementType
+from sofias_memory.domain import ContextStatementType, SupportMode
 from sofias_memory.infrastructure.postgres.base import Base
+from sofias_memory.infrastructure.postgres.models.contextual_evidence import SUPPORT_MODE_ENUM
 
 
 def _statement_type_values(enum_type: type[ContextStatementType]) -> list[str]:
@@ -74,6 +75,8 @@ class ContextCheckpointStatement(Base):
     )
     ordinal: Mapped[int] = mapped_column(Integer(), nullable=False)
     content: Mapped[str] = mapped_column(Text(), nullable=False)
+    support_mode: Mapped[SupportMode | None] = mapped_column(SUPPORT_MODE_ENUM, nullable=True)
+    """SM-CTX-004: statement-level support; NULL = no declared support."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=sql_text("now()")
     )

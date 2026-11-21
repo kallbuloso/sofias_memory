@@ -184,7 +184,8 @@ async def test_mutations_require_idempotency_key(
         ({"kind": "note"}, "INVALID_EPISODE_KIND"),
         ({"summary": " "}, "INVALID_REQUEST"),
         ({"scope": "global", "kind": "note"}, "INVALID_REQUEST"),
-        ({"support": {"mode": "all_required", "refs": []}}, "INVALID_REQUEST"),
+        # SM-CTX-004: support is accepted; an empty Evidence set is an invalid policy.
+        ({"support": {"mode": "all_required", "refs": []}}, "INVALID_SUPPORT_POLICY"),
     ],
 )
 async def test_create_validation_codes(

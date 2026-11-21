@@ -14,6 +14,11 @@ from sofias_memory.infrastructure.postgres.models.context_checkpoint_provenance 
 from sofias_memory.infrastructure.postgres.models.context_checkpoint_statement import (
     ContextCheckpointStatement,
 )
+from sofias_memory.infrastructure.postgres.models.contextual_evidence import (
+    ContextStatementEvidenceRef,
+    ContextualEvidenceRef,
+    EpisodeEvidenceRef,
+)
 from sofias_memory.infrastructure.postgres.models.contextual_memory_idempotency import (
     ContextualMemoryIdempotency,
 )
@@ -49,12 +54,15 @@ __all__ = [
     "ContextCheckpoint",
     "ContextCheckpointProvenance",
     "ContextCheckpointStatement",
+    "ContextStatementEvidenceRef",
+    "ContextualEvidenceRef",
     "ContextualMemoryIdempotency",
     "Dataset",
     "Document",
     "Entity",
     "EntityMention",
     "Episode",
+    "EpisodeEvidenceRef",
     "EpisodeProvenance",
     "Feedback",
     "GraphOutbox",

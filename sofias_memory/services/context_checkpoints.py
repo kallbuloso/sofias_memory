@@ -69,13 +69,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from sofias_memory.api.errors import SofiasMemoryError
 from sofias_memory.config import Settings
@@ -86,6 +86,7 @@ from sofias_memory.domain import (
     ContextualIdempotencyRequest,
     ContextualMemoryOperation,
     build_contextual_canonical_request,
+    canonical_support_payload,
     checkpoint_forget_transition,
     checkpoint_invalidate_transition,
     compute_contextual_request_digest,
@@ -124,6 +125,15 @@ from sofias_memory.schemas.context_checkpoints import (
     ContextCheckpointSupersedeRequest,
     ContextStatementCreateRequest,
     ContextStatementResult,
+)
+from sofias_memory.schemas.contextual_evidence import SupportRequest, SupportResult
+from sofias_memory.services.contextual_evidence import (
+    all_support_keys,
+    hydrate_statement_support,
+    lock_and_resolve,
+    persist_statement_support,
+    raise_if_transient_conflict,
+    validate_new_support,
 )
 from sofias_memory.services.pipeline_submission import (
     idempotency_conflict_error,
@@ -282,6 +292,7 @@ def checkpoint_result(
     checkpoint: ContextCheckpoint,
     provenance: ContextCheckpointProvenance,
     statements: Sequence[ContextCheckpointStatement],
+    supports: Mapping[UUID, SupportResult | None] | None = None,
 ) -> ContextCheckpointResult:
     """The one row -> public shape conversion. Statements are grouped by type
     and ordered by ``ordinal``; never exposes ``invalidation_reason`` or any
@@ -293,7 +304,11 @@ def checkpoint_result(
 
     def collection(statement_type: ContextStatementType) -> list[ContextStatementResult]:
         return [
-            ContextStatementResult(statement_id=item.id, text=item.content)
+            ContextStatementResult(
+                statement_id=item.id,
+                text=item.content,
+                support=(supports or {}).get(item.id),
+            )
             for item in by_type.get(statement_type, [])
         ]
 
@@ -330,24 +345,52 @@ def checkpoint_result(
     )
 
 
+def statement_canonical(statement: ContextStatementCreateRequest) -> object:
+    """A statement without support keeps its exact pre-SM-CTX-004 canonical form
+    (the bare text), so historical digests are unchanged; a supported statement
+    becomes ``{"text", "support": mode + canonical Evidence set}`` (handoff 12 SS 72/73)."""
+
+    if statement.support is None:
+        return statement.text
+    return {
+        "text": statement.text,
+        "support": canonical_support_payload(statement.support.mode, statement.support.keys()),
+    }
+
+
+def snapshot_supports(request: ContextCheckpointSnapshotFields) -> list[SupportRequest | None]:
+    """Every statement-level support declared by a snapshot (for validation)."""
+
+    items: list[ContextStatementCreateRequest | None] = [
+        request.objective,
+        request.current_state,
+        request.next_action,
+        *request.approved_decisions,
+        *request.pending_work,
+        *request.open_items,
+        *request.blockers,
+    ]
+    return [item.support for item in items if item is not None]
+
+
 def canonical_create_payload(request: ContextCheckpointSnapshotFields) -> dict[str, object]:
     """Every semantic Create field (handoff 10 SS 66) with the *resolved*
     ``context_key`` and arrays in caller order (order is semantic, SS 67).
     Never a generated id, ``created_at``, the server-allocated revision,
     transport metadata, or a secret."""
 
-    def text(statement: ContextStatementCreateRequest | None) -> str | None:
-        return None if statement is None else statement.text
+    def text(statement: ContextStatementCreateRequest | None) -> object:
+        return None if statement is None else statement_canonical(statement)
 
     return {
         "scope": request.scope,
         "context_key": request.context_key,
         "objective": text(request.objective),
-        "current_state": request.current_state.text,
-        "approved_decisions": [item.text for item in request.approved_decisions],
-        "pending_work": [item.text for item in request.pending_work],
-        "open_items": [item.text for item in request.open_items],
-        "blockers": [item.text for item in request.blockers],
+        "current_state": statement_canonical(request.current_state),
+        "approved_decisions": [statement_canonical(i) for i in request.approved_decisions],
+        "pending_work": [statement_canonical(i) for i in request.pending_work],
+        "open_items": [statement_canonical(i) for i in request.open_items],
+        "blockers": [statement_canonical(i) for i in request.blockers],
         "next_action": text(request.next_action),
         "provenance": {
             "origin_kind": request.provenance.origin_kind.value,
@@ -363,6 +406,15 @@ def build_checkpoint_statements(
 ) -> list[ContextCheckpointStatement]:
     """Scalars at ordinal 0; collections keep the caller order as 0..n-1."""
 
+    return build_checkpoint_statements_with_support(checkpoint_id, request)[0]
+
+
+def build_checkpoint_statements_with_support(
+    checkpoint_id: UUID, request: ContextCheckpointSnapshotFields
+) -> tuple[list[ContextCheckpointStatement], dict[UUID, SupportRequest]]:
+    """Rows (with ``support_mode``) plus the statement-level support to link."""
+
+    supports: dict[UUID, SupportRequest] = {}
     rows: list[ContextCheckpointStatement] = []
     for field, statement_type in _SCALAR_FIELDS:
         value = cast(ContextStatementCreateRequest | None, getattr(request, field))
@@ -388,7 +440,26 @@ def build_checkpoint_statements(
                     content=item.text,
                 )
             )
-    return rows
+    for row, item in zip(rows, _ordered_inputs(request), strict=True):
+        if item.support is not None:
+            row.support_mode = item.support.mode
+            supports[row.id] = item.support
+    return rows, supports
+
+
+def _ordered_inputs(
+    request: ContextCheckpointSnapshotFields,
+) -> list[ContextStatementCreateRequest]:
+    """Inputs in exactly the order build_checkpoint_statements_with_support emits rows."""
+
+    out: list[ContextStatementCreateRequest] = []
+    for field, _ in _SCALAR_FIELDS:
+        value = cast(ContextStatementCreateRequest | None, getattr(request, field))
+        if value is not None:
+            out.append(value)
+    for field, _ in _COLLECTION_FIELDS:
+        out.extend(cast(list[ContextStatementCreateRequest], getattr(request, field)))
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,9 +499,30 @@ class ContextCheckpointService:
         if replay is not None:
             return replay
 
+        supports = snapshot_supports(request)
+        evidence_keys = all_support_keys(supports)
+        try:
+            return await self._create_current_locked(
+                request, protected_key, operation, digest, supports, evidence_keys
+            )
+        except DBAPIError as error:
+            raise_if_transient_conflict(error)
+            raise
+
+    async def _create_current_locked(
+        self,
+        request: ContextCheckpointCreateRequest,
+        protected_key: str,
+        operation: ContextualMemoryOperation,
+        digest: str,
+        supports: list[SupportRequest | None],
+        evidence_keys: list[Any],
+    ) -> ContextCheckpointResult:
         scope = request.scope
         context_key = request.context_key
         async with self._unit_of_work_factory() as uow:
+            # Global order: Evidence rows (FOR SHARE) -> stream advisory -> ledger.
+            resolutions = await lock_and_resolve(uow, evidence_keys)
             await uow.context_checkpoints.lock_stream(context_stream_lock_key(scope, context_key))
 
             snapshot = await self._find_snapshot(uow, protected_key)
@@ -447,6 +539,11 @@ class ContextCheckpointService:
                     current_checkpoint_id=str(active.id),
                 )
                 raise context_state_conflict_error(active.id)
+
+            if evidence_keys:
+                await validate_new_support(
+                    uow, owner_scope=scope, supports=supports, resolutions=resolutions
+                )
 
             revision = next_checkpoint_revision(
                 await uow.context_checkpoints.max_revision(scope=scope, context_key=context_key)
@@ -465,7 +562,9 @@ class ContextCheckpointService:
                 conversation_ref=request.provenance.conversation_ref,
                 turn_ref=request.provenance.turn_ref,
             )
-            statements = build_checkpoint_statements(checkpoint.id, request)
+            statements, statement_supports = build_checkpoint_statements_with_support(
+                checkpoint.id, request
+            )
             ledger_entry = ContextualMemoryIdempotency(
                 id=uuid4(),
                 idempotency_key=protected_key,
@@ -479,6 +578,8 @@ class ContextCheckpointService:
                     await uow.context_checkpoints.add(checkpoint)
                     await uow.context_checkpoint_provenance.add(provenance)
                     await uow.context_checkpoint_statements.add_all(statements)
+                    if statement_supports:
+                        await persist_statement_support(uow, statement_supports)
                     await uow.contextual_memory_idempotency.add(ledger_entry)
             except IntegrityError as error:
                 name = _constraint_name(error)
@@ -491,7 +592,7 @@ class ContextCheckpointService:
                     raise context_state_conflict_error(None) from error
                 raise
 
-            result = checkpoint_result(checkpoint, provenance, statements)
+            result = await self._hydrate(uow, checkpoint.id, missing_is_internal=True)
             await uow.commit()
 
         _logger.info(
@@ -577,8 +678,28 @@ class ContextCheckpointService:
         if replay is not None:
             return replay
 
+        try:
+            return await self._supersede_locked(
+                checkpoint_id, request, protected_key, operation, digest
+            )
+        except DBAPIError as error:
+            raise_if_transient_conflict(error)
+            raise
+
+    async def _supersede_locked(
+        self,
+        checkpoint_id: UUID,
+        request: ContextCheckpointSupersedeRequest,
+        protected_key: str,
+        operation: ContextualMemoryOperation,
+        digest: str,
+    ) -> ContextCheckpointResult:
+        supports = snapshot_supports(request)
+        evidence_keys = all_support_keys(supports)
         replacement_id = uuid4()
         async with self._unit_of_work_factory() as uow:
+            # 0. Evidence rows (FOR SHARE) precede the ledger key and the row lock.
+            resolutions = await lock_and_resolve(uow, evidence_keys)
             # 1. Idempotency first: replay/IDEMPOTENCY_CONFLICT beat lifecycle.
             replayed = await self._claim(
                 uow,
@@ -615,6 +736,12 @@ class ContextCheckpointService:
                 )
                 raise context_state_conflict_error(current_id, expected_checkpoint_id=checkpoint_id)
 
+            # 3b. New support is validated against current authoritative state.
+            if evidence_keys:
+                await validate_new_support(
+                    uow, owner_scope=target.scope, supports=supports, resolutions=resolutions
+                )
+
             # 4. Atomic transition + replacement (FK checked at COMMIT).
             old_revision = target.revision
             replacement = ContextCheckpoint(
@@ -631,7 +758,9 @@ class ContextCheckpointService:
                 conversation_ref=request.provenance.conversation_ref,
                 turn_ref=request.provenance.turn_ref,
             )
-            statements = build_checkpoint_statements(replacement_id, request)
+            statements, statement_supports = build_checkpoint_statements_with_support(
+                replacement_id, request
+            )
             try:
                 async with uow.savepoint():
                     await uow.context_checkpoints.defer_lineage_foreign_key()
@@ -642,6 +771,8 @@ class ContextCheckpointService:
                     await uow.context_checkpoints.add(replacement)
                     await uow.context_checkpoint_provenance.add(provenance)
                     await uow.context_checkpoint_statements.add_all(statements)
+                    if statement_supports:
+                        await persist_statement_support(uow, statement_supports)
             except IntegrityError as error:
                 if _constraint_name(error) in _STREAM_SAFETY_NET_CONSTRAINTS:
                     _logger.info("checkpoint_conflict", operation=operation.value)
@@ -650,7 +781,7 @@ class ContextCheckpointService:
                     ) from error
                 raise
 
-            result = checkpoint_result(replacement, provenance, statements)
+            result = await self._hydrate(uow, replacement_id, missing_is_internal=True)
             await uow.commit()
 
         _logger.info(
@@ -910,14 +1041,20 @@ class ContextCheckpointService:
         ids = [checkpoint.id for checkpoint in checkpoints]
         provenance = await uow.context_checkpoint_provenance.get_by_checkpoint_ids(ids)
         statements: dict[UUID, list[ContextCheckpointStatement]] = {}
-        for row in await uow.context_checkpoint_statements.list_by_checkpoint_ids(ids):
+        all_rows = await uow.context_checkpoint_statements.list_by_checkpoint_ids(ids)
+        for row in all_rows:
             statements.setdefault(row.checkpoint_id, []).append(row)
+        supports = await hydrate_statement_support(
+            uow, {row.id: row.support_mode for row in all_rows}
+        )
         results: list[ContextCheckpointResult] = []
         for checkpoint in checkpoints:
             prov = provenance.get(checkpoint.id)
             if prov is None:
                 raise _internal_error("Context checkpoint provenance is missing.")
-            results.append(checkpoint_result(checkpoint, prov, statements.get(checkpoint.id, [])))
+            results.append(
+                checkpoint_result(checkpoint, prov, statements.get(checkpoint.id, []), supports)
+            )
         return results
 
 

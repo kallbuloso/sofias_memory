@@ -39,9 +39,10 @@ from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from sofias_memory.domain import EpisodeKind, EpisodeLifecycle
+from sofias_memory.domain import EpisodeKind, EpisodeLifecycle, SupportMode
 from sofias_memory.infrastructure.postgres.base import Base
 from sofias_memory.infrastructure.postgres.models.chunk import EMBEDDING_DIMENSIONS
+from sofias_memory.infrastructure.postgres.models.contextual_evidence import SUPPORT_MODE_ENUM
 
 
 def _episode_kind_values(enum_type: type[EpisodeKind]) -> list[str]:
@@ -124,6 +125,10 @@ class Episode(Base):
             "AND replacement_episode_id IS NULL)",
             name="forgotten_requires_tombstone_shape",
         ),
+        CheckConstraint(
+            "lifecycle <> 'forgotten' OR support_mode IS NULL",
+            name="forgotten_has_no_support",
+        ),
         Index(
             "ix_episodes_scope_lifecycle_occurred_at",
             "scope",
@@ -172,3 +177,5 @@ class Episode(Base):
         nullable=True,
     )
     forgotten_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    support_mode: Mapped[SupportMode | None] = mapped_column(SUPPORT_MODE_ENUM, nullable=True)
+    """SM-CTX-004: NULL = no declared support (independent assertion)."""

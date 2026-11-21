@@ -27,6 +27,7 @@ from sofias_memory.domain import (
     ContextCheckpointLifecycle,
     normalize_context_statement_text,
 )
+from sofias_memory.schemas.contextual_evidence import SupportRequest, SupportResult
 from sofias_memory.schemas.episodes import ContextKey, ContextualScope
 
 CHECKPOINT_PAGE_DEFAULT_LIMIT = 50
@@ -44,6 +45,13 @@ class ContextStatementCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(description="Required, non-blank. Normalized (CRLF -> LF, edges trimmed).")
+    support: SupportRequest | None = Field(
+        default=None,
+        description=(
+            "Optional statement-level Evidence support (SM-CTX-004). Omitted means no declared "
+            "dependency. Never inherited on supersede."
+        ),
+    )
 
     @pydantic_field_validator("text")
     @classmethod
@@ -136,6 +144,7 @@ class ContextStatementResult(BaseModel):
 
     statement_id: UUID
     text: str
+    support: SupportResult | None = None
 
 
 class ContextCheckpointProvenanceResult(BaseModel):

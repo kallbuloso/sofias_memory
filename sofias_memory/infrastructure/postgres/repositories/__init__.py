@@ -18,6 +18,9 @@ from sofias_memory.infrastructure.postgres.repositories.context_checkpoint_state
 from sofias_memory.infrastructure.postgres.repositories.context_checkpoints import (
     ContextCheckpointRepository,
 )
+from sofias_memory.infrastructure.postgres.repositories.contextual_evidence import (
+    ContextualEvidenceRepository,
+)
 from sofias_memory.infrastructure.postgres.repositories.contextual_memory_idempotency import (
     ContextualMemoryIdempotencyRepository,
 )
@@ -65,6 +68,7 @@ __all__ = [
     "ContextCheckpointProvenanceRepository",
     "ContextCheckpointRepository",
     "ContextCheckpointStatementRepository",
+    "ContextualEvidenceRepository",
     "ContextualMemoryIdempotencyRepository",
     "DatasetRepository",
     "DocumentRepository",

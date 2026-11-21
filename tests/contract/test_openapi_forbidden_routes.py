@@ -894,7 +894,7 @@ def test_checkpoint_schemas_separate_input_from_result_and_have_no_evidence() ->
         "provenance",
     }
     assert set(create["required"]) == {"scope", "current_state", "provenance"}
-    assert set(schemas["ContextStatementCreateRequest"]["properties"]) == {"text"}
+    assert set(schemas["ContextStatementCreateRequest"]["properties"]) == {"text", "support"}
 
     result = schemas["ContextCheckpointResult"]
     assert set(result["properties"]) == {
@@ -919,12 +919,16 @@ def test_checkpoint_schemas_separate_input_from_result_and_have_no_evidence() ->
     }
     current_state = json.dumps(result["properties"]["current_state"])
     assert "null" in current_state
-    assert set(schemas["ContextStatementResult"]["properties"]) == {"statement_id", "text"}
+    assert set(schemas["ContextStatementResult"]["properties"]) == {
+        "statement_id",
+        "text",
+        "support",
+    }
     rendered = json.dumps(
         {name: value for name, value in schemas.items() if name.startswith("ContextCheckpoint")}
         | {name: value for name, value in schemas.items() if name.startswith("ContextStatement")}
     ).lower()
-    for forbidden in ("embedding", "support_mode", "evidence_id", "invalidation_reason"):
+    for forbidden in ("embedding", "support_mode", "invalidation_reason"):
         assert forbidden not in rendered
 
 
@@ -946,7 +950,7 @@ def test_episode_mutations_require_idempotency_key_and_reads_do_not_accept_it() 
         assert "Idempotency-Key" not in names
 
 
-def test_episode_result_never_exposes_embedding_and_create_has_no_support() -> None:
+def test_episode_result_never_exposes_embedding_and_create_accepts_optional_support() -> None:
     schema = openapi_schema()
     components = schema["components"]
     assert isinstance(components, dict)
@@ -956,6 +960,7 @@ def test_episode_result_never_exposes_embedding_and_create_has_no_support() -> N
     result = schemas["EpisodeResult"]
     assert "embedding" not in result["properties"]
     assert "invalidation_reason" not in result["properties"]
+    assert "support" in result["properties"]
     create = schemas["EpisodeCreateRequest"]
     assert set(create["properties"]) == {
         "scope",
@@ -968,8 +973,48 @@ def test_episode_result_never_exposes_embedding_and_create_has_no_support() -> N
         "occurred_at",
         "confidence",
         "provenance",
+        "support",
     }
-    assert set(create["required"]) == {"scope", "kind", "summary", "occurred_at", "provenance"}
+    assert "support" not in create.get("required", [])
+
+
+def test_evidence_support_shapes_follow_contract_and_no_evidence_api_exists() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    schemas = schema["components"]["schemas"]
+    assert isinstance(paths, dict) and isinstance(schemas, dict)
+
+    # SM-CTX-004: Evidence is declared by owners, never managed directly.
+    assert not [path for path in paths if "evidence" in path.lower()]
+    assert not [path for path in paths if path.startswith("/api/v1/context/statements")]
+    assert "/api/v1/context/recall" not in paths
+
+    support_request = schemas["SupportRequest"]
+    assert set(support_request["properties"]) == {"mode", "refs"}
+    assert set(support_request["required"]) == {"mode", "refs"}
+    assert set(schemas["EvidenceRefRequest"]["properties"]) == {"source_type", "source_id"}
+    support_result = schemas["SupportResult"]
+    assert set(support_result["properties"]) == {"mode", "evidence"}
+    assert set(schemas["EvidenceResult"]["properties"]) == {
+        "evidence_id",
+        "source_type",
+        "source_id",
+        "availability",
+    }
+    rendered = json.dumps(schemas)
+    for source_type in ("session_entry", "memory_item", "episode", "source", "document", "chunk"):
+        assert f'"{source_type}"' in rendered
+    assert set(schemas["EvidenceSourceType"]["enum"]) == {
+        "session_entry",
+        "memory_item",
+        "episode",
+        "source",
+        "document",
+        "chunk",
+    }
+    assert set(schemas["SupportMode"]["enum"]) == {"all_required", "any_sufficient"}
+    assert set(schemas["EvidenceAvailability"]["enum"]) == {"available", "unavailable", "forgotten"}
+    assert "contextual_project_memory" not in rendered
 
 
 def test_no_provider_or_database_configuration_schema_exposed() -> None:

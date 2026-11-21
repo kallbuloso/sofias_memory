@@ -232,6 +232,36 @@ class ContextStatementType(StrEnum):
     NEXT_ACTION = "next_action"
 
 
+class EvidenceSourceType(StrEnum):
+    """Contextual Evidence source types (Contract v1 SS 11.1, handoff 12 SS 9).
+
+    Exactly these six in v1. ``source`` means the Knowledge ``Source`` resource
+    (handoff 12 SS 10)."""
+
+    SESSION_ENTRY = "session_entry"
+    MEMORY_ITEM = "memory_item"
+    EPISODE = "episode"
+    SOURCE = "source"
+    DOCUMENT = "document"
+    CHUNK = "chunk"
+
+
+class EvidenceAvailability(StrEnum):
+    """Current availability of one Evidence source (Contract v1 SS 11.2). Always
+    computed from the authoritative source state, never cached."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    FORGOTTEN = "forgotten"
+
+
+class SupportMode(StrEnum):
+    """Declared support policy (Contract v1 SS 12). Evaluated deterministically."""
+
+    ALL_REQUIRED = "all_required"
+    ANY_SUFFICIENT = "any_sufficient"
+
+
 class CognitiveMemoryOperation(StrEnum):
     """``cognitive_memory_idempotency`` ledger operation identity.
     Independent of ``PipelineType`` -- Cognitive Memory mutations are never

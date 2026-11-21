@@ -134,6 +134,7 @@ def test_episode_result_shape_never_exposes_embedding_or_ledger_values() -> None
         "lifecycle",
         "confidence",
         "provenance",
+        "support",
         "created_at",
         "invalidated_at",
         "forgotten_at",

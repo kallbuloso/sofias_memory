@@ -1279,34 +1279,45 @@ Senior Software Engineer
 CURRENT SLICE:
 
 ```text
-SM-CTX-001 — First-Class Episodes
+SM-CTX-002 — Context Streams & Initial Checkpoints
 ```
 
 Implementation handoff APPROVED:
 
 ```text
 docs/product-implementation/implementation/
-09-SF-Implementation-SM-CTX-001-First-Class-Episodes.md
+10-SF-Implementation-SM-CTX-002-Context-Streams-Initial-Checkpoints.md
 ```
 
 Este documento deve ser lido integralmente antes de modificar código relacionado ao Slice.
 
+**Implementação ainda NÃO autorizada.** A transição de CURRENT para SM-CTX-002
+foi autorizada em 2026-11-21, mas a execução do Slice exige autorização
+explícita posterior do usuário. Até lá, não modificar código, migrations ou
+OpenAPI para SM-CTX-002.
+
+Slices concluídos: `SM-CTX-001 — First-Class Episodes` — DONE (evidência em
+`docs/product-implementation/08-SF-Technical-Backlog-Memoria-Contextual-Por-Projeto.md`).
+
 ---
 
-## 17.1 Único escopo atualmente autorizado
+## 17.1 Único escopo do Slice CURRENT
 
-Durante `SM-CTX-001`, implementar somente Episode first-class:
+Quando a execução for autorizada, durante `SM-CTX-002` implementar somente
+Context Streams lógicos e checkpoints iniciais, conforme handoff `10` §6:
 
 ```text
-Episode
-├── create
-├── get
+ContextCheckpoint
+├── create current checkpoint when no ACTIVE exists
+├── get current
+├── get by ID
 ├── list
-├── internal semantic retrieval
 ├── invalidate
 ├── direct forget
+├── ContextStatement
+├── revision allocation + single-ACTIVE protection
 ├── provenance
-├── idempotency
+├── idempotency (shared contextual_memory_idempotency)
 └── durable PostgreSQL persistence
 ```
 
@@ -1314,24 +1325,30 @@ Episode
 
 ## 17.2 Explicitamente fora do Slice
 
-MUST NOT implementar em SM-CTX-001:
+MUST NOT implementar em SM-CTX-002 (handoff `10` §7):
 
 ```text
+checkpoint supersede
+checkpoint replacement against an ACTIVE target
+stale writer detection
 Evidence
-ContextCheckpoint
-ContextStatement
+support policy
 Contextual Recall
-Forget propagation to derived resources
-automatic Episode extraction
-automatic Session distillation
-automatic consolidation
+Knowledge integration
+Cognitive Recall composition
+Forget propagation
+semantic checkpoint search
+checkpoint embeddings
 Neo4j projection
+PipelineRun
+automatic checkpoint generation
+automatic Session summarization
 ```
 
 Também não implementar antecipadamente:
 
 ```text
-SM-CTX-002+
+SM-CTX-003+
 ```
 
 ---
@@ -1341,8 +1358,8 @@ SM-CTX-002+
 A existência de:
 
 ```text
-SM-CTX-002
 SM-CTX-003
+SM-CTX-004
 ...
 SM-CTX-008
 ```
@@ -1351,7 +1368,7 @@ no Technical Backlog não autoriza sua implementação.
 
 Cada Slice requer seu próprio implementation handoff APPROVED **e** autorização
 explícita como CURRENT. `future handoff existence != authorization`.
-Ler `10–16` para contexto não autoriza implementá-los durante SM-CTX-001.
+Ler `11–16` para contexto não autoriza implementá-los durante SM-CTX-002.
 
 ---
 
@@ -1672,7 +1689,7 @@ Deve respeitar lifecycle e cleanup aprovado.
 
 A integração futura com Contextual Evidence está definida por ADR-0019 e pelo Slice correspondente.
 
-Não antecipar em SM-CTX-001.
+Não antecipar em SM-CTX-002.
 
 ---
 
@@ -2141,51 +2158,50 @@ Essa lista representa planejamento.
 Não representa autorização automática.
 
 Somente o Slice explicitamente CURRENT cujo implementation handoff estiver
-APPROVED pode ser executado. Atualmente é apenas `SM-CTX-001`, handoff `09`.
+APPROVED pode ser executado. CURRENT é `SM-CTX-002`, handoff `10`, mas sua
+execução ainda aguarda autorização explícita do usuário (§17). `SM-CTX-001` está DONE.
 Esta autorização de implementação não substitui o escopo da tarefa atual do
 usuário: uma auditoria documentation-only não autoriza executar Slice algum.
 
 ---
 
-# 35. SM-CTX-001 guardrails
+# 35. SM-CTX-002 guardrails
 
-Durante o Slice atual:
+Durante o Slice CURRENT (somente após autorização explícita de execução):
 
 ```text
-SM-CTX-001
+SM-CTX-002
 ```
 
 MUST:
 
-- criar Episode first-class;
-- usar PostgreSQL + pgvector;
-- manter embedding boundary fora da transaction;
-- implementar lifecycle;
+- criar ContextCheckpoint/ContextStatement first-class para Context Streams
+  lógicos `(scope, context_key)`;
+- usar PostgreSQL como autoridade;
+- implementar lifecycle, revision allocation e single-ACTIVE protection;
 - implementar provenance;
-- implementar idempotência;
-- implementar direct Forget;
-- garantir tombstone;
-- implementar exact cosine retrieval interno;
-- manter API bounded;
+- reutilizar `contextual_memory_idempotency` (sem segundo ledger);
+- implementar direct Forget com tombstone;
+- permitir recriar current checkpoint após invalidate/Forget, sem reativação histórica;
 - sobreviver a restart.
 
 MUST NOT:
 
-- implementar Evidence;
-- implementar Checkpoints;
+- implementar supersede/stale-writer detection (SM-CTX-003);
+- implementar Evidence (SM-CTX-004);
 - implementar Contextual Recall;
+- criar checkpoint embeddings ou semantic checkpoint search;
 - criar graph projection;
 - criar PipelineRun;
 - criar new datastore;
-- adicionar `memory_type=episodic`;
 - alterar Session semantics;
-- criar automatic promotion.
+- gerar checkpoints automaticamente.
 
 O implementation handoff detalhado é autoridade:
 
 ```text
 docs/product-implementation/implementation/
-09-SF-Implementation-SM-CTX-001-First-Class-Episodes.md
+10-SF-Implementation-SM-CTX-002-Context-Streams-Initial-Checkpoints.md
 ```
 
 ---

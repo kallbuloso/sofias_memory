@@ -711,6 +711,73 @@ sem fallback.
 
 ---
 
+## SM-CTX-002 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-21)
+Baseline:                main @ b4347f34cb157d493033c9a4f5b8e1de4d8b11f9
+Implementation SHA:      a9ab03f0c5c4d0af9aacbb240c75eb2fbc6ec60f
+                          (feat(context): add context streams and initial checkpoints)
+Merge into main:         14e8c8d60308a53f01662e0a56e5631bd7ee4690 (--no-ff)
+Alembic head:            0020 (down_revision = 0019)
+```
+
+- Entregue: ContextCheckpoint/ContextStatement first-class para Context Streams
+  lógicos `(scope, context_key)` (sem tabelas `context_streams`/`projects`);
+  create current quando não há ACTIVE (revision 1 ou `MAX(revision)+1`,
+  tombstones incluídos), get, current, list (keyset cursor), invalidate e
+  direct Forget com tombstone estrutural (scope/context_key/revision mantidos,
+  statements apagados, refs externas e motivo de invalidação scrubbed);
+  provenance 1:1; ledger compartilhado `contextual_memory_idempotency`.
+- Concorrência: Create serializado por stream com
+  `pg_advisory_xact_lock(bigint)` (chave = primeiros 8 bytes de SHA-256 sobre
+  domínio versionado + scope + context_key), adquirido antes de ledger/ACTIVE/
+  revision; safety nets estruturais: índice único parcial
+  `uq_context_checkpoints_active_stream` e
+  `UNIQUE(scope, context_key, revision)`. Replay idempotente precede
+  `CONTEXT_STATE_CONFLICT`.
+- Acceptance Criteria AC-002.1–AC-002.20: PASS.
+- Human Validation A–K: PASS — executada pela API real (uvicorn + banco
+  dedicado `sofias_memory_ctx_episodes_test`, `DATABASE_MIGRATION_MODE=verify_only`,
+  dois restarts reais do processo) e aceita na autorização de closeout.
+- Verificações adicionais pela API real: PASS — replay após invalidate/Forget,
+  same-key/different-payload, isolamento entre projetos, múltiplos streams
+  ACTIVE, MAX+1 após esquecer todas as revisions + restart, ausência de texto
+  semântico em tombstones/ledger/logs, sem graph_outbox/PipelineRun.
+- Concorrência independente via HTTP real: PASS — stream novo 8 keys → 1×201
+  (rev 1) + 7×409; recovery 8 keys → 1×201 (rev 2) + 7×409; mesmo key ×6 → um
+  único checkpoint; sonda Invalidate/Forget × Create (30 iterações) sem
+  violação.
+- Testes: suíte local 2805 passed (672 skipped opt-in); integração do Slice
+  19/19 PASS (corridas com contenção real observada em `pg_locks`); regressão
+  PostgreSQL relevante 235 PASS (Episodes, Cognitive Memory, Sessions, schema
+  guard, UoW, readiness, migration gate); 22 sondas SQL de constraints PASS.
+- Migration 0020: upgrade/downgrade/upgrade PASS no banco dedicado e migration
+  gate a partir de banco vazio PASS. `cognee_db` permanece em 0019.
+- CI GitHub Actions: não verificado (sem evidência coletada).
+- Correções feitas durante a validação independente (incluídas em `a9ab03f`):
+  identificadores de constraint encurtados para caber no limite de 63 bytes do
+  PostgreSQL (com teste de guarda); holder do lock nos testes de corrida usa a
+  API de transação do SQLAlchemy.
+- MINOR:
+  - `ruff format --check .` acusa ~20 arquivos pré-existentes (CRLF), sem
+    relação com o Slice;
+  - replay de Create devolve o recurso no estado atual (inclusive tombstone),
+    com 201, seguindo o precedente de Episodes;
+  - `invalidation_reason` é persistido mas não exposto (Contract §24);
+  - `context_key: null` explícito no Create é rejeitado (apenas omissão → `main`);
+  - SUPERSEDED → invalidate/forget responde conflito (estado inalcançável até
+    SM-CTX-003, que habilita essas transições).
+- DEFERRED:
+  - política transversal de fontes de tempo (`now()` PostgreSQL vs.
+    `utc_now()` da aplicação em `created_at`/lifecycle timestamps);
+  - Create rejeitado com 409 não é registrado no ledger (mesmo padrão de
+    Episodes; Contract §63 desaconselha blind retry);
+  - fixtures de integração Skills/Agents sem `cognitive_idempotency_hmac_key`
+    (pré-existente).
+
+---
+
 # 8. SM-CTX-003 — Checkpoint Revision, Supersession and Concurrency
 
 ## Objective

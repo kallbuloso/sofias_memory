@@ -1279,82 +1279,82 @@ Senior Software Engineer
 CURRENT SLICE:
 
 ```text
-SM-CTX-003 — Checkpoint Revision, Supersession and Concurrency
+SM-CTX-004 — First-Class Evidence and Deterministic Support
 ```
 
 CURRENT HANDOFF (APPROVED):
 
 ```text
 docs/product-implementation/implementation/
-11-SF-Implementation-SM-CTX-003-Checkpoint-Revision-Concurrency.md
+12-SF-Implementation-SM-CTX-004-First-Class-Evidence.md
 ```
 
 Este documento deve ser lido integralmente antes de modificar código relacionado ao Slice.
 
-**SM-CTX-003 is CURRENT but its implementation is NOT authorized until a
-subsequent explicit user decision.** A transição de CURRENT para SM-CTX-003 foi
-autorizada em 2026-11-21 (closeout de SM-CTX-002). Até a autorização explícita
-de execução, não modificar código, migrations ou OpenAPI para SM-CTX-003.
+**SM-CTX-004 is CURRENT but its implementation is NOT authorized until a
+subsequent explicit user decision.** A transição de CURRENT para SM-CTX-004 foi
+autorizada em 2026-11-21 (closeout de SM-CTX-003). Até a autorização explícita
+de execução, não modificar código, migrations ou OpenAPI para SM-CTX-004.
 CURRENT ≠ autorização de implementação.
 
 Slices concluídos (evidência em
 `docs/product-implementation/08-SF-Technical-Backlog-Memoria-Contextual-Por-Projeto.md`):
 
 - `SM-CTX-001 — First-Class Episodes` — DONE;
-- `SM-CTX-002 — Context Streams and Initial Checkpoints` — DONE (migration head `0020`).
+- `SM-CTX-002 — Context Streams and Initial Checkpoints` — DONE (migration `0020`);
+- `SM-CTX-003 — Checkpoint Revision, Supersession and Concurrency` — DONE
+  (migration head `0021`).
 
 ---
 
 ## 17.1 Único escopo do Slice CURRENT
 
-Quando a execução for autorizada, durante `SM-CTX-003` implementar somente
-revision, supersession e concorrência de checkpoints, conforme handoff `11` §5:
+Quando a execução for autorizada, durante `SM-CTX-004` implementar somente
+Evidence first-class e support determinístico, conforme handoff `12` §6/§9/§19:
 
 ```text
-POST /api/v1/context/checkpoints/{checkpoint_id}/supersede
-├── atomic supersession (full replacement)
-├── linear revision + checkpoint lineage (superseded_by)
-├── expected-current semantics
-├── stale writer detection / concurrency conflict
-├── replay precedence (shared contextual_memory_idempotency)
-├── SUPERSEDED lifecycle
-├── lineage constraints, revision guarantees, PostgreSQL locks
-└── unique current protection preserved
+Evidence (identidade canônica interna; sem API pública de Evidence)
+├── EvidenceSourceType: session_entry | memory_item | episode | source | document | chunk
+├── EvidenceAvailability (resolvida no momento da leitura)
+├── SupportMode: all_required | any_sufficient
+├── EvidenceRef + validação de source na criação
+├── deterministic support evaluation (sem LLM/scoring)
+├── Episode support (create/result)
+├── ContextStatement support (checkpoint create/supersede/result)
+├── source resolvers reutilizáveis
+├── Evidence dependency-cycle protection
+└── persistência PostgreSQL de links/support mode com constraints
 ```
 
-O recovery Create de SM-CTX-002 (novo current após invalidate/Forget, sem
-lineage) é pré-condição entregue e verificada, não escopo a reimplementar.
+Recursos anteriores a SM-CTX-004 não são backfilled e continuam compatíveis.
 
 ---
 
 ## 17.2 Explicitamente fora do Slice
 
-MUST NOT implementar em SM-CTX-003 (handoff `11` §6):
+MUST NOT implementar em SM-CTX-004 (handoff `12` §7/§8):
 
 ```text
-Evidence
-support policies
-Evidence cycles
-Forget propagation
+automatic Forget propagation
+transitive invalidation after source Forget
+automatic scrubbing of derived Episodes
+automatic scrubbing of ContextStatements
 Contextual Recall
-Knowledge integration
-checkpoint embeddings
-semantic checkpoint search
-automatic merge
-three-way merge
-automatic conflict resolution
-LLM conflict resolution
-distributed locks
-Redis locks
-Neo4j
-PipelineRun
-automatic checkpoint creation
+Knowledge composition
+automatic Evidence discovery
+semantic Evidence inference
+LLM support evaluation
+Evidence scoring
+Evidence confidence aggregation
+cross-project Evidence inference
+Evidence management API (POST/PATCH/DELETE /api/v1/evidence)
+Evidence PATCH
 ```
 
 Também não implementar antecipadamente:
 
 ```text
-SM-CTX-004+
+SM-CTX-005+
 ```
 
 ---
@@ -1364,8 +1364,8 @@ SM-CTX-004+
 A existência de:
 
 ```text
-SM-CTX-004
 SM-CTX-005
+SM-CTX-006
 ...
 SM-CTX-008
 ```
@@ -1374,7 +1374,7 @@ no Technical Backlog não autoriza sua implementação.
 
 Cada Slice requer seu próprio implementation handoff APPROVED **e** autorização
 explícita como CURRENT. `future handoff existence != authorization`.
-Ler `12–16` para contexto não autoriza implementá-los durante SM-CTX-003.
+Ler `13–16` para contexto não autoriza implementá-los durante SM-CTX-004.
 
 ---
 
@@ -1695,7 +1695,7 @@ Deve respeitar lifecycle e cleanup aprovado.
 
 A integração futura com Contextual Evidence está definida por ADR-0019 e pelo Slice correspondente.
 
-Não antecipar em SM-CTX-003.
+Forget propagation baseada em Evidence pertence ao SM-CTX-005; não antecipar em SM-CTX-004.
 
 ---
 
@@ -2164,55 +2164,56 @@ Essa lista representa planejamento.
 Não representa autorização automática.
 
 Somente o Slice explicitamente CURRENT cujo implementation handoff estiver
-APPROVED pode ser executado. CURRENT é `SM-CTX-003`, handoff `11`, mas sua
+APPROVED pode ser executado. CURRENT é `SM-CTX-004`, handoff `12`, mas sua
 execução NÃO está autorizada até decisão explícita posterior do usuário (§17).
-`SM-CTX-001` e `SM-CTX-002` estão DONE.
+`SM-CTX-001`, `SM-CTX-002` e `SM-CTX-003` estão DONE.
 Esta autorização de implementação não substitui o escopo da tarefa atual do
 usuário: uma auditoria documentation-only não autoriza executar Slice algum.
 
 ---
 
-# 35. SM-CTX-003 guardrails
+# 35. SM-CTX-004 guardrails
 
 Durante o Slice CURRENT (somente após autorização explícita de execução):
 
 ```text
-SM-CTX-003
+SM-CTX-004
 ```
 
 MUST:
 
-- implementar `POST /api/v1/context/checkpoints/{checkpoint_id}/supersede` como
-  full replacement atômico do ACTIVE (novo checkpoint, novos statements, nova
-  provenance, revision `MAX+1`);
-- manter lineage linear (`superseded_by`/`superseded_at`), sem self-supersession
-  e com um único predecessor direto;
-- exigir expected-current: target precisa ser o ACTIVE do stream; stale writer
-  recebe `409 CONTEXT_STATE_CONFLICT` sem criar revision;
-- manter replay idempotente com precedência sobre conflitos de estado, no ledger
-  compartilhado `contextual_memory_idempotency`;
-- serializar via locks PostgreSQL, mantendo índice único parcial ACTIVE e
-  `UNIQUE(scope, context_key, revision)` como safety nets;
-- habilitar SUPERSEDED → INVALIDATED e SUPERSEDED → FORGOTTEN conforme Contract;
-- preservar o recovery Create de SM-CTX-002 (sem lineage para histórico);
-- sobreviver a restart.
+- manter Provenance e Evidence como conceitos distintos (Provenance não é
+  Evidence; lineage de checkpoint não é Evidence);
+- implementar exatamente os source types `session_entry`, `memory_item`,
+  `episode`, `source`, `document`, `chunk` e os support modes
+  `all_required`/`any_sufficient`;
+- validar Evidence na criação (inclusive em `any_sufficient`) e resolver
+  availability no momento da leitura, sem tratar falha transitória como
+  indisponibilidade;
+- avaliar support de forma determinística;
+- impedir ciclos de Evidence (incl. self-reference e Episode → Episode);
+- estender Episode create/result e Checkpoint create/supersede/result,
+  preservando compatibilidade com recursos anteriores (sem backfill) e
+  idempotência (digest incluindo support);
+- persistir identidade canônica de Evidence e links no PostgreSQL, com
+  canonicalização race-safe e constraints;
+- manter transações curtas e PostgreSQL authority.
 
 MUST NOT:
 
-- implementar Evidence/support policies (SM-CTX-004);
-- implementar Forget propagation (SM-CTX-005);
-- implementar Contextual Recall (SM-CTX-006);
-- criar merge automático, three-way merge ou resolução de conflito por LLM;
-- criar distributed/Redis locks ou lock global de projeto;
-- criar checkpoint embeddings ou semantic checkpoint search;
-- criar graph projection ou PipelineRun;
-- gerar checkpoints automaticamente.
+- criar API pública de gestão de Evidence;
+- propagar Forget, invalidar transitivamente ou scrub automático (SM-CTX-005);
+- implementar Contextual Recall (SM-CTX-006) ou Knowledge composition;
+- usar LLM, scoring ou inferência semântica de Evidence;
+- adicionar source types/support modes não aprovados;
+- criar graph projection, graph_outbox ou PipelineRun;
+- anunciar `contextual_project_memory = "1"` em `/api/v1/info`.
 
 O implementation handoff detalhado é autoridade:
 
 ```text
 docs/product-implementation/implementation/
-11-SF-Implementation-SM-CTX-003-Checkpoint-Revision-Concurrency.md
+12-SF-Implementation-SM-CTX-004-First-Class-Evidence.md
 ```
 
 ---

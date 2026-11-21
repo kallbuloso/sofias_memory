@@ -943,6 +943,76 @@ PostgreSQL integration obrigatório:
 
 ---
 
+## SM-CTX-003 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-21)
+Baseline:                main @ 522dc403424d8fd693d122b476200eb3a9e2b7fe
+Implementation SHA:      05376ee4ddbf0ce8f1bfdabb7f9895070001b9dd
+                          (feat(context): add atomic checkpoint supersession)
+Merge into main:         c70ab8609b4ba212f568bc01040675e9d80a34ad (--no-ff)
+Alembic head:            0021 (down_revision = 0020)
+```
+
+- Entregue: `POST /api/v1/context/checkpoints/{checkpoint_id}/supersede` (path id =
+  expected current; full replacement sem herança de campos omitidos; novos
+  statements/provenance; `revision = old + 1`; old → SUPERSEDED com
+  `superseded_by`); stale writer → `409 CONTEXT_STATE_CONFLICT` com
+  `expected_checkpoint_id`/`current_checkpoint_id`, sem criar recurso; replay
+  idempotente precede rejeição de lifecycle; SUPERSEDED → INVALIDATED/FORGOTTEN
+  preservando lineage, sem cascata para descendentes.
+- Migration 0021 (aditiva): índice único parcial
+  `uq_context_checkpoints_superseded_by` (lineage linear) e FK de lineage
+  `DEFERRABLE INITIALLY IMMEDIATE`, diferida apenas dentro da transação de
+  supersede e verificada no COMMIT. Upgrade/downgrade/upgrade PASS no banco
+  dedicado; downgrade restaura FK `NOT DEFERRABLE` e remove o índice. 0001–0020
+  inalteradas.
+- Achado de concorrência identificado e corrigido antes do commit: inversão de
+  ordem de locks (Supersede: key → linha; Invalidate/Forget: linha → key)
+  causava deadlock PostgreSQL (HTTP 500) com o mesmo Idempotency-Key em
+  operações diferentes sobre o mesmo checkpoint; reproduzido de forma
+  determinística (`DeadlockDetectedError`). Correção: ordem única
+  key claim → row lock em Supersede/Invalidate/Forget (handoffs 10 §73–74 e
+  11 §33); Create segura apenas o advisory lock do stream.
+- Acceptance Criteria AC-003.1–AC-003.12: PASS.
+- Human Validation A–J: PASS — pela API real (uvicorn + banco dedicado
+  `sofias_memory_ctx_episodes_test`, `DATABASE_MIGRATION_MODE=verify_only`,
+  restart real do processo).
+- Validações críticas adicionais: 12/12 PASS.
+  - Pela API real + inspeção direta do PostgreSQL (11/12): full replacement,
+    novas identidades de statements/provenance, same-key/different-payload,
+    races same-key e different-key (incl. rajada de 8), Supersede × Invalidate
+    e Supersede × Forget nas duas ordens, mesmo key entre operações diferentes
+    (6 ordens, 0 HTTP 500, nenhum deadlock), replay após replacement
+    SUPERSEDED e FORGOTTEN, isolamento de streams/projetos, ausência de rotas
+    extras/graph_outbox/PipelineRun. A contenção via API foi coordenada por
+    `SELECT ... FOR UPDATE` com cada concorrente observado bloqueado em
+    `pg_stat_activity`.
+  - Somente por harness de integração (1/12): rollback atômico com falha
+    injetada após a transição do alvo e após o insert do replacement
+    (Supersede), e após a mutação em Forget/Invalidate — checkpoint,
+    replacement, statements, provenance e claim do ledger revertidos.
+- Testes: suíte local 2822 passed (710 skipped opt-in); regressão de integração
+  PostgreSQL 273 passed (Episodes, Cognitive Memory, Sessions, checkpoints,
+  schema guard, UoW, readiness, migration gate); suítes de checkpoint
+  (supersede, lock-order, SM-CTX-002) 57/57 em 3 execuções; verificação focada
+  final 272 passed.
+- CI GitHub Actions: não verificado (sem evidência coletada).
+- MINOR:
+  - banco de teste contém 6 registros de ledger órfãos dos ensaios de
+    SM-CTX-002 (checkpoints removidos pelo downgrade de 0020 durante a validação
+    daquele Slice; sem defeito de código);
+  - `ruff format --check .` acusa arquivos pré-existentes (CRLF).
+- DEFERRED:
+  - política transversal de fontes de tempo (`now()` PostgreSQL vs.
+    `utc_now()` da aplicação);
+  - mutations rejeitadas não registradas no ledger (padrão aprovado);
+  - métricas de supersede (opcionais no handoff 11 §111);
+  - resíduos dos testes de integração de Episodes no banco dedicado;
+  - fixtures Skills/Agents sem `cognitive_idempotency_hmac_key` (pré-existente).
+
+---
+
 # 9. SM-CTX-004 — First-Class Evidence and Deterministic Support
 
 ## Objective

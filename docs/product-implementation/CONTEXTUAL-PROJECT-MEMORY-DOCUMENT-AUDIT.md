@@ -105,3 +105,46 @@ capabilities independentes.
 `docs/product-implementation/implementation/09-SF-Implementation-SM-CTX-001-First-Class-Episodes.md`
 
 Somente SM-CTX-001 — First-Class Episodes. Não executado nesta auditoria.
+
+## SM-CTX-001 operational closeout findings (2026-11-20)
+
+Registro operacional posterior à implementação (`f61e5bf`) e à Human Validation
+A–G de SM-CTX-001. Não altera Contract, ADRs ou handoffs.
+
+### Clock skew — host Windows
+
+- Medido contra referência externa (HTTP `Date`): o host Windows está ~64 s
+  atrasado; WSL, container PostgreSQL e `clock_timestamp()` estão corretos
+  (±2 s). `w32tm`: fonte `Local CMOS Clock`, leap indicator 3, nenhuma
+  sincronização bem-sucedida.
+- Python da aplicação usa o relógio do host; `created_at` usa `now()` do
+  PostgreSQL. Efeito reproduzido: Cognitive Recall padrão (`as_of=utc_now()`)
+  não retorna um MemoryItem recém-criado por ~64 s.
+- Status: IMPORTANT (infraestrutura). Correção: sincronização NTP do host.
+
+### Migration `0019` aplicada a `cognee_db`
+
+- Fato: uma única transação `0018 → 0019` (`xmin=140874`), sem escrita de
+  linhas, entre ≈21:17:40 e 21:31:51 (relógio do host). Datação por XID global
+  do cluster; sem logs DDL, sem `track_commit_timestamp`.
+- Origem: **não comprovada**. Hipótese mais compatível: processo iniciado com o
+  `.env` padrão (`DATABASE_URL=cognee_db`, `DATABASE_MIGRATION_MODE=auto`).
+- Decisão aprovada: preservar `cognee_db` em `0019`; nenhum downgrade.
+
+### Documentation
+
+- `AGENTS.md` §11 corrigido para
+  `uv run uvicorn sofias_memory.app:create_app --factory --host 127.0.0.1 --port 8000 --reload`
+  (o módulo não expõe `app`).
+
+### DEFERRED
+
+- Política transversal de fontes de tempo (`now()` do PostgreSQL vs.
+  `utc_now()` da aplicação em `created_at`, lifecycle timestamps e `as_of`),
+  afetando Cognitive Memory e Episodes.
+- Fixtures de integração Skills/Agents sem `cognitive_idempotency_hmac_key`
+  (falham em `HEAD` independentemente de SM-CTX-001).
+- Cleanup dos testes de integração de Episodes, que filtra por `scope` e deixa
+  tombstones FORGOTTEN e linhas de ledger no banco de teste dedicado.
+- Rastreabilidade de migrations em desenvolvimento (política `verify_only` por
+  padrão para agentes/testes, logs DDL ou `track_commit_timestamp`).

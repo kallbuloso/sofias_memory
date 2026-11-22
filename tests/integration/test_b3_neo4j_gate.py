@@ -262,7 +262,11 @@ def compose_service_image(service_name: str) -> str:
 
 
 def alembic_config() -> Config:
-    return Config(str(ALEMBIC_INI))
+    config = Config(str(ALEMBIC_INI))
+    # Runs in-process: keep migrations/env.py from reconfiguring (and
+    # disabling) the pytest process's existing loggers via fileConfig.
+    config.attributes["configure_logger"] = False
+    return config
 
 
 def upgrade_database_to_head(config: Config) -> None:

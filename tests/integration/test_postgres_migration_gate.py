@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from collections.abc import AsyncIterator, Iterator, Mapping
@@ -234,7 +235,11 @@ def quote_postgres_identifier(identifier: str) -> str:
 
 
 def alembic_config() -> Config:
-    return Config(str(ALEMBIC_INI))
+    config = Config(str(ALEMBIC_INI))
+    # Runs in-process: keep migrations/env.py from reconfiguring (and
+    # disabling) the pytest process's existing loggers via fileConfig.
+    config.attributes["configure_logger"] = False
+    return config
 
 
 def code_heads(config: Config) -> frozenset[str]:
@@ -423,6 +428,30 @@ def test_postgres_migration_gate_from_empty_database(
 
     command.upgrade(config, "head")
     asyncio.run(assert_complete_b2_schema(disposable_postgres_url, expected_revision=head))
+
+
+@pytest.mark.integration
+def test_programmatic_upgrade_preserves_host_logging_state(
+    disposable_postgres_url: DisposableDatabaseUrl,
+) -> None:
+    # QA-01: an in-process upgrade must not disable already-existing
+    # application loggers nor replace the host process's root handlers.
+    probe_logger = logging.getLogger("sofias_memory.qa01_programmatic_upgrade_probe")
+    root_logger = logging.getLogger()
+    handlers_before = list(root_logger.handlers)
+    level_before = root_logger.level
+
+    config = alembic_config()
+    command.upgrade(config, "head")
+
+    asyncio.run(
+        assert_complete_b2_schema(
+            disposable_postgres_url, expected_revision=single_code_head(config)
+        )
+    )
+    assert probe_logger.disabled is False
+    assert root_logger.handlers == handlers_before
+    assert root_logger.level == level_before
 
 
 async def database_connection(

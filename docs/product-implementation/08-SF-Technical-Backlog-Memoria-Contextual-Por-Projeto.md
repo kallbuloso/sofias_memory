@@ -1464,6 +1464,142 @@ Repetir com `any_sufficient` e segunda Evidence independente para confirmar pres
 
 ---
 
+## SM-CTX-005 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-22)
+Baseline:                main @ 7a7d4c4befbed23f0065d34782c1499e49b3788d
+Implementation SHA:      5be3b9a99c249aa01008891d3efe77f9470453b2
+                          (feat(context): add provenance-aware forget propagation (SM-CTX-005))
+Merge into main:         26c2fc1d754cd1b83c1e6ca3d0b05c55692b83a7 (--no-ff;
+                          parents 7a7d4c4 + 5be3b9a; tree idêntica à do commit de implementação)
+Alembic head:            0022 (sem nova migration)
+```
+
+- Entregue: `ContextualEvidenceInvalidator` (serviço interno, sem API pública)
+  executado dentro da transação autoritativa PostgreSQL do Forget que causou a
+  perda de Evidence:
+  - Forget direto de Cognitive Memory com propagação atômica (sucesso HTTP ⇒
+    Forget do alvo e propagação commitados juntos; falha reverte ambos);
+  - Forget direto de Episode com propagação atômica;
+  - integração no step `authoritative_mutation` do Knowledge Forget (Source),
+    commitada junto com a desativação do Knowledge e antes de qualquer trabalho
+    Neo4j/storage (`PipelineRun SUCCEEDED` ⇒ propagação durável);
+  - propagação para Dataset Forget, Forget Everything e Administrative Dataset
+    Delete;
+  - Forget memory-only propagando sem ressurreição: Evidence de Document/Chunk
+    não é reativada após re-cognify.
+- Travessia transitiva somente pelo grafo explícito de Evidence
+  (`Provenance != Evidence`), determinística, com defesa de ciclo em runtime;
+  cada owner atingido é reavaliado sobre o support set completo
+  (`all_required`/`any_sufficient`) com a mesma `evaluate_support` das
+  leituras (sem LLM, embedding ou inferência).
+- Episodes sem suporte viram tombstones FORGOTTEN (scrub destrutivo);
+  ContextStatements sem suporte são removidos como unidade inteira (ordinals
+  preservados); perda de `current_state` invalida o checkpoint preservando a
+  lineage de supersession, **sem fallback histórico**.
+- Concorrência PostgreSQL: row locks em ordem determinística (Episodes
+  dependentes `FOR UPDATE` em `(rank, id)` crescente; checkpoints em id
+  crescente), nenhum lock global; conflitos transitórios `40P01`/`40001`
+  tratados de forma limitada (retry limitado do engine nas superfícies de
+  pipeline; `503 DEPENDENCY_UNAVAILABLE` seguro para retry com a mesma
+  Idempotency-Key nas superfícies diretas).
+- Sem projeção Neo4j contextual, sem `PipelineRun` ou evento `graph_outbox`
+  derivados, sem entrada de idempotência por recurso derivado, sem worker,
+  fila ou propagação em background, sem Contextual Recall e sem nova API.
+- Idempotência histórica inalterada.
+- Acceptance Criteria AC-005.1–AC-005.30 (handoff `13`): PASS dentro do escopo
+  verificado.
+- Human Validation formal A–J: PASS (servidor de validação somente via
+  lançador com `create_app(enable_neo4j=False)`, banco dedicado
+  `sofias_memory_ctx_episodes_test`).
+- Verificação após integração no baseline `7a7d4c4` (worktree de integração,
+  banco dedicado, `DATABASE_MIGRATION_MODE=verify_only`, Neo4j inalcançável):
+  - unit: Contextual Evidence 32, Contextual Forget Propagation 17,
+    episódios/checkpoints/idempotência contextual 203, Cognitive Memory 127,
+    Knowledge Forget/DatasetDelete 103 — todos passed;
+  - contrato OpenAPI 78 passed; migration gate 16 passed;
+  - PostgreSQL: Evidence + propagação + Knowledge contextual 43 passed;
+    episódios + checkpoints + supersession + lock order (concorrência/deadlock)
+    76 passed; Cognitive Memory 47 passed (36 skipped por opt-in);
+  - ruff check, ruff format (arquivos alterados) e mypy: PASS.
+- Limitações de validação:
+  - **suíte local completa: 3025 passed, 8 failed, 592 skipped — não é PASS**;
+    as 8 falhas (3 em `tests/unit/test_api_errors.py`, 5 em
+    `tests/unit/test_request_metrics_middleware.py`) dependem da ordem de
+    execução (captura de log) e reproduzem no baseline limpo `7a7d4c4` sob
+    configuração, ambiente e ordem equivalentes;
+  - suítes legadas de Knowledge Forget/DatasetDelete em PostgreSQL real
+    (52 testes) não foram reexecutadas após a integração no baseline (bancos
+    dedicados inexistentes); a Human Validation anterior permanece a evidência;
+  - projeção/reconciliação Neo4j: **NÃO verificada**;
+  - paridade Compose (`scripts/ci_release_consistency_check.py`): **NÃO
+    verificada** (requer Docker); partes sem Docker (Settings/`.env.example`
+    e versões fora do Compose) PASS localmente;
+  - Bandit HIGH gate: PASS localmente;
+  - CI GitHub Actions no merge `26c2fc1`: **FAILURE** no step `pip-audit`
+    (pré-existente, não causado pelo SM-CTX-005: `uv.lock`/`pyproject.toml`
+    idênticos desde `50faff3` e mesma falha em `5cedcc3`, `5def8e0`,
+    `7a7d4c4`); ruff, mypy, pytest unit/contract/security e Docker build
+    passaram no CI; bandit e paridade foram pulados no CI;
+  - incidente de Neo4j compartilhado do SM-CTX-004 documentado separadamente
+    (`docs/security/incidents/2026-11-sm-ctx-004-shared-neo4j.md`);
+  - rotação de credencial local adiada por decisão explícita do owner.
+- MINOR:
+  - deadlock residual recuperável (conflito transitório tratado pelo retry
+    limitado / 503 retryable);
+  - 8 falhas de teste unitário dependentes de ordem (pré-existentes).
+- DEFERRED: ver "Dívida técnica e de segurança rastreada (pós-SM-CTX-005)".
+
+---
+
+## Dívida técnica e de segurança rastreada (pós-SM-CTX-005)
+
+```text
+Registrado em: 2026-11-22 (closeout do SM-CTX-005)
+Natureza:      dívida rastreada; NÃO é um Slice de implementação e NÃO altera
+               o escopo de SM-CTX-006..008
+```
+
+### Alta prioridade — dependências de runtime vulneráveis (segurança)
+
+`pip-audit -r` sobre `uv export --frozen --no-dev` (mesmo comando do CI)
+reporta 35 advisories em 4 pacotes de runtime:
+
+| Pacote | Travado | Relação | Advisories | Correção mínima |
+|---|---|---|---|---|
+| `pypdf` | 6.16.2 | direta | 26 (DoS: loop infinito / memória / CPU) | 6.21.4 |
+| `certifi` | 2026.7.22 | transitiva (httpx, requests) | PYSEC-2026-4320 (CA a desconfiar) | 2026.10.18 |
+| `urllib3` | 2.7.0 | transitiva (botocore, requests) | PYSEC-2026-4175/4176/4177 | 2.8.0 |
+| `soupsieve` | 2.9.2 | transitiva (`beautifulsoup4`, não importado) | 4 (ReDoS/complexidade) | 4.0.0 |
+
+- Tarefa: atualizar as dependências vulneráveis e reexecutar `pip-audit` e
+  todos os gates de CI exigidos (incluindo bandit e paridade Compose). Não
+  suprimir advisories sem justificativa técnica.
+- `pypdf` é alcançável: upload de arquivo/URL → step de Remember →
+  `extract_pdf_text` (`PdfReader` + `extract_text`) executado de forma
+  síncrona. Tratar o isolamento de recursos da ingestão de PDF (timeout, limite
+  de memória/CPU, execução fora do event loop) como hardening separado.
+- Avaliar remover `beautifulsoup4` (declarado, não importado).
+
+### Isolamento de testes no CI
+
+- Investigar as 8 falhas dependentes de ordem de captura de log em
+  `tests/unit/test_api_errors.py` e `tests/unit/test_request_metrics_middleware.py`
+  quando executadas após as suítes PostgreSQL.
+
+### Dívida operacional
+
+- Verificação de paridade Compose (requer Docker).
+- Validação real de projeção/reconciliação Neo4j dos fluxos contextuais, em
+  instância dedicada e descartável; verificação do estado residual da
+  instância compartilhada a cargo do responsável (ver registro do incidente).
+- Rotação de credenciais adiada por decisão explícita do owner.
+- Exposição de credenciais via Redis/processos e hardening de privilégios
+  administrativos, onde aplicável.
+
+---
+
 # 11. SM-CTX-006 — Contextual Recall Core
 
 ## Objective

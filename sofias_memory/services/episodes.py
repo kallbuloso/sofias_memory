@@ -16,7 +16,8 @@ always resolved before any lifecycle rejection (Contract SS 36.3).
 
 Episode mutations are explicit and supervised: nothing here creates a
 ``MemoryItem``, ``Session``/``SessionEntry``, Evidence, or Checkpoint, and
-Forget is direct only (no propagation -- SM-CTX-005).
+Forget scrubs the target and synchronously converges its explicit Evidence
+dependents in the same transaction (SM-CTX-005, ContextualEvidenceInvalidator).
 """
 
 from __future__ import annotations
@@ -41,6 +42,9 @@ from sofias_memory.domain import (
     EpisodeKind,
     EpisodeLifecycle,
     EpisodeTransition,
+    EvidenceGraphCorruptionError,
+    EvidenceKey,
+    EvidenceSourceType,
     build_contextual_canonical_request,
     build_episode_embedding_text,
     canonical_support_payload,
@@ -74,11 +78,17 @@ from sofias_memory.schemas.episodes import (
 from sofias_memory.services.cognitive_memory import EmbeddingClient
 from sofias_memory.services.contextual_evidence import (
     canonical_keys_or_empty,
+    evidence_graph_corruption_error,
     hydrate_episode_support,
     lock_and_resolve,
     persist_episode_support,
     raise_if_transient_conflict,
     validate_new_support,
+)
+from sofias_memory.services.contextual_evidence_invalidator import (
+    ContextualEvidenceInvalidator,
+    PropagationCounts,
+    scrub_episode,
 )
 from sofias_memory.services.pipeline_submission import (
     idempotency_conflict_error,
@@ -577,8 +587,14 @@ class EpisodeService:
         """Direct, destructive Forget (Contract v1 SS 21/67): scrubs every
         semantic field, the embedding, and the external provenance refs;
         keeps only identity, lifecycle, timestamps and minimal provenance
-        (``origin_kind``/``source_system``). No provider call, no
-        propagation (SM-CTX-005), no restore."""
+        (``origin_kind``/``source_system``). No provider call, no restore.
+
+        SM-CTX-005 (handoff 13 SS 37-38/77-78): the scrub and the propagation
+        over ``EvidenceRef("episode", episode_id)`` commit together or not at
+        all. A same-key replay, an in-transaction replay and a new-key Forget of
+        an already-FORGOTTEN Episode all still converge the target's explicit
+        dependents (idempotent, targeted -- never a global backfill) before
+        returning; ledger resolution keeps precedence."""
 
         protected_key = self._protected_key(idempotency_key)
         operation = ContextualMemoryOperation.EPISODE_FORGET
@@ -586,47 +602,37 @@ class EpisodeService:
 
         replay = await self._pre_check(protected_key, operation, digest)
         if replay is not None:
+            await self._converge_forgotten_episode(episode_id)
             return replay
 
-        async with self._unit_of_work_factory() as uow:
-            episode = (await uow.episodes.get_by_ids_for_update([episode_id])).get(episode_id)
-            if episode is None:
-                raise episode_not_found_error(episode_id)
-            provenance = await uow.episode_provenance.get_by_episode_id_for_update(episode_id)
-            if provenance is None:
-                raise _internal_error("Episode provenance is missing.")
+        try:
+            async with self._unit_of_work_factory() as uow:
+                episode = (await uow.episodes.get_by_ids_for_update([episode_id])).get(episode_id)
+                if episode is None:
+                    raise episode_not_found_error(episode_id)
+                provenance = await uow.episode_provenance.get_by_episode_id_for_update(episode_id)
+                if provenance is None:
+                    raise _internal_error("Episode provenance is missing.")
 
-            replayed = await self._claim(uow, protected_key, operation, digest, episode_id)
-            if replayed is not None:
+                replayed = await self._claim(uow, protected_key, operation, digest, episode_id)
+                if replayed is not None:
+                    await self._propagate_episode_loss(uow, episode_id, scrubbed=False)
+                    await uow.commit()
+                    return replayed
+
+                transition = episode_forget_transition(episode.lifecycle)
+                if transition is EpisodeTransition.APPLY:
+                    scrub_episode(episode, provenance, now=utc_now())
+                # NO_OP: already FORGOTTEN -- terminal, 200 state no-op.
+
+                counts = await self._propagate_episode_loss(
+                    uow, episode_id, scrubbed=transition is EpisodeTransition.APPLY
+                )
+                result = episode_result(episode, provenance)
                 await uow.commit()
-                return replayed
-
-            transition = episode_forget_transition(episode.lifecycle)
-            if transition is EpisodeTransition.APPLY:
-                episode.scope = None
-                episode.context_key = None
-                episode.kind = None
-                episode.summary = None
-                episode.situation = None
-                episode.reason = None
-                episode.outcome = None
-                episode.occurred_at = None
-                episode.embedding = None
-                episode.confidence = None
-                episode.invalidation_reason = None
-                episode.replacement_episode_id = None
-                # SM-CTX-004: the Episode's own outgoing support is scrubbed;
-                # inbound refs from other owners stay resolvable (FORGOTTEN).
-                await uow.contextual_evidence.delete_episode_links(episode_id)
-                episode.support_mode = None
-                episode.lifecycle = EpisodeLifecycle.FORGOTTEN
-                episode.forgotten_at = utc_now()
-                provenance.conversation_ref = None
-                provenance.turn_ref = None
-            # NO_OP: already FORGOTTEN -- terminal, 200 state no-op.
-
-            result = episode_result(episode, provenance)
-            await uow.commit()
+        except DBAPIError as error:
+            raise_if_transient_conflict(error)
+            raise
 
         _logger.info(
             "episode_forgotten",
@@ -634,8 +640,37 @@ class EpisodeService:
             episode_id=str(episode_id),
             lifecycle=result.lifecycle.value,
             no_op=transition is EpisodeTransition.NO_OP,
+            **counts.as_log_fields(),
         )
         return result
+
+    @staticmethod
+    async def _propagate_episode_loss(
+        uow: PostgresUnitOfWork, episode_id: UUID, *, scrubbed: bool
+    ) -> PropagationCounts:
+        try:
+            return await ContextualEvidenceInvalidator(uow).propagate(
+                [EvidenceKey(EvidenceSourceType.EPISODE, episode_id)],
+                scrubbed_episode_ids=[episode_id] if scrubbed else (),
+            )
+        except EvidenceGraphCorruptionError as error:
+            raise evidence_graph_corruption_error() from error
+
+    async def _converge_forgotten_episode(self, episode_id: UUID) -> None:
+        """Replay of a completed Forget (handoff 13 SS 77): re-run the idempotent
+        targeted convergence under the target's row lock (same order as the
+        original Forget) before the replayed success is returned."""
+
+        try:
+            async with self._unit_of_work_factory() as uow:
+                episode = (await uow.episodes.get_by_ids_for_update([episode_id])).get(episode_id)
+                if episode is None or episode.lifecycle is not EpisodeLifecycle.FORGOTTEN:
+                    return
+                await self._propagate_episode_loss(uow, episode_id, scrubbed=False)
+                await uow.commit()
+        except DBAPIError as error:
+            raise_if_transient_conflict(error)
+            raise
 
     # --- Idempotency helpers -------------------------------------------------
 

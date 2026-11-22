@@ -10,13 +10,23 @@ reused by SM-CTX-005/006/007).
 Write-path protocol (inside the owner's transaction):
 
 1. :func:``lock_and_resolve`` -- resolve every ref with the referenced source row
-   taken ``FOR SHARE`` (deterministic order). The availability observed is
-   then stable for that row until COMMIT: a concurrent Forget/Invalidate of
-   the same source waits, so the derived write and the source lifecycle change
-   serialize. No global lock; parents of Knowledge rows are not locked.
+   taken ``FOR SHARE``. The availability observed is then stable for that row
+   until COMMIT: a concurrent Forget/Invalidate of the same source waits, so the
+   derived write and the source lifecycle change serialize. No global lock.
    This runs *before* the idempotency claim, so all checkpoint/episode
    mutations keep one acquisition order: Evidence rows -> (stream advisory |
    ledger key) -> checkpoint row.
+
+   SM-CTX-005 global lock order (handoff 13 SS 136, Critical Gate 2). Evidence
+   rows are share-locked in the same order Forget and its propagation take them
+   exclusively, so neither side can wait on the other in a cycle:
+   ``session_entry -> memory_item -> source -> document -> chunk`` (each by id;
+   Knowledge Forget locks Dataset -> Sources -> Documents -> Chunks top-down by
+   id) and then Episodes by ``(rank, id)`` (:func:``episode_ranks``), the order in
+   which Forget propagation exclusively locks dependent Episodes. Knowledge
+   parents need no extra lock: a Knowledge Forget updates every active Document
+   and Chunk of its Sources, which conflicts with the referenced row's share
+   lock (the SM-CTX-004 DEFERRED ancestor-lock question, resolved).
 2. (caller resolves idempotency replay first -- replay never revalidates.)
 3. :func:``validate_new_support`` -- missing -> 404 ``EVIDENCE_NOT_FOUND``;
    cross-project Episode/project-MemoryItem -> 422 ``INVALID_EVIDENCE_REFERENCE``;
@@ -42,6 +52,7 @@ from sqlalchemy.exc import DBAPIError
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.domain import (
     EvidenceAvailability,
+    EvidenceGraphCorruptionError,
     EvidenceKey,
     EvidenceSourceType,
     SupportMode,
@@ -49,6 +60,7 @@ from sofias_memory.domain import (
     chunk_availability,
     document_availability,
     episode_availability,
+    episode_ranks,
     evaluate_support,
     evidence_project_matches,
     memory_item_availability,
@@ -69,6 +81,14 @@ from sofias_memory.schemas.contextual_evidence import (
 _TYPE_ORDER: tuple[EvidenceSourceType, ...] = tuple(
     sorted(EvidenceSourceType, key=lambda t: t.value)
 )
+_LOCK_TYPE_ORDER: tuple[EvidenceSourceType, ...] = (
+    EvidenceSourceType.SESSION_ENTRY,
+    EvidenceSourceType.MEMORY_ITEM,
+    EvidenceSourceType.SOURCE,
+    EvidenceSourceType.DOCUMENT,
+    EvidenceSourceType.CHUNK,
+)
+"""Non-Episode share-lock order; Episodes always come last, by (rank, id)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,8 +144,28 @@ def invalid_evidence_cycle_error(key: EvidenceKey) -> SofiasMemoryError:
     )
 
 
+def evidence_graph_corruption_error() -> SofiasMemoryError:
+    """Sanitized fail-closed error: never exposes the dependency graph."""
+
+    return SofiasMemoryError(
+        code=ErrorCode.INTERNAL_ERROR,
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        message="Contextual Evidence integrity check failed.",
+    )
+
+
 TRANSIENT_CONFLICT_SQLSTATES = frozenset({"40P01", "40001"})
 """deadlock_detected / serialization_failure: transient, never semantic."""
+
+
+def transient_sqlstate(error: DBAPIError) -> str | None:
+    """The SQLSTATE when ``error`` is a deadlock/serialization failure, else None."""
+
+    orig = error.orig
+    state = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if state is None:
+        state = getattr(getattr(orig, "__cause__", None), "sqlstate", None)
+    return state if state in TRANSIENT_CONFLICT_SQLSTATES else None
 
 
 def raise_if_transient_conflict(error: DBAPIError) -> None:
@@ -134,11 +174,7 @@ def raise_if_transient_conflict(error: DBAPIError) -> None:
     Idempotency-Key, Contract SS 63) instead of an opaque 500. Never retried
     blindly here and never turned into Evidence unavailability (handoff 12 SS 18)."""
 
-    orig = error.orig
-    state = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    if state is None:
-        state = getattr(getattr(orig, "__cause__", None), "sqlstate", None)
-    if state in TRANSIENT_CONFLICT_SQLSTATES:
+    if transient_sqlstate(error) is not None:
         raise DependencyUnavailableError(
             "A concurrent contextual mutation conflicted; retry with the same Idempotency-Key."
         ) from error
@@ -160,11 +196,34 @@ class EvidenceResolver:
         for key in keys:
             by_type[key.source_type].append(key.source_id)
         out: dict[EvidenceKey, EvidenceResolution] = {}
-        for source_type in _TYPE_ORDER:  # deterministic lock order
-            ids = sorted(set(by_type.get(source_type, [])), key=str)
+        if not lock:
+            for source_type in _TYPE_ORDER:
+                ids = sorted(set(by_type.get(source_type, [])))
+                if ids:
+                    out.update(await self._resolve_type(source_type, ids, lock=False))
+            return out
+        for source_type in _LOCK_TYPE_ORDER:  # global lock order, see module doc
+            ids = sorted(set(by_type.get(source_type, [])))
             if ids:
-                out.update(await self._resolve_type(source_type, ids, lock=lock))
+                out.update(await self._resolve_type(source_type, ids, lock=True))
+        episode_ids = sorted(set(by_type.get(EvidenceSourceType.EPISODE, [])))
+        for episode_id in await self.episode_lock_order(episode_ids):
+            out.update(
+                await self._resolve_type(EvidenceSourceType.EPISODE, [episode_id], lock=True)
+            )
         return out
+
+    async def episode_lock_order(self, episode_ids: Sequence[UUID]) -> list[UUID]:
+        """Ascending ``(rank, id)%% -- the propagation lock order."""
+
+        if len(episode_ids) <= 1:
+            return list(episode_ids)
+        parents = await self._repo.episode_parent_edges(episode_ids)
+        try:
+            ranks = episode_ranks(episode_ids, parents)
+        except EvidenceGraphCorruptionError as error:
+            raise evidence_graph_corruption_error() from error
+        return sorted(episode_ids, key=lambda episode_id: (ranks[episode_id], episode_id))
 
     async def _resolve_type(
         self, source_type: EvidenceSourceType, ids: Sequence[UUID], *, lock: bool

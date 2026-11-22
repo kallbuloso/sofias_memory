@@ -14,15 +14,18 @@ from a ``PipelineStep.persist`` when it would require external I/O
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
+from sqlalchemy.exc import DBAPIError
+
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
+from sofias_memory.domain import EvidenceGraphCorruptionError, EvidenceKey
 from sofias_memory.domain.document_reset import (
     RESET_DOCUMENT_LANGUAGE,
     RESET_DOCUMENT_METADATA_KEY,
@@ -58,6 +61,7 @@ from sofias_memory.infrastructure.storage.port import (
     StorageDeleteResult,
     StorageDeleteStatus,
 )
+from sofias_memory.pipelines.errors import PermanentPipelineStepError, RetryablePipelineStepError
 from sofias_memory.ports import (
     ProjectionCommand,
     chunk_delete_command,
@@ -67,6 +71,10 @@ from sofias_memory.ports import (
     relation_delete_command,
 )
 from sofias_memory.schemas.common import ErrorCode, JSONValue
+from sofias_memory.services.contextual_evidence import transient_sqlstate
+from sofias_memory.services.contextual_evidence_invalidator import (
+    propagate_knowledge_evidence_loss,
+)
 
 EVERYTHING_CONFIRM_PHRASE = "DELETE EVERYTHING"
 
@@ -233,6 +241,12 @@ class PipelineRunRepositoryForForget(Protocol):
     ) -> PipelineRun | None: ...
 
 
+class ContextualEvidenceRepositoryForForget(Protocol):
+    async def knowledge_seed_keys(self, source_ids: Sequence[UUID]) -> list[EvidenceKey]: ...
+
+    async def source_ids_for_dataset(self, dataset_id: UUID) -> list[UUID]: ...
+
+
 class ForgetUnitOfWork(Protocol):
     datasets: DatasetRepositoryForForget
     sources: SourceRepositoryForForget
@@ -245,6 +259,7 @@ class ForgetUnitOfWork(Protocol):
     summaries: SummaryRepositoryForForget
     graph_outbox: GraphOutboxRepositoryForForget
     pipeline_runs: PipelineRunRepositoryForForget
+    contextual_evidence: ContextualEvidenceRepositoryForForget
 
     async def flush(self) -> None: ...
 
@@ -578,6 +593,55 @@ def reset_document_for_recognify(document: Document) -> Document:
     )
 
 
+FORGET_CONTEXTUAL_PROPAGATION_ERROR_CODE = "FORGET_CONTEXTUAL_PROPAGATION_FAILED"
+FORGET_CONTEXTUAL_PROPAGATION_MESSAGE = "Contextual Evidence propagation failed an integrity check."
+FORGET_CONTEXTUAL_PROPAGATION_CONFLICT_CODE = "FORGET_CONTEXTUAL_PROPAGATION_CONFLICT"
+FORGET_CONTEXTUAL_PROPAGATION_CONFLICT_MESSAGE = (
+    "A concurrent contextual mutation conflicted; the forget step will be retried."
+)
+
+
+async def propagate_contextual_knowledge_loss(
+    uow: ForgetUnitOfWork,
+    *,
+    source_ids: Sequence[UUID] = (),
+    dataset_id: UUID | None = None,
+) -> None:
+    """SM-CTX-005 Knowledge integration point (handoff 13 SS 22-26/30-34): runs
+    inside the ``authoritative_mutation`` transaction, after the Knowledge
+    deactivation and before any Neo4j/storage work, so the contextual scrub
+    commits with it and ``SUCCEEDED`` implies it is durable. Seeds are every
+    canonical source/document/chunk ref of the affected Sources (any
+    generation); Dataset scope includes already-DELETED Sources. Used by the
+    shared mutations (therefore also Administrative Dataset Delete) and by the
+    Forget resume/no-op paths -- one algorithm, idempotent. Corruption fails
+    the run permanently with a sanitized error (SS 138)."""
+
+    ids = set(source_ids)
+    if dataset_id is not None:
+        ids.update(await uow.contextual_evidence.source_ids_for_dataset(dataset_id))
+    if not ids:
+        return
+    try:
+        await propagate_knowledge_evidence_loss(cast(Any, uow), sorted(ids))
+    except EvidenceGraphCorruptionError as error:
+        raise PermanentPipelineStepError(
+            FORGET_CONTEXTUAL_PROPAGATION_ERROR_CODE, FORGET_CONTEXTUAL_PROPAGATION_MESSAGE
+        ) from error
+    except DBAPIError as error:
+        # A PostgreSQL deadlock/serialization failure during propagation is
+        # transient: the step's whole transaction (Knowledge deactivation and
+        # any partial scrub) rolls back, so the engine's bounded retry policy
+        # can safely re-run the idempotent step (handoff 13 SS 137). Anything
+        # else keeps the engine's fail-safe classification.
+        if transient_sqlstate(error) is not None:
+            raise RetryablePipelineStepError(
+                FORGET_CONTEXTUAL_PROPAGATION_CONFLICT_CODE,
+                FORGET_CONTEXTUAL_PROPAGATION_CONFLICT_MESSAGE,
+            ) from error
+        raise
+
+
 async def apply_source_forget_mutation(
     uow: ForgetUnitOfWork,
     *,
@@ -674,6 +738,8 @@ async def apply_source_forget_mutation(
     for command in commands:
         await uow.graph_outbox.add_projection_command(command)
 
+    await propagate_contextual_knowledge_loss(uow, source_ids=[source.id])
+
     return ForgetMutation(
         dataset_id=dataset.id,
         generation=dataset.active_generation,
@@ -765,6 +831,10 @@ async def apply_dataset_forget_mutation(
         event_id = getattr(event, "id", None)
         if isinstance(event_id, int):
             graph_outbox_ids.append(event_id)
+
+    await propagate_contextual_knowledge_loss(
+        uow, source_ids=[source.id for source in sources], dataset_id=dataset.id
+    )
 
     return DatasetMutationPart(
         dataset_id=dataset.id,

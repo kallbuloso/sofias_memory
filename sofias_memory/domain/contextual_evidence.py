@@ -13,7 +13,7 @@ project boundary.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -226,3 +226,54 @@ def evidence_project_matches(
     if source_type is EvidenceSourceType.MEMORY_ITEM:
         return source_scope in (GLOBAL_MEMORY_SCOPE, owner_scope)
     return True
+
+
+# --- Episode Evidence graph order (SM-CTX-005, handoff 13 SS 66-68/136) ------------
+
+
+class EvidenceGraphCorruptionError(RuntimeError):
+    """The persisted Evidence graph violates a structural invariant (cycle,
+    support mode without links, links without a mode, dangling owner). Every
+    caller fails closed; the message never carries semantic content."""
+
+
+def episode_ranks(
+    episode_ids: Iterable[UUID], parents: Mapping[UUID, Sequence[UUID]]
+) -> dict[UUID, int]:
+    """Longest-path depth of each Episode in the Episode -> Episode Evidence DAG:
+    ``0`` without Episode Evidence, otherwise ``1 + max(rank(parent))``.
+
+    ``(rank, episode_id)`` is the one global Episode lock order shared by
+    Evidence-aware Create/Supersede (``FOR SHARE``) and Forget propagation
+    (``FOR UPDATE``): a dependent always ranks strictly above every Episode it
+    depends on, so a propagation walking dependents in increasing rank never
+    waits for a lower-ranked row held by a writer that already holds a
+    higher-ranked one. Iterative (no Python recursion); a cycle raises
+    :class:``EvidenceGraphCorruptionError`` -- CTX-004 forbids cycles, so one
+    found here is corruption and the caller must fail closed."""
+
+    rank: dict[UUID, int] = {}
+    in_progress: set[UUID] = set()
+    for root in sorted(set(episode_ids)):
+        if root in rank:
+            continue
+        stack: list[tuple[UUID, bool]] = [(root, False)]
+        while stack:
+            node, expanded = stack.pop()
+            node_parents = parents.get(node, ())
+            if expanded:
+                in_progress.discard(node)
+                rank[node] = 1 + max(rank[p] for p in node_parents) if node_parents else 0
+                continue
+            if node in rank:
+                continue
+            if node in in_progress:
+                raise EvidenceGraphCorruptionError("Episode Evidence graph contains a cycle.")
+            in_progress.add(node)
+            stack.append((node, True))
+            for parent in sorted(node_parents, reverse=True):
+                if parent in in_progress:
+                    raise EvidenceGraphCorruptionError("Episode Evidence graph contains a cycle.")
+                if parent not in rank:
+                    stack.append((parent, False))
+    return rank

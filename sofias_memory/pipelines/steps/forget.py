@@ -74,6 +74,7 @@ from sofias_memory.services.forget import (
     apply_source_forget_mutation,
     empty_dataset_mutation_part,
     empty_mutation,
+    propagate_contextual_knowledge_loss,
     same_forget_intent,
 )
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
@@ -220,6 +221,9 @@ async def _mutate_source(context: PipelineContext, uow: PostgresUnitOfWork) -> d
     if source.status == SourceStatus.DELETED or (
         source.status == SourceStatus.PENDING and memory_only
     ):
+        # SM-CTX-005: no Knowledge mutation, but explicit contextual dependents
+        # still converge (idempotent; e.g. Evidence from the incremental period).
+        await propagate_contextual_knowledge_loss(cast(Any, uow), source_ids=[source.id])
         mutation = empty_mutation(dataset=dataset, source=source)
         return _source_mutation_output(mutation, proceed=True)
 
@@ -245,6 +249,7 @@ async def _mutate_source(context: PipelineContext, uow: PostgresUnitOfWork) -> d
                 "A prior forget attempt on this source used different options; retry with "
                 "the same options to resume it.",
             )
+        await propagate_contextual_knowledge_loss(cast(Any, uow), source_ids=[source.id])
         mutation = empty_mutation(dataset=dataset, source=source)
         return _source_mutation_output(mutation, proceed=True)
 
@@ -328,6 +333,9 @@ async def _mutate_one_dataset(
                 "A prior forget attempt on this dataset used different options; retry with "
                 "the same options to resume it.",
             )
+        await propagate_contextual_knowledge_loss(
+            cast(Any, uow), source_ids=source_ids, dataset_id=dataset.id
+        )
         part = empty_dataset_mutation_part(dataset)
         return _dataset_mutation_output(part, proceed=True)
 

@@ -86,6 +86,7 @@ from sofias_memory.services.agents import AgentService
 from sofias_memory.services.graph_outbox_batch_processor import GraphOutboxBatchProcessor
 from sofias_memory.services.graph_outbox_processor import GraphOutboxProcessor
 from sofias_memory.services.pipeline_worker import PipelineWorkerCoordinator
+from sofias_memory.services.process_state import ProcessState, ProcessStateHolder
 from sofias_memory.services.session_entries import SessionEntryService
 from sofias_memory.services.sessions import SessionService
 from sofias_memory.services.skills import SkillService
@@ -215,6 +216,9 @@ def make_settings(tmp_path: Path, **overrides: object) -> Settings:
         "worker_stale_after_seconds": 5,
         "embedding_dimensions": EMBEDDING_DIMENSIONS,
         "request_wait_timeout_seconds": 20,
+        # Required Settings field since the Cognitive/contextual idempotency
+        # ledgers; test-only value.
+        "cognitive_idempotency_hmac_key": "test-cognitive-idempotency-hmac-key-0123456789abcdef",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]
@@ -257,6 +261,9 @@ def build_harness(
         postgres_session_factory=session_factory,
         pipeline_registry=registry,
         pipeline_worker_coordinator=coordinator,
+        # ADR-0015: create_app now defaults to BOOTSTRAP_MAINTENANCE; harnesses that
+        # never run the lifespan bootstrap must opt into OPERATIONAL explicitly.
+        process_state_holder=ProcessStateHolder(state=ProcessState.OPERATIONAL),
     )
     return app, session_factory, registry, neo4j_resource
 
@@ -738,6 +745,7 @@ def _forget_skill_service(session_factory: AsyncSessionFactory) -> SkillService:
             _env_file=None,  # type: ignore[call-arg]
             api_key=EXPECTED_API_KEY,
             database_url="postgresql+asyncpg://unused:unused@localhost:5432/unused",
+            cognitive_idempotency_hmac_key="test-cognitive-idempotency-hmac-key-0123456789abcdef",
             neo4j_password=NEO4J_PASSWORD_FALLBACK,
             llm_api_key=LLM_API_KEY,
             app_env="test",

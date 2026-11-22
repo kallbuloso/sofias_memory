@@ -894,10 +894,10 @@ async def test_derived_create_serializes_with_concurrent_source_forget(
             derived = outcome["create"]
             assert not isinstance(derived, BaseException), derived
             refreshed = await episodes(session_factory).get(derived.episode_id)
-            assert refreshed.lifecycle.value == "active"  # never auto-mutated (SM-CTX-005)
-            assert refreshed.support is not None
-            assert refreshed.support.evidence[0].availability.value == "forgotten"
-            assert is_supported(refreshed.support) is False
+            # SM-CTX-005: the dependent committed first is converged by the
+            # Forget's propagation (it waited on the row, then saw the link).
+            assert refreshed.lifecycle.value == "forgotten"
+            assert refreshed.support is None and refreshed.summary is None
         else:
             assert_conflict(outcome["create"], "EVIDENCE_UNAVAILABLE")
     finally:
@@ -969,7 +969,7 @@ async def test_replay_precedes_revalidation_and_order_is_not_identity(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_direct_forget_scrubs_own_support_and_never_propagates(
+async def test_direct_forget_scrubs_own_support_and_reads_never_mutate(
     session_factory: AsyncSessionFactory,
 ) -> None:
     seeds = await seed(session_factory)
@@ -1006,19 +1006,17 @@ async def test_direct_forget_scrubs_own_support_and_never_propagates(
             )
             == 0
         )
-        for _ in range(2):  # repeated reads never mutate
+        # SM-CTX-005: B (all_required [A]) lost support and was converged by the
+        # Forget itself; C (any_sufficient [A, M]) stays. Reads never mutate.
+        for _ in range(2):
             got_b = await svc.get(b.episode_id)
             got_c = await svc.get(c.episode_id)
-            assert got_b.lifecycle.value == "active" and got_c.lifecycle.value == "active"
-            assert (
-                got_b.support is not None
-                and got_b.support.evidence[0].availability.value == "forgotten"
-            )
-            assert is_supported(got_b.support) is False
+            assert got_b.lifecycle.value == "forgotten" and got_b.support is None
+            assert got_c.lifecycle.value == "active"
             assert is_supported(got_c.support) is True
         await memories(session_factory).forget(seeds.memory, idempotency_key=None)
         got_c = await svc.get(c.episode_id)
-        assert is_supported(got_c.support) is False and got_c.lifecycle.value == "active"
+        assert got_c.lifecycle.value == "forgotten" and got_c.support is None
         after = await isolation_counts(session_factory)
         for name in (
             "GraphOutbox",

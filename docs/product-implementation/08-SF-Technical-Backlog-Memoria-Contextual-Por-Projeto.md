@@ -1250,14 +1250,16 @@ Alembic head:            0022 (down_revision = 0021)
   skipped opt-in) e regressão de integração PostgreSQL 286 passed, ambas da
   execução anterior sem mudança de código de produção depois.
 - Migration 0022: upgrade/downgrade/upgrade PASS no banco dedicado; migration
-  gate PASS; 0001–0021 inalteradas. `cognee_db` permanece em 0019; Neo4j
-  compartilhado não foi tocado.
+  gate PASS; 0001–0021 inalteradas. `cognee_db` permanece em 0019.
+  **Correção (incidente):** o Neo4j compartilhado FOI acessado e modificado durante
+  esta validação — ver "SM-CTX-004 — Correção de incidente Neo4j" abaixo.
 - CI GitHub Actions: não verificado (sem evidência coletada).
 - MINOR:
   - no caso concorrente C3 (READ COMMITTED), o detalhe do conflito pode
     descrever uma fonte `forgotten` como `unavailable` (a rejeição é correta);
   - o banco de teste dedicado contém recursos sintéticos de Knowledge e 15
-    eventos de grafo `pending` da validação com Neo4j desabilitado;
+    eventos de grafo gerados pela validação — **correção:** eles não ficaram
+    `pending`; foram projetados no Neo4j compartilhado (ver correção abaixo);
   - `ruff format --check .` ainda acusa divergências CRLF pré-existentes.
 - DEFERRED:
   - política de locks dos ancestrais Source/Dataset para a propagação de
@@ -1266,6 +1268,33 @@ Alembic head:            0022 (down_revision = 0021)
   - política de relógio aplicação vs. PostgreSQL;
   - mutations rejeitadas não registradas no ledger (padrão aprovado);
   - fixtures legadas de Skills/Agents.
+
+## SM-CTX-004 — Correção de incidente Neo4j
+
+```text
+Registrado em: 2026-11-21 (durante a implementação do SM-CTX-005)
+Afeta: afirmação "Neo4j compartilhado não foi tocado" deste closeout
+```
+
+- Servidores de Human Validation dos Slices contextuais foram iniciados com a
+  factory normal (`create_app --factory`) contra o banco de teste, herdando o
+  `NEO4J_URI` compartilhado do `.env` (lançamentos `operational` entre 13:35 e
+  18:30 UTC). Cada um executou o probe e `ensure_neo4j_schema` (DDL
+  `IF NOT EXISTS`) e manteve o consumidor de outbox ativo.
+- Às 18:30:44–18:30:49 UTC o servidor do HV A–I projetou os eventos
+  `graph_outbox` 25–54 do dataset sintético `hv-ctx004-k-mwqqqma1`
+  (`1299201f-54bd-44ed-b8ab-787ff074ce8f`): 15 upserts (5 entity, 1 chunk,
+  5 entity_mention, 4 relation) seguidos de 15 deletes dos mesmos aggregate ids.
+- **A afirmação anterior deste closeout de que o Neo4j compartilhado não foi
+  tocado estava incorreta.**
+- **A instância compartilhada foi modificada.** O efeito líquido esperado é nulo,
+  mas **não foi verificado** (nenhuma consulta ao Neo4j foi feita); eventos
+  anteriores (ids 1–24, já ausentes) não podem ser atribuídos.
+- Prevenção adotada a partir do SM-CTX-005: servidores de validação apenas via
+  lançador com `create_app(enable_neo4j=False)` que aborta se houver recurso
+  Neo4j ou consumidor de outbox.
+- Registro completo do incidente:
+  `docs/security/incidents/2026-11-sm-ctx-004-shared-neo4j.md`.
 
 ---
 

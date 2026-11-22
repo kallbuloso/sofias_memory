@@ -18,7 +18,14 @@ target_metadata = Base.metadata
 
 
 def configure_logging() -> None:
-    if config.config_file_name is not None:
+    # Programmatic callers running Alembic inside an already-configured
+    # process (e.g. the in-process migration gate tests) set
+    # config.attributes["configure_logger"] = False so that fileConfig --
+    # whose default disable_existing_loggers=True disables every existing
+    # logger and replaces the root handlers -- does not clobber the host
+    # process's logging. The Alembic CLI never sets the attribute, so its
+    # logging configuration is unchanged.
+    if config.config_file_name is not None and config.attributes.get("configure_logger", True):
         fileConfig(config.config_file_name)
 
 

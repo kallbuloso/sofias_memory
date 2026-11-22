@@ -27,7 +27,7 @@ from http import HTTPStatus
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import Settings
@@ -35,6 +35,9 @@ from sofias_memory.domain import (
     CognitiveMemoryIdempotencyRequest,
     CognitiveMemoryLifecycle,
     CognitiveMemoryOperation,
+    EvidenceGraphCorruptionError,
+    EvidenceKey,
+    EvidenceSourceType,
     build_canonical_request,
     compute_request_digest,
     is_reserved_idempotency_key,
@@ -54,6 +57,13 @@ from sofias_memory.schemas.memories import (
     MemoryProvenanceResult,
     MemorySupersedeRequest,
     MemorySupersedeResult,
+)
+from sofias_memory.services.contextual_evidence import (
+    evidence_graph_corruption_error,
+    raise_if_transient_conflict,
+)
+from sofias_memory.services.contextual_evidence_invalidator import (
+    ContextualEvidenceInvalidator,
 )
 from sofias_memory.services.pipeline_submission import (
     idempotency_conflict_error,
@@ -453,7 +463,23 @@ class CognitiveMemoryService:
             digest = self._forget_digest(memory_id)
             pre_check_result = await self._pre_check_forget(memory_id, idempotency_key, digest)
             if pre_check_result is not None:
+                # SM-CTX-005 SS 77: a replayed success still converges first.
+                await self._converge_forgotten_memory(memory_id)
                 return pre_check_result
+
+        try:
+            return await self._forget_locked(memory_id, idempotency_key, digest)
+        except DBAPIError as error:
+            raise_if_transient_conflict(error)
+            raise
+
+    async def _forget_locked(
+        self, memory_id: UUID, idempotency_key: str | None, digest: str | None
+    ) -> MemoryItemResult:
+        """SM-CTX-005 (handoff 13 SS 35-36): contextual propagation over
+        ``EvidenceRef("memory_item", memory_id)`` runs in this same transaction
+        after the scrub (and on the no-op/replay paths, idempotently); if it
+        fails, the Cognitive Forget does not commit."""
 
         async with self._unit_of_work_factory() as uow:
             item = await uow.memory_items.get_by_id_for_update(memory_id)
@@ -482,6 +508,8 @@ class CognitiveMemoryService:
                     result = await self._resolve_existing_forget_winner(
                         uow, memory_id, idempotency_key, digest
                     )
+                    if item.lifecycle is CognitiveMemoryLifecycle.FORGOTTEN:
+                        await _propagate_memory_loss(uow, memory_id)
                     await uow.commit()
                     return result
 
@@ -510,8 +538,24 @@ class CognitiveMemoryService:
             if ledger_entry is not None:
                 ledger_entry.result_memory_id = memory_id
 
+            await _propagate_memory_loss(uow, memory_id)
             await uow.commit()
             return memory_item_result(item, provenance)
+
+    async def _converge_forgotten_memory(self, memory_id: UUID) -> None:
+        """Targeted, idempotent convergence for a replayed Forget, under the
+        MemoryItem row lock (the original Forget's first lock)."""
+
+        try:
+            async with self._unit_of_work_factory() as uow:
+                item = await uow.memory_items.get_by_id_for_update(memory_id)
+                if item is None or item.lifecycle is not CognitiveMemoryLifecycle.FORGOTTEN:
+                    return
+                await _propagate_memory_loss(uow, memory_id)
+                await uow.commit()
+        except DBAPIError as error:
+            raise_if_transient_conflict(error)
+            raise
 
     def _digest_for(
         self,
@@ -746,3 +790,12 @@ def _postgres_unit_of_work_factory(session_factory: AsyncSessionFactory) -> Unit
         return PostgresUnitOfWork(session_factory)
 
     return create_unit_of_work
+
+
+async def _propagate_memory_loss(uow: PostgresUnitOfWork, memory_id: UUID) -> None:
+    try:
+        await ContextualEvidenceInvalidator(uow).propagate(
+            [EvidenceKey(EvidenceSourceType.MEMORY_ITEM, memory_id)]
+        )
+    except EvidenceGraphCorruptionError as error:
+        raise evidence_graph_corruption_error() from error

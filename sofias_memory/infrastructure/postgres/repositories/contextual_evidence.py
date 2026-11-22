@@ -8,9 +8,9 @@ in :mod:``sofias_memory.domain.contextual_evidence``, validation in
   ``INSERT ... ON CONFLICT DO NOTHING`` followed by a fresh SELECT (READ
   COMMITTED): concurrent creators of the same identity converge on one row.
 - Source lookups are batched per type (no N+1). With ``lock=True`` the target
-  rows are taken ``FOR SHARE`` (only the referenced row, never its parents),
-  in a deterministic order (type, id), so a concurrent Forget/Invalidate of that
-  source serializes with the derived write.
+  rows are taken ``FOR SHARE`` (only the referenced row; the caller imposes the
+  SM-CTX-005 global order, see services.contextual_evidence), so a concurrent
+  Forget/Invalidate of that source serializes with the derived write.
 - Episode cycle detection is a recursive CTE over the Evidence links (never
   Neo4j).
 """
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import delete, select, text
@@ -30,16 +31,20 @@ from sofias_memory.domain import (
     DatasetStatus,
     EpisodeLifecycle,
     EvidenceKey,
+    EvidenceSourceType,
     SourceStatus,
 )
 from sofias_memory.infrastructure.postgres.models import (
     Chunk,
+    ContextCheckpoint,
+    ContextCheckpointStatement,
     ContextStatementEvidenceRef,
     ContextualEvidenceRef,
     Dataset,
     Document,
     Episode,
     EpisodeEvidenceRef,
+    EpisodeProvenance,
     MemoryItem,
     SessionEntry,
     Source,
@@ -296,3 +301,186 @@ class ContextualEvidenceRepository:
             )
             for rid, c_active, c_gen, d_active, d_gen, s, d, g in rows.all()
         }
+
+    # --- SM-CTX-005: reverse dependency lookup and propagation locks -------------
+    #
+    # Handoff 13 SS 32/41/81-84/143: every query starts from the canonical refs
+    # that actually exist (indexed UNIQUE(source_type, source_id)) and walks the
+    # indexed ``evidence_ref_id`` link columns -- never "all Documents/Chunks".
+
+    @staticmethod
+    def _key_arrays(keys: Sequence[EvidenceKey]) -> dict[str, list[str] | list[UUID]]:
+        return {
+            "types": [key.source_type.value for key in keys],
+            "ids": [key.source_id for key in keys],
+        }
+
+    async def knowledge_seed_keys(self, source_ids: Sequence[UUID]) -> list[EvidenceKey]:
+        """Canonical refs structurally belonging to ``source_ids``: the Sources
+        themselves plus every Document/Chunk of those Sources in *any*
+        generation and activity state (handoff 13 SS 31) -- only refs that some
+        owner actually declared exist here, so nothing else is loaded."""
+
+        if not source_ids:
+            return []
+        statement = text(
+            """
+            SELECT r.source_type::text, r.source_id
+            FROM contextual_evidence_refs r
+            WHERE r.source_type = 'source' AND r.source_id = ANY(CAST(:sources AS uuid[]))
+            UNION
+            SELECT r.source_type::text, r.source_id
+            FROM contextual_evidence_refs r
+            JOIN documents d ON d.id = r.source_id
+            WHERE r.source_type = 'document' AND d.source_id = ANY(CAST(:sources AS uuid[]))
+            UNION
+            SELECT r.source_type::text, r.source_id
+            FROM contextual_evidence_refs r
+            JOIN chunks c ON c.id = r.source_id
+            WHERE r.source_type = 'chunk' AND c.source_id = ANY(CAST(:sources AS uuid[]))
+            """
+        )
+        rows = await self._session.execute(statement, {"sources": list(source_ids)})
+        return sorted(EvidenceKey(EvidenceSourceType(stype), sid) for stype, sid in rows.all())
+
+    async def source_ids_for_dataset(self, dataset_id: UUID) -> list[UUID]:
+        """Every Source of a Dataset in any status (DELETED included): Dataset
+        scope seeds must also converge refs into already-tombstoned Sources."""
+
+        rows = await self._session.scalars(
+            select(Source.id).where(Source.dataset_id == dataset_id).order_by(Source.id)
+        )
+        return list(rows.all())
+
+    async def episode_owners(self, keys: Sequence[EvidenceKey]) -> list[UUID]:
+        """Episodes whose declared support links any of ``keys``, ascending id."""
+
+        if not keys:
+            return []
+        statement = text(
+            """
+            SELECT DISTINCT l.episode_id
+            FROM unnest(CAST(:types AS text[]), CAST(:ids AS uuid[])) AS k(stype, sid)
+            JOIN contextual_evidence_refs r
+              ON r.source_type = CAST(k.stype AS evidence_source_type) AND r.source_id = k.sid
+            JOIN episode_evidence_refs l ON l.evidence_ref_id = r.id
+            ORDER BY l.episode_id
+            """
+        )
+        rows = await self._session.execute(statement, self._key_arrays(keys))
+        return [row[0] for row in rows.all()]
+
+    async def statement_owners(self, keys: Sequence[EvidenceKey]) -> list[tuple[UUID, UUID]]:
+        """``(checkpoint_id, statement_id)`` of every ContextStatement whose declared
+        support links any of ``keys``, ascending."""
+
+        if not keys:
+            return []
+        statement = text(
+            """
+            SELECT DISTINCT s.checkpoint_id, s.id
+            FROM unnest(CAST(:types AS text[]), CAST(:ids AS uuid[])) AS k(stype, sid)
+            JOIN contextual_evidence_refs r
+              ON r.source_type = CAST(k.stype AS evidence_source_type) AND r.source_id = k.sid
+            JOIN context_statement_evidence_refs l ON l.evidence_ref_id = r.id
+            JOIN context_checkpoint_statements s ON s.id = l.statement_id
+            ORDER BY s.checkpoint_id, s.id
+            """
+        )
+        rows = await self._session.execute(statement, self._key_arrays(keys))
+        return [(row[0], row[1]) for row in rows.all()]
+
+    async def episode_parent_edges(self, episode_ids: Sequence[UUID]) -> dict[UUID, list[UUID]]:
+        """Every Episode -> Episode Evidence edge among the ancestors of
+        ``episode_ids`` (recursive CTE with set semantics: terminates even on a
+        corrupt cycle, which :func:``episode_ranks`` then rejects)."""
+
+        if not episode_ids:
+            return {}
+        statement = text(
+            """
+            WITH RECURSIVE anc(episode_id) AS (
+                SELECT unnest(CAST(:starts AS uuid[]))
+                UNION
+                SELECT r.source_id
+                FROM anc
+                JOIN episode_evidence_refs l ON l.episode_id = anc.episode_id
+                JOIN contextual_evidence_refs r ON r.id = l.evidence_ref_id
+                WHERE r.source_type = 'episode'
+            )
+            SELECT l.episode_id, r.source_id
+            FROM anc
+            JOIN episode_evidence_refs l ON l.episode_id = anc.episode_id
+            JOIN contextual_evidence_refs r ON r.id = l.evidence_ref_id
+            WHERE r.source_type = 'episode'
+            """
+        )
+        rows = await self._session.execute(statement, {"starts": list(episode_ids)})
+        parents: dict[UUID, list[UUID]] = {}
+        for child, parent in rows.all():
+            parents.setdefault(child, []).append(parent)
+        return parents
+
+    async def lock_episode_for_propagation(
+        self, episode_id: UUID
+    ) -> tuple[Episode | None, EpisodeProvenance | None]:
+        """``FOR UPDATE`` on the Episode, then its 1:1 provenance (the same
+        Episode -> provenance order as direct Forget). ``populate_existing``:
+        the decision must use the row as locked, never a stale identity-map copy."""
+
+        episode = await self._session.scalar(
+            select(Episode)
+            .where(Episode.id == episode_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if episode is None:
+            return None, None
+        provenance = await self._session.scalar(
+            select(EpisodeProvenance)
+            .where(EpisodeProvenance.episode_id == episode_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return episode, provenance
+
+    async def lock_checkpoint_for_propagation(
+        self, checkpoint_id: UUID
+    ) -> ContextCheckpoint | None:
+        checkpoint = await self._session.scalar(
+            select(ContextCheckpoint)
+            .where(ContextCheckpoint.id == checkpoint_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return cast(ContextCheckpoint | None, checkpoint)
+
+    async def statements_by_ids(
+        self, statement_ids: Sequence[UUID]
+    ) -> list[ContextCheckpointStatement]:
+        if not statement_ids:
+            return []
+        result = await self._session.scalars(
+            select(ContextCheckpointStatement)
+            .where(ContextCheckpointStatement.id.in_(list(statement_ids)))
+            .order_by(
+                ContextCheckpointStatement.statement_type,
+                ContextCheckpointStatement.ordinal,
+                ContextCheckpointStatement.id,
+            )
+            .execution_options(populate_existing=True)
+        )
+        return list(result.all())
+
+    async def delete_statements(self, statement_ids: Sequence[UUID]) -> None:
+        """Whole-unit removal (handoff 13 SS 53/106): the row goes, its outgoing
+        Evidence links follow by ``ON DELETE CASCADE``; surviving statements keep
+        their ids and ordinals (no renumbering, SS 55)."""
+
+        if not statement_ids:
+            return
+        await self._session.execute(
+            delete(ContextCheckpointStatement).where(
+                ContextCheckpointStatement.id.in_(list(statement_ids))
+            )
+        )

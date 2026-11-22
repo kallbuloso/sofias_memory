@@ -60,8 +60,10 @@ Invalidate/Forget
     ``scope``/``context_key``/``revision``/timestamps/lineage (Contract SS 67).
     Neither follows lineage: descendants are never invalidated or forgotten.
 
-Evidence (SM-CTX-004) and Forget propagation (SM-CTX-005) are intentionally
-absent; lineage is not Evidence.
+A checkpoint is not an Evidence source type: its own Invalidate/Forget start no
+inbound propagation (handoff 13 SS 39). Its statements are converged by
+``ContextualEvidenceInvalidator`` when Evidence they declare is forgotten
+(SM-CTX-005). Lineage is not Evidence.
 """
 
 from __future__ import annotations
@@ -852,7 +854,8 @@ class ContextCheckpointService:
         semantic statement, scrubs external provenance refs and the
         invalidation reason; keeps checkpoint id, ``scope``, ``context_key``,
         ``revision``, lifecycle, timestamps and minimal provenance. No
-        propagation (SM-CTX-005), no restore, no background job."""
+        inbound propagation (a checkpoint is not Evidence, handoff 13 SS 39), no
+        restore, no background job."""
 
         protected_key = self._protected_key(idempotency_key)
         operation = ContextualMemoryOperation.CHECKPOINT_FORGET

@@ -192,6 +192,20 @@ class FakePipelineRunsRepo:
         return None
 
 
+class FakeContextualEvidenceRepo:
+    """SM-CTX-005: no contextual Evidence exists in these unit scenarios."""
+
+    def __init__(self) -> None:
+        self.seed_calls: list[list[object]] = []
+
+    async def knowledge_seed_keys(self, source_ids: list[object]) -> list[object]:
+        self.seed_calls.append(list(source_ids))
+        return []
+
+    async def source_ids_for_dataset(self, dataset_id: object) -> list[object]:
+        return []
+
+
 class FakeForgetUow:
     def __init__(
         self,
@@ -211,6 +225,7 @@ class FakeForgetUow:
         self.summaries = EmptyContentRepo()
         self.graph_outbox = FakeGraphOutboxRepo()
         self.pipeline_runs = pipeline_runs or FakePipelineRunsRepo()
+        self.contextual_evidence = FakeContextualEvidenceRepo()
 
     async def flush(self) -> None:
         return None

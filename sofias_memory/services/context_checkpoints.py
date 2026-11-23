@@ -87,6 +87,7 @@ from sofias_memory.domain import (
     ContextStatementType,
     ContextualIdempotencyRequest,
     ContextualMemoryOperation,
+    SupportMode,
     build_contextual_canonical_request,
     canonical_support_payload,
     checkpoint_forget_transition,
@@ -1041,24 +1042,44 @@ class ContextCheckpointService:
     async def _hydrate_many(
         self, uow: PostgresUnitOfWork, checkpoints: Sequence[ContextCheckpoint]
     ) -> list[ContextCheckpointResult]:
-        ids = [checkpoint.id for checkpoint in checkpoints]
-        provenance = await uow.context_checkpoint_provenance.get_by_checkpoint_ids(ids)
-        statements: dict[UUID, list[ContextCheckpointStatement]] = {}
-        all_rows = await uow.context_checkpoint_statements.list_by_checkpoint_ids(ids)
-        for row in all_rows:
-            statements.setdefault(row.checkpoint_id, []).append(row)
-        supports = await hydrate_statement_support(
-            uow, {row.id: row.support_mode for row in all_rows}
+        return await hydrate_checkpoints(uow, checkpoints)
+
+
+async def hydrate_checkpoints(
+    uow: PostgresUnitOfWork, checkpoints: Sequence[ContextCheckpoint]
+) -> list[ContextCheckpointResult]:
+    """Rows -> public shapes with current statement Evidence availability
+    (read-only; shared by the checkpoint reads and Contextual Recall)."""
+
+    results, _ = await hydrate_checkpoints_with_support_modes(uow, checkpoints)
+    return results
+
+
+async def hydrate_checkpoints_with_support_modes(
+    uow: PostgresUnitOfWork, checkpoints: Sequence[ContextCheckpoint]
+) -> tuple[list[ContextCheckpointResult], dict[UUID, SupportMode | None]]:
+    """``hydrate_checkpoints`` plus the persisted ``support_mode`` of every
+    hydrated statement (keyed by statement id), read from the same rows. Lets
+    Contextual Recall tell a declared support whose links are missing from an
+    independent assertion (``support_mode=None``) -- the public shape alone
+    cannot."""
+
+    ids = [checkpoint.id for checkpoint in checkpoints]
+    provenance = await uow.context_checkpoint_provenance.get_by_checkpoint_ids(ids)
+    statements: dict[UUID, list[ContextCheckpointStatement]] = {}
+    all_rows = await uow.context_checkpoint_statements.list_by_checkpoint_ids(ids)
+    for row in all_rows:
+        statements.setdefault(row.checkpoint_id, []).append(row)
+    supports = await hydrate_statement_support(uow, {row.id: row.support_mode for row in all_rows})
+    results: list[ContextCheckpointResult] = []
+    for checkpoint in checkpoints:
+        prov = provenance.get(checkpoint.id)
+        if prov is None:
+            raise _internal_error("Context checkpoint provenance is missing.")
+        results.append(
+            checkpoint_result(checkpoint, prov, statements.get(checkpoint.id, []), supports)
         )
-        results: list[ContextCheckpointResult] = []
-        for checkpoint in checkpoints:
-            prov = provenance.get(checkpoint.id)
-            if prov is None:
-                raise _internal_error("Context checkpoint provenance is missing.")
-            results.append(
-                checkpoint_result(checkpoint, prov, statements.get(checkpoint.id, []), supports)
-            )
-        return results
+    return results, {row.id: row.support_mode for row in all_rows}
 
 
 def _postgres_unit_of_work_factory(session_factory: AsyncSessionFactory) -> UnitOfWorkFactory:
@@ -1079,4 +1100,6 @@ __all__ = [
     "current_checkpoint_not_found_error",
     "decode_checkpoint_cursor",
     "encode_checkpoint_cursor",
+    "hydrate_checkpoints",
+    "hydrate_checkpoints_with_support_modes",
 ]

@@ -337,6 +337,25 @@ class PostgresUnitOfWork:
 
         return self._require_session().begin_nested()
 
+    async def begin_read_only_snapshot(self) -> None:
+        """Start this unit of work's transaction as ``REPEATABLE READ`` +
+        ``READ ONLY``: every later statement reads one consistent PostgreSQL
+        snapshot (taken at the first query) and no write is accepted.
+
+        Must be the first database operation of the unit of work -- the
+        isolation of an already started transaction cannot change. It applies to
+        this unit of work's connection only (SQLAlchemy resets the connection
+        characteristics when the connection returns to the pool); the engine and
+        every other endpoint keep the default ``READ COMMITTED``.
+        """
+
+        session = self._require_session()
+        if session.in_transaction():
+            raise RuntimeError("the read-only snapshot must be established before the first read")
+        await session.connection(
+            execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
+        )
+
     async def flush(self) -> None:
         """Synchronize pending authoritative changes without committing them."""
 

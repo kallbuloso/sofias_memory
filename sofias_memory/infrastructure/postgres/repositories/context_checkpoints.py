@@ -82,6 +82,28 @@ class ContextCheckpointRepository:
         )
         return cast(ContextCheckpoint | None, await self._session.scalar(statement))
 
+    async def list_active(
+        self, *, scope: str, context_key: str, limit: int = 2
+    ) -> list[ContextCheckpoint]:
+        """Every ACTIVE checkpoint of the stream, at most ``limit``, ordered by id.
+
+        Contextual Recall (SM-CTX-006) reads two so a violated single-ACTIVE
+        invariant is detected and fails closed instead of silently picking one
+        (handoff 14 SS 104); the partial unique index normally guarantees <= 1."""
+
+        statement = (
+            select(ContextCheckpoint)
+            .where(
+                ContextCheckpoint.scope == scope,
+                ContextCheckpoint.context_key == context_key,
+                ContextCheckpoint.lifecycle == ContextCheckpointLifecycle.ACTIVE,
+            )
+            .order_by(ContextCheckpoint.id.asc())
+            .limit(limit)
+        )
+        result = await self._session.scalars(statement)
+        return list(result.all())
+
     async def max_revision(self, *, scope: str, context_key: str) -> int | None:
         """Highest revision of the stream over *every* lifecycle, FORGOTTEN
         tombstones included -- revisions are never reused."""

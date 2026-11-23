@@ -70,6 +70,14 @@ def _current_truth_predicate(as_of: datetime) -> ColumnElement[bool]:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentMemoryRow:
+    """One deterministic (non-semantic) current-truth row."""
+
+    item: MemoryItem
+    provenance: MemoryProvenance
+
+
 class MemoryItemRepository:
     """Persistence operations for Native Cognitive Memory items."""
 
@@ -159,4 +167,39 @@ class MemoryItemRepository:
                 is_current_truth=bool(is_current_truth_value),
             )
             for item, provenance, relevance_value, is_current_truth_value in result.all()
+        ]
+
+    async def list_current_for_scope(
+        self,
+        *,
+        memory_types: Sequence[CognitiveMemoryType],
+        scope: str,
+        as_of: datetime,
+        limit: int,
+    ) -> list[CurrentMemoryRow]:
+        """Deterministic bounded current-truth selection for one exact scope
+        (Contextual Recall fallback, SM-CTX-006 handoff 14 SS 45). Exactly the
+        structural eligibility of :meth:`typed_recall` plus
+        :func:`_current_truth_predicate` -- the same single definition of
+        current truth, never a second one -- ordered ``created_at DESC, id
+        ASC`` (the typed recall tie-break). No relevance is computed."""
+
+        statement = (
+            select(MemoryItem, MemoryProvenance)
+            .join(MemoryProvenance, MemoryProvenance.memory_id == MemoryItem.id)
+            .where(
+                MemoryItem.lifecycle != CognitiveMemoryLifecycle.FORGOTTEN,
+                MemoryItem.content.is_not(None),
+                MemoryItem.embedding.is_not(None),
+                MemoryItem.created_at <= as_of,
+                MemoryItem.memory_type.in_(memory_types),
+                MemoryItem.scope == scope,
+                _current_truth_predicate(as_of),
+            )
+            .order_by(MemoryItem.created_at.desc(), MemoryItem.id.asc())
+            .limit(limit)
+        )
+        result = await self._session.execute(statement)
+        return [
+            CurrentMemoryRow(item=item, provenance=provenance) for item, provenance in result.all()
         ]

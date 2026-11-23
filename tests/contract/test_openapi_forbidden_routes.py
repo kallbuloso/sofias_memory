@@ -805,9 +805,9 @@ def test_no_future_contextual_routes_or_contract_advertisement() -> None:
     paths = schema["paths"]
     assert isinstance(paths, dict)
 
-    # SM-CTX-002: only the checkpoint routes exist under /api/v1/context.
+    # SM-CTX-002/003 checkpoint routes + the single SM-CTX-006 recall route.
     context_paths = {path for path in paths if path.startswith("/api/v1/context")}
-    assert context_paths == set(EXPECTED_CHECKPOINT_ROUTES)
+    assert context_paths == {*EXPECTED_CHECKPOINT_ROUTES, CONTEXT_RECALL_PATH}
     for forbidden in (
         "/api/v1/episodes/{episode_id}/restore",
         "/api/v1/episodes/{episode_id}/supersede",
@@ -817,12 +817,92 @@ def test_no_future_contextual_routes_or_contract_advertisement() -> None:
         "/api/v1/context/checkpoints/{checkpoint_id}/restore",
         "/api/v1/context/checkpoints/{checkpoint_id}/unforget",
         "/api/v1/context/checkpoints/search",
-        "/api/v1/context/recall",
+        "/api/v1/context/explain",
+        "/api/v1/context/history",
         "/api/v1/context/streams",
         "/api/v1/projects",
     ):
         assert forbidden not in paths
     assert "contextual_project_memory" not in json.dumps(schema)
+
+
+CONTEXT_RECALL_PATH = "/api/v1/context/recall"
+"""SM-CTX-006: the one Contextual Recall operation (POST only)."""
+
+
+def test_context_recall_route_shape_follows_partial_contract() -> None:
+    schema = openapi_schema()
+    paths = schema["paths"]
+    schemas = schema["components"]["schemas"]
+    assert isinstance(paths, dict) and isinstance(schemas, dict)
+
+    assert set(paths[CONTEXT_RECALL_PATH]) == {"post"}
+    operation = paths[CONTEXT_RECALL_PATH]["post"]
+    assert {"422", "503"} <= set(operation["responses"])
+    assert not [
+        path
+        for path in paths
+        if path.startswith("/api/v1/context/recall") and path != CONTEXT_RECALL_PATH
+    ]
+
+    request = schemas["ContextRecallRequest"]
+    assert set(request["properties"]) == {
+        "scope",
+        "context_key",
+        "intent",
+        "query",
+        "datasets",
+        "include_evidence",
+        "limits",
+    }
+    assert set(request["required"]) == {"scope", "intent", "query"}
+    assert set(schemas["ContextRecallIntent"]["enum"]) == {
+        "resume",
+        "explain",
+        "history",
+        "context",
+    }
+    assert set(schemas["ContextRecallLimits"]["properties"]) == {
+        "memories",
+        "episodes",
+        "historical_checkpoints",
+        "knowledge",
+        "evidence",
+    }
+
+    bundle = schemas["ProjectContextBundle"]
+    assert set(bundle["properties"]) == {
+        "scope",
+        "context_key",
+        "intent",
+        "continuity_available",
+        "current_checkpoint",
+        "current_memories",
+        "episodes",
+        "historical_checkpoints",
+        "knowledge_references",
+        "evidence",
+        "warnings",
+        "degraded_sources",
+    }
+    assert "answer" not in bundle["properties"]
+    assert "degraded" not in bundle["properties"]
+    assert set(schemas["ContextRecallWarning"]["enum"]) == {
+        "NO_CURRENT_CHECKPOINT",
+        "PARTIAL_CONTEXT",
+        "EVIDENCE_UNAVAILABLE",
+        "AMBIGUOUS_CURRENT_TRUTH",
+    }
+    for name, result_class in (
+        ("ContextRecallCheckpoint", "current_checkpoint"),
+        ("ContextRecallMemory", "current_semantic"),
+        ("ContextRecallEpisode", "historical_episode"),
+        ("ContextRecallHistoricalCheckpoint", "historical_checkpoint"),
+        ("ContextRecallEvidence", "evidence"),
+    ):
+        assert schemas[name]["properties"]["result_class"]["const"] == result_class, name
+    assert "content" not in schemas["ContextRecallEvidence"]["properties"]
+    assert "embedding" not in json.dumps(bundle)
 
 
 EXPECTED_CHECKPOINT_ROUTES = {
@@ -987,7 +1067,6 @@ def test_evidence_support_shapes_follow_contract_and_no_evidence_api_exists() ->
     # SM-CTX-004: Evidence is declared by owners, never managed directly.
     assert not [path for path in paths if "evidence" in path.lower()]
     assert not [path for path in paths if path.startswith("/api/v1/context/statements")]
-    assert "/api/v1/context/recall" not in paths
 
     support_request = schemas["SupportRequest"]
     assert set(support_request["properties"]) == {"mode", "refs"}

@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sofias_memory.domain import EpisodeKind, EpisodeLifecycle
@@ -41,6 +41,19 @@ class EpisodeSemanticHit:
     episode: Episode
     provenance: EpisodeProvenance
     relevance: float
+
+
+def _contextual_eligibility(scope: str, context_key: str) -> ColumnElement[bool]:
+    """ACTIVE Episodes of exactly ``scope`` that belong to ``context_key`` or
+    are project-wide (``context_key IS NULL``). Another specific Context
+    Stream never matches; a FORGOTTEN tombstone has a NULL scope and never
+    matches either."""
+
+    return and_(
+        Episode.lifecycle == EpisodeLifecycle.ACTIVE,
+        Episode.scope == scope,
+        or_(Episode.context_key == context_key, Episode.context_key.is_(None)),
+    )
 
 
 class EpisodeRepository:
@@ -107,6 +120,57 @@ class EpisodeRepository:
                 )
             )
         statement = statement.order_by(Episode.occurred_at.desc(), Episode.id.asc()).limit(limit)
+        result = await self._session.execute(statement)
+        return [EpisodeRow(episode=episode, provenance=prov) for episode, prov in result.all()]
+
+    async def contextual_semantic_search(
+        self,
+        *,
+        scope: str,
+        context_key: str,
+        query_embedding: Sequence[float],
+        limit: int,
+    ) -> list[EpisodeSemanticHit]:
+        """Contextual Recall candidates (SM-CTX-006, handoff 14 SS 14/49-53):
+        the same exact pgvector cosine as :meth:`semantic_search`, but the
+        Context Stream eligibility is ``context_key = :context_key OR
+        context_key IS NULL`` (project-wide Episodes). ACTIVE only, exact
+        scope, embedding present. Order: relevance DESC, occurred_at DESC,
+        id ASC."""
+
+        relevance = (1 - Episode.embedding.cosine_distance(list(query_embedding))).label(
+            "relevance"
+        )
+        statement = (
+            select(Episode, EpisodeProvenance, relevance)
+            .join(EpisodeProvenance, EpisodeProvenance.episode_id == Episode.id)
+            .where(
+                _contextual_eligibility(scope, context_key),
+                Episode.embedding.is_not(None),
+            )
+            .order_by(relevance.desc(), Episode.occurred_at.desc(), Episode.id.asc())
+            .limit(limit)
+        )
+        result = await self._session.execute(statement)
+        return [
+            EpisodeSemanticHit(episode=episode, provenance=prov, relevance=float(value))
+            for episode, prov, value in result.all()
+        ]
+
+    async def list_recent_contextual(
+        self, *, scope: str, context_key: str, limit: int
+    ) -> list[EpisodeRow]:
+        """Deterministic bounded recency fallback for Contextual Recall (handoff
+        14 SS 50): same eligibility as :meth:`contextual_semantic_search`,
+        ordered ``occurred_at DESC, id ASC``. No relevance is computed."""
+
+        statement = (
+            select(Episode, EpisodeProvenance)
+            .join(EpisodeProvenance, EpisodeProvenance.episode_id == Episode.id)
+            .where(_contextual_eligibility(scope, context_key))
+            .order_by(Episode.occurred_at.desc(), Episode.id.asc())
+            .limit(limit)
+        )
         result = await self._session.execute(statement)
         return [EpisodeRow(episode=episode, provenance=prov) for episode, prov in result.all()]
 

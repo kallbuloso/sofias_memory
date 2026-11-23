@@ -33,6 +33,7 @@ from sofias_memory.api.middleware import (
 from sofias_memory.api.routes.agents import router as agents_router
 from sofias_memory.api.routes.cognify import router as cognify_router
 from sofias_memory.api.routes.context_checkpoints import router as context_checkpoints_router
+from sofias_memory.api.routes.context_recall import router as context_recall_router
 from sofias_memory.api.routes.datasets import router as datasets_router
 from sofias_memory.api.routes.episodes import router as episodes_router
 from sofias_memory.api.routes.feedback import router as feedback_router
@@ -219,6 +220,15 @@ TAG_METADATA: list[dict[str, str]] = [
             "(scope, context_key): explicit create when no checkpoint is current, current "
             "lookup, history listing, invalidate and direct forget. PostgreSQL-only; no "
             "embedding, no graph projection, never owned by a Session."
+        ),
+    },
+    {
+        "name": "context-recall",
+        "description": (
+            "Read-only Contextual Recall: one bounded, deterministic ProjectContextBundle "
+            "combining the current checkpoint, current project Cognitive Memory and ACTIVE "
+            "Episodes of a Context Stream. Structured context only -- no generated answer, "
+            "no Knowledge Recall, no graph."
         ),
     },
 ]
@@ -444,6 +454,7 @@ def create_app(
     application.include_router(memories_router, prefix="/api/v1")
     application.include_router(episodes_router, prefix="/api/v1")
     application.include_router(context_checkpoints_router, prefix="/api/v1")
+    application.include_router(context_recall_router, prefix="/api/v1")
 
     application.add_middleware(
         RequestBodyLimitMiddleware,

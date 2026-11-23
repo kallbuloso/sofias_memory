@@ -87,6 +87,7 @@ from sofias_memory.domain import (
     ContextStatementType,
     ContextualIdempotencyRequest,
     ContextualMemoryOperation,
+    SupportMode,
     build_contextual_canonical_request,
     canonical_support_payload,
     checkpoint_forget_transition,
@@ -1050,6 +1051,19 @@ async def hydrate_checkpoints(
     """Rows -> public shapes with current statement Evidence availability
     (read-only; shared by the checkpoint reads and Contextual Recall)."""
 
+    results, _ = await hydrate_checkpoints_with_support_modes(uow, checkpoints)
+    return results
+
+
+async def hydrate_checkpoints_with_support_modes(
+    uow: PostgresUnitOfWork, checkpoints: Sequence[ContextCheckpoint]
+) -> tuple[list[ContextCheckpointResult], dict[UUID, SupportMode | None]]:
+    """``hydrate_checkpoints`` plus the persisted ``support_mode`` of every
+    hydrated statement (keyed by statement id), read from the same rows. Lets
+    Contextual Recall tell a declared support whose links are missing from an
+    independent assertion (``support_mode=None``) -- the public shape alone
+    cannot."""
+
     ids = [checkpoint.id for checkpoint in checkpoints]
     provenance = await uow.context_checkpoint_provenance.get_by_checkpoint_ids(ids)
     statements: dict[UUID, list[ContextCheckpointStatement]] = {}
@@ -1065,7 +1079,7 @@ async def hydrate_checkpoints(
         results.append(
             checkpoint_result(checkpoint, prov, statements.get(checkpoint.id, []), supports)
         )
-    return results
+    return results, {row.id: row.support_mode for row in all_rows}
 
 
 def _postgres_unit_of_work_factory(session_factory: AsyncSessionFactory) -> UnitOfWorkFactory:
@@ -1087,4 +1101,5 @@ __all__ = [
     "decode_checkpoint_cursor",
     "encode_checkpoint_cursor",
     "hydrate_checkpoints",
+    "hydrate_checkpoints_with_support_modes",
 ]

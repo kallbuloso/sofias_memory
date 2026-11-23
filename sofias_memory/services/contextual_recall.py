@@ -30,6 +30,8 @@ cross-source score competition) and each is bounded independently.
 
 from __future__ import annotations
 
+import math
+from array import array
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -38,6 +40,7 @@ from typing import cast
 from uuid import UUID
 
 from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
 from sofias_memory.config import Settings
@@ -70,7 +73,7 @@ from sofias_memory.schemas.contextual_evidence import SupportResult
 from sofias_memory.schemas.episodes import EpisodeResult
 from sofias_memory.schemas.memories import MemoryItemResult
 from sofias_memory.services.cognitive_memory import EmbeddingClient, memory_item_result
-from sofias_memory.services.context_checkpoints import hydrate_checkpoints
+from sofias_memory.services.context_checkpoints import hydrate_checkpoints_with_support_modes
 from sofias_memory.services.contextual_evidence import hydrate_episode_support, is_supported
 from sofias_memory.services.episodes import episode_result
 
@@ -89,6 +92,17 @@ EPISODE_CANDIDATE_WINDOW_MAX = 150
 """Episodes are read in a bounded candidate window (``limit * 3``, at most 150)
 so that excluding currently unsupported Episodes rarely leaves the requested
 limit unfilled. Never unbounded."""
+
+CONTEXT_RECALL_MAX_BUNDLE_BYTES = 256 * 1024
+"""Internal operational bound (handoff 14 SS 86) of the serialized
+``ProjectContextBundle`` (UTF-8 JSON, the ``data`` of the envelope). Not a
+public Contract field: resources that do not fit are omitted whole -- never
+truncated -- in deterministic priority order (checkpoint, memories, Episodes)
+and the omission is signalled with ``PARTIAL_CONTEXT``."""
+
+CONTEXT_RECALL_MAX_CHECKPOINT_STATEMENTS = 64
+"""Internal bound on the statements of a returned checkpoint (all sections).
+A larger eligible checkpoint is omitted whole -- never partially rebuilt."""
 
 _logger = get_logger(__name__)
 
@@ -133,6 +147,9 @@ class MemoryCandidate:
 class EpisodeCandidate:
     episode: EpisodeResult
     relevance: float | None
+    support_declared: bool = False
+    """Persisted ``support_mode`` is set. With ``support=None`` (no links read)
+    it is an invariant violation, never an independent assertion."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +161,8 @@ class SourceSnapshot:
     active_checkpoints: list[ContextCheckpointResult]
     memories: list[MemoryCandidate]
     episodes: list[EpisodeCandidate]
+    declared_statement_ids: frozenset[UUID] = frozenset()
+    """Statements of ``active_checkpoints`` whose persisted ``support_mode`` is set."""
 
 
 # --- pure composition -----------------------------------------------------------------
@@ -179,11 +198,23 @@ def violates_forget_invariant(support: SupportResult) -> bool:
     return not evaluate_support(support.mode, forget_only)
 
 
-def _usable(owner_kind: str, owner_id: UUID, support: SupportResult | None) -> bool:
-    """``support=None`` (no declared dependency) is usable; insufficient support
-    is excluded. A post-Forget invariant violation is excluded as well and
-    logged (ids only, never content) -- recall never repairs it."""
+def _usable(
+    owner_kind: str, owner_id: UUID, support: SupportResult | None, *, declared: bool = False
+) -> bool:
+    """``support=None`` with no declared dependency (``support_mode=None``) is
+    an independent assertion and usable; insufficient support is excluded. A
+    declared ``support_mode`` whose links are missing, and a post-Forget
+    invariant violation, are excluded as well and logged (ids only, never
+    content) -- recall never repairs them."""
 
+    if support is None and declared:
+        _logger.error(
+            "context_recall_invariant_violation",
+            owner_kind=owner_kind,
+            owner_id=str(owner_id),
+            reason="declared_support_without_links",
+        )
+        return False
     if is_supported(support) is not False:
         return True
     if support is not None and violates_forget_invariant(support):
@@ -197,7 +228,9 @@ def _usable(owner_kind: str, owner_id: UUID, support: SupportResult | None) -> b
 
 
 def select_current_checkpoint(
-    active: Sequence[ContextCheckpointResult], signals: _Signals
+    active: Sequence[ContextCheckpointResult],
+    signals: _Signals,
+    declared_statement_ids: frozenset[UUID] = frozenset(),
 ) -> ContextRecallCheckpoint | None:
     """Exactly one ACTIVE or none; never a historical fallback (handoff 14
     SS 33/38/103/104). Unsupported statements are omitted; an unsupported or
@@ -236,7 +269,12 @@ def select_current_checkpoint(
         nonlocal excluded
         if statement is None:
             return None
-        if _usable("context_statement", statement.statement_id, statement.support):
+        if _usable(
+            "context_statement",
+            statement.statement_id,
+            statement.support,
+            declared=statement.statement_id in declared_statement_ids,
+        ):
             return statement
         excluded = True
         return None
@@ -279,7 +317,12 @@ def select_episodes(
     for candidate in candidates:
         if len(selected) >= limit:
             break
-        if not _usable("episode", candidate.episode.episode_id, candidate.episode.support):
+        if not _usable(
+            "episode",
+            candidate.episode.episode_id,
+            candidate.episode.support,
+            declared=candidate.support_declared,
+        ):
             signals.evidence_unavailable()
             continue
         selected.append(
@@ -324,45 +367,141 @@ def aggregate_evidence(
     return [unique[identity] for identity in sorted(unique)][:limit]
 
 
+def checkpoint_statement_count(checkpoint: ContextRecallCheckpoint) -> int:
+    """Statements of every section of a (eligibility-filtered) checkpoint."""
+
+    singles = (checkpoint.objective, checkpoint.current_state, checkpoint.next_action)
+    return sum(statement is not None for statement in singles) + sum(
+        len(section)
+        for section in (
+            checkpoint.approved_decisions,
+            checkpoint.pending_work,
+            checkpoint.open_items,
+            checkpoint.blockers,
+        )
+    )
+
+
+def serialized_bundle_bytes(bundle: ProjectContextBundle) -> int:
+    """UTF-8 size of the bundle exactly as the API serializes it (compact JSON)."""
+
+    return len(bundle.model_dump_json(by_alias=True).encode("utf-8"))
+
+
 def compose_bundle(
     request: ContextRecallRequest,
     limits: ContextRecallLimits,
     snapshot: SourceSnapshot,
     *,
     semantic_degraded: bool,
+    max_bundle_bytes: int = CONTEXT_RECALL_MAX_BUNDLE_BYTES,
+    max_checkpoint_statements: int = CONTEXT_RECALL_MAX_CHECKPOINT_STATEMENTS,
 ) -> ProjectContextBundle:
     signals = _Signals()
     if semantic_degraded:
         signals.warnings.add(ContextRecallWarning.PARTIAL_CONTEXT)
         signals.degraded.update({ContextRecallSource.MEMORIES, ContextRecallSource.EPISODES})
 
-    checkpoint = select_current_checkpoint(snapshot.active_checkpoints, signals)
-    continuity_available = checkpoint is not None
-    if not continuity_available:
-        signals.warnings.add(ContextRecallWarning.NO_CURRENT_CHECKPOINT)
-
+    checkpoint = select_current_checkpoint(
+        snapshot.active_checkpoints, signals, snapshot.declared_statement_ids
+    )
     memories = [
         ContextRecallMemory(memory=candidate.memory, relevance=candidate.relevance)
         for candidate in snapshot.memories[: limits.memories]
     ]
     episodes = select_episodes(snapshot.episodes, limits.episodes, signals)
-    evidence = (
-        aggregate_evidence(checkpoint, episodes, limits.evidence)
-        if request.include_evidence
-        else []
+
+    def build(
+        current: ContextRecallCheckpoint | None,
+        kept_memories: list[ContextRecallMemory],
+        kept_episodes: list[ContextRecallEpisode],
+        *,
+        assume_omission: bool,
+    ) -> ProjectContextBundle:
+        warnings = set(signals.warnings)
+        if current is None:
+            warnings.add(ContextRecallWarning.NO_CURRENT_CHECKPOINT)
+        if assume_omission:
+            warnings.add(ContextRecallWarning.PARTIAL_CONTEXT)
+        return ProjectContextBundle(
+            scope=request.scope,
+            context_key=request.context_key,
+            intent=request.intent,
+            continuity_available=current is not None,
+            current_checkpoint=current,
+            current_memories=kept_memories,
+            episodes=kept_episodes,
+            evidence=(
+                aggregate_evidence(current, kept_episodes, limits.evidence)
+                if request.include_evidence
+                else []
+            ),
+            warnings=[warning for warning in ContextRecallWarning if warning in warnings],
+            degraded_sources=[
+                source for source in ContextRecallSource if source in signals.degraded
+            ],
+        )
+
+    statements_fit = (
+        checkpoint is None or checkpoint_statement_count(checkpoint) <= max_checkpoint_statements
     )
-    return ProjectContextBundle(
-        scope=request.scope,
-        context_key=request.context_key,
-        intent=request.intent,
-        continuity_available=continuity_available,
-        current_checkpoint=checkpoint,
-        current_memories=memories,
-        episodes=episodes,
-        evidence=evidence,
-        warnings=[warning for warning in ContextRecallWarning if warning in signals.warnings],
-        degraded_sources=[source for source in ContextRecallSource if source in signals.degraded],
-    )
+    complete = build(checkpoint, memories, episodes, assume_omission=False)
+    if statements_fit and serialized_bundle_bytes(complete) <= max_bundle_bytes:
+        return complete
+
+    # Over an operational bound: deterministic greedy composition in priority
+    # order (checkpoint, memories, Episodes), each source keeping a prefix of its
+    # own ranking. Every trial is measured *with* PARTIAL_CONTEXT, which the
+    # final bundle carries whenever something was omitted, so an accepted
+    # resource always fits the final bundle. Nothing is ever truncated.
+    def fits(
+        current: ContextRecallCheckpoint | None,
+        kept_memories: list[ContextRecallMemory],
+        kept_episodes: list[ContextRecallEpisode],
+    ) -> bool:
+        trial = build(current, kept_memories, kept_episodes, assume_omission=True)
+        return serialized_bundle_bytes(trial) <= max_bundle_bytes
+
+    checkpoint_omitted = False
+    if checkpoint is not None and (not statements_fit or not fits(checkpoint, [], [])):
+        checkpoint_omitted = True
+        checkpoint = None  # omitted whole: continuity_available=false, NO_CURRENT_CHECKPOINT
+    kept_memories: list[ContextRecallMemory] = []
+    for item in memories:
+        if not fits(checkpoint, [*kept_memories, item], []):
+            break
+        kept_memories.append(item)
+    kept_episodes: list[ContextRecallEpisode] = []
+    for selected in episodes:
+        if not fits(checkpoint, kept_memories, [*kept_episodes, selected]):
+            break
+        kept_episodes.append(selected)
+    omitted_memories = len(memories) - len(kept_memories)
+    omitted_episodes = len(episodes) - len(kept_episodes)
+    if checkpoint_omitted or omitted_memories or omitted_episodes:
+        signals.warnings.add(ContextRecallWarning.PARTIAL_CONTEXT)
+        _logger.warning(
+            "context_recall_budget_omission",
+            checkpoint_omitted=checkpoint_omitted,
+            checkpoint_statements_exceeded=not statements_fit,
+            omitted_memories=omitted_memories,
+            omitted_episodes=omitted_episodes,
+            max_bundle_bytes=max_bundle_bytes,
+        )
+    bundle = build(checkpoint, kept_memories, kept_episodes, assume_omission=False)
+    size = serialized_bundle_bytes(bundle)
+    if size > max_bundle_bytes:
+        # Only reachable when the empty bundle itself exceeds the bound (a
+        # misconfigured bound): fail rather than return an oversized response.
+        _logger.error(
+            "context_recall_budget_exceeded", size=size, max_bundle_bytes=max_bundle_bytes
+        )
+        raise SofiasMemoryError(
+            code=ErrorCode.INTERNAL_ERROR,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            message="The contextual recall response exceeds its operational bound.",
+        )
+    return bundle
 
 
 # --- service -------------------------------------------------------------------------
@@ -399,9 +538,11 @@ class ContextualRecallService:
                 limits=limits,
                 as_of=utc_now(),
             )
-        except (OperationalError, InterfaceError, OSError) as exc:
-            # The authoritative store is unavailable: fail, never a fabricated
-            # bundle (Contract SS 52 -> 503, handoff 14 SS 61).
+        except (OperationalError, InterfaceError, OSError, PoolTimeoutError) as exc:
+            # The authoritative store is unavailable -- unreachable, or no pooled
+            # connection could be acquired in time (sqlalchemy.exc.TimeoutError,
+            # pool exhaustion): fail, never a fabricated bundle (Contract SS 52 ->
+            # 503, handoff 14 SS 61).
             raise DependencyUnavailableError("PostgreSQL is unavailable.") from exc
         bundle = compose_bundle(
             request, limits, snapshot, semantic_degraded=query_embedding is None
@@ -434,6 +575,10 @@ class ContextualRecallService:
         if len(embeddings) != 1 or len(embeddings[0]) != self._settings.embedding_dimensions:
             _logger.warning("context_recall_embedding_unavailable", exception_type="dimension")
             return None
+        if not is_valid_query_embedding(embeddings[0]):
+            # Same explicit degraded fallback as an unavailable provider; no retry.
+            _logger.warning("context_recall_embedding_unavailable", exception_type="invalid_vector")
+            return None
         return embeddings[0]
 
     async def _read_sources(
@@ -453,10 +598,23 @@ class ContextualRecallService:
             limits.episodes * EPISODE_CANDIDATE_WINDOW_FACTOR, EPISODE_CANDIDATE_WINDOW_MAX
         )
         async with self._unit_of_work_factory() as uow:
+            # One consistent snapshot for every source, before the first read
+            # (a concurrent Forget can never be half-observed).
+            await uow.begin_read_only_snapshot()
             active_rows = await uow.context_checkpoints.list_active(
                 scope=scope, context_key=context_key, limit=2
             )
-            active = await hydrate_checkpoints(uow, active_rows) if active_rows else []
+            active: list[ContextCheckpointResult] = []
+            declared_statement_ids: frozenset[UUID] = frozenset()
+            if active_rows:
+                active, statement_modes = await hydrate_checkpoints_with_support_modes(
+                    uow, active_rows
+                )
+                declared_statement_ids = frozenset(
+                    statement_id
+                    for statement_id, mode in statement_modes.items()
+                    if mode is not None
+                )
 
             memories: list[MemoryCandidate]
             episodes: list[EpisodeCandidate]
@@ -489,6 +647,7 @@ class ContextualRecallService:
                             hit.episode, hit.provenance, episode_supports[hit.episode.id]
                         ),
                         hit.relevance,
+                        support_declared=hit.episode.support_mode is not None,
                     )
                     for hit in episode_hits
                 ]
@@ -515,10 +674,29 @@ class ContextualRecallService:
                             row.episode, row.provenance, episode_supports[row.episode.id]
                         ),
                         None,
+                        support_declared=row.episode.support_mode is not None,
                     )
                     for row in episode_rows
                 ]
-        return SourceSnapshot(active_checkpoints=active, memories=memories, episodes=episodes)
+        return SourceSnapshot(
+            active_checkpoints=active,
+            memories=memories,
+            episodes=episodes,
+            declared_statement_ids=declared_statement_ids,
+        )
+
+
+def is_valid_query_embedding(vector: Sequence[float]) -> bool:
+    """A usable query vector, judged as pgvector stores it (float4): every
+    component numeric and finite, and a nonzero magnitude (cosine similarity is
+    undefined for a zero vector). Values that overflow float4 (become infinite)
+    or underflow to an all-zero vector are invalid too."""
+
+    try:
+        stored = array("f", vector)
+    except (TypeError, OverflowError):
+        return False
+    return all(math.isfinite(component) for component in stored) and any(stored)
 
 
 def _postgres_unit_of_work_factory(session_factory: AsyncSessionFactory) -> UnitOfWorkFactory:
@@ -529,6 +707,8 @@ def _postgres_unit_of_work_factory(session_factory: AsyncSessionFactory) -> Unit
 
 
 __all__ = [
+    "CONTEXT_RECALL_MAX_BUNDLE_BYTES",
+    "CONTEXT_RECALL_MAX_CHECKPOINT_STATEMENTS",
     "CONTEXT_RECALL_MEMORY_TYPES",
     "SUPPORTED_INTENTS",
     "ContextualRecallService",
@@ -536,9 +716,12 @@ __all__ = [
     "MemoryCandidate",
     "SourceSnapshot",
     "aggregate_evidence",
+    "checkpoint_statement_count",
     "compose_bundle",
+    "is_valid_query_embedding",
     "select_current_checkpoint",
     "select_episodes",
+    "serialized_bundle_bytes",
     "unsupported_partial_contract_error",
     "validate_partial_contract",
     "violates_forget_invariant",

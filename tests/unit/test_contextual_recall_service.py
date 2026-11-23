@@ -423,9 +423,18 @@ class Recorder:
 
 
 class FakeUow:
-    def __init__(self, recorder: Recorder, *, fail_read: bool = False) -> None:
+    def __init__(
+        self,
+        recorder: Recorder,
+        *,
+        fail_read: bool = False,
+        read_error: BaseException | None = None,
+    ) -> None:
         self.recorder = recorder
-        self.fail_read = fail_read
+        self.fail_read = fail_read or read_error is not None
+        self.read_error = read_error or OperationalError(
+            "SELECT 1", {}, ConnectionRefusedError("down")
+        )
         self.context_checkpoints = type(
             "C", (), {"list_active": staticmethod(recorder.method("list_active", []))}
         )()
@@ -454,9 +463,13 @@ class FakeUow:
 
     async def __aenter__(self) -> FakeUow:
         self.recorder.opened += 1
-        if self.fail_read:
-            raise OperationalError("SELECT 1", {}, ConnectionRefusedError("down"))
         return self
+
+    async def begin_read_only_snapshot(self) -> None:
+        # The first database operation: a pooled connection is acquired here.
+        self.recorder.calls.append(("begin_read_only_snapshot", {}))
+        if self.fail_read:
+            raise self.read_error
 
     async def __aexit__(self, *exc: object) -> None:
         return None
@@ -487,7 +500,12 @@ async def test_one_query_embedding_feeds_memories_and_episodes_with_project_scop
     )
     assert client.calls == [["Onde paramos?"]]  # exactly one provider call
     names = [name for name, _ in recorder.calls]
-    assert names == ["list_active", "typed_recall", "contextual_semantic_search"]
+    assert names == [
+        "begin_read_only_snapshot",  # the snapshot precedes every read
+        "list_active",
+        "typed_recall",
+        "contextual_semantic_search",
+    ]
     calls = dict(recorder.calls)
     assert calls["list_active"] == {"scope": "project:x", "context_key": "feature:a", "limit": 2}
     typed = calls["typed_recall"]
@@ -518,6 +536,7 @@ async def test_provider_failure_degrades_to_deterministic_fallback_without_retry
     bundle = await service(client, recorder).recall(request())
     assert len(client.calls) == 1  # the single failed attempt; the fallback calls nothing
     assert [name for name, _ in recorder.calls] == [
+        "begin_read_only_snapshot",
         "list_active",
         "list_current_for_scope",
         "list_recent_contextual",

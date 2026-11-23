@@ -14,9 +14,10 @@ removes the rows it created.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -24,6 +25,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from sofias_memory.config import load_settings
 from sofias_memory.infrastructure.postgres import (
@@ -52,12 +54,20 @@ from sofias_memory.schemas.context_checkpoints import (
     ContextCheckpointInvalidateRequest,
     ContextCheckpointSupersedeRequest,
 )
+from sofias_memory.schemas.context_recall import ContextRecallRequest
 from sofias_memory.schemas.episodes import EpisodeInvalidateRequest
 from sofias_memory.schemas.memories import MemoryCreateRequest
+from sofias_memory.services import context_checkpoints as checkpoint_module
+from sofias_memory.services import contextual_recall as recall_module
 from sofias_memory.services.cognitive_memory import CognitiveMemoryService
 from sofias_memory.services.contextual_evidence_invalidator import (
     ContextualEvidenceInvalidator,
     PropagationCounts,
+)
+from sofias_memory.services.contextual_recall import (
+    CONTEXT_RECALL_MAX_BUNDLE_BYTES,
+    CONTEXT_RECALL_MAX_CHECKPOINT_STATEMENTS,
+    ContextualRecallService,
 )
 from tests.integration.test_context_checkpoints_postgres_integration import (
     HEADERS,
@@ -776,3 +786,402 @@ async def test_recall_is_read_only(world: World, monkeypatch: pytest.MonkeyPatch
         for intent in ("resume", "context"):
             await recall(app, world.scope, intent=intent, include_evidence=True)
     assert await row_counts(world.factory) == before
+
+
+# --- PR #3 corrections: snapshot consistency vs a concurrent Forget -------------------------
+#
+# Deterministic interleaving with two independent PostgreSQL connections (two
+# engines): Recall runs under its read snapshot, is paused by a barrier right
+# before support hydration, a Forget commits on the second engine, then Recall
+# resumes. REPEATABLE READ guarantees one consistent snapshot -- the in-flight
+# Recall observes the pre-Forget state as a whole (payload *and* links) -- not
+# linearizability: a Recall whose snapshot predates the Forget commit may still
+# return what was current at that snapshot. Every Recall that starts after the
+# Forget commit must not expose the forgotten content (Contract SS 73,
+# handoff 13 SS 134).
+
+
+class Barrier:
+    """Wraps a hydration function: on the first call it records the
+    transaction characteristics, signals ``paused`` and blocks on ``resume``."""
+
+    def __init__(self, original: Callable[..., Awaitable[Any]]) -> None:
+        self.original = original
+        self.paused = asyncio.Event()
+        self.resume = asyncio.Event()
+        self.observed: dict[str, str] = {}
+
+    async def __call__(self, uow: Any, modes: Any) -> Any:
+        if not self.paused.is_set():
+            session = uow._require_session()
+            for setting in ("transaction_isolation", "transaction_read_only"):
+                self.observed[setting] = (
+                    await session.execute(text(f"SHOW {setting}"))
+                ).scalar_one()
+            self.paused.set()
+            await self.resume.wait()
+        return await self.original(uow, modes)
+
+
+class SecondConnection:
+    """An independent engine (its own pool and connection) for the Forget."""
+
+    def __init__(self, client: Any) -> None:
+        # The same dedicated test database as the ``session_factory`` fixture.
+        self.engine = create_async_engine_from_settings(load_settings())
+        self.factory = create_session_factory(self.engine)
+        self.client = client
+
+    async def forget_memory(self, memory_id: UUID) -> None:
+        service = CognitiveMemoryService(
+            make_settings(), embedding_client=self.client, session_factory=self.factory
+        )  # type: ignore[arg-type]
+        await service.forget(memory_id, idempotency_key=key("fm"))
+
+    async def close(self) -> None:
+        await dispose_async_engine(self.engine)
+
+
+async def interleaved_recall(
+    world: World,
+    barrier: Barrier,
+    forget: Callable[[], Awaitable[None]],
+    client: Any,
+    **overrides: Any,
+) -> Any:
+    service = ContextualRecallService(
+        make_settings(), embedding_client=client, session_factory=world.factory
+    )
+    body: dict[str, Any] = {"scope": world.scope, "intent": "resume", "query": QUERY}
+    body.update(overrides)
+    task = asyncio.create_task(service.recall(ContextRecallRequest.model_validate(body)))
+    await asyncio.wait_for(barrier.paused.wait(), timeout=30)  # a bound, not a delay
+    assert not task.done()
+    await forget()  # commits on the second connection while Recall is paused
+    barrier.resume.set()
+    return await asyncio.wait_for(task, timeout=30)
+
+
+def _support_of(bundle: Any, episode_id: UUID) -> Any:
+    for item in bundle.episodes:
+        if item.episode.episode_id == episode_id:
+            return item.episode.support
+    return None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["semantic", "fallback"])
+@pytest.mark.parametrize("isolation", ["snapshot", "read_committed_defense"])
+async def test_concurrent_forget_never_half_observed_by_episode_recall(
+    world: World, monkeypatch: pytest.MonkeyPatch, path: str, isolation: str
+) -> None:
+    marker = uuid4().hex
+    m = await world.memory(f"Fonte {marker}", cosine=0.3)
+    dep = await world.episode(
+        f"Derivado {marker}",
+        context_key="main",
+        cosine=0.99,
+        sup=support("all_required", ref("memory_item", m)),
+    )
+    client: Any = (
+        VectorEmbeddingClient(dict(world.client.vectors))
+        if path == "semantic"
+        else FailingEmbeddingClient()
+    )
+    barrier = Barrier(recall_module.hydrate_episode_support)
+    monkeypatch.setattr(recall_module, "hydrate_episode_support", barrier)
+    if isolation == "read_committed_defense":
+        # Control: without the snapshot (default READ COMMITTED) the Forget is
+        # half-observed -- pre-Forget payload, post-Forget missing links -- and
+        # the declared-support fail-closed rule must still exclude it.
+        async def no_snapshot(self: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "sofias_memory.infrastructure.postgres.unit_of_work."
+            "PostgresUnitOfWork.begin_read_only_snapshot",
+            no_snapshot,
+        )
+    second = SecondConnection(world.client)
+    try:
+        bundle = await interleaved_recall(world, barrier, lambda: second.forget_memory(m), client)
+    finally:
+        await second.close()
+
+    rendered = bundle.model_dump_json()
+    if isolation == "snapshot":
+        assert barrier.observed == {
+            "transaction_isolation": "repeatable read",
+            "transaction_read_only": "on",
+        }
+        # One consistent pre-Forget view: the payload comes with its links.
+        sup_result = _support_of(bundle, dep)
+        assert sup_result is not None, "the in-flight snapshot predates the Forget"
+        assert [e.source_id for e in sup_result.evidence] == [m]
+        assert [e.availability.value for e in sup_result.evidence] == ["available"]
+        assert "EVIDENCE_UNAVAILABLE" not in [w.value for w in bundle.warnings]
+    else:
+        assert barrier.observed["transaction_isolation"] == "read committed"
+        assert dep not in [item.episode.episode_id for item in bundle.episodes]
+        assert f"Derivado {marker}" not in rendered
+        assert {"EVIDENCE_UNAVAILABLE", "PARTIAL_CONTEXT"} <= {w.value for w in bundle.warnings}
+    # Never the unsafe combination: content returned with support missing.
+    for item in bundle.episodes:
+        if item.episode.episode_id == dep:
+            assert item.episode.support is not None
+
+    monkeypatch.undo()
+    after = await recall(
+        recall_app(world.factory, monkeypatch, VectorEmbeddingClient(dict(world.client.vectors))),
+        world.scope,
+        include_evidence=True,
+    )
+    assert marker not in json.dumps(after)
+    assert str(dep) not in episode_ids(after)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolation", ["snapshot", "read_committed_defense"])
+async def test_concurrent_forget_never_half_observed_by_checkpoint_statements(
+    world: World, monkeypatch: pytest.MonkeyPatch, isolation: str
+) -> None:
+    marker = uuid4().hex
+    m = await world.memory(f"Fonte {marker}", cosine=0.3)
+    await world.checkpoint(
+        current_state={"text": f"Estado independente {uuid4().hex}"},
+        pending_work=[
+            {
+                "text": f"Pendência derivada {marker}",
+                "support": support("all_required", ref("memory_item", m)),
+            }
+        ],
+    )
+    barrier = Barrier(checkpoint_module.hydrate_statement_support)
+    monkeypatch.setattr(checkpoint_module, "hydrate_statement_support", barrier)
+    if isolation == "read_committed_defense":
+
+        async def no_snapshot(self: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "sofias_memory.infrastructure.postgres.unit_of_work."
+            "PostgresUnitOfWork.begin_read_only_snapshot",
+            no_snapshot,
+        )
+    second = SecondConnection(world.client)
+    try:
+        bundle = await interleaved_recall(
+            world,
+            barrier,
+            lambda: second.forget_memory(m),
+            VectorEmbeddingClient(dict(world.client.vectors)),
+        )
+    finally:
+        await second.close()
+
+    checkpoint = bundle.current_checkpoint
+    assert checkpoint is not None  # current_state is independent
+    pending = checkpoint.pending_work
+    if isolation == "snapshot":
+        assert barrier.observed["transaction_isolation"] == "repeatable read"
+        assert [item.text for item in pending] == [f"Pendência derivada {marker}"]
+        assert pending[0].support is not None
+        assert [e.availability.value for e in pending[0].support.evidence] == ["available"]
+    else:
+        assert barrier.observed["transaction_isolation"] == "read committed"
+        assert pending == []
+        assert {"EVIDENCE_UNAVAILABLE", "PARTIAL_CONTEXT"} <= {w.value for w in bundle.warnings}
+    for item in pending:
+        assert item.support is not None  # never pre-Forget text without its links
+
+    monkeypatch.undo()
+    after = await recall(
+        recall_app(world.factory, monkeypatch, VectorEmbeddingClient(dict(world.client.vectors))),
+        world.scope,
+        include_evidence=True,
+    )
+    assert marker not in json.dumps(after)
+    assert after["current_checkpoint"]["pending_work"] == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_snapshot_is_per_unit_of_work_and_never_leaks_to_the_pool(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_async_engine(
+        load_settings().database_url.get_secret_value(), pool_size=1, max_overflow=0
+    )
+    factory = create_session_factory(engine)
+    try:
+        app = recall_app(factory, monkeypatch, VectorEmbeddingClient(dict(world.client.vectors)))
+        await recall(app, world.scope)  # used the pool's only connection
+        async with factory() as s:  # the same pooled connection, default again
+            isolation = (await s.execute(text("SHOW transaction_isolation"))).scalar_one()
+            read_only = (await s.execute(text("SHOW transaction_read_only"))).scalar_one()
+        assert (isolation, read_only) == ("read committed", "off")
+    finally:
+        await dispose_async_engine(engine)
+
+
+# --- PR #3 corrections: malformed persisted support (declared mode, links missing) ---------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_declared_support_with_missing_links_fails_closed_without_repair(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = uuid4().hex
+    m = await world.memory(f"Fonte {uuid4().hex}", cosine=0.2)
+    malformed = await world.episode(
+        f"Episódio sem links {marker}",
+        context_key="main",
+        cosine=0.99,
+        sup=support("all_required", ref("memory_item", m)),
+    )
+    independent = await world.episode(f"Independente {uuid4().hex}", context_key=None, cosine=0.5)
+    cp = await world.checkpoint(
+        current_state={"text": f"Estado {uuid4().hex}"},
+        open_items=[
+            {
+                "text": f"Item sem links {marker}",
+                "support": support("all_required", ref("memory_item", m)),
+            }
+        ],
+    )
+    statement_id = cp.open_items[0].statement_id
+    async with world.factory() as s:  # malformed persisted state, not Forget propagation
+        await s.execute(
+            text("DELETE FROM episode_evidence_refs WHERE episode_id = :i"), {"i": malformed}
+        )
+        await s.execute(
+            text("DELETE FROM context_statement_evidence_refs WHERE statement_id = :i"),
+            {"i": statement_id},
+        )
+        await s.commit()
+
+    app = recall_app(world.factory, monkeypatch, VectorEmbeddingClient(dict(world.client.vectors)))
+    before = await row_counts(world.factory)
+    for include_evidence in (False, True):
+        data = await recall(app, world.scope, include_evidence=include_evidence)
+        assert marker not in json.dumps(data)
+        assert str(malformed) not in episode_ids(data)
+        assert str(independent) in episode_ids(data)  # support_mode=None stays usable
+        assert data["continuity_available"] is True
+        assert data["current_checkpoint"]["open_items"] == []
+        assert data["warnings"] == ["PARTIAL_CONTEXT", "EVIDENCE_UNAVAILABLE"]
+        assert data["degraded_sources"] == []
+    assert await row_counts(world.factory) == before  # nothing repaired
+    async with world.factory() as s:
+        modes = (
+            await s.execute(
+                text(
+                    "SELECT (SELECT support_mode FROM episodes WHERE id = :e)::text, "
+                    "(SELECT support_mode FROM context_checkpoint_statements WHERE id = :s)::text"
+                ),
+                {"e": malformed, "s": statement_id},
+            )
+        ).one()
+    assert modes == ("all_required", "all_required")
+
+
+# --- PR #3 corrections: bounded bundle over HTTP ------------------------------------------
+
+
+def _statements(n: int) -> list[dict[str, str]]:
+    return [{"text": f"Pendência {i} {uuid4().hex}"} for i in range(n)]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_checkpoint_statement_cap_over_http(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default payload has 5 statements outside pending_work.
+    over = CONTEXT_RECALL_MAX_CHECKPOINT_STATEMENTS - 5 + 1
+    cp = await world.checkpoint(pending_work=_statements(over))
+    app = recall_app(world.factory, monkeypatch, VectorEmbeddingClient(dict(world.client.vectors)))
+    before = await row_counts(world.factory)
+    data = await recall(app, world.scope)
+    assert data["current_checkpoint"] is None and data["continuity_available"] is False
+    assert data["warnings"] == ["NO_CURRENT_CHECKPOINT", "PARTIAL_CONTEXT"]
+    assert data["degraded_sources"] == []
+    assert str(cp.checkpoint_id) not in json.dumps(data)
+    assert await row_counts(world.factory) == before
+    persisted = await checkpoints(world.factory).get(cp.checkpoint_id)
+    assert persisted.lifecycle.value == "active" and len(persisted.pending_work) == over
+
+    exact = await world.checkpoint(
+        context_key="feature:cap",
+        pending_work=_statements(CONTEXT_RECALL_MAX_CHECKPOINT_STATEMENTS - 5),
+    )
+    data = await recall(app, world.scope, context_key="feature:cap")
+    assert data["current_checkpoint"]["checkpoint_id"] == str(exact.checkpoint_id)
+    assert "PARTIAL_CONTEXT" not in data["warnings"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_oversized_checkpoint_over_http_is_omitted_and_response_stays_bounded(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    big_text = "ç" * (CONTEXT_RECALL_MAX_BUNDLE_BYTES // 2 + 1)  # > 256 KiB in UTF-8 bytes
+    cp = await world.checkpoint(current_state={"text": big_text})
+    kept = await world.memory(f"Memória que cabe {uuid4().hex}", cosine=0.9)
+    app = recall_app(world.factory, monkeypatch, VectorEmbeddingClient(dict(world.client.vectors)))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            PATH, json={"scope": world.scope, "intent": "resume", "query": QUERY}, headers=HEADERS
+        )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    data_bytes = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(data_bytes) <= CONTEXT_RECALL_MAX_BUNDLE_BYTES
+    assert data["current_checkpoint"] is None
+    assert data["warnings"] == ["NO_CURRENT_CHECKPOINT", "PARTIAL_CONTEXT"]
+    assert str(kept) in memory_ids(data)
+    assert str(cp.checkpoint_id) not in response.text and "ççç" not in response.text
+    persisted = await checkpoints(world.factory).get(cp.checkpoint_id)
+    assert persisted.current_state is not None and persisted.current_state.text == big_text
+
+
+# --- PR #3 corrections: pool exhaustion ------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_pool_exhaustion_is_503_dependency_unavailable(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_async_engine(
+        load_settings().database_url.get_secret_value(),
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.5,
+    )
+    factory = create_session_factory(engine)
+    client = VectorEmbeddingClient(dict(world.client.vectors))
+    app = recall_app(factory, monkeypatch, client)
+    body = {"scope": world.scope, "intent": "resume", "query": QUERY}
+    try:
+        held = await engine.connect()  # the pool's only connection is checked out
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as http:
+                response = await http.post(PATH, json=body, headers=HEADERS)
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+            assert response.json()["error"]["message"] == "PostgreSQL is unavailable."
+            assert "QueuePool" not in response.text
+            assert len(client.calls) == 1  # embedded once before the transaction
+        finally:
+            await held.close()
+        assert (await recall(app, world.scope))["scope"] == world.scope  # recovers
+    finally:
+        await dispose_async_engine(engine)

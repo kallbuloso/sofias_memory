@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from sofias_memory.api.errors import DependencyUnavailableError
 from sofias_memory.api.middleware import API_KEY_HEADER
@@ -53,8 +54,9 @@ class EmptyUow:
 
     opened = 0
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, pool_timeout: bool = False) -> None:
         self.fail = fail
+        self.pool_timeout = pool_timeout
 
         async def empty(**kwargs: Any) -> list[Any]:
             del kwargs
@@ -81,12 +83,22 @@ class EmptyUow:
             raise DependencyUnavailableError("PostgreSQL is unavailable.")
         return self
 
+    async def begin_read_only_snapshot(self) -> None:
+        if self.pool_timeout:
+            # What SQLAlchemy's QueuePool raises when no connection can be
+            # checked out within pool_timeout (pool exhaustion).
+            raise PoolTimeoutError("QueuePool limit of size 1 overflow 0 reached")
+
     async def __aexit__(self, *exc: object) -> None:
         return None
 
 
 def build_app(
-    monkeypatch: pytest.MonkeyPatch, *, provider_fails: bool = False, db_fails: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider_fails: bool = False,
+    db_fails: bool = False,
+    pool_timeout: bool = False,
 ) -> tuple[Any, CountingEmbeddingClient]:
     client = CountingEmbeddingClient(fail=provider_fails)
     EmptyUow.opened = 0
@@ -101,7 +113,7 @@ def build_app(
         return ContextualRecallService(
             settings,
             embedding_client=client,
-            unit_of_work_factory=lambda: EmptyUow(fail=db_fails),  # type: ignore[arg-type,return-value]
+            unit_of_work_factory=lambda: EmptyUow(fail=db_fails, pool_timeout=pool_timeout),  # type: ignore[arg-type,return-value]
         )
 
     monkeypatch.setattr("sofias_memory.api.routes.context_recall.ContextualRecallService", factory)
@@ -256,6 +268,20 @@ async def test_postgres_unavailable_is_503(monkeypatch: pytest.MonkeyPatch) -> N
     response = await post(app, valid())
     assert response.status_code == 503
     assert error(response)["code"] == "DEPENDENCY_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_pool_acquisition_timeout_is_503_with_the_safe_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, client = build_app(monkeypatch, pool_timeout=True)
+    response = await post(app, valid())
+    assert response.status_code == 503
+    body = error(response)
+    assert body["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert body["message"] == "PostgreSQL is unavailable."
+    assert "QueuePool" not in response.text  # the driver message never leaks
+    assert client.calls == 1  # embedded once, before the transaction; never retried
 
 
 @pytest.mark.asyncio

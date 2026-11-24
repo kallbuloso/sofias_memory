@@ -50,7 +50,7 @@ import math
 from array import array
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http import HTTPStatus
 from typing import Literal, cast
@@ -200,6 +200,9 @@ class SourceSnapshot:
 class _Signals:
     warnings: set[ContextRecallWarning] = field(default_factory=set)
     degraded: set[ContextRecallSource] = field(default_factory=set)
+    quiet: bool = False
+    """Selection only (explain trace roots): the authoritative composition that
+    follows logs every invariant violation exactly once."""
 
     def evidence_unavailable(self) -> None:
         self.warnings.update(
@@ -227,7 +230,12 @@ def violates_forget_invariant(support: SupportResult) -> bool:
 
 
 def _usable(
-    owner_kind: str, owner_id: UUID, support: SupportResult | None, *, declared: bool = False
+    owner_kind: str,
+    owner_id: UUID,
+    support: SupportResult | None,
+    *,
+    declared: bool = False,
+    log: bool = True,
 ) -> bool:
     """``support=None`` with no declared dependency (``support_mode=None``) is
     an independent assertion and usable; insufficient support is excluded. A
@@ -236,16 +244,17 @@ def _usable(
     content) -- recall never repairs them."""
 
     if support is None and declared:
-        _logger.error(
-            "context_recall_invariant_violation",
-            owner_kind=owner_kind,
-            owner_id=str(owner_id),
-            reason="declared_support_without_links",
-        )
+        if log:
+            _logger.error(
+                "context_recall_invariant_violation",
+                owner_kind=owner_kind,
+                owner_id=str(owner_id),
+                reason="declared_support_without_links",
+            )
         return False
     if is_supported(support) is not False:
         return True
-    if support is not None and violates_forget_invariant(support):
+    if log and support is not None and violates_forget_invariant(support):
         _logger.error(
             "context_recall_invariant_violation",
             owner_kind=owner_kind,
@@ -268,12 +277,13 @@ def select_current_checkpoint(
         return None
     if len(active) > 1:
         # Violated single-ACTIVE invariant: fail closed -- never "newest wins".
-        _logger.error(
-            "context_recall_invariant_violation",
-            owner_kind="checkpoint_stream",
-            reason="multiple_active_checkpoints",
-            checkpoint_ids=[str(item.checkpoint_id) for item in active],
-        )
+        if not signals.quiet:
+            _logger.error(
+                "context_recall_invariant_violation",
+                owner_kind="checkpoint_stream",
+                reason="multiple_active_checkpoints",
+                checkpoint_ids=[str(item.checkpoint_id) for item in active],
+            )
         signals.warnings.update(
             {ContextRecallWarning.AMBIGUOUS_CURRENT_TRUTH, ContextRecallWarning.PARTIAL_CONTEXT}
         )
@@ -282,12 +292,13 @@ def select_current_checkpoint(
     if checkpoint.current_state is None:
         # CTX-005 invalidates a checkpoint that loses current_state: an ACTIVE one
         # without it is an invariant failure. Expose nothing, repair nothing.
-        _logger.error(
-            "context_recall_invariant_violation",
-            owner_kind="checkpoint",
-            owner_id=str(checkpoint.checkpoint_id),
-            reason="active_checkpoint_without_current_state",
-        )
+        if not signals.quiet:
+            _logger.error(
+                "context_recall_invariant_violation",
+                owner_kind="checkpoint",
+                owner_id=str(checkpoint.checkpoint_id),
+                reason="active_checkpoint_without_current_state",
+            )
         signals.warnings.add(ContextRecallWarning.PARTIAL_CONTEXT)
         return None
 
@@ -302,6 +313,7 @@ def select_current_checkpoint(
             statement.statement_id,
             statement.support,
             declared=statement.statement_id in declared_statement_ids,
+            log=not signals.quiet,
         ):
             return statement
         excluded = True
@@ -350,6 +362,7 @@ def select_episodes(
             candidate.episode.episode_id,
             candidate.episode.support,
             declared=candidate.support_declared,
+            log=not signals.quiet,
         ):
             signals.evidence_unavailable()
             continue
@@ -634,7 +647,8 @@ def trace_evidence(
     returned root; descendants of a dropped edge are never shown. Returns
     ``(items, partial)``: ``partial`` when ``limit`` identities, the owner-link
     cap, a traversal bound (``trace.cut``) or a corrupt cycle prevented the
-    complete reachable trace -- never presented as complete."""
+    complete reachable trace, or an Episode declares support whose persisted
+    links are missing -- never presented as complete."""
 
     identities: dict[IdentityKey, EvidenceResult] = {}
     owners: dict[IdentityKey, dict[OwnerKey, SupportMode]] = {}
@@ -668,6 +682,11 @@ def trace_evidence(
             expanded.add(target)
             if target in trace.cut or target not in trace.supports:
                 partial = True  # reached but not expanded: never claim completeness
+                continue
+            if target in trace.declared_without_links:
+                # Declared dependency without persisted links: an invariant
+                # violation, never a legitimate leaf. Nothing is invented.
+                partial = True
                 continue
             child = trace.supports[target]
             if child is not None:
@@ -959,6 +978,80 @@ def compose_bundle(
     return bundle
 
 
+EXPLAIN_TRACE_MAX_REREADS = 2
+"""explain: bounded re-reads of the Evidence trace inside the same snapshot when
+the byte budget dropped selected roots *and* the trace was cut by a traversal
+bound, so that omitted roots' ancestry does not consume capacity of the kept
+ones. Each re-read can only shrink the root set."""
+
+
+def select_trace_roots(
+    snapshot: SourceSnapshot, limits: ContextRecallLimits
+) -> tuple[ContextRecallCheckpoint | None, list[ContextRecallEpisode]]:
+    """The explain resources that can be returned: the *same* deterministic
+    selection ``compose_bundle`` applies (eligible current checkpoint statements,
+    the first ``limits.episodes`` eligible Episodes) -- never the whole candidate
+    window. Quiet: the authoritative composition logs violations once."""
+
+    quiet = _Signals(quiet=True)
+    checkpoint = select_current_checkpoint(
+        snapshot.active_checkpoints, quiet, snapshot.declared_statement_ids
+    )
+    return checkpoint, select_episodes(snapshot.episodes, limits.episodes, quiet)
+
+
+def trace_root_keys(
+    checkpoint: ContextRecallCheckpoint | None, episodes: Sequence[ContextRecallEpisode]
+) -> frozenset[OwnerKey]:
+    owners = returned_owners(checkpoint, episodes)
+    return frozenset((owner_type, str(owner_id)) for owner_type, owner_id, _ in owners)
+
+
+async def compose_explain_bundle(
+    uow: PostgresUnitOfWork,
+    request: ContextRecallRequest,
+    limits: ContextRecallLimits,
+    snapshot: SourceSnapshot,
+    *,
+    semantic_degraded: bool,
+) -> tuple[SourceSnapshot, ProjectContextBundle]:
+    """explain + include_evidence=true, inside the caller's read-only snapshot:
+    the bounded trace is read from the *selected* roots only (amended Contract
+    SS 48: "a partir dos recursos retornados"), so unreturned candidates never
+    consume traversal capacity. If the byte budget then drops selected roots
+    while the trace was cut, the trace is re-read from the kept roots (at most
+    ``EXPLAIN_TRACE_MAX_REREADS`` times; such a bundle already carries
+    ``PARTIAL_CONTEXT`` for the omission)."""
+
+    checkpoint, episodes = select_trace_roots(snapshot, limits)
+    read_keys = trace_root_keys(checkpoint, episodes)
+    trace = await read_evidence_trace(uow, returned_supports(checkpoint, episodes))
+    snapshot = replace(snapshot, trace=trace)
+    bundle = compose_bundle(request, limits, snapshot, semantic_degraded=semantic_degraded)
+    for _ in range(EXPLAIN_TRACE_MAX_REREADS):
+        if not trace.cut:
+            break
+        kept_keys = trace_root_keys(bundle.current_checkpoint, bundle.episodes)
+        if kept_keys == read_keys:
+            break
+        read_keys = kept_keys
+        trace = await read_evidence_trace(
+            uow, returned_supports(bundle.current_checkpoint, bundle.episodes)
+        )
+        snapshot = replace(snapshot, trace=trace)
+        bundle = compose_bundle(request, limits, snapshot, semantic_degraded=semantic_degraded)
+    if trace.declared_without_links:
+        # Ids only, never content; nothing is repaired (the Episodes stay as
+        # persisted) and the trace never claims completeness through them.
+        _logger.error(
+            "context_recall_invariant_violation",
+            owner_kind="episode",
+            owner_ids=sorted(str(episode_id) for episode_id in trace.declared_without_links),
+            reason="declared_support_without_links",
+        )
+    return snapshot, bundle
+
+
 # --- service -------------------------------------------------------------------------
 
 
@@ -991,7 +1084,7 @@ class ContextualRecallService:
         # shared by Cognitive Memory, Episodes and Knowledge vector retrieval.
         query_embedding = await self._embed_query_once(request.query)
         try:
-            snapshot = await self._read_sources(
+            snapshot, bundle = await self._read_and_compose(
                 request, query_embedding=query_embedding, limits=limits, as_of=utc_now()
             )
         except (OperationalError, InterfaceError, OSError, PoolTimeoutError) as exc:
@@ -1006,9 +1099,6 @@ class ContextualRecallService:
                 owner_kind="episode_evidence_graph",
                 reason="evidence_cycle",
             )
-        bundle = compose_bundle(
-            request, limits, snapshot, semantic_degraded=query_embedding is None
-        )
         _logger.info(
             "context_recall",
             scope=bundle.scope,
@@ -1047,17 +1137,18 @@ class ContextualRecallService:
             return None
         return embeddings[0]
 
-    async def _read_sources(
+    async def _read_and_compose(
         self,
         request: ContextRecallRequest,
         *,
         query_embedding: list[float] | None,
         limits: ContextRecallLimits,
         as_of: datetime,
-    ) -> SourceSnapshot:
+    ) -> tuple[SourceSnapshot, ProjectContextBundle]:
         """One short read-only unit of work (rolled back, never committed).
         Public shapes are built while the session is open (rollback expires
-        loaded ORM instances)."""
+        loaded ORM instances). explain with Evidence composes inside the same
+        snapshot, because its trace is read from the selected roots."""
 
         scope, context_key = request.scope, request.context_key
         history = request.intent is ContextRecallIntent.HISTORY
@@ -1135,27 +1226,26 @@ class ContextualRecallService:
                     uow, candidate_supports, datasets
                 )
 
-            trace: EvidenceTrace | None = None
+            snapshot = SourceSnapshot(
+                active_checkpoints=active,
+                memories=memories,
+                episodes=episodes,
+                declared_statement_ids=declared_statement_ids,
+                historical_checkpoints=historical,
+                datasets=datasets,
+                knowledge_hits=knowledge_hits,
+                knowledge_locations=knowledge_locations,
+            )
+            semantic_degraded = query_embedding is None
             if request.intent is ContextRecallIntent.EXPLAIN and request.include_evidence:
                 # The public causal trace exists only when Evidence is requested
                 # (include_evidence=false keeps the SM-CTX-006 output contract).
-                trace = await read_evidence_trace(
-                    uow,
-                    [
-                        *(s for c in active for s in _statement_supports(c)),
-                        *(candidate.episode.support for candidate in episodes),
-                    ],
+                # It is read from the selected roots, never the candidate window.
+                return await compose_explain_bundle(
+                    uow, request, limits, snapshot, semantic_degraded=semantic_degraded
                 )
-        return SourceSnapshot(
-            active_checkpoints=active,
-            memories=memories,
-            episodes=episodes,
-            declared_statement_ids=declared_statement_ids,
-            historical_checkpoints=historical,
-            datasets=datasets,
-            knowledge_hits=knowledge_hits,
-            knowledge_locations=knowledge_locations,
-            trace=trace,
+        return snapshot, compose_bundle(
+            request, limits, snapshot, semantic_degraded=semantic_degraded
         )
 
     @staticmethod

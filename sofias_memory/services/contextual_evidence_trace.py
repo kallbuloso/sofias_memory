@@ -15,7 +15,11 @@ breadth-first, PostgreSQL-only, inside the caller's read-only snapshot:
   ``EXPLAIN_TRACE_MAX_EPISODES`` expanded Episodes); anything not expanded is
   recorded in ``cut`` so a truncated trace is never presented as complete;
 - set semantics (each Episode expanded once) terminate even on a corrupt
-  cycle, which is detected and reported (CTX-004 forbids cycles).
+  cycle, which is detected and reported (CTX-004 forbids cycles);
+- the persisted ``support_mode`` is the authority on whether an Episode
+  declares a dependency: a declared mode whose links are missing (an invariant
+  violation, never a legitimate independent leaf) is recorded in
+  ``declared_without_links`` so the explanation is never presented as complete.
 
 The internal model preserves every edge (owner type/id, support mode, source
 type/id, availability). Nothing is mutated or repaired.
@@ -60,11 +64,15 @@ class EvidenceTrace:
     ``supports`` holds the hydrated support (``None`` = no declared
     dependency) of every expanded Episode; ``cut`` the Episodes reached but not
     expanded because of a bound; ``cycle`` whether the traced Episode graph is
-    cyclic (an invariant violation)."""
+    cyclic (an invariant violation); ``declared_without_links`` the expanded
+    Episodes whose persisted ``support_mode`` is set but which have no persisted
+    Evidence link (their ``supports`` entry is ``None``, exactly as for an
+    independent leaf, so this set is what tells them apart)."""
 
     supports: Mapping[UUID, SupportResult | None]
     cut: frozenset[UUID]
     cycle: bool
+    declared_without_links: frozenset[UUID] = frozenset()
 
     def edges(self) -> list[TraceEdge]:
         """Every traced Episode edge in deterministic ``(owner_id, source_type,
@@ -152,6 +160,7 @@ async def read_evidence_trace(
 
     supports: dict[UUID, SupportResult | None] = {}
     cut: set[UUID] = set()
+    declared_without_links: set[UUID] = set()
     frontier = sorted(
         {target for support in root_supports for target in available_episode_targets(support)},
         key=str,
@@ -171,6 +180,11 @@ async def read_evidence_trace(
             uow, {episode_id: modes.get(episode_id) for episode_id in expand}
         )
         supports.update(hydrated)
+        declared_without_links.update(
+            episode_id
+            for episode_id in expand
+            if modes.get(episode_id) is not None and hydrated.get(episode_id) is None
+        )
         discovered = {
             target
             for episode_id in expand
@@ -179,7 +193,12 @@ async def read_evidence_trace(
         }
         frontier = sorted(discovered, key=str)
         depth += 1
-    return EvidenceTrace(supports=supports, cut=frozenset(cut), cycle=has_cycle(supports))
+    return EvidenceTrace(
+        supports=supports,
+        cut=frozenset(cut),
+        cycle=has_cycle(supports),
+        declared_without_links=frozenset(declared_without_links),
+    )
 
 
 __all__ = [

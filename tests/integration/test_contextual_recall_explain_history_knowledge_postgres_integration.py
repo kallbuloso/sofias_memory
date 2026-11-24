@@ -743,3 +743,117 @@ async def test_every_intent_is_read_only_and_restart_stable(
 
 def test_dimension_constant_matches_the_shared_fixture() -> None:
     assert DIM == 3072
+
+
+# --- PR #4 corrections: review findings B and C ------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_explain_intermediate_declared_support_without_links_is_partial_and_read_only(
+    kworld: KnowledgeWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding B through the real support hydration: A keeps its persisted
+    support_mode but has no Evidence link (controlled corruption of this
+    disposable database). The trace keeps the persisted edges, never invents
+    A -> K, signals PARTIAL_CONTEXT and writes nothing."""
+
+    a, b, k, _ = await explain_chain(kworld)
+    app = recall_app(
+        kworld.factory, monkeypatch, VectorEmbeddingClient(dict(kworld.client.vectors))
+    )
+    async with kworld.factory() as s:
+        await s.execute(text("DELETE FROM episode_evidence_refs WHERE episode_id = :a"), {"a": a})
+        await s.commit()
+    async with kworld.factory() as s:
+        mode = await s.scalar(text("SELECT support_mode FROM episodes WHERE id = :a"), {"a": a})
+        a_summary = await s.scalar(text("SELECT summary FROM episodes WHERE id = :a"), {"a": a})
+    assert mode == "all_required"
+    before = await row_counts(kworld.factory)
+
+    data = await recall(
+        app, kworld.scope, intent="explain", include_evidence=True, limits={"episodes": 1}
+    )
+
+    assert episode_ids(data) == [str(b)]  # A is an intermediate, not returned
+    assert {(e["source_type"], e["source_id"]) for e in data["evidence"]} == {
+        ("episode", str(b)),
+        ("episode", str(a)),
+    }
+    a_item = next(e for e in data["evidence"] if e["source_id"] == str(a))
+    assert [(o["owner_type"], o["owner_id"]) for o in a_item["owners"]] == [("episode", str(b))]
+    assert str(k) not in json.dumps(data["evidence"])  # no invented Evidence
+    assert data["warnings"] == ["PARTIAL_CONTEXT"] and data["degraded_sources"] == []
+    assert a_summary not in json.dumps(data)  # no intermediate semantic payload
+    assert await row_counts(kworld.factory) == before  # read-only
+    async with kworld.factory() as s:
+        links = await s.scalar(
+            text("SELECT count(*) FROM episode_evidence_refs WHERE episode_id = :a"), {"a": a}
+        )
+        mode_after = await s.scalar(
+            text("SELECT support_mode FROM episodes WHERE id = :a"), {"a": a}
+        )
+    assert links == 0 and mode_after == "all_required"  # never repaired
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_explain_discarded_candidates_never_consume_trace_capacity(
+    kworld: KnowledgeWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding C with valid data: limits.episodes=8 reads 24 candidates; the 16
+    discarded ones carry 17 Episode Evidence refs each (272 > 256 Episodes).
+    The returned checkpoint depends on X -> Y -> Chunk K. Rooted at the
+    candidate window the trace was cut (K missing, PARTIAL_CONTEXT); rooted at
+    the selected resources it is complete."""
+
+    k = kworld.seeds.chunk
+    tag = uuid4().hex
+    y = await kworld.episode(
+        f"Y {tag}", context_key="main", cosine=0.01, sup=support("all_required", ref("chunk", k))
+    )
+    x = await kworld.episode(
+        f"X {tag}", context_key="main", cosine=0.01, sup=support("all_required", ref("episode", y))
+    )
+    returned = [
+        await kworld.episode(f"Selecionado {i} {tag}", context_key="main", cosine=0.9 - i * 0.01)
+        for i in range(8)
+    ]
+    for i in range(16):
+        parents = [
+            await kworld.episode(f"Pai {i}-{j} {tag}", context_key="main", cosine=0.05)
+            for j in range(17)
+        ]
+        await kworld.episode(
+            f"Descartado {i} {tag}",
+            context_key="main",
+            cosine=0.5 - i * 0.01,
+            sup=support("any_sufficient", *(ref("episode", p) for p in parents)),
+        )
+    await kworld.checkpoint(
+        current_state={
+            "text": f"Estado apoiado por X {tag}",
+            "support": support("all_required", ref("episode", x)),
+        }
+    )
+    app = recall_app(
+        kworld.factory, monkeypatch, VectorEmbeddingClient(dict(kworld.client.vectors))
+    )
+    before = await row_counts(kworld.factory)
+
+    data = await recall(
+        app, kworld.scope, intent="explain", include_evidence=True, limits={"episodes": 8}
+    )
+
+    assert episode_ids(data) == [str(e) for e in returned]
+    by_id = {e["source_id"]: e for e in data["evidence"]}
+    assert set(by_id) == {str(x), str(y), str(k)}  # only the selected trace
+    assert [(o["owner_type"], o["owner_id"]) for o in by_id[str(k)]["owners"]] == [
+        ("episode", str(y))
+    ]
+    assert data["warnings"] == [] and data["degraded_sources"] == []  # no spurious partial
+    again = await recall(
+        app, kworld.scope, intent="explain", include_evidence=True, limits={"episodes": 8}
+    )
+    assert again["evidence"] == data["evidence"]  # deterministic
+    assert await row_counts(kworld.factory) == before

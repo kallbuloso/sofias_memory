@@ -1811,6 +1811,114 @@ sem replay de Session A.
 
 ---
 
+## SM-CTX-006 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-23)
+Baseline:                main @ 40c92702b432a254accde11ac3b4352093520ddd
+Implementation SHA:      3005a8dd27575c640bc22c22b6b3d204c9986cb3
+                          (feat(context): implement contextual recall core (SM-CTX-006))
+Corrective SHA:          e70c92d9ca47d94ac636e606b01fb3c0b0257062
+                          (fix(context): enforce safe recall snapshots and bounded responses)
+Merge into main:         579ee17ab6c38ce3b2640ed33e93db16f6d09546 (PR #3, merge commit;
+                          parents 40c9270 + e70c92d; tree idêntica à do HEAD aprovado do PR)
+Alembic head:            0022 (sem nova migration)
+```
+
+- Entregue (handoff `14`):
+  - `POST /api/v1/context/recall`, separado de `/api/v1/recall` e
+    `/api/v1/memories/recall`;
+  - intents funcionais `resume` e `context`; `explain` e `history` rejeitados
+    explicitamente (`INVALID_REQUEST`) até o SM-CTX-007;
+  - `ProjectContextBundle` estruturado, com o checkpoint ACTIVE vigente de
+    `(scope, context_key)`, sem fallback histórico (checkpoint ausente ⇒
+    `NO_CURRENT_CHECKPOINT`; mais de um ACTIVE ⇒ `AMBIGUOUS_CURRENT_TRUTH`,
+    fail closed);
+  - Cognitive Memory current limitada ao scope do projeto (Cognitive Memory
+    global nunca é incluída automaticamente);
+  - Episodes ACTIVE do Context Stream solicitado e project-wide
+    (`context_key` nulo);
+  - Evidence refs opcionais (`include_evidence`), deduplicadas e em ordem
+    canônica, sem expansão de conteúdo;
+  - recuperação semântica com no máximo uma tentativa de embedding por request
+    (fora de transação; cliente com `llm_max_retries=0`), reutilizada para
+    memórias e Episodes;
+  - fallback determinístico (recência) com degradação explícita
+    (`PARTIAL_CONTEXT`, `degraded_sources=[memories, episodes]`,
+    `relevance=null`), inclusive para embedding malformado ou de magnitude
+    zero (validação float4);
+  - snapshot PostgreSQL consistente: unidade de trabalho `REPEATABLE READ`
+    `READ ONLY` estabelecida antes da primeira leitura, cobrindo checkpoint,
+    statements, memórias, Episodes, links e availability (caminhos semântico e
+    fallback);
+  - elegibilidade fail-closed: `support_mode` declarado sem links ⇒ recurso
+    excluído com `EVIDENCE_UNAVAILABLE` + `PARTIAL_CONTEXT` e log apenas com
+    identificadores, sem reparo; `support_mode=None` continua asserção
+    independente;
+  - budget operacional interno: bundle serializado ≤ 262144 bytes UTF-8
+    (Evidence aninhada incluída) e ≤ 64 statements elegíveis no checkpoint;
+    recursos acima do limite são omitidos inteiros, nunca truncados, em ordem
+    determinística (checkpoint, memórias, Episodes), com `PARTIAL_CONTEXT`;
+  - isolamento de projeto e proteção pós-Forget: conteúdo esquecido,
+    invalidado ou superseded nunca retorna; inconsistência encontrada na
+    leitura é excluída, nunca reparada;
+  - PostgreSQL indisponível (incluindo timeout de aquisição do pool
+    `sqlalchemy.exc.TimeoutError`) ⇒ `503 DEPENDENCY_UNAVAILABLE` com envelope
+    seguro;
+  - zero mutação de domínio: nenhuma Query, PipelineRun, Session, MemoryItem,
+    Episode, ContextCheckpoint, Evidence ou evento `graph_outbox`;
+  - independente de LLM, Neo4j, Knowledge Recall e Session.
+- Evidência local (fora do CI; banco PostgreSQL isolado e descartável,
+  `create_app` com Neo4j e worker desabilitados, stub local de embedding):
+  - Acceptance Criteria AC-006.1–AC-006.27 (handoff `14`): PASS, conforme a
+    cobertura reportada;
+  - Human Validation A–J: PASS pela API HTTP real;
+  - cinco casos dirigidos de validação: PASS (underfill da janela de
+    candidatos de Episodes documentado);
+  - concorrência PostgreSQL com duas engines e interleavings controlados por
+    barreira (Episodes semânticos, Episodes fallback e statements de
+    checkpoint), cada um sob o snapshot e como controle `READ COMMITTED`: PASS;
+  - testes de fail-closed e mutação negativa (fingerprints de linhas e
+    contadores inalterados): PASS;
+  - suíte completa isolada após as correções: 3259 passed, 0 failed,
+    517 skipped; ruff, ruff format e mypy limpos.
+- Evidência de CI (GitHub Actions, sem PostgreSQL real):
+  - PR HEAD `e70c92d`: run 45284655979 SUCCESS;
+  - pós-merge `579ee17`: run 45291886819 SUCCESS — `uv lock --check`, ruff
+    check/format, mypy, pytest unit + contract + security (2919 passed),
+    pip-audit, Bandit HIGH, paridade Settings/`.env.example`/Compose,
+    consistência de versão, Docker build e labels OCI;
+  - as suítes de integração PostgreSQL, a concorrência e a Human Validation
+    **não** são executadas pelo CI; sua evidência é a local acima.
+- Revisão:
+  - cinco findings do PR #3 (concorrência com Forget, elegibilidade de
+    Evidence, budget de resposta, timeout do pool, embeddings inválidos)
+    corrigidos em `e70c92d`;
+  - revisão independente dirigida das cinco correções: aprovada;
+  - cinco threads de revisão do PR #3 resolvidas.
+- Limitações e dívidas (não bloqueadoras):
+  - `REPEATABLE READ` oferece snapshot consistente, não linearizabilidade: um
+    Recall cujo snapshot antecede o commit de um Forget devolve o estado
+    consistente anterior; todo Recall iniciado após o commit exclui o conteúdo
+    esquecido;
+  - a janela limitada de candidatos de Episodes pode resultar em underfill
+    (sinalizado por warnings);
+  - o budget pode omitir recursos grandes inteiros, preservando a ordenação de
+    cada fonte;
+  - outros endpoints contextuais ainda podem devolver 500 em falhas
+    PostgreSQL;
+  - suítes Neo4j e demais opt-ins permanecem fora do escopo desta validação;
+  - débitos existentes de testes S3 e de hardening da ingestão PDF permanecem
+    rastreados (ver "Dívida técnica e de segurança rastreada
+    (pós-SM-CTX-005)");
+  - `explain`, `history`, checkpoints históricos e Knowledge Integration
+    pertencem ao SM-CTX-007;
+  - o anúncio do Contract contextual completo
+    (`contextual_project_memory = "1"`) pertence ao SM-CTX-008.
+- Este registro não declara release readiness.
+
+---
+
 # 12. SM-CTX-007 — Explain, History and Knowledge Integration
 
 ## Objective

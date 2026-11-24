@@ -2109,6 +2109,115 @@ query="Quais decisões anteriores tivemos?"
 
 Confirmar que histórico não é confundido com current truth.
 
+## SM-CTX-007 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-24)
+Baseline:                main @ a11a51a6b3e3b4030b8071b141e8b83ba7c36c05
+Implementation SHA:      7a076219b931a8596c46a980a661e18d92d63fde
+                          (feat(context): add explain history and knowledge integration (SM-CTX-007))
+Corrective SHA:          770e2d1893f42c55f58684dcbda4609609f7040a
+                          (fix(context): preserve explain support integrity and selected trace roots)
+Merge into main:         7a193078a0b11ce92cb89b3766f793dd5197d02b (PR #4, merge commit;
+                          parents a11a51a + 770e2d1; 17 arquivos alterados)
+Alembic head:            0022 (sem nova migration; sem nova dependência)
+```
+
+- Entregue (handoff `15`, com o Amendment R2 do Contract `05` §48/§49):
+  - intent `explain`: trace causal bounded construído somente a partir de
+    Evidence links persistidos (nunca lineage de checkpoint, cronologia,
+    similaridade ou ranking de Knowledge), em largura a partir dos recursos
+    selecionados para a resposta;
+  - ownership multi-hop pela extensão aditiva R2: cada item de `evidence[]`
+    carrega `owners` (`owner_type`, `owner_id`, `support_mode`), deduplicados
+    e em ordem determinística; Episodes intermediários fora de `episodes[]`
+    aparecem somente como identidade, nunca com payload semântico;
+    `include_evidence=false` preserva o contrato anterior;
+  - traversal bounded (8 hops, 256 Episodes expandidos, `limits.evidence`
+    identidades, 256 owner links) com subconjunto coerente: toda aresta
+    mantida está conectada a uma raiz retornada; truncamento, corte, ciclo
+    corrompido ou suporte declarado sem links ⇒ `PARTIAL_CONTEXT`;
+  - intent `history`: checkpoint atual como orientação, revisões SUPERSEDED e
+    INVALIDATED do mesmo stream (`revision DESC`) e Episodes ACTIVE/INVALIDATED
+    (`occurred_at DESC`) com lifecycle explícito; sem Cognitive Memory current;
+    conteúdo FORGOTTEN nunca retorna;
+  - Knowledge somente com datasets explícitos e ACTIVE (máximo 16; inexistente
+    ou não ACTIVE ⇒ `422 INVALID_REQUEST` com `details.dataset`, validado no
+    mesmo snapshot; nunca `main` implícito);
+  - retrieval vetorial + lexical restrito à coleção Knowledge, com rank fusion
+    local; referências tipadas (`ContextRecallKnowledgeReference`) somente com
+    identidades, nunca texto de chunk;
+  - Knowledge references Evidence-backed apenas quando um recurso retornado
+    declara explicitamente o recurso Knowledge como Evidence (hit de retrieval
+    nunca é Evidence);
+  - um único query embedding por request, compartilhado por Cognitive Memory,
+    Episodes e Knowledge; falha do provider ⇒ fallback lexical de Knowledge com
+    `PARTIAL_CONTEXT` único e `degraded_sources=[memories, episodes, knowledge]`;
+  - budget global de resposta mantido: bundle serializado ≤ 262144 bytes UTF-8
+    (owners incluídos) e ≤ 64 statements por checkpoint;
+  - Forget e isolamento de projeto/Context Stream preservados em todos os
+    intents (sem ressurreição, sem vazamento entre projetos ou streams);
+  - snapshot PostgreSQL `REPEATABLE READ READ ONLY` único por request,
+    incluindo validação de datasets, trace e releituras;
+  - sem LLM, sem Neo4j, sem persistência ou auditoria de Contextual Recall;
+  - `/api/v1/info` não anuncia `contextual_project_memory` nem capability
+    contextual (activation gate do SM-CTX-008).
+- Findings IMPORTANT da revisão do PR #4, ambos reproduzidos contra a
+  implementação anterior (`7a07621`) e corrigidos em `770e2d1` com testes de
+  regressão (unitários e PostgreSQL que falham em `7a07621` e passam em
+  `770e2d1`):
+  - **Finding B** — Episode intermediário com suporte declarado mas sem
+    Evidence links persistidos era tratado como folha legítima. Correção: a
+    declaração persistida (`support_mode`) é preservada no trace
+    (`declared_without_links`), distinguindo suporte inconsistente de folha
+    legítima; emite `PARTIAL_CONTEXT`; registra
+    `context_recall_invariant_violation` apenas com identificadores; nenhuma
+    Evidence inventada, nenhuma mutação;
+  - **Finding C** — o traversal usava a janela inteira de candidatos de
+    Episodes em vez das raízes selecionadas para a resposta. Correção: raízes
+    do trace derivadas da mesma seleção determinística da composição;
+    candidatos descartados não consomem a capacidade do traversal; releitura do
+    trace no mesmo snapshot quando a omissão por budget de bytes descarta
+    raízes selecionadas; traces causais determinísticos e coerentes
+    preservados.
+- Aceitação e evidência local (fora do CI; PostgreSQL isolado e descartável,
+  `create_app` com Neo4j e worker desabilitados, stub local de embedding):
+  - Acceptance Criteria AC-007.1–AC-007.30 (handoff `15`): PASS, conforme o
+    handoff APPROVED;
+  - suíte completa isolada após as correções: 3205 passed, 0 failed,
+    655 skipped;
+  - testes unitários dirigidos de B/C: 13 passed;
+  - suítes PostgreSQL contextuais (recall, Forget, Evidence, checkpoints,
+    Episodes): 139 passed, 18 skipped;
+  - Contextual Recall PostgreSQL: 38/38 em três execuções consecutivas;
+  - Human Validation A–J pela API HTTP real: 60/60 PASS (inclui os cenários de
+    janela de candidatos e de suporte declarado sem links);
+  - ruff check, ruff format (arquivos alterados) e mypy limpos.
+- Evidência de CI (GitHub Actions, sem PostgreSQL real):
+  - PR HEAD `770e2d1`: run 45499757332 SUCCESS;
+  - pós-merge `7a19307`: run 45501843539 SUCCESS — os dois jobs (`Lint, type
+    check, unit/contract/security tests` e `Docker image build + OCI label
+    check`): `uv lock --check`, ruff check/format, mypy, pytest unit +
+    contract + security (2989 passed), pip-audit, Bandit HIGH, paridade
+    Settings/`.env.example`/Compose, consistência de versão, Docker build e
+    labels OCI;
+  - as suítes de integração PostgreSQL e a Human Validation **não** são
+    executadas pelo CI; sua evidência é a local acima.
+- Revisão: threads de revisão B e C do PR #4 respondidas e resolvidas.
+- Limitações conhecidas (não bloqueadoras):
+  - MINOR: o query embedding é calculado antes da validação explícita de
+    datasets (dataset inválido ainda custa uma chamada ao provider);
+  - MINOR: em releituras raras do trace por omissão de budget, logs de
+    invariante/omissão podem ser emitidos em duplicidade;
+  - DEFERRED: manutenção do `integration.yml` existente;
+  - DEFERRED: dependência de rede existente em testes S3;
+  - específico de ambiente: clock skew Windows/WSL durante a integração
+    PostgreSQL (suítes executadas dentro do WSL);
+  - específico de ambiente: ruído de formatação CRLF no checkout Windows.
+- O anúncio do Contract contextual completo
+  (`contextual_project_memory = "1"`) pertence ao SM-CTX-008.
+- Este registro não declara release readiness.
+
 ---
 
 # 13. SM-CTX-008 — Contract Hardening and Longitudinal Validation

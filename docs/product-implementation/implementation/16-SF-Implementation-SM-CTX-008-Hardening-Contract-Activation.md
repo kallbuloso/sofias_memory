@@ -1,7 +1,7 @@
 # Sofias Memory — Implementation: SM-CTX-008 — Contract Hardening and Longitudinal Validation
 
 **Document:** `implementation/16-SF-Implementation-SM-CTX-008-Hardening-Contract-Activation.md`\
-**Status:** APPOVED\
+**Status:** APPROVED\
 **Date:** 2026-11-20\
 **Project:** Sofias Memory\
 **Current Slice:** `SM-CTX-008 — Contract Hardening and Longitudinal Validation`

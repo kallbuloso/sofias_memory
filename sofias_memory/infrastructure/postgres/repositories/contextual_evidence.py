@@ -59,6 +59,16 @@ class LinkedEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeLocation:
+    """Structural identity of a Knowledge Evidence target (never content)."""
+
+    dataset_id: UUID
+    source_id: UUID
+    document_id: UUID | None = None
+    chunk_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class KnowledgeState:
     source_status: SourceStatus
     dataset_status: DatasetStatus
@@ -301,6 +311,51 @@ class ContextualEvidenceRepository:
             )
             for rid, c_active, c_gen, d_active, d_gen, s, d, g in rows.all()
         }
+
+    async def knowledge_locations(
+        self, keys: Sequence[EvidenceKey]
+    ) -> dict[EvidenceKey, KnowledgeLocation]:
+        """Dataset/Source/Document/Chunk identities of Source, Document and Chunk
+        Evidence keys (SM-CTX-007 Evidence-backed Knowledge references, handoff
+        15 SS 62/66). Structural only and unlocked: current availability is
+        decided by the caller from the Evidence resolution, never here."""
+
+        by_type: dict[EvidenceSourceType, list[UUID]] = {}
+        for key in keys:
+            by_type.setdefault(key.source_type, []).append(key.source_id)
+        out: dict[EvidenceKey, KnowledgeLocation] = {}
+        chunk_ids = by_type.get(EvidenceSourceType.CHUNK, [])
+        if chunk_ids:
+            rows = await self._session.execute(
+                select(Chunk.id, Chunk.dataset_id, Chunk.source_id, Chunk.document_id).where(
+                    Chunk.id.in_(chunk_ids)
+                )
+            )
+            for chunk_id, dataset_id, source_id, document_id in rows.all():
+                out[EvidenceKey(EvidenceSourceType.CHUNK, chunk_id)] = KnowledgeLocation(
+                    dataset_id, source_id, document_id, chunk_id
+                )
+        document_ids = by_type.get(EvidenceSourceType.DOCUMENT, [])
+        if document_ids:
+            rows = await self._session.execute(
+                select(Document.id, Document.dataset_id, Document.source_id).where(
+                    Document.id.in_(document_ids)
+                )
+            )
+            for document_id, dataset_id, source_id in rows.all():
+                out[EvidenceKey(EvidenceSourceType.DOCUMENT, document_id)] = KnowledgeLocation(
+                    dataset_id, source_id, document_id
+                )
+        source_ids = by_type.get(EvidenceSourceType.SOURCE, [])
+        if source_ids:
+            rows = await self._session.execute(
+                select(Source.id, Source.dataset_id).where(Source.id.in_(source_ids))
+            )
+            for source_id, dataset_id in rows.all():
+                out[EvidenceKey(EvidenceSourceType.SOURCE, source_id)] = KnowledgeLocation(
+                    dataset_id, source_id
+                )
+        return out
 
     # --- SM-CTX-005: reverse dependency lookup and propagation locks -------------
     #

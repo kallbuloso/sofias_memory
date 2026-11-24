@@ -1,5 +1,5 @@
-"""Route-level proof for SM-CTX-006 ``POST /api/v1/context/recall``: auth,
-envelope, validation codes, partial-contract gates and degradation. The real
+"""Route-level proof for SM-CTX-006/007 ``POST /api/v1/context/recall``: auth,
+envelope, validation codes, all four intents, explicit datasets and degradation. The real
 ``ContextualRecallService`` runs over a fake unit of work and a counting fake
 embedding provider -- no PostgreSQL, provider, LLM or Neo4j is exercised."""
 
@@ -62,7 +62,17 @@ class EmptyUow:
             del kwargs
             return []
 
-        self.context_checkpoints = type("C", (), {"list_active": staticmethod(empty)})()
+        async def no_modes(episode_ids: Any) -> dict[Any, Any]:
+            del episode_ids
+            return {}
+
+        async def no_dataset(slug: str) -> None:
+            del slug
+
+        self.context_checkpoints = type(
+            "C", (), {"list_active": staticmethod(empty), "list_history": staticmethod(empty)}
+        )()
+        self.datasets = type("D", (), {"get_by_slug": staticmethod(no_dataset)})()
         self.memory_items = type(
             "M",
             (),
@@ -74,6 +84,9 @@ class EmptyUow:
             {
                 "contextual_semantic_search": staticmethod(empty),
                 "list_recent_contextual": staticmethod(empty),
+                "historical_semantic_search": staticmethod(empty),
+                "list_recent_historical": staticmethod(empty),
+                "support_modes": staticmethod(no_modes),
             },
         )()
 
@@ -217,22 +230,56 @@ async def test_validation_codes(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("overrides", "field"),
-    [
-        ({"intent": "explain"}, "intent"),
-        ({"intent": "history"}, "intent"),
-        ({"datasets": ["docs"]}, "datasets"),
-    ],
-)
-async def test_partial_contract_inputs_fail_explicitly(
-    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any], field: str
+@pytest.mark.parametrize("intent", ["explain", "history"])
+async def test_explain_and_history_are_supported(
+    monkeypatch: pytest.MonkeyPatch, intent: str
 ) -> None:
     app, client = build_app(monkeypatch)
-    response = await post(app, valid(**overrides))
+    response = await post(app, valid(intent=intent))
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["intent"] == intent
+    assert data["historical_checkpoints"] == [] and data["knowledge_references"] == []
+    assert data["warnings"] == ["NO_CURRENT_CHECKPOINT"] and data["degraded_sources"] == []
+    assert "answer" not in data and "explanation" not in data
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent", ["resume", "context", "explain", "history"])
+async def test_unknown_explicit_dataset_fails_never_ignored_nor_main(
+    monkeypatch: pytest.MonkeyPatch, intent: str
+) -> None:
+    app, _ = build_app(monkeypatch)
+    response = await post(app, valid(intent=intent, datasets=["docs"]))
     assert response.status_code == 422
     assert error(response)["code"] == "INVALID_REQUEST"
-    assert error(response)["details"]["field"] == field
+    assert error(response)["details"] == {"field": "datasets", "dataset": "docs"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("datasets", [["  "], [f"d{i}" for i in range(17)], "docs", [None]])
+async def test_malformed_datasets_are_invalid_request_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch, datasets: object
+) -> None:
+    app, client = build_app(monkeypatch)
+    response = await post(app, valid(datasets=datasets))
+    assert response.status_code == 422
+    assert error(response)["code"] == "INVALID_REQUEST"
+    assert client.calls == 0 and EmptyUow.opened == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent", ["explain", "history"])
+async def test_datasets_never_replace_the_required_query(
+    monkeypatch: pytest.MonkeyPatch, intent: str
+) -> None:
+    app, client = build_app(monkeypatch)
+    body = valid(intent=intent, datasets=["docs"])
+    del body["query"]
+    response = await post(app, body)
+    assert response.status_code == 422
+    assert error(response)["code"] == "INVALID_REQUEST"
     assert client.calls == 0 and EmptyUow.opened == 0
 
 

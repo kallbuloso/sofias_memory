@@ -104,6 +104,31 @@ class ContextCheckpointRepository:
         result = await self._session.scalars(statement)
         return list(result.all())
 
+    async def list_history(
+        self, *, scope: str, context_key: str, limit: int
+    ) -> list[ContextCheckpoint]:
+        """Historical revisions of exactly one Context Stream for Contextual Recall
+        ``history`` (SM-CTX-007, handoff 15 SS 26-31/89): SUPERSEDED and
+        INVALIDATED only -- never ACTIVE (that is ``current_checkpoint``) and never
+        a FORGOTTEN tombstone. Ordered ``revision DESC, id ASC`` (revision is the
+        authority, never created_at), at most ``limit``. Served by
+        ``ix_context_checkpoints_scope_lifecycle_listing``."""
+
+        statement = (
+            select(ContextCheckpoint)
+            .where(
+                ContextCheckpoint.scope == scope,
+                ContextCheckpoint.context_key == context_key,
+                ContextCheckpoint.lifecycle.in_(
+                    (ContextCheckpointLifecycle.SUPERSEDED, ContextCheckpointLifecycle.INVALIDATED)
+                ),
+            )
+            .order_by(ContextCheckpoint.revision.desc(), ContextCheckpoint.id.asc())
+            .limit(limit)
+        )
+        result = await self._session.scalars(statement)
+        return list(result.all())
+
     async def max_revision(self, *, scope: str, context_key: str) -> int | None:
         """Highest revision of the stream over *every* lifecycle, FORGOTTEN
         tombstones included -- revisions are never reused."""

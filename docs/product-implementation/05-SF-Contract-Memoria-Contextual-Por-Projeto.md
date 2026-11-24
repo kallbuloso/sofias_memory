@@ -1573,6 +1573,34 @@ o serviço MAY expandir conteúdo disponível das evidências internas, respeita
 
 Evidence esquecida nunca é expandida.
 
+**Amendment R2 — 2026-11-24 (SM-CTX-007, clarificação que habilita a implementação):**
+
+Com `include_evidence=true`, cada item de `evidence[]` carrega, além de identidade
+(`evidence_id`, `source_type`, `source_id`) e `availability`, a coleção `owners`:
+
+```json
+{
+  "owners": [
+    { "owner_type": "episode", "owner_id": "uuid", "support_mode": "all_required" }
+  ]
+}
+```
+
+- `owner_type` ∈ `context_statement | episode`; `support_mode` é a política persistida do owner.
+- Um owner só aparece quando existe um Evidence link persistido entre ele e a Evidence;
+  nunca por chronology, checkpoint lineage, provenance, similarity ou ranking de Knowledge.
+- Uma identidade aparece uma única vez; múltiplos owners preservam cada `support_mode`;
+  owners são deduplicados e ordenados por `(owner_type, owner_id)`.
+- Para `intent=explain`, `evidence[]` é o causal trace bounded a partir dos recursos
+  retornados: inclui Episodes intermediários alcançados por Evidence explícita mesmo quando
+  não estão em `episodes[]` (somente identidade, nunca payload semântico).
+- Limites: `limits.evidence` identidades, limites internos de traversal e um cap interno de
+  owner links. Truncamento retorna subconjunto coerente (toda aresta conectada a um recurso
+  retornado) com `PARTIAL_CONTEXT`, sem novo warning e sem `degraded_sources`.
+
+Com `include_evidence=false` nada muda: `evidence[]` permanece vazio, nenhum owner é
+serializado e os support refs/availability dos recursos retornados são preservados.
+
 ---
 
 # 49. Contextual Recall Response
@@ -1595,6 +1623,9 @@ Modelo conceitual:
   "degraded_sources": []
 }
 ```
+
+**Amendment R2 — 2026-11-24:** os itens de `evidence` seguem o shape do §48 (identidade,
+`availability`, `owners`); a estrutura de topo do bundle não muda.
 
 ---
 

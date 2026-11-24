@@ -1,4 +1,5 @@
-"""SM-CTX-006 ContextualRecallService unit proof (handoff 14 SS 117-124/135-138):
+"""SM-CTX-006 ContextualRecallService unit proof (SM-CTX-007 additions live in
+test_contextual_recall_sm_ctx_007) (handoff 14 SS 117-124/135-138):
 pure deterministic composition plus orchestration over a fake unit of work.
 The real SQL eligibility is proven by the PostgreSQL integration suite."""
 
@@ -14,7 +15,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from sofias_memory.api.errors import DependencyUnavailableError, SofiasMemoryError
+from sofias_memory.api.errors import DependencyUnavailableError
 from sofias_memory.config import Settings
 from sofias_memory.domain import (
     CognitiveMemoryType,
@@ -322,7 +323,8 @@ def test_evidence_is_deduplicated_canonically_ordered_and_bounded() -> None:
             episode=episode(support=sup(SupportMode.ANY_SUFFICIENT, shared)), relevance=None
         ),
     ]
-    aggregated = aggregate_evidence(cp_result, episodes, 10)
+    aggregated, truncated = aggregate_evidence(cp_result, episodes, 10)
+    assert truncated is False
     assert [(e.source_type, e.source_id) for e in aggregated] == [
         (other.source_type, other.source_id),
         (shared.source_type, shared.source_id),
@@ -334,8 +336,9 @@ def test_evidence_is_deduplicated_canonically_ordered_and_bounded() -> None:
         "source_id",
         "availability",
         "result_class",
+        "owners",
     }
-    assert len(aggregate_evidence(cp_result, episodes, 1)) == 1
+    assert len(aggregate_evidence(cp_result, episodes, 1)[0]) == 1
 
 
 # --- composition ------------------------------------------------------------------------------
@@ -545,27 +548,6 @@ async def test_provider_failure_degrades_to_deterministic_fallback_without_retry
     assert fallback["scope"] == "project:x" and fallback["limit"] == 8
     assert [w.value for w in bundle.warnings] == ["NO_CURRENT_CHECKPOINT", "PARTIAL_CONTEXT"]
     assert [s.value for s in bundle.degraded_sources] == ["memories", "episodes"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("overrides", "field"),
-    [
-        ({"intent": "explain"}, "intent"),
-        ({"intent": "history"}, "intent"),
-        ({"datasets": ["docs"]}, "datasets"),
-    ],
-)
-async def test_partial_contract_inputs_fail_before_provider_and_database(
-    overrides: dict[str, Any], field: str
-) -> None:
-    client, recorder = CountingEmbeddingClient(), Recorder()
-    with pytest.raises(SofiasMemoryError) as excinfo:
-        await service(client, recorder).recall(request(**overrides))
-    assert excinfo.value.code.value == "INVALID_REQUEST"
-    assert excinfo.value.status_code == 422
-    assert excinfo.value.details["field"] == field
-    assert client.calls == [] and recorder.opened == 0
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
-"""Public schemas for Contextual Recall (SM-CTX-006, Contract v1 Contextual
-Project Memory SS 37-53, handoff 14).
+"""Public schemas for Contextual Recall (SM-CTX-006/007, Contract v1 Contextual
+Project Memory SS 37-53, handoffs 14 and 15).
 
 ``POST /api/v1/context/recall`` returns a bounded, structured
 ``ProjectContextBundle`` -- never a generated answer. Request fields follow
@@ -12,19 +12,25 @@ schema validators, so the shared validation handler returns
 
 Every returned item carries an explicit ``result_class`` (Contract SS 50) so a
 consumer never infers current/historical from text. Requested limits are
-clamped server-side to hard maximums (Contract SS 53); the Contract's limit
-names are kept even for sections SM-CTX-006 never populates.
+clamped server-side to hard maximums (Contract SS 53). SM-CTX-007 adds the
+``explain``/``history`` intents, historical checkpoints and explicit-dataset
+Knowledge references (structured identities, never chunk text).
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import field_validator as pydantic_field_validator
 
-from sofias_memory.domain import DEFAULT_CONTEXT_KEY, normalize_cognitive_memory_recall_query
+from sofias_memory.domain import (
+    DEFAULT_CONTEXT_KEY,
+    SupportMode,
+    normalize_cognitive_memory_recall_query,
+)
 from sofias_memory.schemas.context_checkpoints import ContextCheckpointResult
 from sofias_memory.schemas.contextual_evidence import EvidenceResult
 from sofias_memory.schemas.episodes import ContextKey, ContextualScope, EpisodeResult
@@ -46,10 +52,14 @@ CONTEXT_RECALL_MAX_EVIDENCE = 100
 configuration/Architecture, not to the Contract). Memories/Episodes reuse the
 existing Cognitive Recall/Episode search ceilings (50)."""
 
+CONTEXT_RECALL_MAX_DATASETS = 16
+"""Hard maximum of explicitly selected datasets in one request (bounded work;
+more is a 422, never silently dropped)."""
+
 
 class ContextRecallIntent(StrEnum):
-    """Contract v1 SS 40. SM-CTX-006 implements ``resume`` and ``context``;
-    ``explain``/``history`` are rejected explicitly until SM-CTX-007."""
+    """Contract v1 SS 40, all four implemented (``explain``/``history`` since
+    SM-CTX-007). Intent selects the sources deterministically (no LLM router)."""
 
     RESUME = "resume"
     EXPLAIN = "explain"
@@ -73,6 +83,9 @@ class ContextRecallSource(StrEnum):
 
     MEMORIES = "memories"
     EPISODES = "episodes"
+    KNOWLEDGE = "knowledge"
+    """Semantic (vector) Knowledge retrieval did not run; lexical-only
+    references may still be returned (handoff 15 SS 68/69/135)."""
 
 
 class ContextRecallLimits(BaseModel):
@@ -95,8 +108,8 @@ class ContextRecallLimits(BaseModel):
         default=CONTEXT_RECALL_DEFAULT_HISTORICAL_CHECKPOINTS,
         ge=1,
         description=(
-            "historical_checkpoints cap; server maximum "
-            f"{CONTEXT_RECALL_MAX_HISTORICAL_CHECKPOINTS}. That section is not populated yet."
+            "historical_checkpoints cap (intent history); server maximum "
+            f"{CONTEXT_RECALL_MAX_HISTORICAL_CHECKPOINTS}."
         ),
     )
     knowledge: int = Field(
@@ -104,7 +117,7 @@ class ContextRecallLimits(BaseModel):
         ge=1,
         description=(
             f"knowledge_references cap; server maximum {CONTEXT_RECALL_MAX_KNOWLEDGE}. "
-            "That section is not populated yet."
+            "Only used when datasets are explicitly selected."
         ),
     )
     evidence: int = Field(
@@ -139,21 +152,27 @@ class ContextRecallRequest(BaseModel):
     )
     intent: ContextRecallIntent = Field(
         description=(
-            "resume | context. explain and history are part of Contract v1 but are rejected "
-            "with 422 INVALID_REQUEST until they are implemented."
+            "resume (current continuity) | context (relevant present context) | explain "
+            "(explicit Evidence-driven support trace, never inferred causality) | history "
+            "(chronological evolution: historical checkpoints and Episodes)."
         )
     )
     query: str = Field(
         description=(
             "Required, 1..8192 Unicode characters after normalization. Used for semantic "
-            "selection of Cognitive Memory and Episodes; never answered by an LLM."
+            "selection of Cognitive Memory, Episodes and (with explicit datasets) Knowledge; "
+            "never answered by an LLM."
         )
     )
     datasets: list[str] = Field(
         default_factory=list,
+        max_length=CONTEXT_RECALL_MAX_DATASETS,
         description=(
-            "Reserved for Knowledge Memory integration. Absent or empty is accepted; a "
-            "non-empty list is rejected with 422 INVALID_REQUEST (never ignored)."
+            "Explicit Knowledge Memory dataset slugs. Absent or empty means no Knowledge "
+            "retrieval at all (never an implicit 'main', never inferred from scope). Every "
+            "listed dataset must exist and be ACTIVE, otherwise 422 INVALID_REQUEST "
+            f"(never ignored). Blank slugs are rejected, duplicates collapsed; at most "
+            f"{CONTEXT_RECALL_MAX_DATASETS}."
         ),
     )
     include_evidence: bool = Field(
@@ -171,6 +190,18 @@ class ContextRecallRequest(BaseModel):
     def _normalize_query(cls, value: str) -> str:
         return normalize_cognitive_memory_recall_query(value)
 
+    @pydantic_field_validator("datasets")
+    @classmethod
+    def _normalize_datasets(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            slug = value.strip()
+            if not slug:
+                raise ValueError("datasets entries must be non-blank dataset slugs")
+            if slug not in normalized:
+                normalized.append(slug)
+        return normalized
+
 
 class ContextRecallCheckpoint(ContextCheckpointResult):
     """The current ContextCheckpoint of the Context Stream. Statements whose
@@ -181,7 +212,9 @@ class ContextRecallCheckpoint(ContextCheckpointResult):
 
 
 class ContextRecallHistoricalCheckpoint(ContextCheckpointResult):
-    """Reserved for SM-CTX-007 ``history``; never populated by SM-CTX-006."""
+    """A SUPERSEDED or INVALIDATED revision of the requested Context Stream
+    (intent ``history``), with its own remaining statements and their current
+    Evidence availability. Never current truth; never a FORGOTTEN tombstone."""
 
     result_class: Literal["historical_checkpoint"] = "historical_checkpoint"
 
@@ -202,7 +235,8 @@ class ContextRecallMemory(BaseModel):
 
 
 class ContextRecallEpisode(BaseModel):
-    """An ACTIVE Episode: historical experience, never current truth."""
+    """Historical experience, never current truth: ACTIVE Episodes, plus
+    INVALIDATED ones (explicit ``lifecycle``) for intent ``history`` only."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -216,11 +250,72 @@ class ContextRecallEpisode(BaseModel):
     )
 
 
+class ContextRecallKnowledgeReference(BaseModel):
+    """A Knowledge Memory reference of an explicitly selected, ACTIVE dataset
+    (handoff 15 SS 54/62/65/114-118). Identities only -- never chunk text, a
+    URL or a summary. Ranks/relevance compare only inside
+    ``knowledge_references``; a reference is never Evidence by itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_class: Literal["knowledge_reference"] = "knowledge_reference"
+    dataset_id: UUID
+    dataset_slug: str
+    source_id: UUID
+    document_id: UUID | None = Field(
+        description="null only for an Evidence-backed reference to a whole Source."
+    )
+    chunk_id: UUID | None = Field(
+        description="null only for an Evidence-backed reference to a Source or Document."
+    )
+    rank: int | None = Field(
+        description=(
+            "1-based position in this request's Knowledge retrieval (vector + lexical rank "
+            "fusion, or lexical only when degraded); null when not retrieved."
+        )
+    )
+    relevance: float | None = Field(
+        description=(
+            "Local reciprocal-rank-fusion score of the retrieval, comparable only inside "
+            "knowledge_references; null when not retrieved (never fabricated)."
+        )
+    )
+    evidence_backed: bool = Field(
+        description=(
+            "true when a returned contextual resource explicitly declares this Knowledge "
+            "resource as Evidence (direct grounding). A retrieval hit alone is never Evidence."
+        )
+    )
+
+
+class ContextRecallEvidenceOwner(BaseModel):
+    """One persisted explicit Evidence link: ``owner`` declares this Evidence in
+    its support with ``support_mode`` (Contract SS 48/49 amendment R2). Never
+    inferred from chronology, lineage, provenance, similarity or ranking."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_type: Literal["context_statement", "episode"]
+    owner_id: UUID
+    support_mode: SupportMode
+
+
 class ContextRecallEvidence(EvidenceResult):
-    """One canonical Evidence identity referenced by a returned resource, with
-    its current availability. Never source content."""
+    """One canonical Evidence identity with its current availability and the
+    owners whose persisted support links declare it. Never source content."""
 
     result_class: Literal["evidence"] = "evidence"
+    owners: list[ContextRecallEvidenceOwner] = Field(
+        default_factory=list,
+        description=(
+            "Owners (context_statement or episode) whose persisted support explicitly links "
+            "this Evidence, each with its own support_mode; ordered by (owner_type, owner_id), "
+            "de-duplicated. For intent explain this includes Episodes reached by the bounded "
+            "Evidence traversal even when they are not returned in episodes[] (their identity "
+            "only, never their payload). Bounded: an internal owner-link cap applies and any "
+            "truncation of the reachable trace is signalled with PARTIAL_CONTEXT."
+        ),
+    )
 
 
 class ProjectContextBundle(BaseModel):
@@ -241,16 +336,25 @@ class ProjectContextBundle(BaseModel):
     episodes: list[ContextRecallEpisode]
     historical_checkpoints: list[ContextRecallHistoricalCheckpoint] = Field(
         default_factory=list,
-        max_length=0,
-        description="Reserved for the history intent (SM-CTX-007); always empty.",
+        description=(
+            "intent history only: SUPERSEDED/INVALIDATED revisions of the requested stream, "
+            "revision DESC. Always empty for resume, context and explain."
+        ),
     )
-    knowledge_references: list[dict[str, Any]] = Field(
+    knowledge_references: list[ContextRecallKnowledgeReference] = Field(
         default_factory=list,
-        max_length=0,
-        description="Reserved for Knowledge Memory integration (SM-CTX-007); always empty.",
+        description=(
+            "Only when datasets are explicitly selected: retrieval hits (rank order) then "
+            "Evidence-only references (identity order). Empty without datasets."
+        ),
     )
     evidence: list[ContextRecallEvidence] = Field(
-        description="Aggregated Evidence when include_evidence=true; otherwise empty."
+        description=(
+            "include_evidence=true: de-duplicated Evidence identities with availability and "
+            "owners -- for explain the bounded causal trace from the returned resources "
+            "(at most limits.evidence identities). include_evidence=false: empty (support refs "
+            "inside returned resources are always kept)."
+        )
     )
     warnings: list[ContextRecallWarning]
     degraded_sources: list[ContextRecallSource]

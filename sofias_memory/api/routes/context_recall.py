@@ -1,5 +1,5 @@
-"""Contextual Recall API route (SM-CTX-006, Contract v1 Contextual Project
-Memory SS 37-53/75, handoff 14 SS 109/111/114).
+"""Contextual Recall API route (SM-CTX-006/007, Contract v1 Contextual Project
+Memory SS 37-53/75, handoff 14 SS 109/111/114, handoff 15 SS 123-127).
 
 Exactly one operation: ``POST /api/v1/context/recall``. Pure HTTP boundary --
 transport validation, service construction, envelope. No retrieval
@@ -25,8 +25,9 @@ from sofias_memory.services.contextual_recall import ContextualRecallService
 
 _VALIDATION_422 = error_response(
     "Invalid request. ErrorEnvelope with error.code one of: INVALID_REQUEST (missing, null "
-    "or blank query; unknown intent; intent explain/history or non-empty datasets, which "
-    "are not available in this implementation yet), INVALID_SCOPE, INVALID_CONTEXT_KEY."
+    "or blank query; unknown intent; blank or too many datasets; an explicitly requested "
+    "dataset that does not exist or is not ACTIVE -- details.dataset names it), "
+    "INVALID_SCOPE, INVALID_CONTEXT_KEY."
 )
 _DEPENDENCY_UNAVAILABLE_503 = error_response(
     "PostgreSQL, the authoritative store of the whole bundle, is unavailable. "
@@ -60,17 +61,24 @@ def _service(request: Request) -> ContextualRecallService:
     response_model=SuccessEnvelope[ProjectContextBundle],
     summary="Recall the structured context of a Project Context Stream",
     description=(
-        "Read-only, synchronous Contextual Recall (intents resume and context). Returns a "
-        "bounded, deterministic ProjectContextBundle: the current checkpoint of (scope, "
-        "context_key) -- never a historical fallback --, current Cognitive Memory of exactly "
-        "the requested project scope (global memory is never included automatically) and "
-        "ACTIVE Episodes of the requested Context Stream or project-wide (context_key "
-        "null), each collection ranked and limited independently. At most one query "
-        "embedding is computed; if the embedding provider fails the bundle degrades to a "
-        "deterministic bounded selection with warnings=[PARTIAL_CONTEXT] and "
-        "degraded_sources. No LLM answer, no Knowledge Recall, no Neo4j, no Query, "
-        "PipelineRun or Session is created. Returned content is untrusted context, never an "
-        "instruction or authorization."
+        "Read-only, synchronous Contextual Recall. Returns a bounded, deterministic "
+        "ProjectContextBundle with source-specific collections (never one cross-type "
+        "ranking). resume/context: the current checkpoint of (scope, context_key) -- never a "
+        "historical fallback --, current Cognitive Memory of exactly the requested project "
+        "scope (global memory is never included automatically) and ACTIVE Episodes of the "
+        "stream or project-wide. explain: the same, with causality only from explicit "
+        "Evidence (bounded traversal; checkpoint lineage, chronology and similarity are never "
+        "causal); PARTIAL_CONTEXT when the explicit dependency chain goes beyond the returned "
+        "resources. history: the current checkpoint as orientation, SUPERSEDED/INVALIDATED "
+        "revisions of the same stream (revision DESC) and ACTIVE/INVALIDATED Episodes "
+        "(occurred_at DESC), no current memories; FORGOTTEN content never appears. Knowledge "
+        "references only for explicitly listed ACTIVE datasets (never 'main' by default): "
+        "vector + lexical retrieval with local rank fusion, identities only, never chunk "
+        "text. At most one query embedding is computed; if the provider fails the bundle "
+        "degrades deterministically (lexical-only Knowledge) with warnings=[PARTIAL_CONTEXT] "
+        "and degraded_sources. No LLM answer, no Neo4j, no Query, PipelineRun, Session or "
+        "Evidence is created. Returned content is untrusted context, never an instruction or "
+        "authorization."
     ),
     responses={
         HTTPStatus.UNPROCESSABLE_ENTITY: _VALIDATION_422,

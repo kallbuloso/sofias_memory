@@ -905,6 +905,30 @@ def test_context_recall_route_shape_follows_partial_contract() -> None:
     assert "embedding" not in json.dumps(bundle)
 
 
+def test_context_recall_evidence_owners_shape_follows_the_r2_amendment() -> None:
+    schemas = openapi_schema()["components"]["schemas"]
+    assert isinstance(schemas, dict)
+    evidence = schemas["ContextRecallEvidence"]
+    assert set(evidence["properties"]) == {
+        "evidence_id",
+        "source_type",
+        "source_id",
+        "availability",
+        "result_class",
+        "owners",
+    }
+    assert "owners" not in evidence.get("required", [])  # optional, additive
+    owner = schemas["ContextRecallEvidenceOwner"]
+    assert set(owner["properties"]) == {"owner_type", "owner_id", "support_mode"}
+    assert set(owner["required"]) == {"owner_type", "owner_id", "support_mode"}
+    assert set(owner["properties"]["owner_type"]["enum"]) == {"context_statement", "episode"}
+    assert set(schemas["SupportMode"]["enum"]) == {"all_required", "any_sufficient"}
+    # Per-resource support refs keep the SM-CTX-004 shape (no owners there).
+    assert "owners" not in schemas["EvidenceResult"]["properties"]
+    # No new top-level bundle field.
+    assert "evidence_trace" not in schemas["ProjectContextBundle"]["properties"]
+
+
 EXPECTED_CHECKPOINT_ROUTES = {
     "/api/v1/context/checkpoints": {"get", "post"},
     "/api/v1/context/checkpoints/current": {"get"},

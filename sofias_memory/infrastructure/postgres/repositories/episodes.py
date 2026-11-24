@@ -16,7 +16,7 @@ from uuid import UUID
 from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sofias_memory.domain import EpisodeKind, EpisodeLifecycle
+from sofias_memory.domain import EpisodeKind, EpisodeLifecycle, SupportMode
 from sofias_memory.infrastructure.postgres.models import Episode, EpisodeProvenance
 
 
@@ -51,6 +51,27 @@ def _contextual_eligibility(scope: str, context_key: str) -> ColumnElement[bool]
 
     return and_(
         Episode.lifecycle == EpisodeLifecycle.ACTIVE,
+        Episode.scope == scope,
+        or_(Episode.context_key == context_key, Episode.context_key.is_(None)),
+    )
+
+
+HISTORICAL_EPISODE_LIFECYCLES: tuple[EpisodeLifecycle, ...] = (
+    EpisodeLifecycle.ACTIVE,
+    EpisodeLifecycle.INVALIDATED,
+)
+"""Episodes whose semantic content still exists (SM-CTX-007 ``history``,
+handoff 15 SS 35-37/90). FORGOTTEN is a scrubbed tombstone and never matches."""
+
+
+def _historical_eligibility(scope: str, context_key: str) -> ColumnElement[bool]:
+    """Same Context Stream boundary as :func:`_contextual_eligibility`
+    (exact scope; requested ``context_key`` or project-wide), but ACTIVE *or*
+    INVALIDATED -- the explicitly historical intent may show invalidated
+    experience with its lifecycle (handoff 15 SS 35/36/38)."""
+
+    return and_(
+        Episode.lifecycle.in_(HISTORICAL_EPISODE_LIFECYCLES),
         Episode.scope == scope,
         or_(Episode.context_key == context_key, Episode.context_key.is_(None)),
     )
@@ -173,6 +194,64 @@ class EpisodeRepository:
         )
         result = await self._session.execute(statement)
         return [EpisodeRow(episode=episode, provenance=prov) for episode, prov in result.all()]
+
+    async def historical_semantic_search(
+        self,
+        *,
+        scope: str,
+        context_key: str,
+        query_embedding: Sequence[float],
+        limit: int,
+    ) -> list[EpisodeSemanticHit]:
+        """``history`` candidate selection (handoff 15 SS 40/137): exact
+        pgvector cosine over ACTIVE and INVALIDATED Episodes of the Context
+        Stream (or project-wide). Order: relevance DESC, occurred_at DESC, id
+        ASC; the service re-orders the selection chronologically."""
+
+        relevance = (1 - Episode.embedding.cosine_distance(list(query_embedding))).label(
+            "relevance"
+        )
+        statement = (
+            select(Episode, EpisodeProvenance, relevance)
+            .join(EpisodeProvenance, EpisodeProvenance.episode_id == Episode.id)
+            .where(_historical_eligibility(scope, context_key), Episode.embedding.is_not(None))
+            .order_by(relevance.desc(), Episode.occurred_at.desc(), Episode.id.asc())
+            .limit(limit)
+        )
+        result = await self._session.execute(statement)
+        return [
+            EpisodeSemanticHit(episode=episode, provenance=prov, relevance=float(value))
+            for episode, prov, value in result.all()
+        ]
+
+    async def list_recent_historical(
+        self, *, scope: str, context_key: str, limit: int
+    ) -> list[EpisodeRow]:
+        """Deterministic chronological ``history`` primitive (handoff 15
+        SS 41/106): ACTIVE and INVALIDATED, ``occurred_at DESC, id ASC``, no
+        embedding and no relevance."""
+
+        statement = (
+            select(Episode, EpisodeProvenance)
+            .join(EpisodeProvenance, EpisodeProvenance.episode_id == Episode.id)
+            .where(_historical_eligibility(scope, context_key))
+            .order_by(Episode.occurred_at.desc(), Episode.id.asc())
+            .limit(limit)
+        )
+        result = await self._session.execute(statement)
+        return [EpisodeRow(episode=episode, provenance=prov) for episode, prov in result.all()]
+
+    async def support_modes(self, episode_ids: Sequence[UUID]) -> dict[UUID, SupportMode | None]:
+        """Persisted ``support_mode`` of existing Episodes (no lock, no
+        content): the read-only Evidence trace of ``explain`` uses it to tell a
+        declared dependency from an independent assertion."""
+
+        if not episode_ids:
+            return {}
+        rows = await self._session.execute(
+            select(Episode.id, Episode.support_mode).where(Episode.id.in_(list(episode_ids)))
+        )
+        return {episode_id: mode for episode_id, mode in rows.all()}
 
     async def semantic_search(
         self,

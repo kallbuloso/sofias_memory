@@ -79,9 +79,17 @@ def test_query_is_normalized() -> None:
 
 @pytest.mark.parametrize("intent", ["resume", "context", "explain", "history"])
 def test_all_contract_intents_parse(intent: str) -> None:
-    # explain/history parse (they are Contract v1 values) and are rejected by
-    # the service's partial-contract gate, never silently treated as context.
+    # Every Contract v1 intent parses and is served (explain/history since SM-CTX-007).
     assert ContextRecallRequest.model_validate(body(intent=intent)).intent.value == intent
+
+
+def test_datasets_are_explicit_normalized_and_bounded() -> None:
+    request = ContextRecallRequest.model_validate(body(datasets=[" docs ", "docs", "arch"]))
+    assert request.datasets == ["docs", "arch"]  # trimmed, duplicates collapsed, order kept
+    assert ContextRecallRequest.model_validate(body()).datasets == []  # never an implicit main
+    for invalid in (["  "], [f"d{i}" for i in range(17)], "docs"):
+        with pytest.raises(ValidationError):
+            ContextRecallRequest.model_validate(body(datasets=invalid))
 
 
 def test_unknown_intent_and_unknown_fields_are_rejected() -> None:

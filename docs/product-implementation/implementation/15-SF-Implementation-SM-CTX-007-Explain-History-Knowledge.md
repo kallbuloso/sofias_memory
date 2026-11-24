@@ -374,7 +374,11 @@ owner
 
 Não basta retornar apenas um conjunto plano de IDs se isso destruir causalidade.
 
-A representação pública deve seguir o Contract aprovado.
+A representação pública deve seguir o Contract aprovado (`05` §48/§49, Amendment R2):
+cada item de `evidence[]` carrega `owners` (`owner_type`, `owner_id`, `support_mode`),
+somente a partir de Evidence links persistidos. A cadeia
+`current_state(S) → Episode B → Episode A → Chunk K` é reconstruída por
+`B.owners ∋ S`, `A.owners ∋ B` e `K.owners ∋ A`, mesmo que A não esteja em `episodes[]`.
 
 Internamente, o modelo precisa preservar pelo menos:
 
@@ -457,11 +461,22 @@ Não sobrescrever silenciosamente a escolha do caller.
 
 Retornar causal Evidence trace bounded.
 
+Amendment R2: traversal breadth-first a partir dos recursos retornados; um Episode AVAILABLE
+alcançado por Evidence é expandido com seu próprio support mesmo fora de `episodes[]`
+(identidade apenas, nunca payload). Limites: 8 hops, 256 Episodes expandidos,
+`limits.evidence` identidades e cap interno de 256 owner links. Uma aresta só entra se seu
+owner já pertence ao trace mantido (subconjunto coerente). Qualquer truncamento, ou ciclo
+corrompido, emite `PARTIAL_CONTEXT`; a ausência de um Episode intermediário em `episodes[]`
+não emite `PARTIAL_CONTEXT` por si só.
+
 ---
 
 # 22. `explain` With `include_evidence=false`
 
 Não expandir conteúdo textual de Evidence. Preservar refs, support mode e availability dos recursos retornados conforme `05` §48; a flag false não apaga provenance nem Evidence refs. Traversal interno continua read-only e não cria public fields extras.
+
+Amendment R2: com `include_evidence=false` o contrato de saída anterior é preservado:
+`evidence[]` vazio, nenhum `owners` serializado e nenhum causal trace público.
 
 ---
 

@@ -23,9 +23,36 @@ COGNITIVE_MEMORY_CAPABILITIES: tuple[str, ...] = (
     "cognitive_memory.supersede",
     "cognitive_memory.forget",
 )
-"""SM-1004 HEAD: all five v0.7 Cognitive Memory capabilities are
-implemented -- the complete Feature Contract SS 11 list, in its frozen
-deterministic order. No capability beyond these five exists."""
+"""All five v0.7 Cognitive Memory capabilities -- the complete Feature
+Contract SS 11 list, in its frozen deterministic order."""
+
+CONTEXTUAL_PROJECT_MEMORY_CONTRACT_VERSION = "1"
+
+CONTEXTUAL_PROJECT_MEMORY_CAPABILITIES: tuple[str, ...] = (
+    "contextual_project_memory.episodes",
+    "contextual_project_memory.checkpoints",
+    "contextual_project_memory.recall",
+    "contextual_project_memory.explain",
+    "contextual_project_memory.history",
+)
+"""Exactly the five Contextual Project Memory v1 capabilities frozen by its
+Contract (SS 6.1), in their frozen order. Evidence and Forget propagation are
+integral guarantees of that contract, never separate capabilities. Each one
+corresponds to a working surface: Episodes, Context Checkpoints and the
+resume/context, explain and history intents of Contextual Recall."""
+
+CONTRACTS: dict[str, str] = {
+    "cognitive_memory": COGNITIVE_MEMORY_CONTRACT_VERSION,
+    "contextual_project_memory": CONTEXTUAL_PROJECT_MEMORY_CONTRACT_VERSION,
+}
+"""Per-feature contract major versions, in deterministic order. Additive:
+a feature contract is never removed or renamed implicitly."""
+
+CAPABILITIES: tuple[str, ...] = (
+    *COGNITIVE_MEMORY_CAPABILITIES,
+    *CONTEXTUAL_PROJECT_MEMORY_CAPABILITIES,
+)
+"""Every capability string advertised, grouped by feature in a frozen order."""
 
 
 class ApplicationInfo(BaseModel):
@@ -51,13 +78,16 @@ class ApplicationInfo(BaseModel):
         )
     )
     contracts: dict[str, str] = Field(
-        description="Per-feature contract major versions, e.g. {'cognitive_memory': '1'}."
+        description=(
+            "Per-feature contract major versions. A consumer negotiates a feature only "
+            "through its entry here, never from the application version."
+        )
     )
     capabilities: list[str] = Field(
         description=(
-            "Cognitive Memory capability strings actually implemented by this "
-            "HEAD -- never a health/readiness signal, never anticipates an "
-            "operation whose route/service does not exist yet."
+            "Capability strings of every advertised feature contract, each one "
+            "backed by an implemented, working surface -- never a health/readiness "
+            "signal and never an operation that does not exist."
         )
     )
 
@@ -84,8 +114,8 @@ async def info(request: Request) -> SuccessEnvelope[ApplicationInfo]:
             embedding_model=settings.embedding_model,
             embedding_dimensions=settings.embedding_dimensions,
             api_contract_version=API_CONTRACT_VERSION,
-            contracts={"cognitive_memory": COGNITIVE_MEMORY_CONTRACT_VERSION},
-            capabilities=list(COGNITIVE_MEMORY_CAPABILITIES),
+            contracts=dict(CONTRACTS),
+            capabilities=list(CAPABILITIES),
         ),
         meta=ResponseMeta(request_id=current_request_id()),
     )

@@ -39,6 +39,7 @@ Sofias Memory makes those concerns a dedicated infrastructure layer instead of a
 |---|---|---|
 | **Knowledge Memory** | Documents, files, URLs, extracted entities/relations, RAG, source-grounded answers | Dataset → Source → Document/Chunks → semantic + graph knowledge |
 | **Cognitive Memory** | Durable facts, preferences, persistent semantic context, temporal truth | First-class `MemoryItem` with provenance and lifecycle |
+| **Contextual Project Memory** | Project continuity: what happened, where the work is now, and why | `Episode` + `ContextCheckpoint` with explicit Evidence, and a structured Contextual Recall |
 
 They are intentionally separate. A cognitive fact does not need to pretend to be a document, and a document does not need to pretend to be a personal memory.
 
@@ -67,6 +68,15 @@ They are intentionally separate. A cognitive fact does not need to pretend to be
 - Forget one precise memory destructively while preserving only a minimal tombstone.
 - Use HMAC-keyed idempotency for safe replay of write operations.
 - Negotiate support through `/api/v1/info` capabilities instead of guessing from the application version.
+
+### Contextual Project Memory
+
+- Record **Episodes** — explicit, project-scoped historical experience (decisions, incidents, outcomes).
+- Keep one current **Context Checkpoint** per Context Stream `(project, context_key)`: objective, current state, decisions, pending work, blockers and next action, with monotonic revisions and stale-writer protection.
+- Declare explicit **Evidence** (`all_required` / `any_sufficient`) linking context to Cognitive Memory, Session entries, other Episodes or Knowledge — never inferred.
+- **Forget propagates** through explicit Evidence only: unsupported context is scrubbed and never resurrected, with no automatic fallback to old revisions.
+- **Contextual Recall** (`resume`, `context`, `explain`, `history`) returns a structured, bounded, read-only bundle — no LLM answer, Knowledge only from explicitly selected datasets.
+- Negotiate support through `contracts.contextual_project_memory` in `/api/v1/info`.
 
 ### Sessions, Skills, and Agent Profiles
 
@@ -108,10 +118,12 @@ flowchart LR
 
     API --> KM[Knowledge Memory]
     API --> CM[Cognitive Memory]
+    API --> CPM[Contextual Project Memory]
     API --> CTX[Sessions · Skills · Agent Profiles]
 
     KM --> PG[(PostgreSQL + pgvector)]
     CM --> PG
+    CPM --> PG
     CTX --> PG
 
     PG --> OUTBOX[graph_outbox]
@@ -126,6 +138,7 @@ flowchart LR
 - **PostgreSQL + pgvector is authoritative.** Durable business state, memory, provenance, runs, sessions, skills, agents, and cognitive memory live there.
 - **Neo4j is reconstructible.** It projects the knowledge graph and can be rebuilt from PostgreSQL.
 - **Cognitive Memory is PostgreSQL-only.** It has no Neo4j projection and no graph outbox.
+- **Contextual Project Memory is PostgreSQL-only.** Episodes, Context Checkpoints, Evidence and Contextual Recall read and write only PostgreSQL, never query Neo4j and never call an LLM. The service startup bootstrap still includes a configured Neo4j for every feature (see [`docs/api.md`](docs/api.md) §21.9).
 - **Source originals are durable.** Filesystem is the default backend; S3-compatible object storage is supported.
 - **Providers are replaceable.** LLM and embedding calls use OpenAI-compatible endpoints.
 - **Migrations are operationally safe.** The default serialized migration bootstrap automatically advances eligible schemas at startup and fails closed on ambiguous states.
@@ -268,6 +281,7 @@ Major API families include:
 - Skills
 - Agent profiles
 - Cognitive Memory
+- Contextual Project Memory (Episodes, Context Checkpoints, Contextual Recall)
 - Capability negotiation through `/api/v1/info`
 
 See [`docs/api.md`](docs/api.md) for semantic documentation.

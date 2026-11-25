@@ -2,6 +2,60 @@
 
 All notable, user-facing changes to Sofias Memory are documented in this file.
 
+## [Unreleased]
+
+Adds **Contextual Project Memory** (Contract v1), entirely additive to the
+existing API — nothing existing is removed, renamed, or changed in behavior.
+Not yet part of a tagged release.
+
+### Episodes, Context Checkpoints and Evidence
+
+- `Episode` (`/api/v1/episodes`): explicit, project-scoped historical
+  experience — create, get, list, invalidate, forget. Never current truth and
+  never extracted automatically.
+- `ContextCheckpoint` (`/api/v1/context/checkpoints`): the explicit current
+  state of a Context Stream `(scope, context_key)` — create, get, get current,
+  list, supersede, invalidate, forget. Exactly one ACTIVE checkpoint per
+  stream, monotonic revisions, stale writers rejected with
+  `409 CONTEXT_STATE_CONFLICT`.
+- Explicit Evidence `support` (`all_required` / `any_sufficient`) on Episodes
+  and checkpoint statements, referencing Session entries, Cognitive Memory,
+  Episodes or Knowledge Sources/Documents/Chunks; never inferred.
+- `Idempotency-Key` is required on every contextual mutation.
+
+### Forget propagation
+
+- A successful Cognitive, Episode or Knowledge Forget propagates through
+  explicit Evidence dependencies only: unsupported Episodes and statements are
+  scrubbed, a checkpoint that loses its `current_state` becomes `invalidated`
+  with no automatic fallback, and nothing is resurrected by restart or
+  re-cognify.
+
+### Contextual Recall
+
+- `POST /api/v1/context/recall` with intents `resume`, `context`, `explain`
+  and `history`: a structured, bounded, read-only `ProjectContextBundle` (no
+  LLM answer, no Query/Session/PipelineRun rows, no Neo4j). Knowledge only for
+  explicitly listed ACTIVE datasets; one embedding call per request with an
+  explicit degraded fallback; explain returns Evidence owners so causal chains
+  are reconstructable.
+
+### Compatibility negotiation
+
+- `GET /api/v1/info` adds `contracts.contextual_project_memory = "1"` and the
+  capabilities `contextual_project_memory.episodes`, `.checkpoints`, `.recall`,
+  `.explain` and `.history`. `api_contract_version` stays `"1"`;
+  `cognitive_memory` and its capabilities are unchanged.
+- Migrations `0019`–`0022` (additive; no backfill of existing data).
+
+### Known limitations
+
+- Contextual operations never use Neo4j, but the service startup bootstrap
+  (shared by every feature) still includes a configured Neo4j: if Neo4j is
+  unavailable at startup, all business routes, contextual ones included,
+  answer `503` until bootstrap succeeds. A Neo4j outage after startup does not
+  affect contextual operations.
+
 ## [0.7.0]
 
 Minor release adding **Native Cognitive Memory** (ADR-0016): a first-class,

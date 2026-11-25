@@ -207,9 +207,10 @@ class ContextualMemoryOperation(StrEnum):
 class ContextCheckpointLifecycle(StrEnum):
     """Contextual Project Memory ContextCheckpoint lifecycle (Contract v1 SS 26).
 
-    The full approved enum exists from SM-CTX-002 on. ``superseded`` is
-    schema readiness only: no SM-CTX-002 operation produces it (functional
-    supersession belongs to SM-CTX-003). ``forgotten`` is terminal."""
+    ``active`` is the single current checkpoint of a Context Stream;
+    ``superseded`` is a revision replaced through Supersede; ``invalidated``
+    is no longer current truth (explicitly, or after it lost its required
+    ``current_state`` support); ``forgotten`` is a terminal scrubbed tombstone."""
 
     ACTIVE = "active"
     SUPERSEDED = "superseded"
@@ -233,10 +234,10 @@ class ContextStatementType(StrEnum):
 
 
 class EvidenceSourceType(StrEnum):
-    """Contextual Evidence source types (Contract v1 SS 11.1, handoff 12 SS 9).
+    """Contextual Evidence source types (Contract v1 SS 11.1).
 
-    Exactly these six in v1. ``source`` means the Knowledge ``Source`` resource
-    (handoff 12 SS 10)."""
+    Exactly these six in v1. ``source`` means the Knowledge ``Source``
+    resource."""
 
     SESSION_ENTRY = "session_entry"
     MEMORY_ITEM = "memory_item"

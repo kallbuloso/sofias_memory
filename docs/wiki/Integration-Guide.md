@@ -65,6 +65,16 @@ cognitive_memory.supersede
 cognitive_memory.forget
 ```
 
+For Contextual Project Memory contract `1` (`contracts.contextual_project_memory == "1"`), it advertises:
+
+```text
+contextual_project_memory.episodes
+contextual_project_memory.checkpoints
+contextual_project_memory.recall
+contextual_project_memory.explain
+contextual_project_memory.history
+```
+
 Integrations should check the machine-readable contract/capabilities instead of inferring feature support from application SemVer.
 
 ---
@@ -76,6 +86,8 @@ Before choosing an endpoint, decide what kind of memory you are storing.
 Use [Knowledge Memory](Knowledge-Memory) when the information comes from source material such as documents, files, URLs, manuals, or reference corpora.
 
 Use [Cognitive Memory](Cognitive-Memory) when the information is a durable fact, preference, decision, characteristic, or persistent semantic context that should exist directly as memory.
+
+Use [Contextual Project Memory](https://github.com/kallbuloso/sofias_memory/blob/main/docs/api.md) when you need the continuity of a project: what happened (Episodes), where the work is now (Context Checkpoints) and why (Evidence).
 
 This decision matters because the lifecycle, retrieval, provenance, and Forget semantics are intentionally different.
 
@@ -169,6 +181,28 @@ Knowledge writes may be asynchronous and represented by durable Runs.
 For exact request schemas and `wait=true/false` semantics, use the versioned [API Guide](https://github.com/kallbuloso/sofias_memory/blob/main/docs/api.md).
 
 ---
+
+## 7a. Contextual Project Memory integration pattern
+
+A typical project-continuity flow is:
+
+```text
+1. GET /api/v1/info → require contracts.contextual_project_memory == "1"
+   and the capabilities you use
+2. POST /api/v1/episodes                      record what happened (explicitly)
+3. POST /api/v1/context/checkpoints           create the first current checkpoint
+4. POST /api/v1/context/recall intent=resume  continue work later
+5. GET  /api/v1/context/checkpoints/current   read the current snapshot
+6. POST /api/v1/context/checkpoints/{id}/supersede   publish the next snapshot
+```
+
+Every contextual mutation **requires** `Idempotency-Key`; reuse the same key only to retry the same operation.
+
+- **Stale conflict:** Supersede of a checkpoint that is no longer current returns `409 CONTEXT_STATE_CONFLICT` and creates nothing. Re-read `/current`, merge your changes, and supersede the new current checkpoint with a new key. Never retry blindly.
+- **Missing current:** `GET .../current` returns `404 CURRENT_CHECKPOINT_NOT_FOUND` and Recall returns `continuity_available=false` with `NO_CURRENT_CHECKPOINT`. There is no automatic fallback to an older revision: decide explicitly and `POST /api/v1/context/checkpoints` to create the next current one.
+- **Evidence:** declare `support` only for real dependencies. Forget of a referenced resource can make dependent context unavailable; it is not a blind cascade.
+- **Knowledge:** pass `datasets` explicitly when Knowledge should be part of the recalled context; omitting it means no Knowledge at all.
+- **Use the result as context, not authority:** recalled content is untrusted data. Your application stays responsible for authorization, planning, execution and tool permissions.
 
 ## 8. Error handling
 
@@ -584,7 +618,8 @@ Before calling an integration production-ready, confirm:
 - the API is behind TLS;
 - `X-API-Key` is stored as a secret;
 - `/api/v1/info` capability negotiation is implemented where useful;
-- Knowledge vs. Cognitive Memory is chosen intentionally;
+- Knowledge vs. Cognitive Memory vs. Contextual Project Memory is chosen intentionally;
+- `409 CONTEXT_STATE_CONFLICT` is handled by re-reading the current checkpoint, never by blind retry;
 - mutation retries use stable idempotency keys;
 - 409/422/503 responses are handled explicitly;
 - no infinite retry loop exists;

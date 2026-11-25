@@ -303,15 +303,16 @@ async def test_no_patch_put_delete_on_episodes(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
-async def test_info_does_not_advertise_contextual_contract_in_sm_ctx_001(
+async def test_info_advertises_the_episodes_capability_with_the_contextual_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The Episode routes are backed by ``contextual_project_memory.episodes``,
+    advertised only together with the complete contextual contract."""
+
     app, _ = build_app(monkeypatch)
     async with client(app) as http:
         response = await http.get("/api/v1/info", headers=HEADERS)
     assert response.status_code == 200
     data = response.json()["data"]
-    assert "contextual_project_memory" not in data.get("contracts", {})
-    assert not [
-        c for c in data.get("capabilities", []) if c.startswith("contextual_project_memory")
-    ]
+    assert data["contracts"]["contextual_project_memory"] == "1"
+    assert "contextual_project_memory.episodes" in data["capabilities"]

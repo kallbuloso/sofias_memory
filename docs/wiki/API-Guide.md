@@ -128,6 +128,16 @@ cognitive_memory.supersede
 cognitive_memory.forget
 ```
 
+For Contextual Project Memory v1 (`contracts.contextual_project_memory = "1"`), it advertises:
+
+```text
+contextual_project_memory.episodes
+contextual_project_memory.checkpoints
+contextual_project_memory.recall
+contextual_project_memory.explain
+contextual_project_memory.history
+```
+
 Use these machine-readable capabilities instead of inferring support from the application SemVer alone.
 
 ---
@@ -154,6 +164,9 @@ Sofias Memory deliberately exposes multiple domain families rather than one gene
 | Skills | `/api/v1/skills/**` | Versioned procedural memory and semantic Skill discovery |
 | Agents | `/api/v1/agents/**` | Durable Agent Profile management and explicit Skill/Session associations |
 | Cognitive Memory | `/api/v1/memories/**` | Typed durable facts/preferences with lifecycle and temporal truth |
+| Episodes | `/api/v1/episodes/**` | Explicit project-scoped historical experience |
+| Context Checkpoints | `/api/v1/context/checkpoints/**` | The explicit current state of a project Context Stream, with revisions |
+| Contextual Recall | `/api/v1/context/recall` | Read-only structured project context: resume, context, explain, history |
 
 Read [Knowledge Memory](Knowledge-Memory), [Cognitive Memory](Cognitive-Memory), [Sessions](Sessions), and [Skills & Agents](Skills-and-Agents) before choosing an endpoint family.
 
@@ -229,6 +242,10 @@ same key + different semantic request
 ```
 
 Idempotency does not mean semantic deduplication. Two identical facts created intentionally under different keys can still be distinct memories.
+
+### Contextual Project Memory mutations
+
+Every Episode and Context Checkpoint mutation (create, supersede, invalidate, forget) **requires** `Idempotency-Key`; a missing header is `422 INVALID_REQUEST`. Same key + same request replays the original result; same key + different request is `409 IDEMPOTENCY_CONFLICT`. Contextual Recall is read-only and takes no key.
 
 ### Session entries
 

@@ -48,7 +48,7 @@ class ContextStatementCreateRequest(BaseModel):
     support: SupportRequest | None = Field(
         default=None,
         description=(
-            "Optional statement-level Evidence support (SM-CTX-004). Omitted means no declared "
+            "Optional statement-level Evidence support. Omitted means no declared "
             "dependency. Never inherited on supersede."
         ),
     )
@@ -138,7 +138,8 @@ class ContextCheckpointInvalidateRequest(BaseModel):
 
 
 class ContextStatementResult(BaseModel):
-    """Public ContextStatement shape in SM-CTX-002 (support arrives in SM-CTX-004)."""
+    """Public ContextStatement shape: its text and, when declared, its explicit Evidence
+    support with current availability."""
 
     model_config = ConfigDict(extra="forbid")
 

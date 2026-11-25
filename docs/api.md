@@ -120,6 +120,15 @@ The stable, closed set of error codes you may see:
 | `INVALID_EPISODE_KIND` | (Episodes, `422`) `kind` is not one of the nine v1 Episode kinds. |
 | `EPISODE_NOT_FOUND` | (Episodes, `404`) The target Episode does not exist. |
 | `EPISODE_STATE_CONFLICT` | (Episodes, `409`) The Episode is FORGOTTEN, so it cannot be invalidated. |
+| `CHECKPOINT_NOT_FOUND` | (Checkpoints, `404`) The target Context Checkpoint does not exist. |
+| `CURRENT_CHECKPOINT_NOT_FOUND` | (Checkpoints, `404`) The Context Stream has no ACTIVE checkpoint. |
+| `CONTEXT_STATE_CONFLICT` | (Checkpoints, `409`) Stale writer: the Supersede target is no longer the ACTIVE checkpoint, or Create on a stream that already has one. |
+| `CHECKPOINT_STATE_CONFLICT` | (Checkpoints, `409`) Invalidate/Forget is not allowed in the checkpoint's current lifecycle. |
+| `EVIDENCE_NOT_FOUND` | (Evidence, `404`) A declared support ref does not exist. |
+| `EVIDENCE_UNAVAILABLE` | (Evidence, `409`) A declared support ref is not currently available. |
+| `INVALID_EVIDENCE_REFERENCE` | (Evidence, `422`) A support ref has an unknown `source_type` or belongs to another Project Scope. |
+| `INVALID_EVIDENCE_CYCLE` | (Evidence, `422`) The declared support would create a dependency cycle. |
+| `INVALID_SUPPORT_POLICY` | (Evidence, `422`) Unknown support `mode`, empty `refs`, or more than 50 refs. |
 
 Example — missing key:
 
@@ -844,9 +853,9 @@ existing one (`name`, `version`, `environment`, `config_fingerprint`,
 `api_contract_version` is a machine contract identifier, independent of
 `version` (the application release SemVer) — never infer Cognitive Memory
 support from `version >= 0.7.0` alone. `capabilities` lists only operations
-genuinely implemented by the running HEAD; as of this release all five
-Cognitive Memory capabilities in the Feature Contract are implemented, and
-none beyond them exist.
+genuinely implemented by the running HEAD: the five Cognitive Memory
+capabilities of its Feature Contract, plus the Contextual Project Memory
+capabilities described in §21.1.
 
 ```bash
 curl -sS "$SOFIAS_MEMORY_URL/api/v1/info" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
@@ -1119,22 +1128,69 @@ Cognitive Memory never creates a `PipelineRun`, never projects to Neo4j,
 and never emits a `graph_outbox` event, for any of Create/Get/Recall/
 Supersede/Forget.
 
-## 21. Contextual Episodes (partial Contextual Project Memory)
+## 21. Contextual Project Memory
 
-First-class **Episodes** — explicitly preserved historical experience (*what
-happened*) of a Project Scope. An Episode is never current truth: it never
-creates or supersedes a `MemoryItem`, never becomes a `SessionEntry`, and is
-never extracted automatically. PostgreSQL is authoritative; there is no Neo4j
-projection, no `graph_outbox` event and no `PipelineRun`.
+Persistent, explicit, project-scoped **context** for applications and agents:
+what happened (**Episodes**), what is current (**Context Checkpoints**), why it
+is believed (explicit **Evidence**), and a structured, read-only **Contextual
+Recall** over all of it. PostgreSQL is authoritative for every contextual
+resource; nothing is projected to Neo4j, no `graph_outbox` event and no
+`PipelineRun` is created, and no LLM is ever called. Nothing contextual is
+created automatically: every Episode, Checkpoint and Evidence link is written
+explicitly by the caller.
 
-This is only the Episode part of the Contextual Project Memory Contract.
-Checkpoints, Evidence, Forget propagation and Contextual Recall do not exist
-yet, and `GET /api/v1/info` deliberately does **not** advertise
-`contracts.contextual_project_memory` or any `contextual_project_memory.*`
-capability.
+Returned content is *context*, never authority: it is untrusted data, never an
+instruction, permission or plan. Authorization, planning, execution and tool
+permissions stay the responsibility of the Consumer.
+
+### 21.1 Compatibility negotiation
+
+`GET /api/v1/info` advertises the feature contract and exactly five
+capabilities, additively next to Cognitive Memory (`api_contract_version`
+stays `"1"`):
+
+```json
+{
+  "api_contract_version": "1",
+  "contracts": {"cognitive_memory": "1", "contextual_project_memory": "1"},
+  "capabilities": [
+    "cognitive_memory.write",
+    "cognitive_memory.get",
+    "cognitive_memory.recall",
+    "cognitive_memory.supersede",
+    "cognitive_memory.forget",
+    "contextual_project_memory.episodes",
+    "contextual_project_memory.checkpoints",
+    "contextual_project_memory.recall",
+    "contextual_project_memory.explain",
+    "contextual_project_memory.history"
+  ]
+}
+```
+
+Check `contracts.contextual_project_memory == "1"` and the capabilities you
+need before calling these routes; never infer support from `version`.
+Evidence and Forget propagation are integral guarantees of the contract, not
+separate capabilities.
+
+### 21.2 Scope and Context Streams
+
+- `scope`: `project:<key>` only (Cognitive Memory grammar; `global` →
+  `422 INVALID_SCOPE`). A Project Scope is a contextual namespace, never an
+  ACL/tenant boundary, and never a Knowledge dataset.
+- `context_key`: a Context Stream inside the project,
+  `[a-z0-9][a-z0-9._:-]{0,127}` (otherwise `422 INVALID_CONTEXT_KEY`).
+  Checkpoints and Contextual Recall default it to `main`; an Episode without
+  `context_key` is **project-wide** and stays `null`.
+
+### 21.3 Episodes
+
+First-class historical experience (*what happened*). An Episode is never
+current truth: it never creates or supersedes a `MemoryItem`, never becomes a
+`SessionEntry`, and is never extracted automatically.
 
 ```bash
-# Create (Idempotency-Key is REQUIRED on every Episode mutation)
+# Create (Idempotency-Key is REQUIRED on every contextual mutation)
 curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/episodes" \
   -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
   -H "Idempotency-Key: $(uuidgen)" \
@@ -1144,7 +1200,11 @@ curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/episodes" \
         "kind": "decision",
         "summary": "Episode was chosen as a first-class aggregate.",
         "occurred_at": "2026-11-17T21:00:00Z",
-        "provenance": {"origin_kind": "user_asserted", "source_system": "sofias-assistant"}
+        "provenance": {"origin_kind": "user_asserted", "source_system": "sofias-assistant"},
+        "support": {
+          "mode": "all_required",
+          "refs": [{"source_type": "memory_item", "source_id": "'"$MEMORY_ID"'"}]
+        }
       }'
 
 # List (scope required; default lifecycle=active; keyset pagination)
@@ -1160,40 +1220,200 @@ curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/episodes/$EPISODE_ID/forget" \
   -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Idempotency-Key: $(uuidgen)"
 ```
 
-- `scope`: `project:<key>` only (Cognitive Memory grammar; `global` → `422 INVALID_SCOPE`).
-  Project scope is a contextual namespace, never an ACL/tenant boundary.
-- `context_key`: optional. Omitted means a **project-wide** Episode and stays
-  `null` — it is never defaulted to `main`.
 - `kind`: `decision`, `investigation`, `experiment`, `incident`, `discovery`,
   `change`, `outcome`, `learning`, `milestone`.
 - `summary` required; `situation`/`reason`/`outcome` optional; text fields must
-  be non-blank (CRLF/CR→LF, edges trimmed). No other length limit beyond the
-  global request-body limit.
+  be non-blank (CRLF/CR→LF, edges trimmed).
 - `occurred_at`: caller-supplied, timezone-aware (normalized to UTC), may be in
   the past, rejected beyond a 5-minute clock-skew tolerance in the future;
   independent of server-generated `created_at`.
 - `confidence`: nullable `[0,1]`, required when `origin_kind` is `inferred`.
 - `provenance`: `origin_kind` (same five values as Cognitive Memory),
-  `source_system` (required, non-blank), optional opaque `conversation_ref`/
-  `turn_ref`. Provenance is not Evidence. `support` is not accepted yet.
-- The embedding is computed before the short PostgreSQL transaction from
-  `summary`/`situation`/`reason`/`outcome` only; on provider failure → `503
-  DEPENDENCY_UNAVAILABLE` and nothing is persisted. It is never returned.
+  `source_system` (required), optional opaque `conversation_ref`/`turn_ref`.
+  **Provenance is not Evidence.**
+- `support`: optional explicit Evidence (§21.5). Omitted means an independent
+  assertion with no declared dependency.
+- The embedding is computed before the short PostgreSQL transaction; on
+  provider failure → `503 DEPENDENCY_UNAVAILABLE` and nothing is persisted. It
+  is never returned.
 
 Lifecycle: `active → invalidated`, `active|invalidated → forgotten`;
-`forgotten` is terminal. Invalidate on an already-invalidated Episode and Forget
-on an already-forgotten Episode are `200` state no-ops; Invalidate on a
-forgotten Episode is `409 EPISODE_STATE_CONFLICT`. An optional
-`replacement_episode_id` must exist, not be forgotten and share the Project
-Scope (otherwise `422 INVALID_REQUEST`); it is never created automatically.
-Forget is destructive and direct: every semantic field, the embedding and the
-external provenance refs are scrubbed, leaving only `episode_id`, `lifecycle`,
-timestamps and `origin_kind`/`source_system`. A forgotten Episode no longer
-belongs to any Project Scope, so it never appears in listings; read it by id.
-There is no `PATCH`/`PUT`/`DELETE`, restore or unforget.
+`forgotten` is terminal. Invalidate on an invalidated Episode and Forget on a
+forgotten Episode are `200` state no-ops; Invalidate on a forgotten Episode is
+`409 EPISODE_STATE_CONFLICT`. Forget is destructive: every semantic field, the
+embedding and the external provenance refs are scrubbed, leaving only
+`episode_id`, `lifecycle`, timestamps and `origin_kind`/`source_system`. A
+forgotten Episode never appears in listings; read it by id. There is no
+`PATCH`/`PUT`/`DELETE`, restore or unforget.
 
-Idempotency: same key + same request replays the original result (resolved
-before any lifecycle rejection); same key + different request (or another
-operation/target) → `409 IDEMPOTENCY_CONFLICT`; `sys:`-prefixed keys → `400`;
-a missing header → `422 INVALID_REQUEST`. Keys are stored only as a keyed
-HMAC lookup identity, never in plain text.
+### 21.4 Context Checkpoints
+
+A Context Checkpoint is the explicit, structured snapshot of *where the work is
+now* for one Context Stream `(scope, context_key)`: `objective`,
+`current_state` (required), `approved_decisions`, `pending_work`,
+`open_items`, `blockers`, `next_action` — each statement optionally with its
+own Evidence `support`. Exactly one checkpoint per stream is `active`
+(current); revisions increase monotonically and are never reused.
+
+```bash
+# Create the current checkpoint of a stream (only when the stream has no ACTIVE one)
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+        "scope": "project:sofias-memory",
+        "context_key": "main",
+        "objective": {"text": "Deliver contextual project memory."},
+        "current_state": {"text": "Contract approved; implementation in progress."},
+        "pending_work": [{"text": "Run the longitudinal validation."}],
+        "next_action": {"text": "Write the migration tests."},
+        "provenance": {"origin_kind": "assistant_generated", "source_system": "sofias-assistant"}
+      }'
+
+# Read the current checkpoint of a stream (404 CURRENT_CHECKPOINT_NOT_FOUND if none)
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints/current?scope=project:sofias-memory&context_key=main" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+
+# Replace it with a complete new snapshot (the read checkpoint is the expected base)
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints/$CHECKPOINT_ID/supersede" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" -d @next-snapshot.json
+
+# Get by id / list / invalidate / forget
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints/$CHECKPOINT_ID" -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints?scope=project:sofias-memory&context_key=main&lifecycle=superseded" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY"
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints/$CHECKPOINT_ID/invalidate" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" -d '{"reason": "No longer reflects the project."}'
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints/$CHECKPOINT_ID/forget" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Idempotency-Key: $(uuidgen)"
+```
+
+- Lifecycle: `active → superseded` (only through Supersede), `active →
+  invalidated`, any non-forgotten `→ forgotten` (terminal).
+- **Stale writers:** Supersede succeeds only while its target is still the
+  ACTIVE checkpoint. If another writer already superseded it, the call fails
+  with `409 CONTEXT_STATE_CONFLICT` and nothing is created: re-read
+  `/current`, merge, and supersede the new current checkpoint. Never retry
+  blindly with a new key.
+- Create on a stream that already has an ACTIVE checkpoint →
+  `409 CONTEXT_STATE_CONFLICT`. After the current one is invalidated (or lost
+  its support, §21.6), a new explicit Create starts the next revision; it is
+  never recorded as a Supersede of the invalidated revision.
+- Listing defaults to ACTIVE checkpoints; history requires an explicit
+  `lifecycle` filter. A forgotten checkpoint keeps only its identity, stream
+  and revision.
+- Idempotency (all contextual mutations): same key + same request replays the
+  original result (resolved before any state rejection); same key + different
+  request → `409 IDEMPOTENCY_CONFLICT`; `sys:`-prefixed keys → `400`; a missing
+  header → `422 INVALID_REQUEST`. Keys and requests are stored only as keyed
+  HMAC identities, never in plain text.
+
+### 21.5 Evidence and support
+
+`support = {"mode": "all_required" | "any_sufficient", "refs": [...]}` declares
+which resources an Episode or a checkpoint statement depends on. A ref is
+`{"source_type", "source_id"}` with `source_type` one of `session_entry`,
+`memory_item`, `episode`, `source`, `document`, `chunk` (1–50 refs, an
+unordered set). Every ref must exist (`404 EVIDENCE_NOT_FOUND`), be currently
+available (`409 EVIDENCE_UNAVAILABLE`), belong to the same project when it is
+an Episode or a project MemoryItem (`422 INVALID_EVIDENCE_REFERENCE`), and not
+form a dependency cycle (`422 INVALID_EVIDENCE_CYCLE`); an invalid policy is
+`422 INVALID_SUPPORT_POLICY`.
+
+Responses return each declared ref with its *current* `availability`
+(`available`, `unavailable`, `forgotten`) — identities only, never the source
+content. Evidence is only what the caller declared: it is never inferred from
+provenance, timestamps, checkpoint lineage or semantic similarity.
+
+### 21.6 Forget propagation
+
+A successful Forget may propagate through **explicit Evidence dependencies**
+— never a blind cascade:
+
+- an Episode whose `all_required` support loses a forgotten ref, or whose
+  `any_sufficient` refs are all forgotten, is forgotten (scrubbed) as well, and
+  so are its own dependants, transitively;
+- an `any_sufficient` Episode that still has an available ref stays active;
+- a checkpoint statement that loses its required support is removed; if the
+  `current_state` of the ACTIVE checkpoint is removed, the checkpoint becomes
+  `invalidated` — with **no automatic fallback** to an older revision.
+
+This applies to Cognitive Forget, Episode Forget and Knowledge Forget
+(the resources that can be Evidence). With Knowledge Forget `memory_only: true` the original Source may be
+preserved for reprocessing, but contextual content that lost its required
+support is still scrubbed, and re-cognify never resurrects it. Forgotten
+content never comes back after a restart; there is no restore.
+
+### 21.7 Contextual Recall
+
+`POST /api/v1/context/recall` is synchronous and **read-only** (no Query,
+Session entry, PipelineRun or Evidence is created) and returns a structured
+`ProjectContextBundle` — never a generated answer.
+
+```bash
+curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/context/recall" \
+  -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "scope": "project:sofias-memory",
+        "context_key": "main",
+        "intent": "explain",
+        "query": "Why is PostgreSQL authoritative?",
+        "datasets": ["docs"],
+        "include_evidence": true
+      }'
+```
+
+| `intent` | Returns |
+|---|---|
+| `resume` | the current checkpoint, current project Cognitive Memory and relevant ACTIVE Episodes |
+| `context` | the same, focused on the query |
+| `explain` | the same, plus the bounded causal trace of the explicit Evidence of the returned resources |
+| `history` | the current checkpoint as orientation, SUPERSEDED/INVALIDATED revisions (revision DESC) and ACTIVE/INVALIDATED Episodes (`occurred_at` DESC); no current memories |
+
+- `query` is required (1–8192 characters). At most **one** embedding call is
+  made per request, shared by Cognitive Memory, Episodes and Knowledge. If the
+  provider fails, the bundle degrades deterministically (lexical Knowledge,
+  recency for Episodes/memories) with `warnings=["PARTIAL_CONTEXT"]` and the
+  affected `degraded_sources`.
+- Knowledge is used **only** for datasets listed explicitly in `datasets`
+  (at most 16; a dataset that does not exist or is not ACTIVE →
+  `422 INVALID_REQUEST`). Omitting `datasets` means no Knowledge at all —
+  never an implicit `main`. `knowledge_references` carry identities and a
+  local rank, never chunk text; a retrieval hit is never Evidence.
+- Cognitive Memory is limited to the requested project scope: `global` memory
+  is never included automatically.
+- `include_evidence=true` returns `evidence[]`: each identity once, with its
+  `availability` and its `owners` (`owner_type` `context_statement`/`episode`,
+  `owner_id`, `support_mode`), so a chain such as statement → Episode B →
+  Episode A → Chunk is reconstructable. Intermediate Episodes appear as
+  identities only. A trace cut by a limit is never presented as complete.
+- `limits`: `memories` (default 8, max 50), `episodes` (8, 50),
+  `historical_checkpoints` (4, 20), `knowledge` (8, 50), `evidence` (12, 100).
+  The response is bounded; anything omitted is signalled with
+  `PARTIAL_CONTEXT`.
+- Warnings: `NO_CURRENT_CHECKPOINT`, `PARTIAL_CONTEXT`,
+  `EVIDENCE_UNAVAILABLE`, `AMBIGUOUS_CURRENT_TRUTH`. Forgotten content is
+  never returned by any intent; content whose support is currently
+  insufficient is excluded from current context.
+- PostgreSQL unavailable → `503 DEPENDENCY_UNAVAILABLE` (never an empty
+  bundle pretending nothing exists). Contextual Recall reads only PostgreSQL;
+  it never queries Neo4j (see §21.9 for the service-level startup dependency).
+
+### 21.8 What Contextual Project Memory does not do
+
+No automatic checkpoint creation, Episode extraction, Evidence inference,
+summarization, contradiction resolution or consolidation; no Neo4j projection;
+no cross-project recall; no LLM explanation. All of these remain out of scope.
+
+### 21.9 Operational note: Neo4j and service startup
+
+Every contextual operation reads and writes only PostgreSQL and never uses
+Neo4j. This does **not** make the service start without Neo4j: when Neo4j is
+configured, the service's standard startup bootstrap (shared by every feature)
+includes it, and while that bootstrap has not succeeded the service is not
+operational — every business route, contextual routes included, answers
+`503 DEPENDENCY_UNAVAILABLE`. If Neo4j becomes unavailable *after* the service
+is operational, Episodes, Context Checkpoints, Evidence, Contextual Recall and
+Forget propagation keep working, and `GET /health/ready` reports the outage.

@@ -1290,8 +1290,11 @@ curl -sS -X POST "$SOFIAS_MEMORY_URL/api/v1/context/checkpoints/$CHECKPOINT_ID/f
   -H "X-API-Key: $SOFIAS_MEMORY_API_KEY" -H "Idempotency-Key: $(uuidgen)"
 ```
 
-- Lifecycle: `active → superseded` (only through Supersede), `active →
-  invalidated`, any non-forgotten `→ forgotten` (terminal).
+- Lifecycle: `active → superseded` (only through Supersede); `active →
+  invalidated` and `superseded → invalidated` (explicitly through Invalidate,
+  or when Forget propagation removes the checkpoint's `current_state`, §21.6);
+  any non-forgotten `→ forgotten` through Forget (terminal). Invalidating a
+  checkpoint never restores or reactivates an older revision.
 - **Stale writers:** Supersede succeeds only while its target is still the
   ACTIVE checkpoint. If another writer already superseded it, the call fails
   with `409 CONTEXT_STATE_CONFLICT` and nothing is created: re-read
@@ -1329,16 +1332,31 @@ provenance, timestamps, checkpoint lineage or semantic similarity.
 
 ### 21.6 Forget propagation
 
-A successful Forget may propagate through **explicit Evidence dependencies**
-— never a blind cascade:
+A successful Forget propagates only through **explicitly persisted Evidence
+dependencies** — it is not an unconditional cascade through every descendant:
 
-- an Episode whose `all_required` support loses a forgotten ref, or whose
-  `any_sufficient` refs are all forgotten, is forgotten (scrubbed) as well, and
-  so are its own dependants, transitively;
-- an `any_sufficient` Episode that still has an available ref stays active;
-- a checkpoint statement that loses its required support is removed; if the
-  `current_state` of the ACTIVE checkpoint is removed, the checkpoint becomes
-  `invalidated` — with **no automatic fallback** to an older revision.
+- every resource that explicitly declares the forgotten resource as Evidence
+  is re-evaluated **individually**, against its own declared support policy and
+  the *current* availability of **all** its refs — including refs that are
+  unavailable for reasons other than Forget (for example an invalidated
+  Episode);
+- `all_required` loses support as soon as any of its refs is not available;
+  `any_sufficient` stays supported while at least one of its refs is still
+  available;
+- a dependant Episode whose support became insufficient is forgotten
+  (scrubbed); then the resources that depend on *it* are re-evaluated the same
+  way, one by one, so the propagation continues only through real
+  dependencies and stops at every dependant whose policy is still satisfied;
+- checkpoint statements are evaluated individually: a statement whose support
+  became insufficient is removed; if the removed statement is the
+  `current_state` of an ACTIVE or SUPERSEDED checkpoint, that checkpoint becomes
+  `invalidated` — with **no automatic fallback** to, or reactivation of, an
+  older revision.
+
+Only a successful Forget starts this destructive propagation. Ordinary
+invalidation never scrubs dependants: invalidating an Episode only makes it
+`unavailable` as Evidence, and Contextual Recall then excludes current content
+whose support is insufficient, without mutating it.
 
 This applies to Cognitive Forget, Episode Forget and Knowledge Forget
 (the resources that can be Evidence). With Knowledge Forget `memory_only: true` the original Source may be

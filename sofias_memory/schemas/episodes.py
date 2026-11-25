@@ -145,7 +145,7 @@ class EpisodeCreateRequest(BaseModel):
     support: SupportRequest | None = Field(
         default=None,
         description=(
-            "Optional explicit Evidence support (SM-CTX-004). Omitted means an independent "
+            "Optional explicit Evidence support. Omitted means an independent "
             "assertion with no declared dependency -- never inferred from provenance."
         ),
     )

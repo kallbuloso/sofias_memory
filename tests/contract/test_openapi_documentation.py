@@ -26,7 +26,7 @@ NEO4J_PASSWORD = "fake-neo4j-password"
 LLM_API_KEY = "sk-fake-test-key"
 COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 
-INTERNAL_MARKER_PATTERN = re.compile(r"SM-\d|ADR-\d|\bB5\b|\bB4\b|\bB3\b")
+INTERNAL_MARKER_PATTERN = re.compile(r"SM-\d|SM-CTX|ADR-\d|\bB5\b|\bB4\b|\bB3\b|[Hh]andoff|Codex")
 
 # Idempotency-Key is accepted only by these operations (verified against the
 # route code, not docs/api.md) -- SWAGGER-002 SS10. Every synchronous

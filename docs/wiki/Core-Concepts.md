@@ -18,7 +18,7 @@ Durable application state lives in PostgreSQL, including datasets, sources, chun
 
 Neo4j is a **reconstructible projection** used for knowledge-graph workloads. It is not authoritative and can be rebuilt from PostgreSQL.
 
-Cognitive Memory has no Neo4j projection in v0.7.0.
+Cognitive Memory has no Neo4j projection in v0.7.0. Contextual Project Memory (Episodes, Context Checkpoints, Evidence) is PostgreSQL-only as well.
 
 Original source objects are stored durably on the local filesystem by default or through the supported S3-compatible storage backend.
 
@@ -74,6 +74,28 @@ A Cognitive Memory does not require a Dataset, Source, Document, or Chunk.
 This separation is deliberate. If something is a durable fact, it should not need a fake document merely to become retrievable.
 
 ---
+
+## 2a. Contextual Project Memory
+
+Contextual Project Memory keeps the **continuity of a project** for the applications and agents that work on it. It is explicit: nothing is created, summarized or inferred automatically.
+
+- **Episode** — something that *happened* in a project (a decision, incident, experiment, outcome…). Historical experience, never current truth. Lifecycle: `active → invalidated → forgotten`.
+- **ContextCheckpoint** — *where the work is now* for one Context Stream `(scope, context_key)`: objective, current state, approved decisions, pending work, open items, blockers and next action. Exactly one checkpoint per stream is `active`; a new snapshot replaces it through Supersede (`superseded`), it can be `invalidated`, and `forgotten` is terminal. Revisions only increase.
+- **Evidence** — an explicit, declared dependency of an Episode or of one checkpoint statement on another resource (`support.mode` `all_required` or `any_sufficient`). Evidence is never inferred from provenance, time, lineage or similarity.
+- **Contextual Recall** — a read-only, structured `ProjectContextBundle` for one stream with the intents `resume`, `context`, `explain` (Evidence-driven) and `history` (chronological). It never generates an answer.
+
+How the durable concepts differ:
+
+| Concept | It is | It is not |
+|---|---|---|
+| `MemoryItem` | a durable fact or preference (Cognitive Memory), current or historical truth | an event or a project status |
+| `Episode` | something that happened in a project, kept as history | current truth |
+| `ContextCheckpoint` | the explicit current state of one Context Stream | a log or a generated summary |
+| `SessionEntry` | one append-only interaction record of a Session | curated project context |
+| Knowledge (Source/Document/Chunk) | source-backed reference material in a Dataset | project state; a retrieval hit is never Evidence |
+| Evidence | a declared link "this depends on that", with current availability | a copy of the source content |
+
+Recalled context is context, not authority: the Consumer stays responsible for authorization, planning, execution and tool permissions.
 
 ## 3. Dataset
 
@@ -464,6 +486,10 @@ forgets one exact Cognitive Memory destructively.
 
 The two APIs are intentionally separate and should not be treated as aliases.
 
+### Contextual Forget propagation
+
+A successful Cognitive, Episode or Knowledge Forget may propagate through **explicit Evidence dependencies** — never a blind cascade. An Episode or checkpoint statement that loses its required support is scrubbed; an `any_sufficient` dependant that keeps another available reference survives; a current checkpoint that loses its `current_state` becomes `invalidated`, with no automatic fallback to an older revision. With Knowledge Forget `memory_only: true` the Source may be preserved for reprocessing, but contextual content that lost its required support stays scrubbed, and re-cognify does not resurrect it.
+
 ---
 
 ## 20. Authentication and tenancy boundary
@@ -512,6 +538,18 @@ cognitive_memory.supersede
 cognitive_memory.forget
 ```
 
+Contextual Project Memory contract `1` (`contracts.contextual_project_memory = "1"`) advertises:
+
+```text
+contextual_project_memory.episodes
+contextual_project_memory.checkpoints
+contextual_project_memory.recall
+contextual_project_memory.explain
+contextual_project_memory.history
+```
+
+Evidence and Forget propagation are part of that contract, not separate capabilities.
+
 This gives external integrations a stable machine-readable compatibility boundary.
 
 ---
@@ -525,6 +563,9 @@ When deciding where something belongs, ask:
 | Is this source-backed material that should preserve document provenance? | Knowledge Memory |
 | Is this a durable fact, preference, decision, or persistent semantic context? | Cognitive Memory |
 | Is this temporary/temporal interaction context? | Session |
+| Did something happen in a project that should be remembered as history? | Episode |
+| Is this where a project's work stands right now? | ContextCheckpoint |
+| Does one context item depend on another resource? | Evidence (`support`) |
 | Is this an executable procedure another system may choose to use? | Skill |
 | Is this durable configuration/identity for an external agent? | Agent profile |
 | Is this a long-running source-processing operation? | PipelineRun |

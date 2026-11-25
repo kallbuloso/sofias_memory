@@ -58,8 +58,8 @@ more is a 422, never silently dropped)."""
 
 
 class ContextRecallIntent(StrEnum):
-    """Contract v1 SS 40, all four implemented (``explain``/``history`` since
-    SM-CTX-007). Intent selects the sources deterministically (no LLM router)."""
+    """Contract v1 SS 40. Intent selects the sources deterministically (no LLM
+    router)."""
 
     RESUME = "resume"
     EXPLAIN = "explain"
@@ -251,8 +251,8 @@ class ContextRecallEpisode(BaseModel):
 
 
 class ContextRecallKnowledgeReference(BaseModel):
-    """A Knowledge Memory reference of an explicitly selected, ACTIVE dataset
-    (handoff 15 SS 54/62/65/114-118). Identities only -- never chunk text, a
+    """A Knowledge Memory reference of an explicitly selected, ACTIVE dataset.
+    Identities only -- never chunk text, a
     URL or a summary. Ranks/relevance compare only inside
     ``knowledge_references``; a reference is never Evidence by itself."""
 

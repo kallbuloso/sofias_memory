@@ -21,6 +21,20 @@ LLM_API_KEY = "LLM_SECRET_DO_NOT_LEAK_123"
 COGNITIVE_IDEMPOTENCY_HMAC_KEY = "test-cognitive-idempotency-hmac-key-0123456789abcdef"
 EMBEDDING_API_KEY = "EMBEDDING_SECRET_DO_NOT_LEAK_123"
 DATABASE_URL = f"postgresql+asyncpg://sofias_memory:{DATABASE_PASSWORD}@postgres:5432/sofias_memory"
+COGNITIVE_CAPABILITIES = [
+    "cognitive_memory.write",
+    "cognitive_memory.get",
+    "cognitive_memory.recall",
+    "cognitive_memory.supersede",
+    "cognitive_memory.forget",
+]
+CONTEXTUAL_CAPABILITIES = [
+    "contextual_project_memory.episodes",
+    "contextual_project_memory.checkpoints",
+    "contextual_project_memory.recall",
+    "contextual_project_memory.explain",
+    "contextual_project_memory.history",
+]
 INFO_DATA_FIELDS = {
     "name",
     "version",
@@ -132,14 +146,8 @@ async def test_info_returns_expected_application_metadata() -> None:
         "embedding_model": "text-embedding-test",
         "embedding_dimensions": 3072,
         "api_contract_version": "1",
-        "contracts": {"cognitive_memory": "1"},
-        "capabilities": [
-            "cognitive_memory.write",
-            "cognitive_memory.get",
-            "cognitive_memory.recall",
-            "cognitive_memory.supersede",
-            "cognitive_memory.forget",
-        ],
+        "contracts": {"cognitive_memory": "1", "contextual_project_memory": "1"},
+        "capabilities": [*COGNITIVE_CAPABILITIES, *CONTEXTUAL_CAPABILITIES],
     }
 
 
@@ -325,14 +333,61 @@ async def test_info_announces_all_five_cognitive_memory_capabilities() -> None:
 
     data = data_object(response)
     assert data["api_contract_version"] == "1"
-    assert data["contracts"] == {"cognitive_memory": "1"}
-    assert data["capabilities"] == [
-        "cognitive_memory.write",
-        "cognitive_memory.get",
-        "cognitive_memory.recall",
-        "cognitive_memory.supersede",
-        "cognitive_memory.forget",
+    assert data["contracts"]["cognitive_memory"] == "1"
+    assert data["capabilities"][: len(COGNITIVE_CAPABILITIES)] == COGNITIVE_CAPABILITIES
+
+
+@pytest.mark.asyncio
+async def test_info_activates_contextual_project_memory_contract_additively() -> None:
+    """Contextual Project Memory Contract v1 SS 6/6.1 activation: the feature
+    contract and exactly its five frozen capabilities are advertised, after
+    and without changing the Cognitive Memory ones; the API contract major and
+    the serialized order stay deterministic."""
+
+    async with make_client(create_app(make_settings())) as client:
+        first = data_object(
+            await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
+        )
+        second = data_object(
+            await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
+        )
+
+    assert first["api_contract_version"] == "1"
+    assert first["contracts"] == {"cognitive_memory": "1", "contextual_project_memory": "1"}
+    assert list(cast(dict[str, str], first["contracts"])) == [
+        "cognitive_memory",
+        "contextual_project_memory",
     ]
+    assert first["capabilities"] == [*COGNITIVE_CAPABILITIES, *CONTEXTUAL_CAPABILITIES]
+    assert first["contracts"] == second["contracts"]
+    assert first["capabilities"] == second["capabilities"]
+
+
+@pytest.mark.asyncio
+async def test_info_advertises_no_phantom_or_independent_contextual_capability() -> None:
+    """No Evidence/Forget capability (integral guarantees of the contract) and
+    no DEFERRED or future contextual capability is ever advertised."""
+
+    async with make_client(create_app(make_settings())) as client:
+        data = data_object(
+            await client.get("/api/v1/info", headers={API_KEY_HEADER: EXPECTED_API_KEY})
+        )
+
+    capabilities = cast(list[str], data["capabilities"])
+    contextual = [c for c in capabilities if c.startswith("contextual_project_memory")]
+    assert contextual == CONTEXTUAL_CAPABILITIES
+    assert len(set(capabilities)) == len(capabilities)
+    for phantom in (
+        "contextual_project_memory.evidence",
+        "contextual_project_memory.forget",
+        "contextual_project_memory.forget_propagation",
+        "contextual_project_memory.streams",
+        "contextual_project_memory.graph",
+        "contextual_project_memory.distillation",
+        "contextual_project_memory.consolidation",
+        "contextual_project_memory.answer",
+    ):
+        assert phantom not in capabilities
 
 
 @pytest.mark.asyncio

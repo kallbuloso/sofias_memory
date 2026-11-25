@@ -2522,6 +2522,115 @@ Registrar:
 - final `/api/v1/info`;
 - documentação atualizada.
 
+## SM-CTX-008 — Evidência de fechamento (DONE)
+
+```text
+Status:                  DONE (2026-11-25)
+Baseline:                main @ d6de329af84184ad03301c75a4e4993245cb1bf0
+Implementation SHA:      7b53b4b773c61378141dc22db3892369336339c2
+                          (feat(context): harden and activate contextual memory contract v1 (SM-CTX-008))
+Documentation SHA:       d2f59454d9bb411e688ef548d9d728c2d45d62f1
+                          (docs(context): clarify checkpoint lifecycle and forget propagation)
+Merge into main:         18b0034ec9074147b71aa490075065ac45ad021b (PR #5, merge commit;
+                          parents d6de329 + d2f5945; 16 arquivos alterados)
+Alembic head:            0022 (sem nova migration; sem nova dependência; sem novo
+                          workflow de CI)
+```
+
+- Entregue (handoff `16`): hardening, documentação e ativação pública do
+  **Contextual Project Memory Contract v1**, consolidando SM-CTX-001..007:
+  - Episodes, ContextCheckpoints, Evidence e Contextual Recall;
+  - os quatro intents de Recall: `resume`, `context`, `explain` e `history`;
+  - integração com Knowledge somente com datasets explícitos;
+  - ownership determinístico de Evidence e trace causal bounded;
+  - garantias de lifecycle e supersession (um único checkpoint ACTIVE por
+    stream, revisão monotônica, lineage explícita);
+  - idempotency e segurança de concorrência (stale writer ⇒
+    `409 CONTEXT_STATE_CONFLICT`, replay idempotente);
+  - Forget propagation e não-ressurreição;
+  - PostgreSQL como autoridade; nenhuma projeção contextual em Neo4j;
+  - Contextual Recall read-only;
+  - compatibilidade da API legada (Knowledge, Cognitive Memory, Sessions,
+    Skills, Agents).
+- Hardening: descrições públicas do OpenAPI sem terminologia interna; o teste
+  de contrato de documentação também rejeita `SM-CTX`, `handoff` e `Codex`;
+  `docs/api.md` §21, wiki, README e CHANGELOG `[Unreleased]` alinhados ao
+  comportamento real.
+- Negociação de Contract — estado final de `GET /api/v1/info`:
+
+```text
+api_contract_version                    = "1"
+contracts["cognitive_memory"]           = "1"
+contracts["contextual_project_memory"]  = "1"
+
+capabilities (após as cinco capabilities cognitivas, nesta ordem):
+  contextual_project_memory.episodes
+  contextual_project_memory.checkpoints
+  contextual_project_memory.recall
+  contextual_project_memory.explain
+  contextual_project_memory.history
+```
+
+  Nenhuma capability independente de Evidence ou Forget foi adicionada; não há
+  capability parcial ou fantasma.
+- Sequência da ativação: o anúncio em `/api/v1/info` foi adicionado na
+  implementação (`7b53b4b`) somente depois de os gates preliminares de
+  hardening e o cenário longitudinal passarem; a negociação de Contract e a
+  Human Validation foram executadas em seguida sobre o build ativado; o DONE
+  documental é registrado aqui somente após implementação, validação, revisão
+  e merge.
+- Evidência de aceitação (local, fora do CI; PostgreSQL `pgvector/pg17`
+  descartável no WSL, credenciais sintéticas):
+  - Acceptance Criteria AC-008.1–AC-008.50: PASS;
+  - suíte completa isolada com o Contract ativado: 3829 passed, 0 failed,
+    35 skipped (os 35 skips são opt-ins que exigem Neo4j real ou o smoke
+    S3/compose, mantidos desligados; **não** foram executados);
+  - cenário longitudinal pela API pública A–V: PASS;
+  - dois restarts reais da aplicação (novo app, engine e pool): PASS;
+  - stale writer e replay idempotente: PASS;
+  - Forget sem ressurreição: PASS;
+  - hardening de migrations PostgreSQL: 18 passed;
+  - upgrade de `0018` para `0022` (passo a passo, sem backfill contextual): PASS;
+  - roundtrip downgrade/upgrade contextual: PASS;
+  - 24 constraints/invariantes de schema inspecionados;
+  - sentinel de privacy (respostas, tabelas contextuais e cognitivas, ledgers de
+    idempotency e logs capturados): PASS;
+  - regressão de Knowledge, Cognitive Memory, Sessions, Skills e Agents: PASS;
+  - Human Validation: 41/41 contra processos uvicorn reais (fases 1–10,
+    incluindo um Neo4j descartável parado com o processo já operacional);
+  - ruff check, ruff format (arquivos alterados) e mypy limpos.
+- Evidência de CI (GitHub Actions, sem PostgreSQL real):
+  - PR HEAD `d2f5945`: run 45534870661 SUCCESS;
+  - pós-merge `18b0034`: run 45536611215 SUCCESS — os dois jobs (`Lint, type
+    check, unit/contract/security tests` com 2991 passed e `Docker image
+    build + OCI label check`);
+  - o CI padrão **não** executa todas as suítes PostgreSQL isoladas nem a
+    Human Validation; sua evidência é a local acima.
+- Findings do PR #5 (dois MINOR de documentação, ambos corrigidos em
+  `d2f5945`, threads resolvidas):
+  1. lifecycle de checkpoint em `docs/api.md` §21.4, incluindo
+     `SUPERSEDED → INVALIDATED`;
+  2. Forget propagation em `docs/api.md` §21.6: cada dependente é
+     reavaliado individualmente pela sua política de suporte com a
+     disponibilidade atual das suas referências, sem cascata incondicional.
+- Limitações conhecidas (aceitas, não bloqueadoras):
+  - DEFERRED: o bootstrap global de startup inclui o Neo4j configurado; se o
+    Neo4j estiver indisponível antes da inicialização do processo, as rotas de
+    negócio (inclusive as contextuais) respondem `503` até o bootstrap
+    concluir (pré-existente; documentado em `docs/api.md` §21.9 e no
+    CHANGELOG). **A independência do Neo4j no cold start não foi
+    demonstrada**;
+  - DEFERRED: manutenção do `integration.yml` existente;
+  - DEFERRED: dependência de rede existente em teste S3;
+  - MINOR: o query embedding é calculado antes da validação de datasets;
+  - MINOR: logs raros duplicados na releitura do trace de Evidence;
+  - MINOR: pequenas lacunas pré-existentes de documentação;
+  - MINOR: comportamento intermitente de teste associado ao clock skew
+    Windows/WSL.
+- Este registro não declara tagged release, deploy em produção, SLA de
+  produção nem prontidão operacional para toda configuração de
+  infraestrutura suportada.
+
 ---
 
 # 14. Slice Dependency Matrix
@@ -2753,3 +2862,41 @@ contextual_project_memory = "1"
 ```
 
 deverá ser considerado implementado.
+
+## 18.1 Estado final (2026-11-25)
+
+```text
+SM-CTX-001 DONE
+SM-CTX-002 DONE
+SM-CTX-003 DONE
+SM-CTX-004 DONE
+SM-CTX-005 DONE
+SM-CTX-006 DONE
+SM-CTX-007 DONE
+SM-CTX-008 DONE   (merge 18b0034, PR #5)
+
+Contextual Project Memory v1 — IMPLEMENTATION COMPLETE
+```
+
+O cenário longitudinal acima foi provado pela API pública com PostgreSQL real
+e restarts reais (SM-CTX-008, cenário A–V; ver a evidência de fechamento do
+§13). `contextual_project_memory = "1"` é considerado implementado.
+
+Sequência, sem contradição com o gate acima:
+
+1. o anúncio em `GET /api/v1/info` foi ativado dentro do SM-CTX-008 somente
+   depois de os gates de hardening preliminares e o cenário longitudinal
+   passarem (activation gate do §2.5 e do handoff `16`);
+2. a negociação de Contract e a Human Validation foram executadas em seguida,
+   sobre o build já ativado;
+3. o DONE documental foi registrado somente depois de implementação,
+   validação, revisão e merge.
+
+A ativação de `/api/v1/info` não esperou o DONE documental: o DONE registra
+que todos os gates prescritos já haviam passado. A regra de que o Contract v1
+só pode ser anunciado após esses gates permanece normativa.
+
+Implementação concluída não estabelece automaticamente tagged release, deploy
+em produção, SLA de produção, disponibilidade completa da aplicação sem Neo4j
+no cold start nem prontidão operacional para toda configuração de
+infraestrutura suportada.

@@ -1225,6 +1225,27 @@ A implementação ocorre por Slices.
 
 ## 16.1 Contract activation gate
 
+**Status: ATIVADO.** O activation gate do `SM-CTX-008` passou e o anúncio foi
+mergeado em `main` (merge `18b0034`, PR #5). Estado atual de
+`GET /api/v1/info`:
+
+```text
+api_contract_version                    = "1"
+contracts["cognitive_memory"]           = "1"
+contracts["contextual_project_memory"]  = "1"
+capabilities (após as cinco cognitivas, nesta ordem):
+  contextual_project_memory.episodes
+  contextual_project_memory.checkpoints
+  contextual_project_memory.recall
+  contextual_project_memory.explain
+  contextual_project_memory.history
+```
+
+Não desativar essas capabilities, não adicionar capability independente de
+Evidence ou Forget e não alterar `api_contract_version` sem decisão explícita
+do usuário. A regra abaixo permanece normativa para qualquer mudança futura do
+Contract.
+
 Enquanto o activation gate de `SM-CTX-008` não tiver passado, a aplicação MUST NOT anunciar o Contract nem qualquer uma das cinco capabilities contextuais em `GET /api/v1/info`:
 
 ```json
@@ -1267,36 +1288,40 @@ Não implementar antecipadamente APIs de Slices futuros só porque o Contract j�
 CURRENT PHASE:
 
 ```text
-Implementation
-```
-
-CURRENT ROLE:
-
-```text
-Senior Software Engineer
+Contextual Project Memory v1 — IMPLEMENTATION COMPLETE
 ```
 
 CURRENT SLICE:
 
 ```text
-SM-CTX-008 — Contract Hardening and Longitudinal Validation
+NONE — initiative closed
 ```
 
-CURRENT HANDOFF (APPROVED):
+CURRENT HANDOFF:
+
+```text
+NONE
+```
+
+A iniciativa **Contextual Project Memory v1** foi encerrada em 2026-11-25
+(closeout documental do SM-CTX-008, após o merge `18b0034`, PR #5). Nenhum
+Slice de implementação de Contextual Project Memory está CURRENT. Esse
+encerramento se refere somente a esta iniciativa; não declara o projeto Sofias
+Memory como completo.
+
+Nenhum Slice futuro, nova fase de implementação ou fase de release está
+planejado ou autorizado por este documento. Qualquer trabalho novo exige
+decisão explícita do usuário e, quando aplicável, artefatos APPROVED próprios.
+
+Histórico de implementação (handoffs concluídos, não atribuições ativas):
 
 ```text
 docs/product-implementation/implementation/
-16-SF-Implementation-SM-CTX-008-Hardening-Contract-Activation.md
+16-SF-Implementation-SM-CTX-008-Hardening-Contract-Activation.md   (SM-CTX-008, concluído)
 ```
 
-Este documento deve ser lido integralmente antes de modificar código relacionado ao Slice.
-
-**SM-CTX-008 is CURRENT but implementation is NOT AUTHORIZED until a
-subsequent explicit user decision.** A transição de CURRENT para SM-CTX-008 foi
-autorizada em 2026-11-24 (closeout de SM-CTX-007). A promoção documental não
-autoriza implementação: até a autorização explícita de execução, não modificar
-código, migrations, OpenAPI ou `/api/v1/info` para SM-CTX-008.
-CURRENT ≠ autorização de implementação.
+Os handoffs `09–16` são histórico de implementação e permanecem fonte para o
+racional e os invariantes entregues; não autorizam execução.
 
 Slices concluídos (evidência em
 `docs/product-implementation/08-SF-Technical-Backlog-Memoria-Contextual-Por-Projeto.md`):
@@ -1312,39 +1337,37 @@ Slices concluídos (evidência em
 - `SM-CTX-006 — Contextual Recall Core` — DONE
   (merge `579ee17`, PR #3; sem nova migration; head `0022`);
 - `SM-CTX-007 — Explain, History and Knowledge Integration` — DONE
-  (merge `7a19307`, PR #4; sem nova migration; head `0022`).
+  (merge `7a19307`, PR #4; sem nova migration; head `0022`);
+- `SM-CTX-008 — Contract Hardening and Longitudinal Validation` — DONE
+  (merge `18b0034`, PR #5; sem nova migration; head `0022`; Contract v1
+  anunciado em `/api/v1/info`).
 
 ---
 
-## 17.1 Único escopo do Slice CURRENT
+## 17.1 Implementado e validado versus não estabelecido
 
-Quando a execução for autorizada, durante `SM-CTX-008` executar somente
-hardening e validação do Contract já implementado por SM-CTX-001..007, conforme
-handoff `16` §1–§8 e §253 — o Slice não adiciona feature nova:
+Implementado e validado:
 
-```text
-contract hardening / integration hardening
-compatibility validation (Knowledge, Sessions, Skills, Agents, Cognitive Memory)
-privacy validation (logs, banco, idempotency, Evidence, tombstones, OpenAPI)
-migration validation (cadeia, fresh upgrade, upgrade pré-contextual, downgrade)
-OpenAPI / error / idempotency / lifecycle / Evidence / Forget / Recall audits
-longitudinal validation pela API pública com restarts obrigatórios (§139–§167)
-documentation alignment (documentação deve refletir a realidade, §131–§138)
-capability activation em GET /api/v1/info, somente após todos os gates (§8/§254)
-```
+- Contextual Project Memory Contract v1;
+- negociação pública de capabilities em `GET /api/v1/info` (§16.1);
+- comportamento longitudinal e gates de aceitação obrigatórios (cenário A–V
+  pela API pública, restarts reais, Forget sem ressurreição, Human Validation).
 
-Exit guarantee (§2): um único cenário longitudinal real
-`persist → restart → resume → explain → history → supersede → stale conflict →
-Forget → restart → no resurrection`. Preferência por nenhuma migration; somente
-migration aditiva pequena se o hardening comprovar constraint/index ausente
-(§252).
+Não estabelecido automaticamente:
+
+- tagged release;
+- deploy em produção;
+- SLA de produção;
+- disponibilidade completa da aplicação sem Neo4j no cold start (o bootstrap
+  global de startup ainda inclui o Neo4j configurado; limitação DEFERRED);
+- prontidão operacional para toda configuração de infraestrutura suportada.
 
 ---
 
-## 17.2 Explicitamente fora do Slice
+## 17.2 Itens que permanecem DEFERRED
 
-MUST NOT implementar em SM-CTX-008 (handoff `16` §6/§191–§199/§202; tudo
-DEFERRED):
+Continuam fora de escopo e exigem decisão/artefatos próprios (handoff `16`
+§6/§191–§199/§202; backlog §16):
 
 ```text
 automatic distillation / automatic checkpoint creation / automatic Evidence inference
@@ -1357,15 +1380,14 @@ background contextual reconciliation / contextual cleanup scheduler
 new contextual resource types / nova dependência operacional
 ```
 
-Não usar "hardening" como justificativa para redesign especulativo (§7).
+Não usar "hardening" ou manutenção como justificativa para implementá-los.
 
 ---
 
-## 17.3 CURRENT não é autorização implícita
+## 17.3 Encerramento não é autorização implícita
 
-`SM-CTX-008` é o último Slice planejado desta iniciativa. Seu estado CURRENT é
-planejamento, não execução: requer handoff APPROVED **e** autorização explícita
-de execução do usuário. `future handoff existence != authorization`.
+O encerramento da iniciativa não autoriza novo Slice, release, deploy ou
+mudança do Contract. `future handoff existence != authorization`.
 
 ---
 
@@ -2150,73 +2172,45 @@ SM-CTX-007 — Explain, History and Knowledge Integration
 SM-CTX-008 — Contract Hardening and Longitudinal Validation
 ```
 
-Essa lista representa planejamento.
-
-Não representa autorização automática.
-
-Somente o Slice explicitamente CURRENT cujo implementation handoff estiver
-APPROVED pode ser executado. CURRENT é `SM-CTX-008`, handoff `16`, mas sua
-execução NÃO está autorizada até decisão explícita posterior do usuário (§17).
-`SM-CTX-001`, `SM-CTX-002`, `SM-CTX-003`, `SM-CTX-004`, `SM-CTX-005`,
-`SM-CTX-006` e `SM-CTX-007` estão DONE.
-Esta autorização de implementação não substitui o escopo da tarefa atual do
-usuário: uma auditoria documentation-only não autoriza executar Slice algum.
+Todos os oito Slices desta sequência estão DONE (`SM-CTX-001` a
+`SM-CTX-008`); a iniciativa Contextual Project Memory v1 está encerrada e
+nenhum Slice está CURRENT (§17). A lista não autoriza trabalho novo: qualquer
+Slice futuro exige decisão explícita do usuário e handoff APPROVED próprio.
+Uma auditoria documentation-only não autoriza executar Slice algum.
 
 ---
 
-# 35. SM-CTX-008 guardrails
+# 35. Contextual Project Memory v1 — invariantes entregues
 
-Durante o Slice CURRENT (somente após autorização explícita de execução):
+`SM-CTX-008` está DONE; seus guardrails de execução são históricos (handoff
+`16`). Qualquer manutenção futura do código contextual MUST:
 
-```text
-SM-CTX-008
-```
-
-MUST:
-
-- preservar todas as garantias entregues por SM-CTX-001..007 (lifecycle,
+- preservar todas as garantias entregues por SM-CTX-001..008 (lifecycle,
   concorrência, Evidence determinística, Forget sem ressurreição, Recall
   read-only em snapshot consistente, isolamento de projeto/stream, Knowledge
   somente com datasets explícitos), incluindo as regras semânticas
   `lineage != causality`, `semantic relevance != Evidence`,
   `provenance != Evidence`, `project scope != Dataset`,
   `datasets omitted != main` e `history != forgotten-content recovery`, e
-  Contextual Recall sem LLM, sem Neo4j e sem persistência; hardening corrige,
-  não redesenha (§7);
-- classificar todo finding como BLOCKER, IMPORTANT, MINOR ou DEFERRED
-  (§246–§249) e voltar para decisão humana nos casos do §250 (mudança de
-  public Contract, capability congelada, support semantics, Forget guarantee,
-  lifecycle, novo datastore, Neo4j ou LLM contextual, background convergence,
-  backfill histórico, API Contract major);
-- anunciar `contracts["contextual_project_memory"] = "1"` e exatamente as cinco
-  capabilities do Contract `05` §6.1 somente depois de todos os gates
-  passarem, perto do fim do Slice (§8/§11/§253/§254); nunca capability
-  parcial ou fantasma (§173/§174);
-- manter `api_contract_version = "1"` e `contracts["cognitive_memory"] = "1"`
-  intactos, com serialização determinística (§9/§10/§127/§128);
-- executar o cenário longitudinal pela API pública, com PostgreSQL real e
-  restarts obrigatórios, sem atalho white-box (§139–§167);
-- validar cadeia de migrations, fresh upgrade, upgrade a partir do baseline
-  pré-contextual e downgrade, sem backfill contextual (§107–§114);
-- auditar OpenAPI (sem vazamento de terminologia interna), envelopes, códigos
-  de erro, idempotency e compatibilidade legada (§115–§126);
-- executar as inspeções de privacy e segurança (§178–§185) e alinhar a
-  documentação ao comportamento real (§131–§138);
-- tratar a Human Validation como gate final e não declarar sucesso parcial
-  (§256–§258).
+  Contextual Recall sem LLM, sem Neo4j e sem persistência;
+- manter o anúncio de `/api/v1/info` descrito no §16.1, com
+  `api_contract_version = "1"`, `contracts["cognitive_memory"] = "1"` e
+  serialização determinística; nunca capability parcial ou fantasma;
+- manter as descrições públicas do OpenAPI sem terminologia interna;
+- classificar todo finding como BLOCKER, IMPORTANT, MINOR ou DEFERRED e voltar
+  para decisão humana em mudança de public Contract, capability congelada,
+  support semantics, Forget guarantee, lifecycle, novo datastore, Neo4j ou LLM
+  contextual, background convergence, backfill histórico ou API Contract major.
 
-MUST NOT:
+MUST NOT, sem decisão explícita do usuário:
 
-- implementar os itens DEFERRED do §6 e do §191–§199 (ANN, RRF entre domínios,
-  projeção Neo4j contextual, distillation, extraction, contradiction solver,
-  consolidation, importance, cleanup scheduler);
-- adicionar dependência operacional nova (§202) ou alterar
-  `api_contract_version` para `"2"` (§9);
-- adicionar `contracts["contextual_project_memory"]` no início do Slice para
-  "esperar os testes" (§254);
-- declarar Contract activation READY com qualquer BLOCKER pendente (§256).
+- implementar os itens DEFERRED do §17.2;
+- adicionar dependência operacional nova ou alterar `api_contract_version`;
+- desativar as capabilities contextuais já anunciadas;
+- alterar o comportamento global de startup, bootstrap ou readiness em relação
+  ao Neo4j (limitação DEFERRED documentada em `docs/api.md` §21.9).
 
-O implementation handoff detalhado é autoridade:
+Histórico de implementação:
 
 ```text
 docs/product-implementation/implementation/
